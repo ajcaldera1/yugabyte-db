@@ -16,6 +16,9 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
+
+#include "yb/client/table.h"
+
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 
 DECLARE_bool(use_cassandra_authentication);
@@ -81,6 +84,28 @@ PTDmlStmt::PTDmlStmt(MemoryContext *memctx, const PTDmlStmt& other)
 }
 
 PTDmlStmt::~PTDmlStmt() {
+}
+
+int PTDmlStmt::num_columns() const {
+  return table_->schema().num_columns();
+}
+
+int PTDmlStmt::num_key_columns() const {
+  return table_->schema().num_key_columns();
+}
+
+int PTDmlStmt::num_hash_key_columns() const {
+  return table_->schema().num_hash_key_columns();
+}
+
+string PTDmlStmt::hash_key_columns() const {
+  std::stringstream s;
+  auto &schema = table_->schema();
+  for (int i = 0; i < schema.num_hash_key_columns(); ++i) {
+    if (i != 0) s << ", ";
+    s << schema.Column(i).name();
+  }
+  return s.str();
 }
 
 Status PTDmlStmt::LookupTable(SemContext *sem_context) {
@@ -277,14 +302,13 @@ Status PTDmlStmt::AnalyzeWhereExpr(SemContext *sem_context, PTExpr *expr) {
   } else { // ReadOp
     // Add the hash to the where clause if the list is incomplete. Clear key_where_ops_ to do
     // whole-table scan.
-    bool has_incomplete_hash = false;
     for (int idx = 0; idx < num_hash_key_columns(); idx++) {
       if (!key_where_ops_[idx].IsInitialized()) {
-        has_incomplete_hash = true;
+        has_incomplete_hash_ = true;
         break;
       }
     }
-    if (has_incomplete_hash) {
+    if (has_incomplete_hash_) {
       for (int idx = num_hash_key_columns() - 1; idx >= 0; idx--) {
         if (key_where_ops_[idx].IsInitialized()) {
           where_ops_.push_front(key_where_ops_[idx]);

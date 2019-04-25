@@ -89,6 +89,13 @@
     } \
   } while (0);
 
+#define WARN_WITH_PREFIX_NOT_OK(to_call, warning_prefix) do { \
+    ::yb::Status _s = (to_call); \
+    if (PREDICT_FALSE(!_s.ok())) { \
+      YB_LOG(WARNING) << LogPrefix() << (warning_prefix) << ": " << _s; \
+    } \
+  } while (0);
+
 // Log the given status and return immediately.
 #define YB_LOG_AND_RETURN(level, status) do { \
     ::yb::Status _s = (status); \
@@ -246,6 +253,7 @@ class Status {
          const char* file_name,
          int line_number,
          const Slice& msg,
+         // Error message details. If present - would be combined as "msg: msg2".
          const Slice& msg2 = Slice(),
          int64_t error_code = -1,
          DupFileName dup_file_name = DupFileName::kFalse);

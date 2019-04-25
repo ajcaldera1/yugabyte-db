@@ -19,6 +19,7 @@
 
 #include "yb/yql/cql/ql/ptree/sem_context.h"
 
+#include "yb/client/table.h"
 #include "yb/client/schema-internal.h"
 
 namespace yb {
@@ -258,6 +259,14 @@ void PTInsertStmt::PrintSemanticAnalysisResult(SemContext *sem_context) {
               << ", Expr Type: " << arg.expr()->ql_type_id();
     }
   }
+}
+
+ExplainPlanPB PTInsertStmt::AnalysisResultToPB() {
+  ExplainPlanPB explain_plan;
+  InsertPlanPB *insert_plan = explain_plan.mutable_insert_plan();
+  insert_plan->set_insert_type("Insert on " + table_name().ToString());
+  insert_plan->set_output_width(insert_plan->insert_type().length());
+  return explain_plan;
 }
 
 }  // namespace ql

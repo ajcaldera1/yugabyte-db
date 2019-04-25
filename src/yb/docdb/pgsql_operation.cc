@@ -15,7 +15,9 @@
 
 #include <boost/optional/optional_io.hpp>
 
+#include "yb/common/partition.h"
 #include "yb/common/ql_storage_interface.h"
+#include "yb/common/index.h"
 
 #include "yb/docdb/doc_pgsql_scanspec.h"
 #include "yb/docdb/doc_rowwise_iterator.h"
@@ -44,6 +46,21 @@ CHECKED_STATUS CreateProjection(const Schema& schema,
     }
   }
   return schema.CreateProjectionByIdsIgnoreMissing(column_ids, projection);
+}
+
+DocKey UniqueIndexSearchKey(const Schema& schema, const DocKey& key) {
+  DCHECK(schema.columns().back().order() == static_cast<int>(PgSystemAttrNum::kYBBaseTupleId));
+  auto range_components = key.range_group();
+  range_components.pop_back();
+  return DocKey(schema, key.hash(), key.hashed_group(), range_components);
+}
+
+bool HasNullValue(const std::vector<PrimitiveValue>& items) {
+  return std::find(items.begin(), items.end(), PrimitiveValue()) != items.end();
+}
+
+bool HasNullValue(const DocKey& key) {
+  return HasNullValue(key.hashed_group()) || HasNullValue(key.range_group());
 }
 
 } // namespace
@@ -118,10 +135,15 @@ Status PgsqlWriteOperation::Apply(const DocOperationApplyData& data) {
 
 Status PgsqlWriteOperation::ApplyInsert(const DocOperationApplyData& data) {
   QLTableRow::SharedPtr table_row = std::make_shared<QLTableRow>();
-  RETURN_NOT_OK(ReadColumns(data, table_row));
+  RETURN_NOT_OK(ReadColumns(data, table_row,
+      index_info_ && index_info_->is_unique() && !HasNullValue(*range_doc_key_)
+          ? UniqueIndexSearchKey(schema_, *range_doc_key_)
+          : *range_doc_key_));
   if (!table_row->IsEmpty()) {
     // Primary key or unique index value found.
-    return STATUS(QLError, "Duplicate key found in primary key or unique index");
+    response_->set_status(PgsqlResponsePB::PGSQL_STATUS_DUPLICATE_KEY_ERROR);
+    response_->set_error_message("Duplicate key found in primary key or unique index");
+    return Status::OK();
   }
 
   const MonoDelta ttl = Value::kMaxTtl;
@@ -280,27 +302,24 @@ Status PgsqlWriteOperation::ApplyDelete(const DocOperationApplyData& data) {
 }
 
 Status PgsqlWriteOperation::ReadColumns(const DocOperationApplyData& data,
-                                        const QLTableRow::SharedPtr& table_row) {
-  // Filter the columns using primary key.
-  if (range_doc_key_) {
-    Schema projection;
-    RETURN_NOT_OK(CreateProjection(schema_, request_.column_refs(), &projection));
-    DocPgsqlScanSpec spec(projection, request_.stmt_id(), *range_doc_key_);
-    DocRowwiseIterator iterator(projection,
-                                schema_,
-                                txn_op_context_,
-                                data.doc_write_batch->doc_db(),
-                                data.deadline,
-                                data.read_time);
-    RETURN_NOT_OK(iterator.Init(spec));
-    if (iterator.HasNext()) {
-      RETURN_NOT_OK(iterator.NextRow(table_row.get()));
-    } else {
-      table_row->Clear();
-    }
-    data.restart_read_ht->MakeAtLeast(iterator.RestartReadHt());
+                                        const QLTableRow::SharedPtr& table_row,
+                                        const DocKey& key) {
+  Schema projection;
+  RETURN_NOT_OK(CreateProjection(schema_, request_.column_refs(), &projection));
+  DocPgsqlScanSpec spec(projection, request_.stmt_id(), key);
+  DocRowwiseIterator iterator(projection,
+                              schema_,
+                              txn_op_context_,
+                              data.doc_write_batch->doc_db(),
+                              data.deadline,
+                              data.read_time);
+  RETURN_NOT_OK(iterator.Init(spec));
+  if (VERIFY_RESULT(iterator.HasNext())) {
+    RETURN_NOT_OK(iterator.NextRow(table_row.get()));
+  } else {
+    table_row->Clear();
   }
-
+  data.restart_read_ht->MakeAtLeast(iterator.RestartReadHt());
   return Status::OK();
 }
 
@@ -394,7 +413,7 @@ Status PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storage,
   // Fetching data.
   int match_count = 0;
   QLTableRow::SharedPtr row = std::make_shared<QLTableRow>();
-  while (resultset->rsrow_count() < row_count_limit && iter->HasNext()) {
+  while (resultset->rsrow_count() < row_count_limit && VERIFY_RESULT(iter->HasNext())) {
     // The filtering process runs in the following order.
     // <hash_code><hash_components><range_components><regular_column_id> -> value;
     row->Clear();
@@ -404,7 +423,7 @@ Status PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storage,
       RETURN_NOT_OK(iter->NextRow(row.get()));
       RETURN_NOT_OK(row->GetValue(ybbasectid_id, &row_key));
       RETURN_NOT_OK(table_iter_->Seek(row_key.binary_value()));
-      if (!table_iter_->HasNext() ||
+      if (!VERIFY_RESULT(table_iter_->HasNext()) ||
           VERIFY_RESULT(table_iter_->GetRowKey()) != row_key.binary_value()) {
         DocKey doc_key;
         RETURN_NOT_OK(doc_key.DecodeFrom(Slice(row_key.binary_value())));
@@ -443,8 +462,27 @@ Status PgsqlReadOperation::Execute(const common::YQLStorageIf& ql_storage,
   }
   *restart_read_ht = iter->RestartReadHt();
 
+  return SetPagingStateIfNecessary(iter, resultset, row_count_limit);
+}
+
+Status PgsqlReadOperation::SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,
+                                                     const PgsqlResultSet* resultset,
+                                                     const size_t row_count_limit) {
   if (resultset->rsrow_count() >= row_count_limit && !request_.is_aggregate()) {
-    RETURN_NOT_OK(iter->SetPagingStateIfNecessary(request_, &response_));
+    SubDocKey next_row_key;
+    RETURN_NOT_OK(iter->GetNextReadSubDocKey(&next_row_key));
+    // When the "limit" number of rows are returned and we are asked to return the paging state,
+    // return the partition key and row key of the next row to read in the paging state if there are
+    // still more rows to read. Otherwise, leave the paging state empty which means we are done
+    // reading from this tablet.
+    if (request_.return_paging_state()) {
+      if (!next_row_key.doc_key().empty()) {
+        PgsqlPagingStatePB* paging_state = response_.mutable_paging_state();
+        paging_state->set_next_partition_key(
+            PartitionSchema::EncodeMultiColumnHashValue(next_row_key.doc_key().hash()));
+        paging_state->set_next_row_key(next_row_key.Encode().data());
+      }
+    }
   }
 
   return Status::OK();

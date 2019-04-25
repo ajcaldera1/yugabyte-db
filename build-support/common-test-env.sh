@@ -1119,8 +1119,13 @@ did_test_succeed() {
     return 1
   fi
 
-  if grep -q '(AddressSanitizer|UndefinedBehaviorSanitizer): undefined-behavior' "$log_path"; then
-    log 'Detected undefined behavior'
+  if grep -q 'AddressSanitizer: undefined-behavior' "$log_path"; then
+    log 'Detected ASAN undefined behavior'
+    return 1
+  fi
+
+  if grep -q 'UndefinedBehaviorSanitizer: undefined-behavior' "$log_path"; then
+    log 'Detected UBSAN undefined behavior'
     return 1
   fi
 
@@ -1443,9 +1448,9 @@ run_java_test() {
   local surefire_reports_dir
   if [[ -n ${YB_SUREFIRE_REPORTS_DIR:-} ]]; then
     surefire_reports_dir=$YB_SUREFIRE_REPORTS_DIR
-  elif should_run_java_test_methods_separately; then
+  else
     surefire_reports_dir=$module_dir/target/surefire-reports_${report_suffix}
-    if [[ -n $test_method_name ]]; then
+    if should_run_java_test_methods_separately && [[ -n $test_method_name ]]; then
       # This report directory only has data for one test method (see how we come up with
       # report_suffix above if test method name is defined ), so it is OK to clean it before running
       # the test.

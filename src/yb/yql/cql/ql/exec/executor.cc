@@ -16,9 +16,15 @@
 #include <yb/yql/cql/ql/util/errcodes.h>
 #include "yb/yql/cql/ql/exec/executor.h"
 #include "yb/yql/cql/ql/ql_processor.h"
-#include "yb/client/client.h"
+
 #include "yb/client/callbacks.h"
+#include "yb/client/client.h"
+#include "yb/client/error.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/common/common.pb.h"
 #include "yb/common/ql_protocol_util.h"
 #include "yb/common/wire_protocol.h"
@@ -36,21 +42,19 @@ using std::shared_ptr;
 using namespace std::placeholders;
 
 using client::YBColumnSpec;
+using client::YBOperation;
+using client::YBqlOpPtr;
+using client::YBqlReadOp;
+using client::YBqlReadOpPtr;
+using client::YBqlWriteOp;
+using client::YBqlWriteOpPtr;
 using client::YBSchema;
 using client::YBSchemaBuilder;
-using client::YBTable;
-using client::YBTableCreator;
-using client::YBTableAlterer;
-using client::YBTableType;
-using client::YBTableName;
 using client::YBSessionPtr;
-using client::YBOperation;
-using client::YBqlOp;
-using client::YBqlReadOp;
-using client::YBqlWriteOp;
-using client::YBqlOpPtr;
-using client::YBqlReadOpPtr;
-using client::YBqlWriteOpPtr;
+using client::YBTableAlterer;
+using client::YBTableCreator;
+using client::YBTableName;
+using client::YBTableType;
 using strings::Substitute;
 
 #define RETURN_STMT_NOT_OK(s) do {                                         \
@@ -236,6 +240,9 @@ Status Executor::ExecTreeNode(const TreeNode *tnode) {
 
     case TreeNodeOpcode::kPTAlterKeyspace:
       return ExecPTNode(static_cast<const PTAlterKeyspace *>(tnode));
+
+    case TreeNodeOpcode::kPTExplainStmt:
+      return ExecPTNode(static_cast<const PTExplainStmt *>(tnode));
 
     default:
       return exec_context_->Error(tnode, ErrorCode::FEATURE_NOT_SUPPORTED);
@@ -732,8 +739,11 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
 
   // Default row count limit is the page size.
   // We should return paging state when page size limit is hit.
-  req->set_limit(params.page_size());
-  req->set_return_paging_state(true);
+  // For system tables, we do not support page size so do nothing.
+  if (!tnode->is_system()) {
+    req->set_limit(params.page_size());
+    req->set_return_paging_state(true);
+  }
 
   // Check if there is a limit and compute the new limit based on the number of returned rows.
   if (tnode->limit()) {
@@ -751,7 +761,7 @@ Status Executor::ExecPTNode(const PTSelectStmt *tnode, TnodeContext* tnode_conte
     // the page size limit set from above, set the lower limit and do not return paging state when
     // this limit is hit.
     limit -= params.total_num_rows_read();
-    if (limit <= req->limit()) {
+    if (!req->has_limit() || limit <= req->limit()) {
       req->set_limit(limit);
       req->set_return_paging_state(false);
     }
@@ -1193,6 +1203,89 @@ Status Executor::ExecPTNode(const PTAlterKeyspace *tnode) {
   }
 
   result_ = std::make_shared<SchemaChangeResult>("UPDATED", "KEYSPACE", tnode->name());
+  return Status::OK();
+}
+
+//--------------------------------------------------------------------------------------------------
+
+namespace {
+
+void AddStringRow(const string& str, QLRowBlock* row_block) {
+  row_block->Extend().mutable_column(0)->set_string_value(str);
+}
+
+void RightPad(const int length, string *s) {
+  s->append(length - s->length(), ' ');
+}
+} // namespace
+
+Status Executor::ExecPTNode(const PTExplainStmt *tnode) {
+  TreeNode::SharedPtr subStmt = tnode->stmt();
+  PTDmlStmt *dmlStmt = down_cast<PTDmlStmt *>(subStmt.get());
+  const YBTableName explainTable("Explain");
+  ColumnSchema explainColumn("QUERY PLAN", STRING);
+  auto explainColumns = std::make_shared<std::vector<ColumnSchema>>(
+      std::initializer_list<ColumnSchema>{explainColumn});
+  auto explainSchema = std::make_shared<Schema>(*explainColumns, 0);
+  QLRowBlock row_block(*explainSchema);
+  faststring buffer;
+  ExplainPlanPB explain_plan = dmlStmt->AnalysisResultToPB();
+  switch (explain_plan.plan_case()) {
+    case ExplainPlanPB::kSelectPlan: {
+      SelectPlanPB *select_plan = explain_plan.mutable_select_plan();
+      if (select_plan->has_aggregate()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_aggregate());
+        AddStringRow(select_plan->aggregate(), &row_block);
+      }
+      RightPad(select_plan->output_width(), select_plan->mutable_select_type());
+      AddStringRow(select_plan->select_type(), &row_block);
+      if (select_plan->has_key_conditions()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_key_conditions());
+        AddStringRow(select_plan->key_conditions(), &row_block);
+      }
+      if (select_plan->has_filter()) {
+        RightPad(select_plan->output_width(), select_plan->mutable_filter());
+        AddStringRow(select_plan->filter(), &row_block);
+      }
+      break;
+    }
+    case ExplainPlanPB::kInsertPlan: {
+      InsertPlanPB *insert_plan = explain_plan.mutable_insert_plan();
+      RightPad(insert_plan->output_width(), insert_plan->mutable_insert_type());
+      AddStringRow(insert_plan->insert_type(), &row_block);
+      break;
+    }
+    case ExplainPlanPB::kUpdatePlan: {
+      UpdatePlanPB *update_plan = explain_plan.mutable_update_plan();
+      RightPad(update_plan->output_width(), update_plan->mutable_update_type());
+      AddStringRow(update_plan->update_type(), &row_block);
+      RightPad(update_plan->output_width(), update_plan->mutable_scan_type());
+      AddStringRow(update_plan->scan_type(), &row_block);
+      RightPad(update_plan->output_width(), update_plan->mutable_key_conditions());
+      AddStringRow(update_plan->key_conditions(), &row_block);
+      break;
+    }
+    case ExplainPlanPB::kDeletePlan: {
+      DeletePlanPB *delete_plan = explain_plan.mutable_delete_plan();
+      RightPad(delete_plan->output_width(), delete_plan->mutable_delete_type());
+      AddStringRow(delete_plan->delete_type(), &row_block);
+      RightPad(delete_plan->output_width(), delete_plan->mutable_scan_type());
+      AddStringRow(delete_plan->scan_type(), &row_block);
+      RightPad(delete_plan->output_width(), delete_plan->mutable_key_conditions());
+      AddStringRow(delete_plan->key_conditions(), &row_block);
+      if (delete_plan->has_filter()) {
+        RightPad(delete_plan->output_width(), delete_plan->mutable_filter());
+        AddStringRow(delete_plan->filter(), &row_block);
+      }
+      break;
+    }
+    case ExplainPlanPB::PLAN_NOT_SET: {
+      return exec_context_->Error(tnode, ErrorCode::EXEC_ERROR);
+      break;
+    }
+  }
+  row_block.Serialize(YQL_CLIENT_CQL, &buffer);
+  result_ = std::make_shared<RowsResult>(explainTable, explainColumns, buffer.ToString());
   return Status::OK();
 }
 

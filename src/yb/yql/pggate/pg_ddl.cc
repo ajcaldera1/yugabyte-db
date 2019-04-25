@@ -15,7 +15,10 @@
 
 #include "yb/yql/pggate/pg_ddl.h"
 
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/common/entity_ids.h"
 
 namespace yb {
@@ -285,7 +288,7 @@ Status PgCreateIndex::Exec() {
                           static_cast<int32_t>(PgSystemAttrNum::kYBBaseTupleId),
                           YB_YQL_DATA_TYPE_BINARY,
                           false /* is_hash */,
-                          !is_unique_index_  /* is_range */));
+                          true /* is_range */));
   return PgCreateTable::Exec();
 }
 

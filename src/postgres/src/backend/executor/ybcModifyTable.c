@@ -168,7 +168,7 @@ static bool IsSystemCatalogChange(Relation rel)
  * Will handle the case if the write changes the system catalogs meaning
  * we need to increment the catalog versions accordingly.
  */
-static void YBCExecWriteStmt(YBCPgStatement ybc_stmt, Relation rel)
+static YBCStatus YBCExecWriteStmt(YBCPgStatement ybc_stmt, Relation rel)
 {
 	bool is_syscatalog_change = IsSystemCatalogChange(rel);
 	bool is_syscatalog_version_change = false;
@@ -185,7 +185,7 @@ static void YBCExecWriteStmt(YBCPgStatement ybc_stmt, Relation rel)
 		               ybc_stmt);
 
 	/* Execute the insert. */
-	HandleYBStmtStatus(YBCPgDmlExecWriteOp(ybc_stmt), ybc_stmt);
+	YBCStatus status = YBCPgDmlExecWriteOp(ybc_stmt);
 
 	/*
 	 * Optimization to increment the catalog version for the local cache as
@@ -197,9 +197,56 @@ static void YBCExecWriteStmt(YBCPgStatement ybc_stmt, Relation rel)
 	 * other backends).
 	 * If changes occurred, then a cache refresh will be needed as usual.
 	 */
-	if (is_syscatalog_version_change)
+	if (!status && is_syscatalog_version_change)
 	{
 		yb_catalog_cache_version += 1;
+	}
+
+	return status;
+}
+
+/*
+ * Utility method to handle the status of an insert statement to return unique
+ * constraint violation error message due to duplicate key in primary key or
+ * unique index / constraint.
+ */
+static void YBCHandleInsertStatus(YBCStatus status, Relation rel, YBCPgStatement stmt)
+{
+	if (!status)
+		return;
+
+	HandleYBStatus(YBCPgDeleteStatement(stmt));
+
+	if (YBCStatusIsAlreadyPresent(status))
+	{
+		char *constraint;
+
+		/*
+		 * If this is the base table and there is a primary key, the primary key is
+		 * the constraint. Otherwise, the rel is the unique index constraint.
+		 */
+		if (!rel->rd_index && rel->rd_pkindex != InvalidOid)
+		{
+			Relation pkey = RelationIdGetRelation(rel->rd_pkindex);
+
+			constraint = pstrdup(RelationGetRelationName(pkey));
+
+			RelationClose(pkey);
+		}
+		else
+		{
+			constraint = pstrdup(RelationGetRelationName(rel));
+		}
+
+		YBCFreeStatus(status);
+		ereport(ERROR,
+				(errcode(ERRCODE_UNIQUE_VIOLATION),
+				 errmsg("duplicate key value violates unique constraint \"%s\"",
+						constraint)));
+	}
+	else
+	{
+		HandleYBStatus(status);
 	}
 }
 
@@ -274,7 +321,7 @@ static Oid YBCExecuteInsertInternal(Relation rel,
 	}
 
 	/* Execute the insert */
-	YBCExecWriteStmt(insert_stmt, rel);
+	YBCHandleInsertStatus(YBCExecWriteStmt(insert_stmt, rel), rel, insert_stmt);
 
 	/*
 	 * If the relation has indexes, save ybctid to insert the new row into the
@@ -325,6 +372,35 @@ Oid YBCExecuteSingleRowTxnInsert(Relation rel,
 	                                true /* is_single_row_txn */);
 }
 
+Oid YBCHeapInsert(TupleTableSlot *slot,
+									HeapTuple tuple,
+									EState *estate) {
+	/*
+	 * get information on the (current) result relation
+	 */
+	ResultRelInfo *resultRelInfo = estate->es_result_relation_info;
+	Relation resultRelationDesc = resultRelInfo->ri_RelationDesc;
+	bool has_triggers = resultRelInfo->ri_TrigDesc && resultRelInfo->ri_TrigDesc->numtriggers > 0;
+	bool has_indices = YBCRelInfoHasSecondaryIndices(resultRelInfo);
+	bool is_single_row_txn = estate->es_yb_is_single_row_modify_txn && !has_indices && !has_triggers;
+
+	if (is_single_row_txn)
+	{
+		/*
+		 * Try to execute the statement as a single row transaction (rather
+		 * than a distributed transaction) if it is safe to do so.
+		 * I.e. if we are in a single-statement transaction that targets a
+		 * single row (i.e. single-row-modify txn), and there are no indices
+		 * or triggers on the target table.
+		 */
+		return YBCExecuteSingleRowTxnInsert(resultRelationDesc, slot->tts_tupleDescriptor, tuple);
+	}
+	else
+	{
+		return YBCExecuteInsert(resultRelationDesc, slot->tts_tupleDescriptor, tuple);
+	}
+}
+
 void YBCExecuteInsertIndex(Relation index, Datum *values, bool *isnull, Datum ybctid)
 {
 	Oid            dboid    = YBCGetDatabaseOid(index);
@@ -366,7 +442,7 @@ void YBCExecuteInsertIndex(Relation index, Datum *values, bool *isnull, Datum yb
 					   insert_stmt);
 
 	/* Execute the insert and clean up. */
-	YBCExecWriteStmt(insert_stmt, index);
+	YBCHandleInsertStatus(YBCExecWriteStmt(insert_stmt, index), index, insert_stmt);
 	HandleYBStatus(YBCPgDeleteStatement(insert_stmt));
 	insert_stmt = NULL;
 }
@@ -394,7 +470,7 @@ void YBCExecuteDelete(Relation rel, TupleTableSlot *slot)
 	HandleYBStmtStatus(YBCPgDmlBindColumn(delete_stmt,
 										  YBTupleIdAttributeNumber,
 										  ybctid_expr), delete_stmt);
-	YBCExecWriteStmt(delete_stmt, rel);
+	HandleYBStmtStatus(YBCExecWriteStmt(delete_stmt, rel), delete_stmt);
 
 	/* Complete execution */
 	HandleYBStatus(YBCPgDeleteStatement(delete_stmt));
@@ -424,26 +500,23 @@ void YBCExecuteDeleteIndex(Relation index, Datum *values, bool *isnull, Datum yb
 		HandleYBStmtStatus(YBCPgDmlBindColumn(ybc_stmt, attnum, ybc_expr), ybc_stmt);
 	}
 
-	if (!index->rd_index->indisunique)
+	/*
+	 * Bind the ybctid from the base table to the ybbasectid column.
+	 */
+	if (ybctid == 0)
 	{
-		/*
-		 * Bind the ybctid from the base table to the ybbasectid column.
-		 */
-		if (ybctid == 0)
-		{
-			YBC_LOG_WARNING("Skipping index deletion in %s", RelationGetRelationName(index));
+		YBC_LOG_WARNING("Skipping index deletion in %s", RelationGetRelationName(index));
 
-			HandleYBStatus(YBCPgDeleteStatement(ybc_stmt));
-			return;
-		}
-
-		YBCPgExpr ybc_expr = YBCNewConstant(ybc_stmt, BYTEAOID, ybctid, false /* is_null */);
-		HandleYBStmtStatus(YBCPgDmlBindColumn(ybc_stmt, YBBaseTupleIdAttributeNumber, ybc_expr),
-						   ybc_stmt);
+		HandleYBStatus(YBCPgDeleteStatement(ybc_stmt));
+		return;
 	}
 
+	YBCPgExpr ybc_expr = YBCNewConstant(ybc_stmt, BYTEAOID, ybctid, false /* is_null */);
+	HandleYBStmtStatus(YBCPgDmlBindColumn(ybc_stmt, YBBaseTupleIdAttributeNumber, ybc_expr),
+			ybc_stmt);
+
 	/* Execute the delete and clean up. */
-	YBCExecWriteStmt(ybc_stmt, index);
+	HandleYBStmtStatus(YBCExecWriteStmt(ybc_stmt, index), ybc_stmt);
 
 	HandleYBStatus(YBCPgDeleteStatement(ybc_stmt));
 	ybc_stmt = NULL;
@@ -488,7 +561,7 @@ void YBCExecuteUpdate(Relation rel, TupleTableSlot *slot, HeapTuple tuple)
 	}
 
 	/* Execute the statement and clean up */
-	YBCExecWriteStmt(update_stmt, rel);
+	HandleYBStmtStatus(YBCExecWriteStmt(update_stmt, rel), update_stmt);
 	HandleYBStatus(YBCPgDeleteStatement(update_stmt));
 	update_stmt = NULL;
 
@@ -552,7 +625,7 @@ void YBCDeleteSysCatalogTuple(Relation rel, HeapTuple tuple)
 	 */
 	CacheInvalidateHeapTuple(rel, tuple, NULL);
 
-	YBCExecWriteStmt(delete_stmt, rel);
+	HandleYBStmtStatus(YBCExecWriteStmt(delete_stmt, rel), delete_stmt);
 
 	/* Complete execution */
 	HandleYBStatus(YBCPgDeleteStatement(delete_stmt));
@@ -627,7 +700,7 @@ void YBCUpdateSysCatalogTuple(Relation rel, HeapTuple oldtuple, HeapTuple tuple)
 		CacheInvalidateHeapTuple(rel, tuple, NULL);
 
 	/* Execute the statement and clean up */
-	YBCExecWriteStmt(update_stmt, rel);
+	HandleYBStmtStatus(YBCExecWriteStmt(update_stmt, rel), update_stmt);
 	HandleYBStatus(YBCPgDeleteStatement(update_stmt));
 	update_stmt = NULL;
 }
@@ -640,4 +713,35 @@ void YBCStartBufferingWriteOperations()
 void YBCFlushBufferedWriteOperations()
 {
 	HandleYBStatus(YBCPgFlushBufferedWriteOperations(ybc_pg_session));
+}
+
+bool
+YBCRelInfoHasSecondaryIndices(ResultRelInfo *resultRelInfo)
+{
+	return resultRelInfo->ri_NumIndices > 1 ||
+			(resultRelInfo->ri_NumIndices == 1 &&
+			 !resultRelInfo->ri_IndexRelationDescs[0]->rd_index->indisprimary);
+}
+
+bool
+YBCRelHasSecondaryIndices(Relation relation)
+{
+	if (!relation->rd_rel->relhasindex)
+		return false;
+
+	bool	 has_indices = false;
+	List	 *indexlist = RelationGetIndexList(relation);
+	ListCell *lc;
+
+	foreach(lc, indexlist)
+	{
+		if (lfirst_oid(lc) == relation->rd_pkindex)
+			continue;
+		has_indices = true;
+		break;
+	}
+
+	list_free(indexlist);
+
+	return has_indices;
 }
