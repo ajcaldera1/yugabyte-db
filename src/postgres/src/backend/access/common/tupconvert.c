@@ -4,10 +4,8 @@
  *	  Tuple conversion support.
  *
  * These functions provide conversion between rowtypes that are logically
- * equivalent but might have columns in a different order or different sets
- * of dropped columns.  There is some overlap of functionality with the
- * executor's "junkfilter" routines, but these functions work on bare
- * HeapTuples rather than TupleTableSlots.
+ * equivalent but might have columns in a different order or different sets of
+ * dropped columns.
  *
  * Portions Copyright (c) 1996-2018, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -21,9 +19,12 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/sysattr.h"
 #include "access/tupconvert.h"
+#include "executor/tuptable.h"
 #include "utils/builtins.h"
 
+#include "pg_yb_utils.h"
 
 /*
  * The conversion setup routines have the following common API:
@@ -31,7 +32,7 @@
  * The setup routine checks whether the given source and destination tuple
  * descriptors are logically compatible.  If not, it throws an error.
  * If so, it returns NULL if they are physically compatible (ie, no conversion
- * is needed), else a TupleConversionMap that can be used by do_convert_tuple
+ * is needed), else a TupleConversionMap that can be used by execute_attr_map_tuple
  * to perform the conversion.
  *
  * The TupleConversionMap, if needed, is palloc'd in the caller's memory
@@ -214,11 +215,116 @@ convert_tuples_by_name(TupleDesc indesc,
 	TupleConversionMap *map;
 	AttrNumber *attrMap;
 	int			n = outdesc->natts;
+
+	/* Verify compatibility and prepare attribute-number map */
+	attrMap = convert_tuples_by_name_map_if_req(indesc, outdesc, msg);
+
+	if (attrMap == NULL)
+	{
+		/* runtime conversion is not needed */
+		return NULL;
+	}
+
+	/* Prepare the map structure */
+	map = (TupleConversionMap *) palloc(sizeof(TupleConversionMap));
+	map->indesc = indesc;
+	map->outdesc = outdesc;
+	map->attrMap = attrMap;
+	/* preallocate workspace for Datum arrays */
+	map->outvalues = (Datum *) palloc(n * sizeof(Datum));
+	map->outisnull = (bool *) palloc(n * sizeof(bool));
+	n = indesc->natts + 1;		/* +1 for NULL */
+	map->invalues = (Datum *) palloc(n * sizeof(Datum));
+	map->inisnull = (bool *) palloc(n * sizeof(bool));
+	map->invalues[0] = (Datum) 0;	/* set up the NULL entry */
+	map->inisnull[0] = true;
+
+	return map;
+}
+
+/*
+ * Return a palloc'd bare attribute map for tuple conversion, matching input
+ * and output columns by name.  (Dropped columns are ignored in both input and
+ * output.)  This is normally a subroutine for convert_tuples_by_name, but can
+ * be used standalone.
+ */
+AttrNumber *
+convert_tuples_by_name_map(TupleDesc indesc, TupleDesc outdesc, const char *msg,
+						   bool yb_ignore_type_mismatch)
+{
+	AttrNumber *attrMap;
+	int			n;
+	int			i;
+
+	n = outdesc->natts;
+	attrMap = (AttrNumber *) palloc0(n * sizeof(AttrNumber));
+	for (i = 0; i < n; i++)
+	{
+		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
+		char	   *attname;
+		Oid			atttypid;
+		int32		atttypmod;
+		int			j;
+
+		if (outatt->attisdropped)
+			continue;			/* attrMap[i] is already 0 */
+		attname = NameStr(outatt->attname);
+		atttypid = outatt->atttypid;
+		atttypmod = outatt->atttypmod;
+		for (j = 0; j < indesc->natts; j++)
+		{
+			Form_pg_attribute inatt = TupleDescAttr(indesc, j);
+
+			if (inatt->attisdropped)
+				continue;
+			if (strcmp(attname, NameStr(inatt->attname)) == 0)
+			{
+				/* Found it, check type */
+				if (!(IsYugaByteEnabled() && yb_ignore_type_mismatch) &&
+					(atttypid != inatt->atttypid ||
+					 atttypmod != inatt->atttypmod))
+					ereport(ERROR,
+							(errcode(ERRCODE_DATATYPE_MISMATCH),
+							 errmsg_internal("%s", _(msg)),
+							 errdetail("Attribute \"%s\" of type %s does not match corresponding attribute of type %s.",
+									   attname,
+									   format_type_be(outdesc->tdtypeid),
+									   format_type_be(indesc->tdtypeid))));
+				attrMap[i] = (AttrNumber) (j + 1);
+				break;
+			}
+		}
+		if (attrMap[i] == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg_internal("%s", _(msg)),
+					 errdetail("Attribute \"%s\" of type %s does not exist in type %s.",
+							   attname,
+							   format_type_be(outdesc->tdtypeid),
+							   format_type_be(indesc->tdtypeid))));
+	}
+
+	return attrMap;
+}
+
+/*
+ * Returns mapping created by convert_tuples_by_name_map, or NULL if no
+ * conversion not required. This is a convenience routine for
+ * convert_tuples_by_name() and other functions.
+ */
+AttrNumber *
+convert_tuples_by_name_map_if_req(TupleDesc indesc,
+								  TupleDesc outdesc,
+								  const char *msg)
+{
+	AttrNumber *attrMap;
+	int			n = outdesc->natts;
 	int			i;
 	bool		same;
 
 	/* Verify compatibility and prepare attribute-number map */
-	attrMap = convert_tuples_by_name_map(indesc, outdesc, msg);
+	attrMap = convert_tuples_by_name_map(indesc, outdesc, msg,
+										 false /* yb_ignore_type_mismatch */);
 
 	/*
 	 * Check to see if the map is one-to-one, in which case we need not do a
@@ -265,93 +371,15 @@ convert_tuples_by_name(TupleDesc indesc,
 		pfree(attrMap);
 		return NULL;
 	}
-
-	/* Prepare the map structure */
-	map = (TupleConversionMap *) palloc(sizeof(TupleConversionMap));
-	map->indesc = indesc;
-	map->outdesc = outdesc;
-	map->attrMap = attrMap;
-	/* preallocate workspace for Datum arrays */
-	map->outvalues = (Datum *) palloc(n * sizeof(Datum));
-	map->outisnull = (bool *) palloc(n * sizeof(bool));
-	n = indesc->natts + 1;		/* +1 for NULL */
-	map->invalues = (Datum *) palloc(n * sizeof(Datum));
-	map->inisnull = (bool *) palloc(n * sizeof(bool));
-	map->invalues[0] = (Datum) 0;	/* set up the NULL entry */
-	map->inisnull[0] = true;
-
-	return map;
-}
-
-/*
- * Return a palloc'd bare attribute map for tuple conversion, matching input
- * and output columns by name.  (Dropped columns are ignored in both input and
- * output.)  This is normally a subroutine for convert_tuples_by_name, but can
- * be used standalone.
- */
-AttrNumber *
-convert_tuples_by_name_map(TupleDesc indesc,
-						   TupleDesc outdesc,
-						   const char *msg)
-{
-	AttrNumber *attrMap;
-	int			n;
-	int			i;
-
-	n = outdesc->natts;
-	attrMap = (AttrNumber *) palloc0(n * sizeof(AttrNumber));
-	for (i = 0; i < n; i++)
-	{
-		Form_pg_attribute outatt = TupleDescAttr(outdesc, i);
-		char	   *attname;
-		Oid			atttypid;
-		int32		atttypmod;
-		int			j;
-
-		if (outatt->attisdropped)
-			continue;			/* attrMap[i] is already 0 */
-		attname = NameStr(outatt->attname);
-		atttypid = outatt->atttypid;
-		atttypmod = outatt->atttypmod;
-		for (j = 0; j < indesc->natts; j++)
-		{
-			Form_pg_attribute inatt = TupleDescAttr(indesc, j);
-
-			if (inatt->attisdropped)
-				continue;
-			if (strcmp(attname, NameStr(inatt->attname)) == 0)
-			{
-				/* Found it, check type */
-				if (atttypid != inatt->atttypid || atttypmod != inatt->atttypmod)
-					ereport(ERROR,
-							(errcode(ERRCODE_DATATYPE_MISMATCH),
-							 errmsg_internal("%s", _(msg)),
-							 errdetail("Attribute \"%s\" of type %s does not match corresponding attribute of type %s.",
-									   attname,
-									   format_type_be(outdesc->tdtypeid),
-									   format_type_be(indesc->tdtypeid))));
-				attrMap[i] = (AttrNumber) (j + 1);
-				break;
-			}
-		}
-		if (attrMap[i] == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATATYPE_MISMATCH),
-					 errmsg_internal("%s", _(msg)),
-					 errdetail("Attribute \"%s\" of type %s does not exist in type %s.",
-							   attname,
-							   format_type_be(outdesc->tdtypeid),
-							   format_type_be(indesc->tdtypeid))));
-	}
-
-	return attrMap;
+	else
+		return attrMap;
 }
 
 /*
  * Perform conversion of a tuple according to the map.
  */
 HeapTuple
-do_convert_tuple(HeapTuple tuple, TupleConversionMap *map)
+execute_attr_map_tuple(HeapTuple tuple, TupleConversionMap *map)
 {
 	AttrNumber *attrMap = map->attrMap;
 	Datum	   *invalues = map->invalues;
@@ -383,6 +411,115 @@ do_convert_tuple(HeapTuple tuple, TupleConversionMap *map)
 	 * Now form the new tuple.
 	 */
 	return heap_form_tuple(map->outdesc, outvalues, outisnull);
+}
+
+/*
+ * Perform conversion of a tuple slot according to the map.
+ */
+TupleTableSlot *
+execute_attr_map_slot(AttrNumber *attrMap,
+					  TupleTableSlot *in_slot,
+					  TupleTableSlot *out_slot)
+{
+	Datum	   *invalues;
+	bool	   *inisnull;
+	Datum	   *outvalues;
+	bool	   *outisnull;
+	int			outnatts;
+	int			i;
+
+	/* Sanity checks */
+	Assert(in_slot->tts_tupleDescriptor != NULL &&
+		   out_slot->tts_tupleDescriptor != NULL);
+	Assert(in_slot->tts_values != NULL && out_slot->tts_values != NULL);
+
+	outnatts = out_slot->tts_tupleDescriptor->natts;
+
+	/* Extract all the values of the in slot. */
+	slot_getallattrs(in_slot);
+
+	/* Before doing the mapping, clear any old contents from the out slot */
+	ExecClearTuple(out_slot);
+
+	invalues = in_slot->tts_values;
+	inisnull = in_slot->tts_isnull;
+	outvalues = out_slot->tts_values;
+	outisnull = out_slot->tts_isnull;
+
+	/* Transpose into proper fields of the out slot. */
+	for (i = 0; i < outnatts; i++)
+	{
+		int			j = attrMap[i] - 1;
+
+		/* attrMap[i] == 0 means it's a NULL datum. */
+		if (j == -1)
+		{
+			outvalues[i] = (Datum) 0;
+			outisnull[i] = true;
+		}
+		else
+		{
+			outvalues[i] = invalues[j];
+			outisnull[i] = inisnull[j];
+		}
+	}
+
+	ExecStoreVirtualTuple(out_slot);
+
+	return out_slot;
+}
+
+/*
+ * Perform conversion of bitmap of columns according to the map.
+ *
+ * The input and output bitmaps are offset by
+ * YBGetFirstLowInvalidAttributeNumber to accommodate system cols, like the
+ * column-bitmaps in RangeTblEntry.
+ */
+Bitmapset *
+execute_attr_map_cols(Bitmapset *in_cols, TupleConversionMap *map, Relation rel)
+{
+	AttrNumber *attrMap = map->attrMap;
+	int			maplen = map->outdesc->natts;
+	Bitmapset  *out_cols;
+	int			out_attnum;
+
+	/* fast path for the common trivial case */
+	if (in_cols == NULL)
+		return NULL;
+
+	/*
+	 * For each output column, check which input column it corresponds to.
+	 */
+	out_cols = NULL;
+
+	for (out_attnum = YBGetFirstLowInvalidAttributeNumber(rel) + 1;
+		 out_attnum <= maplen;
+		 out_attnum++)
+	{
+		int			in_attnum;
+
+		if (out_attnum < 0)
+		{
+			/* System column. No mapping. */
+			in_attnum = out_attnum;
+		}
+		else if (out_attnum == 0)
+			continue;
+		else
+		{
+			/* normal user column */
+			in_attnum = attrMap[out_attnum - 1];
+
+			if (in_attnum == 0)
+				continue;
+		}
+
+		if (bms_is_member(in_attnum - YBGetFirstLowInvalidAttributeNumber(rel), in_cols))
+			out_cols = bms_add_member(out_cols, out_attnum - YBGetFirstLowInvalidAttributeNumber(rel));
+	}
+
+	return out_cols;
 }
 
 /*

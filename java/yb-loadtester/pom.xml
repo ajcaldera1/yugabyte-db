@@ -6,7 +6,7 @@
   <parent>
     <groupId>org.yb</groupId>
     <artifactId>yb-parent</artifactId>
-    <version>0.8.0-SNAPSHOT</version>
+    <version>0.8.87-SNAPSHOT</version>
   </parent>
 
   <artifactId>yb-loadtester</artifactId>
@@ -16,12 +16,14 @@
     <dependency>
       <groupId>org.yb</groupId>
       <artifactId>yb-client</artifactId>
+      <version>0.8.87-SNAPSHOT</version>
       <type>test-jar</type>
       <scope>test</scope>
     </dependency>
     <dependency>
       <groupId>org.yb</groupId>
       <artifactId>yb-client</artifactId>
+      <version>0.8.87-SNAPSHOT</version>
       <scope>test</scope>
     </dependency>
     <dependency>
@@ -38,16 +40,13 @@
       </exclusions>
     </dependency>
     <dependency>
-      <groupId>log4j</groupId>
-      <artifactId>log4j</artifactId>
-    </dependency>
-    <dependency>
-      <groupId>org.slf4j</groupId>
-      <artifactId>slf4j-log4j12</artifactId>
-    </dependency>
-    <dependency>
       <groupId>org.slf4j</groupId>
       <artifactId>slf4j-api</artifactId>
+    </dependency>
+    <dependency>
+      <groupId>ch.qos.logback</groupId>
+      <artifactId>logback-classic</artifactId>
+      <version>1.2.10</version>
     </dependency>
     <dependency>
       <groupId>${junit.groupId}</groupId>
@@ -68,21 +67,20 @@
     </dependency>
     <dependency>
       <groupId>com.yugabyte.spark</groupId>
-      <artifactId>spark-cassandra-connector_2.10</artifactId>
+      <artifactId>spark-cassandra-connector_2.11</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
-      <artifactId>spark-core_2.10</artifactId>
+      <artifactId>spark-core_2.11</artifactId>
     </dependency>
     <dependency>
       <groupId>org.apache.spark</groupId>
-      <artifactId>spark-sql_2.10</artifactId>
+      <artifactId>spark-sql_2.11</artifactId>
     </dependency>
     <dependency>
-          <groupId>org.apache.commons</groupId>
-            <artifactId>commons-math3</artifactId>
-              <version>3.5</version>
-          </dependency>
+      <groupId>org.apache.commons</groupId>
+      <artifactId>commons-math3</artifactId>
+    </dependency>
     <dependency>
       <groupId>com.google.code.gson</groupId>
       <artifactId>gson</artifactId>
@@ -90,12 +88,11 @@
     <dependency>
       <groupId>org.postgresql</groupId>
       <artifactId>postgresql</artifactId>
-      <version>42.2.2</version>
     </dependency>
     <dependency>
       <groupId>com.yugabyte</groupId>
       <artifactId>yb-sample-apps</artifactId>
-      <version>1.0.9</version>
+      <version>1.0.11</version>
     </dependency>
   </dependencies>
 

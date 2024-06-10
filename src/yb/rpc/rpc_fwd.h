@@ -13,114 +13,152 @@
 //
 //
 
-#ifndef YB_RPC_RPC_FWD_H
-#define YB_RPC_RPC_FWD_H
+#pragma once
 
 #include <chrono>
 #include <functional>
+#include <unordered_map>
 
-#include <boost/version.hpp>
+#include <boost/functional/hash.hpp>
+#include <boost/container/small_vector.hpp>
 
 #include "yb/gutil/ref_counted.h"
 
-#include "yb/rpc/rpc_introspection.pb.h"
-
 #include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+#include "yb/util/slice.h"
 #include "yb/util/strongly_typed_bool.h"
 
-namespace boost {
-namespace asio {
-
-#if BOOST_VERSION >= 106600
-class io_context;
-typedef io_context io_service;
-#else
-class io_service;
-#endif
-
-} // namespace asio
-} // namespace boost
-
 namespace yb {
+
+class RefCntBuffer;
+class RefCntSlice;
+class Slice;
+
 namespace rpc {
 
 class Acceptor;
 class AcceptorPool;
+class AnyMessageConstPtr;
+class AnyMessagePtr;
+class CallResponse;
 class ConnectionContext;
+class DelayedTask;
+class DumpRunningRpcsRequestPB;
+class DumpRunningRpcsResponsePB;
 class GrowableBufferAllocator;
+class LightweightMessage;
 class MessengerBuilder;
+class PeriodicTimer;
 class Proxy;
+class ProxyBase;
 class ProxyCache;
+class ProxyContext;
 class Reactor;
 class ReactorTask;
+class ReceivedSidecars;
+class RpcCallParams;
+class RemoteMethod;
+class RequestHeader;
+class ResponseHeader;
 class RpcConnectionPB;
 class RpcContext;
 class RpcController;
-class RpcService;
 class Rpcs;
+class Poller;
 class Protocol;
+class Proxy;
+class ProxySource;
+class RefinedStream;
 class Scheduler;
+class SecureContext;
 class ServicePoolImpl;
+class Sidecars;
+class Strand;
+class StrandTask;
 class Stream;
 class StreamReadBuffer;
 class ThreadPool;
 class ThreadPoolTask;
+class LocalYBInboundCall;
 
 struct CallData;
-struct ProcessDataResult;
+struct OutboundCallMetrics;
+struct OutboundMethodMetrics;
+struct ProcessCallsResult;
+struct ReactorMetrics;
 struct RpcMethodMetrics;
 struct RpcMetrics;
 
+class RpcService;
+using RpcServicePtr = scoped_refptr<RpcService>;
+using RpcEndpointMap = std::unordered_map<
+    Slice, std::pair<RpcServicePtr, size_t>, boost::hash<Slice>>;
+
 class RpcCommand;
-typedef std::shared_ptr<RpcCommand> RpcCommandPtr;
+using RpcCommandPtr = std::shared_ptr<RpcCommand>;
 
 class Connection;
 class ConnectionContext;
-typedef std::shared_ptr<Connection> ConnectionPtr;
-typedef std::weak_ptr<Connection> ConnectionWeakPtr;
+using ConnectionPtr = std::shared_ptr<Connection>;
+using ConnectionWeakPtr = std::weak_ptr<Connection>;
 
 class InboundCall;
-typedef std::shared_ptr<InboundCall> InboundCallPtr;
+using InboundCallPtr = std::shared_ptr<InboundCall>;
+using InboundCallWeakPtr = std::weak_ptr<InboundCall>;
 
 class Messenger;
-typedef std::shared_ptr<Messenger> MessengerPtr;
 
 class OutboundCall;
-typedef std::shared_ptr<OutboundCall> OutboundCallPtr;
+using OutboundCallPtr = std::shared_ptr<OutboundCall>;
+using OutboundCallWeakPtr = std::weak_ptr<OutboundCall>;
 
 class OutboundData;
-typedef std::shared_ptr<OutboundData> OutboundDataPtr;
+using OutboundDataPtr = std::shared_ptr<OutboundData>;
 
 class ServerEventList;
-typedef std::shared_ptr<ServerEventList> ServerEventListPtr;
+using ServerEventListPtr = std::shared_ptr<ServerEventList>;
 
 class ServiceIf;
-typedef std::shared_ptr<ServiceIf> ServiceIfPtr;
+using ServiceIfPtr = std::shared_ptr<ServiceIf>;
 
-class ErrorStatusPB;
+using Publisher = std::function<int(const std::string&, const std::string&)>;
 
-typedef boost::asio::io_service IoService;
-
-typedef std::function<int(const std::string&, const std::string&)> Publisher;
+using ConnectionFilter = std::function<bool(const ConnectionPtr&)>;
 
 // SteadyTimePoint is something like MonoTime, but 3rd party libraries know it and don't know about
 // our private MonoTime.
-typedef std::chrono::steady_clock::time_point SteadyTimePoint;
+using SteadyTimePoint = std::chrono::steady_clock::time_point;
 
 class ConnectionContextFactory;
-typedef std::shared_ptr<ConnectionContextFactory> ConnectionContextFactoryPtr;
+using ConnectionContextFactoryPtr = std::shared_ptr<ConnectionContextFactory>;
 
 class StreamFactory;
-typedef std::shared_ptr<StreamFactory> StreamFactoryPtr;
+using StreamFactoryPtr = std::shared_ptr<StreamFactory>;
 
 YB_STRONGLY_TYPED_BOOL(ReadBufferFull);
+YB_STRONGLY_TYPED_BOOL(Queue);
 
-typedef int64_t ScheduledTaskId;
-const ScheduledTaskId kInvalidTaskId = -1;
+using ScheduledTaskId = int64_t;
+constexpr ScheduledTaskId kInvalidTaskId = -1;
+
+using ProxyPtr = std::shared_ptr<Proxy>;
+using ResponseCallback = std::function<void()>;
 
 YB_DEFINE_ENUM(ServicePriority, (kNormal)(kHigh));
 
+// Specifies how to run callback for async outbound call.
+YB_DEFINE_ENUM(InvokeCallbackMode,
+    // On reactor thread.
+    (kReactorThread)
+    // On thread pool.
+    (kThreadPoolNormal)
+    (kThreadPoolHigh));
+
+using SidecarHolder = std::pair<RefCntBuffer, Slice>;
+using CallResponsePtr = std::shared_ptr<CallResponse>;
+using RpcCallParamsPtr = std::shared_ptr<RpcCallParams>;
+using ByteBlocks = boost::container::small_vector_base<RefCntSlice>;
+
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_RPC_FWD_H

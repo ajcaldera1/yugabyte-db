@@ -11,10 +11,9 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_INDEXES_VTABLE_H
-#define YB_MASTER_YQL_INDEXES_VTABLE_H
+#pragma once
 
-#include "yb/master/yql_empty_vtable.h"
+#include "yb/master/yql_virtual_table.h"
 
 namespace yb {
 namespace master {
@@ -22,9 +21,10 @@ namespace master {
 // VTable implementation of system_schema.indexes.
 class YQLIndexesVTable : public YQLVirtualTable {
  public:
-  explicit YQLIndexesVTable(const Master* const master);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  explicit YQLIndexesVTable(const TableName& table_name,
+                            const NamespaceName& namespace_name,
+                            Master * const master);
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
 
  protected:
   Schema CreateSchema() const;
@@ -38,8 +38,8 @@ class YQLIndexesVTable : public YQLVirtualTable {
   static constexpr const char* const kIndexId = "index_id";
   static constexpr const char* const kTransactions = "transactions";
   static constexpr const char* const kIsUnique = "is_unique";
+  static constexpr const char* const kNumTablets = "tablets";
 };
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_INDEXES_VTABLE_H

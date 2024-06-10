@@ -30,14 +30,14 @@
 // under the License.
 //
 
-
 #include <algorithm>
 #include <map>
 #include <vector>
 
-#include "yb/client/client.h"
 #include "yb/client/client-test-util.h"
+#include "yb/client/client.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_alterer.h"
@@ -45,13 +45,17 @@
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
 
+#include "yb/gutil/casts.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/external_mini_cluster.h"
+
 #include "yb/util/random.h"
-#include "yb/util/random_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
 
 using namespace std::literals;
@@ -59,10 +63,6 @@ using namespace std::literals;
 namespace yb {
 
 using client::YBClient;
-using client::YBClientBuilder;
-using client::YBTableType;
-using client::YBColumnSchema;
-using client::YBError;
 using client::YBqlWriteOp;
 using client::YBSchema;
 using client::YBSchemaBuilder;
@@ -71,15 +71,15 @@ using client::YBTable;
 using client::YBTableAlterer;
 using client::YBTableCreator;
 using client::YBTableName;
-using client::YBValue;
 using std::shared_ptr;
 using std::make_pair;
 using std::map;
 using std::pair;
 using std::vector;
+using std::string;
 using strings::SubstituteAndAppend;
 
-static const YBTableName kTableName("my_keyspace", "test-table");
+static const YBTableName kTableName(YQL_DATABASE_CQL, "my_keyspace", "test-table");
 static const int kMaxColumns = 30;
 
 class AlterTableRandomized : public YBTest {
@@ -96,26 +96,26 @@ class AlterTableRandomized : public YBTest {
     cluster_.reset(new ExternalMiniCluster(opts));
     ASSERT_OK(cluster_->Start());
 
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
   }
 
   void TearDown() override {
+    client_.reset();
     cluster_->Shutdown();
     YBTest::TearDown();
   }
 
-  void RestartTabletServer(int idx) {
+  void RestartTabletServer(size_t idx) {
     LOG(INFO) << "Restarting TS " << idx;
     cluster_->tablet_server(idx)->Shutdown();
     CHECK_OK(cluster_->tablet_server(idx)->Restart());
-    CHECK_OK(cluster_->WaitForTabletsRunning(cluster_->tablet_server(idx),
-        MonoDelta::FromSeconds(60)));
+    CHECK_OK(cluster_->WaitForTabletsRunning(
+        cluster_->tablet_server(idx), MonoDelta::FromSeconds(60)));
   }
 
  protected:
-  gscoped_ptr<ExternalMiniCluster> cluster_;
-  shared_ptr<YBClient> client_;
+  std::unique_ptr<ExternalMiniCluster> cluster_;
+  std::unique_ptr<YBClient> client_;
 };
 
 typedef std::vector<std::pair<std::string, int32_t>> Row;
@@ -156,7 +156,7 @@ struct TableState {
     }
     row->clear();
     row->push_back(make_pair("key", key));
-    for (int i = 1; i < col_names_.size(); i++) {
+    for (size_t i = 1; i < col_names_.size(); i++) {
       int32_t val;
       if (col_nullable_[i] && seed % 2 == 1) {
         val = kNullValue;
@@ -198,7 +198,7 @@ struct TableState {
 
   void DropColumn(const string& name) {
     auto col_it = std::find(col_names_.begin(), col_names_.end(), name);
-    int index = col_it - col_names_.begin();
+    auto index = col_it - col_names_.begin();
     col_names_.erase(col_it);
     col_nullable_.erase(col_nullable_.begin() + index);
     for (auto& e : rows_) {
@@ -231,14 +231,15 @@ struct TableState {
 };
 
 struct MirrorTable {
-  explicit MirrorTable(shared_ptr<YBClient> client)
-      : client_(std::move(client)) {}
+  explicit MirrorTable(client::YBClient* client)
+      : client_(client) {}
 
   Status Create() {
-    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
+    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                      kTableName.namespace_type()));
     YBSchema schema;
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->HashPrimaryKey()->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->HashPrimaryKey()->NotNull();
     CHECK_OK(b.Build(&schema));
     std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     return table_creator->table_name(kTableName)
@@ -280,8 +281,8 @@ struct MirrorTable {
 
     vector<pair<string, int32_t>> update;
     update.push_back(make_pair("key", row_key));
-    for (int i = 1; i < num_columns(); i++) {
-      int32_t val = rand * i;
+    for (size_t i = 1; i < num_columns(); i++) {
+      auto val = static_cast<int32_t>(rand * i);
       if (val == kNullValue) val++;
       if (ts_.col_nullable_[i] && val % 2 == 1) {
         val = kNullValue;
@@ -311,9 +312,9 @@ struct MirrorTable {
 
   void AddAColumn(const string& name, bool nullable) {
     // Add to the real table.
-    gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
 
-    table_alterer->AddColumn(name)->Type(INT32);
+    table_alterer->AddColumn(name)->Type(DataType::INT32);
     ASSERT_OK(table_alterer->Alter());
 
     // Add to the mirror state.
@@ -321,7 +322,7 @@ struct MirrorTable {
   }
 
   void DropAColumn(const string& name) {
-    gscoped_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    std::unique_ptr<YBTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
     CHECK_OK(table_alterer->DropColumn(name)->Alter());
     ts_.DropColumn(name);
   }
@@ -333,7 +334,7 @@ struct MirrorTable {
     DropAColumn(name);
   }
 
-  int num_columns() const {
+  size_t num_columns() const {
     return ts_.col_names_.size();
   }
 
@@ -342,7 +343,7 @@ struct MirrorTable {
     vector<string> rows;
     {
       client::TableHandle table;
-      CHECK_OK(table.Open(kTableName, client_.get()));
+      CHECK_OK(table.Open(kTableName, client_));
       client::ScanTableToStrings(table, &rows);
     }
     std::sort(rows.begin(), rows.end());
@@ -363,8 +364,7 @@ struct MirrorTable {
 
   Status DoRealOp(const vector<pair<string, int32_t>>& data, OpType op_type) {
     auto deadline = MonoTime::Now() + 15s;
-    shared_ptr<YBSession> session = client_->NewSession();
-    session->SetTimeout(15s);
+    auto session = client_->NewSession(15s);
     shared_ptr<YBTable> table;
     RETURN_NOT_OK(client_->OpenTable(kTableName, &table));
     for (;;) {
@@ -390,7 +390,9 @@ struct MirrorTable {
           }
         }
       }
-      auto s = session->ApplyAndFlush(op);
+      session->Apply(op);
+      const auto flush_status = session->TEST_FlushAndGetOpsErrors();
+      const auto& s = flush_status.status;
       if (s.ok()) {
         if (op->response().status() == QLResponsePB::YQL_STATUS_SCHEMA_VERSION_MISMATCH &&
             MonoTime::Now() < deadline) {
@@ -400,9 +402,8 @@ struct MirrorTable {
         return s;
       }
 
-      client::CollectedErrors errors = session->GetPendingErrors();
-      CHECK_EQ(errors.size(), 1);
-      return errors[0]->status();
+      CHECK_EQ(flush_status.errors.size(), 1);
+      return flush_status.errors[0]->status();
     }
   }
 
@@ -418,7 +419,7 @@ struct MirrorTable {
     return shared_ptr<YBqlWriteOp>();
   }
 
-  shared_ptr<YBClient> client_;
+  YBClient* client_;
   TableState ts_;
 };
 
@@ -434,7 +435,7 @@ struct MirrorTable {
 // date. We periodically scan the actual table, and ensure that the data in YB
 // matches our in-memory "mirror".
 TEST_F(AlterTableRandomized, TestRandomSequence) {
-  MirrorTable t(client_);
+  MirrorTable t(client_.get());
   ASSERT_OK(t.Create());
 
   Random rng(SeedRandom());
@@ -461,7 +462,7 @@ TEST_F(AlterTableRandomized, TestRandomSequence) {
     } else if (r < 995) {
       t.DropRandomColumn(rng.Next());
     } else {
-      RestartTabletServer(rng.Uniform(cluster_->num_tablet_servers()));
+      RestartTabletServer(rng.Uniform64(cluster_->num_tablet_servers()));
     }
 
     if (i % 1000 == 0) {
@@ -482,7 +483,7 @@ TEST_F(AlterTableRandomized, TestRandomSequence) {
 }
 
 TEST_F(AlterTableRandomized, AddDropRestart) {
-  MirrorTable t(client_);
+  MirrorTable t(client_.get());
   ASSERT_OK(t.Create());
 
   t.AddAColumn("value", true);

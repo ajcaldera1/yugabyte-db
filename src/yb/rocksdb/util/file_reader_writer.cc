@@ -24,18 +24,38 @@
 #include "yb/rocksdb/util/file_reader_writer.h"
 
 #include <algorithm>
-#include <mutex>
+
+#include "yb/ash/wait_state.h"
 
 #include "yb/rocksdb/port/port.h"
+#include "yb/rocksdb/rate_limiter.h"
 #include "yb/rocksdb/util/histogram.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
-#include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/rate_limiter.h"
-#include "yb/rocksdb/util/sync_point.h"
+#include "yb/rocksdb/util/stop_watch.h"
+
+#include "yb/util/priority_thread_pool.h"
+#include "yb/util/stats/iostats_context_imp.h"
+#include "yb/util/status_log.h"
+#include "yb/util/sync_point.h"
+#include "yb/util/test_kill.h"
+#include "yb/util/flags.h"
+
+using std::unique_ptr;
+
+DEFINE_UNKNOWN_bool(allow_preempting_compactions, true,
+            "Whether a compaction may be preempted in favor of another compaction with higher "
+            "priority");
+
+DEFINE_UNKNOWN_int32(rocksdb_file_starting_buffer_size, 8192,
+             "Starting buffer size for writable files, grows by 2x every new allocation.");
+
+DECLARE_uint64(rocksdb_check_sst_file_tail_for_zeros);
+
+DEFINE_test_flag(bool, simulate_fully_zeroed_file, false,
+                 "Simulates fully zeroed file for CheckFileTailForZeros function");
 
 namespace rocksdb {
 
-Status SequentialFileReader::Read(size_t n, Slice* result, char* scratch) {
+Status SequentialFileReader::Read(size_t n, Slice* result, uint8_t* scratch) {
   Status s = file_->Read(n, result, scratch);
   IOSTATS_ADD(bytes_read, result->size());
   return s;
@@ -44,23 +64,57 @@ Status SequentialFileReader::Read(size_t n, Slice* result, char* scratch) {
 Status SequentialFileReader::Skip(uint64_t n) { return file_->Skip(n); }
 
 Status RandomAccessFileReader::Read(uint64_t offset, size_t n, Slice* result,
-                                    char* scratch) const {
+                                    char* scratch, Statistics* statistics) const {
   Status s;
   uint64_t elapsed = 0;
+  auto* effective_statistics = statistics ? statistics : stats_;
   {
-    StopWatch sw(env_, stats_, hist_type_,
-                 (stats_ != nullptr) ? &elapsed : nullptr);
+    StopWatch sw(env_, effective_statistics, hist_type_,
+                 (effective_statistics != nullptr) ? &elapsed : nullptr);
     IOSTATS_TIMER_GUARD(read_nanos);
     s = file_->Read(offset, n, result, scratch);
     IOSTATS_ADD_IF_POSITIVE(bytes_read, result->size());
   }
-  if (stats_ != nullptr && file_read_hist_ != nullptr) {
+  if (effective_statistics == stats_ && stats_ != nullptr && file_read_hist_ != nullptr) {
     file_read_hist_->Add(elapsed);
   }
   return s;
 }
 
+Status RandomAccessFileReader::ReadAndValidate(
+    uint64_t offset, size_t n, Slice* result, char* scratch, const yb::ReadValidator& validator,
+    Statistics* statistics) {
+  Status s;
+  uint64_t elapsed = 0;
+  auto* effective_statistics = statistics ? statistics : stats_;
+  {
+    StopWatch sw(env_, effective_statistics, hist_type_,
+                 (effective_statistics != nullptr) ? &elapsed : nullptr);
+    IOSTATS_TIMER_GUARD(read_nanos);
+    constexpr auto kMaxReadAttempts = 2;
+    for (size_t read_attempt = 1; read_attempt <= kMaxReadAttempts; ++read_attempt) {
+      s = file_->ReadAndValidate(offset, n, result, scratch, validator);
+      if (s.ok()) {
+        break;
+      }
+      TEST_SYNC_POINT("RandomAccessFileReader::ReadAndValidate:0");
+      LOG(WARNING) << Format("Read attempt #$0 failed in file $1 : $2",
+          read_attempt, file_->filename(), s);
+    }
+    IOSTATS_ADD_IF_POSITIVE(bytes_read, result->size());
+  }
+  if (effective_statistics == stats_ && stats_ != nullptr && file_read_hist_ != nullptr) {
+    file_read_hist_->Add(elapsed);
+  }
+  return s;
+}
+
+WritableFileWriter::~WritableFileWriter() {
+  WARN_NOT_OK(Close(), "Failed to close file");
+}
+
 Status WritableFileWriter::Append(const Slice& data) {
+  SCOPED_WAIT_STATUS(RocksDB_WriteToFile);
   const char* src = data.cdata();
   size_t left = data.size();
   Status s;
@@ -68,11 +122,11 @@ Status WritableFileWriter::Append(const Slice& data) {
   pending_fsync_ = true;
 
   TEST_KILL_RANDOM("WritableFileWriter::Append:0",
-                   rocksdb_kill_odds * REDUCE_ODDS2);
+                   test_kill_odds * REDUCE_ODDS2);
 
   {
     IOSTATS_TIMER_GUARD(prepare_write_nanos);
-    TEST_SYNC_POINT("WritableFileWriter::Append:BeforePrepareWrite");
+    DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::Append:BeforePrepareWrite");
     writable_file_->PrepareWrite(static_cast<size_t>(GetFileSize()), left);
   }
 
@@ -125,7 +179,7 @@ Status WritableFileWriter::Append(const Slice& data) {
     s = WriteBuffered(src, left);
   }
 
-  TEST_KILL_RANDOM("WritableFileWriter::Append:1", rocksdb_kill_odds);
+  TEST_KILL_RANDOM("WritableFileWriter::Append:1", test_kill_odds);
   if (s.ok()) {
     filesize_ += data.size();
   }
@@ -133,6 +187,7 @@ Status WritableFileWriter::Append(const Slice& data) {
 }
 
 Status WritableFileWriter::Close() {
+  SCOPED_WAIT_STATUS(RocksDB_CloseFile);
 
   // Do not quit immediately on failure the file MUST be closed
   Status s;
@@ -150,18 +205,26 @@ Status WritableFileWriter::Close() {
   // In unbuffered mode we write whole pages so
   // we need to let the file know where data ends.
   Status interim = writable_file_->Truncate(filesize_);
+  if (FLAGS_rocksdb_check_sst_file_tail_for_zeros > 0) {
+    LOG(INFO) << "Truncated " << writable_file_->filename() << " to " << filesize_
+              << " interim: " << interim << " status: " << s;
+  }
   if (!interim.ok() && s.ok()) {
     s = interim;
   }
 
-  TEST_KILL_RANDOM("WritableFileWriter::Close:0", rocksdb_kill_odds);
+  TEST_KILL_RANDOM("WritableFileWriter::Close:0", test_kill_odds);
   interim = writable_file_->Close();
+  if (FLAGS_rocksdb_check_sst_file_tail_for_zeros > 0) {
+    LOG(INFO) << "Closed " << writable_file_->filename() << " last_sync_size_: " << last_sync_size_
+              << " filesize_: " << filesize_ << " interim: " << interim << " status: " << s;
+  }
   if (!interim.ok() && s.ok()) {
     s = interim;
   }
 
   writable_file_.reset();
-  TEST_KILL_RANDOM("WritableFileWriter::Close:1", rocksdb_kill_odds);
+  TEST_KILL_RANDOM("WritableFileWriter::Close:1", test_kill_odds);
 
   return s;
 }
@@ -170,7 +233,7 @@ Status WritableFileWriter::Close() {
 Status WritableFileWriter::Flush() {
   Status s;
   TEST_KILL_RANDOM("WritableFileWriter::Flush:0",
-                   rocksdb_kill_odds * REDUCE_ODDS2);
+                   test_kill_odds * REDUCE_ODDS2);
 
   if (buf_.CurrentSize() > 0) {
     if (use_os_buffer_) {
@@ -223,14 +286,14 @@ Status WritableFileWriter::Sync(bool use_fsync) {
   if (!s.ok()) {
     return s;
   }
-  TEST_KILL_RANDOM("WritableFileWriter::Sync:0", rocksdb_kill_odds);
+  TEST_KILL_RANDOM("WritableFileWriter::Sync:0", test_kill_odds);
   if (!direct_io_ && pending_sync_) {
     s = SyncInternal(use_fsync);
     if (!s.ok()) {
       return s;
     }
   }
-  TEST_KILL_RANDOM("WritableFileWriter::Sync:1", rocksdb_kill_odds);
+  TEST_KILL_RANDOM("WritableFileWriter::Sync:1", test_kill_odds);
   pending_sync_ = false;
   if (use_fsync) {
     pending_fsync_ = false;
@@ -244,16 +307,20 @@ Status WritableFileWriter::SyncWithoutFlush(bool use_fsync) {
       "Can't WritableFileWriter::SyncWithoutFlush() because "
       "WritableFile::IsSyncThreadSafe() is false");
   }
-  TEST_SYNC_POINT("WritableFileWriter::SyncWithoutFlush:1");
+  DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::SyncWithoutFlush:1");
   Status s = SyncInternal(use_fsync);
-  TEST_SYNC_POINT("WritableFileWriter::SyncWithoutFlush:2");
+  DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::SyncWithoutFlush:2");
   return s;
+}
+
+Status WritableFileWriter::InvalidateCache(size_t offset, size_t length) {
+  return writable_file_->InvalidateCache(offset, length);
 }
 
 Status WritableFileWriter::SyncInternal(bool use_fsync) {
   Status s;
   IOSTATS_TIMER_GUARD(fsync_nanos);
-  TEST_SYNC_POINT("WritableFileWriter::SyncInternal:0");
+  DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::SyncInternal:0");
   if (use_fsync) {
     s = writable_file_->Fsync();
   } else {
@@ -264,14 +331,17 @@ Status WritableFileWriter::SyncInternal(bool use_fsync) {
 
 Status WritableFileWriter::RangeSync(uint64_t offset, uint64_t nbytes) {
   IOSTATS_TIMER_GUARD(range_sync_nanos);
-  TEST_SYNC_POINT("WritableFileWriter::RangeSync:0");
+  DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::RangeSync:0");
   return writable_file_->RangeSync(offset, nbytes);
 }
 
 size_t WritableFileWriter::RequestToken(size_t bytes, bool align) {
-  Env::IOPriority io_priority;
-  if (rate_limiter_ && (io_priority = writable_file_->GetIOPriority()) <
-      Env::IO_TOTAL) {
+  if (suspender_ && FLAGS_allow_preempting_compactions) {
+    SCOPED_WAIT_STATUS(RocksDB_PriorityThreadPoolTaskPaused);
+    suspender_->PauseIfNecessary();
+  }
+  yb::IOPriority io_priority;
+  if (rate_limiter_ && (io_priority = writable_file_->GetIOPriority()) < yb::IOPriority::kTotal) {
     bytes = std::min(
       bytes, static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()));
 
@@ -300,7 +370,7 @@ Status WritableFileWriter::WriteBuffered(const char* data, size_t size) {
 
     {
       IOSTATS_TIMER_GUARD(write_nanos);
-      TEST_SYNC_POINT("WritableFileWriter::Flush:BeforeAppend");
+      DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::Flush:BeforeAppend");
       s = writable_file_->Append(Slice(src, allowed));
       if (!s.ok()) {
         return s;
@@ -308,7 +378,7 @@ Status WritableFileWriter::WriteBuffered(const char* data, size_t size) {
     }
 
     IOSTATS_ADD(bytes_written, allowed);
-    TEST_KILL_RANDOM("WritableFileWriter::WriteBuffered:0", rocksdb_kill_odds);
+    TEST_KILL_RANDOM("WritableFileWriter::WriteBuffered:0", test_kill_odds);
 
     left -= allowed;
     src += allowed;
@@ -356,7 +426,7 @@ Status WritableFileWriter::WriteUnbuffered() {
 
     {
       IOSTATS_TIMER_GUARD(write_nanos);
-      TEST_SYNC_POINT("WritableFileWriter::Flush:BeforeAppend");
+      DEBUG_ONLY_TEST_SYNC_POINT("WritableFileWriter::Flush:BeforeAppend");
       // Unbuffered writes must be positional
       s = writable_file_->PositionedAppend(Slice(src, size), write_offset);
       if (!s.ok()) {
@@ -388,20 +458,21 @@ Status WritableFileWriter::WriteUnbuffered() {
 
 
 namespace {
-class ReadaheadRandomAccessFile : public RandomAccessFile {
+
+class ReadaheadRandomAccessFile : public yb::RandomAccessFileWrapper {
  public:
   ReadaheadRandomAccessFile(std::unique_ptr<RandomAccessFile>&& file,
                             size_t readahead_size)
-      : file_(std::move(file)),
+      : RandomAccessFileWrapper(std::move(file)),
         readahead_size_(readahead_size),
-        forward_calls_(file_->ShouldForwardRawRequest()),
+        forward_calls_(ShouldForwardRawRequest()),
         buffer_(),
         buffer_offset_(0),
         buffer_len_(0) {
     if (!forward_calls_) {
-      buffer_.reset(new char[readahead_size_]);
+      buffer_.reset(new uint8_t[readahead_size_]);
     } else if (readahead_size_ > 0) {
-      file_->EnableReadAhead();
+      EnableReadAhead();
     }
   }
 
@@ -409,10 +480,9 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
 
   ReadaheadRandomAccessFile& operator=(const ReadaheadRandomAccessFile&) = delete;
 
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const override {
+  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
     if (n >= readahead_size_) {
-      return file_->Read(offset, n, result, scratch);
+      return RandomAccessFileWrapper::Read(offset, n, result, scratch);
     }
 
     // On Windows in unbuffered mode this will lead to double buffering
@@ -420,7 +490,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     // In normal mode Windows caches so much data from disk that we do
     // not need readahead.
     if (forward_calls_) {
-      return file_->Read(offset, n, result, scratch);
+      return RandomAccessFileWrapper::Read(offset, n, result, scratch);
     }
 
     std::unique_lock<std::mutex> lk(lock_);
@@ -438,7 +508,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
       }
     }
     Slice readahead_result;
-    Status s = file_->Read(offset + copied, readahead_size_, &readahead_result,
+    Status s = RandomAccessFileWrapper::Read(offset + copied, readahead_size_, &readahead_result,
       buffer_.get());
     if (!s.ok()) {
       return s;
@@ -448,7 +518,7 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     memcpy(scratch + copied, readahead_result.data(), left_to_copy);
     *result = Slice(scratch, copied + left_to_copy);
 
-    if (readahead_result.cdata() == buffer_.get()) {
+    if (readahead_result.data() == buffer_.get()) {
       buffer_offset_ = offset + copied;
       buffer_len_ = readahead_result.size();
     } else {
@@ -458,23 +528,12 @@ class ReadaheadRandomAccessFile : public RandomAccessFile {
     return Status::OK();
   }
 
-  size_t GetUniqueId(char* id, size_t max_size) const override {
-    return file_->GetUniqueId(id, max_size);
-  }
-
-  void Hint(AccessPattern pattern) override { file_->Hint(pattern); }
-
-  Status InvalidateCache(size_t offset, size_t length) override {
-    return file_->InvalidateCache(offset, length);
-  }
-
  private:
-  std::unique_ptr<RandomAccessFile> file_;
   size_t               readahead_size_;
   const bool           forward_calls_;
 
   mutable std::mutex   lock_;
-  mutable std::unique_ptr<char[]> buffer_;
+  mutable std::unique_ptr<uint8_t[]> buffer_;
   mutable uint64_t     buffer_offset_;
   mutable size_t       buffer_len_;
 };
@@ -491,8 +550,78 @@ Status NewWritableFile(Env* env, const std::string& fname,
                        unique_ptr<WritableFile>* result,
                        const EnvOptions& options) {
   Status s = env->NewWritableFile(fname, result, options);
-  TEST_KILL_RANDOM("NewWritableFile:0", rocksdb_kill_odds * REDUCE_ODDS2);
+  TEST_KILL_RANDOM("NewWritableFile:0", test_kill_odds * REDUCE_ODDS2);
   return s;
+}
+
+Status CheckFileTailForZeros(
+    Env* env, const EnvOptions& env_options, const std::string& file_path,
+    const size_t check_tail_size) {
+  constexpr auto kBufferSize = 1024;
+
+  // TODO - do we want to update stats and metrics as we do with usual file reads?
+
+  std::unique_ptr<RandomAccessFile> file;
+  RETURN_NOT_OK(env->NewRandomAccessFile(file_path, &file, env_options));
+  const auto file_size = VERIFY_RESULT(file->Size());
+
+  uint8_t buffer[kBufferSize];
+
+  size_t left_to_check = std::min<size_t>(check_tail_size, file_size);
+  size_t left_in_file = file_size;
+  size_t offset = file_size;
+  size_t zero_tail_size = file_size;
+
+  while (left_in_file > 0) {
+    const auto chunk_size_bytes = std::min<size_t>(kBufferSize, left_in_file);
+    offset -= chunk_size_bytes;
+
+    auto* chunk_end = buffer + chunk_size_bytes - 1;
+    const auto* check_start =
+        left_to_check < chunk_size_bytes ? chunk_end - left_to_check + 1 : buffer;
+
+    Slice slice;
+    RETURN_NOT_OK(file->Read(offset, chunk_size_bytes, &slice, pointer_cast<uint8_t*>(buffer)));
+    SCHECK_EQ(chunk_size_bytes, slice.size(), IllegalState, "Read unexpected number of bytes");
+
+    auto* p = chunk_end;
+    // Check based on check_tail_size and return OK if not all check_tail_size are zeros.
+    // Note that by-byte comparison is optimized by clang much better than trying to optimize
+    // by comparing 32-bit/64-bit words using custom code.
+    for (; p >= check_start; --p) {
+      if (*p != 0 && PREDICT_TRUE(!FLAGS_TEST_simulate_fully_zeroed_file)) {
+        return Status::OK();
+      }
+    }
+    bool found_all_tail_zeros = false;
+    // After we've confirmed end of the file contains at least check_tail_size zero bytes, we need
+    // to calculate how many zeros we actually have at the end of the file because it could be more,
+    // and we want to log that for further analysis.
+    for (; p >= buffer; --p) {
+      if (*p != 0 && PREDICT_TRUE(!FLAGS_TEST_simulate_fully_zeroed_file)) {
+        // Zeros found before current while iteration.
+        zero_tail_size = file_size - left_in_file;
+        // Zeros found by this for loop.
+        zero_tail_size += chunk_end - p;
+        found_all_tail_zeros = true;
+        break;
+      }
+    }
+
+    if (found_all_tail_zeros) {
+      break;
+    }
+
+    left_in_file -= chunk_size_bytes;
+    if (left_to_check > chunk_size_bytes) {
+      left_to_check -= chunk_size_bytes;
+    } else {
+      left_to_check = 0;
+    }
+  }
+
+  return STATUS_FORMAT(
+      IOError, "$2: last $0 of $1 bytes are all zeros", zero_tail_size, file_size, file_path);
 }
 
 }  // namespace rocksdb

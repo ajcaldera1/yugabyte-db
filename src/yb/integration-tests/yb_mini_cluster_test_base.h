@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_INTEGRATION_TESTS_YB_MINI_CLUSTER_TEST_BASE_H_
-#define YB_INTEGRATION_TESTS_YB_MINI_CLUSTER_TEST_BASE_H_
+#pragma once
 
 #include <memory>
 
@@ -21,6 +20,12 @@
 #include "yb/client/client.h"
 
 namespace yb {
+
+namespace test {
+
+YB_DEFINE_ENUM(Partitioning, (kHash)(kRange))
+
+}
 
 template <class T>
 class YBMiniClusterTestBase: public YBTest {
@@ -44,6 +49,7 @@ class YBMiniClusterTestBase: public YBTest {
  protected:
   std::unique_ptr<T> cluster_;
   bool verify_cluster_before_next_tear_down_;
+  bool saved_use_priority_thread_pool_for_flushes_;
 
   virtual void DoTearDown();
   virtual void DoBeforeTearDown();
@@ -53,14 +59,17 @@ template <class T>
 class MiniClusterTestWithClient : public YBMiniClusterTestBase<T> {
  public:
   // Create a new YB session
-  client::YBSessionPtr NewSession();
+  virtual client::YBSessionPtr NewSession();
 
  protected:
-  virtual CHECKED_STATUS CreateClient();
+  virtual Status CreateClient();
 
-  client::YBClientPtr client_;
+  // Creates the client only if it has not been created before.
+  virtual Status EnsureClientCreated();
+
+  void DoTearDown() override;
+
+  std::unique_ptr<client::YBClient> client_;
 };
 
 } // namespace yb
-
-#endif // YB_INTEGRATION_TESTS_YB_MINI_CLUSTER_TEST_BASE_H_

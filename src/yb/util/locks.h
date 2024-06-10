@@ -29,43 +29,41 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_LOCKS_H
-#define YB_UTIL_LOCKS_H
+#pragma once
 
 #include <algorithm>
 #include <mutex>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
+
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/dynamic_annotations.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
 #include "yb/gutil/spinlock.h"
 #include "yb/gutil/sysinfo.h"
+#include "yb/gutil/thread_annotations.h"
+
 #include "yb/util/errno.h"
 #include "yb/util/rw_semaphore.h"
 
 namespace yb {
 
-using base::subtle::Acquire_CompareAndSwap;
-using base::subtle::NoBarrier_Load;
-using base::subtle::Release_Store;
-
 // Wrapper around the Google SpinLock class to adapt it to the method names
 // expected by Boost.
-class simple_spinlock {
+class CAPABILITY("mutex") simple_spinlock {
  public:
-  simple_spinlock() {}
+  constexpr simple_spinlock() {}
 
-  void lock() EXCLUSIVE_LOCK_FUNCTION() {
+  void lock() ACQUIRE() {
     l_.Lock();
   }
 
-  void unlock() UNLOCK_FUNCTION() {
+  void unlock() RELEASE() {
     l_.Unlock();
   }
 
-  bool try_lock() EXCLUSIVE_TRYLOCK_FUNCTION(true) {
+  bool try_lock() TRY_ACQUIRE(true) {
     return l_.TryLock();
   }
 
@@ -94,12 +92,12 @@ struct padded_spinlock : public simple_spinlock {
 
 // Reader-writer lock.
 // This is functionally equivalent to rw_semaphore in rw_semaphore.h, but should be
-// used whenever the lock is expected to only be acquired on a single thread.
+// used whenever the lock is expected to be released on the same thread which acquired it.
 // It adds TSAN annotations which will detect misuse of the lock, but those
 // annotations also assume that the same thread the takes the lock will unlock it.
 //
 // See rw_semaphore.h for documentation on the individual methods where unclear.
-class rw_spinlock {
+class CAPABILITY("mutex") rw_spinlock  {
  public:
   rw_spinlock() {
     ANNOTATE_RWLOCK_CREATE(this);
@@ -148,34 +146,34 @@ class rw_spinlock {
   rw_semaphore sem_;
 };
 
-// A reader-writer lock implementation which is biased for use cases where
+// A reader-writer mutex implementation which is biased for use cases where
 // the write lock is taken infrequently, but the read lock is used often.
 //
 // Internally, this creates N underlying mutexes, one per CPU. When a thread
-// wants to lock in read (shared) mode, it locks only its own CPU's mutex. When it
-// wants to lock in write (exclusive) mode, it locks all CPU's mutexes.
+// wants to lock in read (shared) mode, it locks only its own CPU's mutex for read. When it
+// wants to lock in write (exclusive) mode, it locks all CPU's mutexes execlusively.
 //
 // This means that in the read-mostly case, different readers will not cause any
 // cacheline contention.
 //
 // Usage:
-//   percpu_rwlock mylock;
+//   PerCpuRwMutex mylock;
 //
 //   // Lock shared:
 //   {
-//     boost::shared_lock<rw_spinlock> lock(mylock.get_lock());
+//     PerCpuRwSharedLock lock(mylock);
 //     ...
 //   }
 //
 //   // Lock exclusive:
 //
 //   {
-//     boost::lock_guard<percpu_rwlock> lock(mylock);
+//     boost::lock_guard<PerCpuRwMutex> lock(mylock);
 //     ...
 //   }
-class percpu_rwlock {
+class CAPABILITY("mutex") PerCpuRwMutex {
  public:
-  percpu_rwlock() {
+  PerCpuRwMutex() {
     errno = 0;
     n_cpus_ = base::MaxCPUIndex() + 1;
     CHECK_EQ(errno, 0) << ErrnoToString(errno);
@@ -183,22 +181,11 @@ class percpu_rwlock {
     locks_ = new padded_lock[n_cpus_];
   }
 
-  ~percpu_rwlock() {
+  ~PerCpuRwMutex() {
     delete [] locks_;
   }
 
-  rw_spinlock &get_lock() {
-#if defined(__APPLE__)
-    // OSX doesn't have a way to get the CPU, so we'll pick a random one.
-    int cpu = reinterpret_cast<uintptr_t>(this) % n_cpus_;
-#else
-    int cpu = sched_getcpu();
-    CHECK_LT(cpu, n_cpus_);
-#endif  // defined(__APPLE__)
-    return locks_[cpu].lock;
-  }
-
-  bool try_lock() {
+  bool try_lock() TRY_ACQUIRE(true) {
     for (int i = 0; i < n_cpus_; i++) {
       if (!locks_[i].lock.try_lock()) {
         while (i--) {
@@ -219,13 +206,13 @@ class percpu_rwlock {
     return false;
   }
 
-  void lock() {
+  void lock() ACQUIRE() {
     for (int i = 0; i < n_cpus_; i++) {
       locks_[i].lock.lock();
     }
   }
 
-  void unlock() {
+  void unlock() RELEASE() {
     for (int i = 0; i < n_cpus_; i++) {
       locks_[i].lock.unlock();
     }
@@ -240,6 +227,22 @@ class percpu_rwlock {
   size_t memory_footprint_including_this() const;
 
  private:
+  friend class PerCpuRwSharedLock;
+
+  rw_spinlock &get_lock() {
+#if defined(__APPLE__)
+    // OSX doesn't have a way to get the CPU, so we'll pick a random one.
+    int cpu = reinterpret_cast<uintptr_t>(this) % n_cpus_;
+#else
+    int cpu = sched_getcpu();
+    if (cpu < 0) {
+      LOG(FATAL) << ErrnoToString(errno);
+    }
+    CHECK_LT(cpu, n_cpus_);
+#endif  // defined(__APPLE__)
+    return locks_[cpu].lock;
+  }
+
   struct padded_lock {
     rw_spinlock lock;
     static constexpr size_t kPaddingSize = CACHELINE_SIZE - (sizeof(rw_spinlock) % CACHELINE_SIZE);
@@ -250,59 +253,68 @@ class percpu_rwlock {
   padded_lock *locks_;
 };
 
-// Simple implementation of the std::shared_lock API, which is not available in
-// the standard library until C++14. Defers error checking to the underlying
-// mutex.
-
-template <typename Mutex>
-class shared_lock {
+// A scoped lock for PerCpuRwMutex. Works by choosing the current CPU and locking the lock for that
+// CPU. The lock is released when the guard goes out of scope.
+class SCOPED_CAPABILITY PerCpuRwSharedLock {
  public:
-  shared_lock()
-      : m_(nullptr) {
+  explicit PerCpuRwSharedLock(PerCpuRwMutex& per_cpu_rwlock)  // NOLINT
+      ACQUIRE_SHARED(per_cpu_rwlock) {
+    current_cpu_lock_ = &per_cpu_rwlock.get_lock();
+    current_cpu_lock_->lock();
   }
 
-  explicit shared_lock(Mutex& m) // NOLINT
-      : m_(&m) {
-    m_->lock_shared();
+  ~PerCpuRwSharedLock() RELEASE() {
+    current_cpu_lock_->unlock();
   }
-
-  shared_lock(Mutex& m, std::try_to_lock_t t) // NOLINT
-      : m_(nullptr) {
-    if (m.try_lock_shared()) {
-      m_ = &m;
-    }
-  }
-
-  bool owns_lock() const {
-    return m_;
-  }
-
-  void swap(shared_lock& other) {
-    std::swap(m_, other.m_);
-  }
-
-  ~shared_lock() {
-    if (m_ != nullptr) {
-      m_->unlock_shared();
-    }
-  }
-
  private:
-  Mutex* m_;
-  DISALLOW_COPY_AND_ASSIGN(shared_lock<Mutex>);
+  rw_spinlock* current_cpu_lock_;
 };
 
 template <class Container>
 auto ToVector(const Container& container, std::mutex* mutex) {
   std::vector<typename Container::value_type> result;
   {
-    std::lock_guard<std::mutex> lock(*mutex);
+    std::lock_guard lock(*mutex);
     result.reserve(container.size());
     result.assign(container.begin(), container.end());
   }
   return result;
 }
 
-} // namespace yb
+template <class Mutex, class Rep, class Period>
+std::unique_lock<Mutex> LockMutex(Mutex* mutex, std::chrono::duration<Rep, Period> duration) {
+  if (duration == std::chrono::duration<Rep, Period>::max()) {
+    return std::unique_lock<Mutex>(*mutex);
+  }
 
-#endif // YB_UTIL_LOCKS_H
+  return std::unique_lock<Mutex>(*mutex, duration);
+}
+
+template <class Mutex, class Clock, class Duration>
+std::unique_lock<Mutex> LockMutex(Mutex* mutex, std::chrono::time_point<Clock, Duration> time) {
+  if (time == std::chrono::time_point<Clock, Duration>::max()) {
+    return std::unique_lock<Mutex>(*mutex);
+  }
+
+  return std::unique_lock<Mutex>(*mutex, time);
+}
+
+template <class Lock>
+class ReverseLock {
+ public:
+  ReverseLock(const ReverseLock&) = delete;
+  void operator=(const ReverseLock&) = delete;
+
+  explicit ReverseLock(Lock& lock) : lock_(lock) {
+    lock_.unlock();
+  }
+
+  ~ReverseLock() {
+    lock_.lock();
+  }
+
+ private:
+  Lock& lock_;
+};
+
+} // namespace yb

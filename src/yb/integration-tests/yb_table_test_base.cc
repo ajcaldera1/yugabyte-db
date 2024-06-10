@@ -13,23 +13,39 @@
 
 #include "yb/integration-tests/yb_table_test_base.h"
 
+#include "yb/client/client.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/yql/redis/redisserver/redis_parser.h"
-#include "yb/yql/redis/redisserver/redis_constants.h"
+#include "yb/common/ql_value.h"
+
+#include "yb/master/master_client.proxy.h"
+
+#include "yb/tools/yb-admin_client.h"
+
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/curl_util.h"
+#include "yb/util/monotime.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+#include "yb/util/string_util.h"
+
+DECLARE_bool(enable_ysql);
 
 using std::unique_ptr;
 using std::shared_ptr;
+using std::vector;
+using std::string;
 
 namespace yb {
 
 using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTableCreator;
@@ -39,14 +55,22 @@ using strings::Substitute;
 
 namespace integration_tests {
 
-const YBTableName YBTableTestBase::kDefaultTableName("my_keyspace", "kv-table-test");
+YBTableTestBase::~YBTableTestBase() {
+}
 
-int YBTableTestBase::num_masters() {
+const YBTableName YBTableTestBase::kDefaultTableName(
+    YQL_DATABASE_CQL, "my_keyspace", "kv-table-test");
+
+size_t YBTableTestBase::num_masters() {
   return kDefaultNumMasters;
 }
 
-int YBTableTestBase::num_tablet_servers() {
+size_t YBTableTestBase::num_tablet_servers() {
   return kDefaultNumTabletServers;
+}
+
+int YBTableTestBase::num_drives() {
+  return kDefaultNumDrives;
 }
 
 int YBTableTestBase::num_tablets() {
@@ -58,7 +82,10 @@ int YBTableTestBase::session_timeout_ms() {
 }
 
 YBTableName YBTableTestBase::table_name() {
-  return kDefaultTableName;
+  if (table_names_.empty()) {
+    table_names_.push_back(kDefaultTableName);
+  }
+  return table_names_[0];
 }
 
 bool YBTableTestBase::need_redis_table() {
@@ -73,7 +100,21 @@ bool YBTableTestBase::use_external_mini_cluster() {
   return kDefaultUsingExternalMiniCluster;
 }
 
+bool YBTableTestBase::use_yb_admin_client() {
+  return false;
+}
+
+bool YBTableTestBase::enable_ysql() {
+  return kDefaultEnableYSQL;
+}
+
 YBTableTestBase::YBTableTestBase() {
+}
+
+void YBTableTestBase::BeforeCreateTable() {
+}
+
+void YBTableTestBase::BeforeStartCluster() {
 }
 
 void YBTableTestBase::SetUp() {
@@ -81,20 +122,34 @@ void YBTableTestBase::SetUp() {
 
   Status mini_cluster_status;
   if (use_external_mini_cluster()) {
-    auto opts = ExternalMiniClusterOptions();
-    opts.num_masters = num_masters();
-    opts.master_rpc_ports = master_rpc_ports();
-    opts.num_tablet_servers = num_tablet_servers();
+    auto opts = ExternalMiniClusterOptions {
+        .num_masters = num_masters(),
+        .num_tablet_servers = num_tablet_servers(),
+        .num_drives = num_drives(),
+        .master_rpc_ports = master_rpc_ports(),
+        .enable_ysql = enable_ysql(),
+        .extra_tserver_flags = {},
+        .extra_master_flags = {},
+        .cluster_id = {},
+    };
     CustomizeExternalMiniCluster(&opts);
 
     external_mini_cluster_.reset(new ExternalMiniCluster(opts));
     mini_cluster_status = external_mini_cluster_->Start();
   } else {
-    auto opts = MiniClusterOptions();
-    opts.num_masters = num_masters();
-    opts.num_tablet_servers = num_tablet_servers();
+    auto opts = MiniClusterOptions {
+        .num_masters = num_masters(),
+        .num_tablet_servers = num_tablet_servers(),
+        .num_drives = num_drives(),
+        .master_env = env_.get(),
+        .ts_env = ts_env_ ? ts_env_.get() : nullptr,
+        .ts_rocksdb_env = ts_rocksdb_env_ ? ts_rocksdb_env_.get() : nullptr
+    };
+    LOG(INFO) << "opts: " << opts.ts_env;
+    SetAtomicFlag(enable_ysql(), &FLAGS_enable_ysql);
 
-    mini_cluster_.reset(new MiniCluster(env_.get(), opts));
+    mini_cluster_.reset(new MiniCluster(opts));
+    BeforeStartCluster();
     mini_cluster_status = mini_cluster_->Start();
   }
   if (!mini_cluster_status.ok()) {
@@ -105,16 +160,19 @@ void YBTableTestBase::SetUp() {
   ASSERT_OK(mini_cluster_status);
 
   CreateClient();
+  CreateAdminClient();
+
+  BeforeCreateTable();
+
   CreateTable();
   OpenTable();
 }
 
 void YBTableTestBase::TearDown() {
-  DeleteTable();
-
-  // Fetch the tablet server metrics page after we delete the table. [ENG-135].
-  FetchTSMetricsPage();
-
+  client_.reset();
+  if (use_yb_admin_client()) {
+    yb_admin_client_.reset();
+  }
   if (use_external_mini_cluster()) {
     external_mini_cluster_->Shutdown();
   } else {
@@ -125,7 +183,7 @@ void YBTableTestBase::TearDown() {
 
 vector<uint16_t> YBTableTestBase::master_rpc_ports() {
   vector<uint16_t> master_rpc_ports;
-  for (int i = 0; i < num_masters(); ++i) {
+  for (size_t i = 0; i < num_masters(); ++i) {
     master_rpc_ports.push_back(0);
   }
   return master_rpc_ports;
@@ -135,16 +193,29 @@ void YBTableTestBase::CreateClient() {
   client_ = CreateYBClient();
 }
 
-shared_ptr<yb::client::YBClient> YBTableTestBase::CreateYBClient() {
-  shared_ptr<yb::client::YBClient> client;
+std::unique_ptr<YBClient> YBTableTestBase::CreateYBClient() {
   YBClientBuilder builder;
   builder.default_rpc_timeout(MonoDelta::FromMilliseconds(client_rpc_timeout_ms()));
   if (use_external_mini_cluster()) {
-    CHECK_OK(external_mini_cluster_->CreateClient(&builder, &client));
+    return CHECK_RESULT(external_mini_cluster_->CreateClient(&builder));
   } else {
-    CHECK_OK(mini_cluster_->CreateClient(&builder, &client));
+    return CHECK_RESULT(mini_cluster_->CreateClient(&builder));
   }
-  return client;
+}
+
+void YBTableTestBase::CreateAdminClient() {
+  if (use_yb_admin_client()) {
+    string addrs;
+    if (use_external_mini_cluster()) {
+      addrs = external_mini_cluster_->GetMasterAddresses();
+    }  else {
+      addrs = mini_cluster_->GetMasterAddresses();
+    }
+    yb_admin_client_ = std::make_unique<tools::ClusterAdminClient>(
+        addrs, MonoDelta::FromMilliseconds(client_rpc_timeout_ms()));
+
+    ASSERT_OK(yb_admin_client_->Init());
+  }
 }
 
 void YBTableTestBase::OpenTable() {
@@ -152,26 +223,28 @@ void YBTableTestBase::OpenTable() {
   session_ = NewSession();
 }
 
-void YBTableTestBase::CreateRedisTable(shared_ptr<yb::client::YBClient> client,
-                                       YBTableName table_name) {
+void YBTableTestBase::CreateRedisTable(const YBTableName& table_name) {
+  CHECK(table_name.namespace_type() == YQLDatabase::YQL_DATABASE_REDIS);
+
   ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name(),
-                                                YQLDatabase::YQL_DATABASE_REDIS));
+                                                table_name.namespace_type()));
   ASSERT_OK(NewTableCreator()->table_name(table_name)
                 .table_type(YBTableType::REDIS_TABLE_TYPE)
-                .num_tablets(CalcNumTablets(3))
+                .num_tablets(num_tablets())
                 .Create());
 }
 
 void YBTableTestBase::CreateTable() {
+  const auto tn = table_name();
   if (!table_exists_) {
-    ASSERT_OK(client_->CreateNamespaceIfNotExists(table_name().namespace_name()));
+    ASSERT_OK(client_->CreateNamespaceIfNotExists(tn.namespace_name(), tn.namespace_type()));
 
     YBSchemaBuilder b;
-    b.AddColumn("k")->Type(BINARY)->NotNull()->HashPrimaryKey();
-    b.AddColumn("v")->Type(BINARY)->NotNull();
+    b.AddColumn("k")->Type(DataType::BINARY)->NotNull()->HashPrimaryKey();
+    b.AddColumn("v")->Type(DataType::BINARY)->NotNull();
     ASSERT_OK(b.Build(&schema_));
 
-    ASSERT_OK(NewTableCreator()->table_name(table_name()).schema(&schema_).Create());
+    ASSERT_OK(NewTableCreator()->table_name(tn).schema(&schema_).Create());
     table_exists_ = true;
   }
 }
@@ -184,20 +257,26 @@ void YBTableTestBase::DeleteTable() {
 }
 
 shared_ptr<YBSession> YBTableTestBase::NewSession() {
-  shared_ptr<YBSession> session = client_->NewSession();
-  session->SetTimeout(MonoDelta::FromMilliseconds(session_timeout_ms()));
-  return session;
+  return client_->NewSession(MonoDelta::FromMilliseconds(session_timeout_ms()));
 }
 
-void YBTableTestBase::PutKeyValue(YBSession* session, string key, string value) {
+Status YBTableTestBase::PutKeyValue(YBSession* session, const string& key, const string& value) {
   auto insert = table_.NewInsertOp();
   QLAddStringHashValue(insert->mutable_request(), key);
   table_.AddStringColumnValue(insert->mutable_request(), "v", value);
-  ASSERT_OK(session->ApplyAndFlush(insert));
+  return session->TEST_ApplyAndFlush(insert);
 }
 
-void YBTableTestBase::PutKeyValue(string key, string value) {
-  PutKeyValue(session_.get(), key, value);
+void YBTableTestBase::PutKeyValue(const string& key, const string& value) {
+  ASSERT_OK(PutKeyValue(session_.get(), key, value));
+}
+
+void YBTableTestBase::PutKeyValueIgnoreError(const string& key, const string& value) {
+  auto s ATTRIBUTE_UNUSED = PutKeyValue(session_.get(), key, value);
+  if (!s.ok()) {
+    LOG(WARNING) << "PutKeyValueIgnoreError: " << s;
+  }
+  return;
 }
 
 void YBTableTestBase::RestartCluster() {
@@ -205,6 +284,52 @@ void YBTableTestBase::RestartCluster() {
   CHECK_OK(mini_cluster_->RestartSync());
   ASSERT_NO_FATALS(CreateClient());
   ASSERT_NO_FATALS(OpenTable());
+}
+
+Result<std::vector<uint32_t>> YBTableTestBase::GetTserverLoads(const std::vector<int>& ts_idxs) {
+  std::vector<uint32_t> tserver_loads;
+  for (const auto& ts_idx : ts_idxs) {
+    tserver_loads.push_back(
+        VERIFY_RESULT(GetLoadOnTserver(external_mini_cluster_->tablet_server(ts_idx))));
+  }
+  return tserver_loads;
+}
+
+Result<uint32_t> YBTableTestBase::GetLoadOnTserver(ExternalTabletServer* server) {
+  auto proxy = GetMasterLeaderProxy<master::MasterClientProxy>();
+  uint32_t count = 0;
+  std::vector<string> replicas;
+  // Need to get load from each table.
+  for (const auto& table_name : table_names_) {
+    master::GetTableLocationsRequestPB req;
+    if (table_name.namespace_type() == YQL_DATABASE_PGSQL) {
+      // Use table_id/namespace_id for SQL tables.
+      req.mutable_table()->set_table_id(table_name.table_id());
+      req.mutable_table()->mutable_namespace_()->set_id(table_name.namespace_id());
+    } else {
+      req.mutable_table()->set_table_name(table_name.table_name());
+      req.mutable_table()->mutable_namespace_()->set_name(table_name.namespace_name());
+    }
+    req.set_max_returned_locations(num_tablets());
+    master::GetTableLocationsResponsePB resp;
+
+    rpc::RpcController rpc;
+    rpc.set_timeout(MonoDelta::FromMilliseconds(client_rpc_timeout_ms()));
+    RETURN_NOT_OK(proxy.GetTableLocations(req, &resp, &rpc));
+
+    for (const auto& loc : resp.tablet_locations()) {
+      for (const auto& replica : loc.replicas()) {
+        if (replica.ts_info().permanent_uuid() == server->instance_id().permanent_uuid()) {
+          replicas.push_back(loc.tablet_id());
+          count++;
+        }
+      }
+    }
+  }
+
+  LOG(INFO) << Format("For ts $0, tablets are $1 with count $2",
+                      server->instance_id().permanent_uuid(), VectorToString(replicas), count);
+  return count;
 }
 
 std::vector<std::pair<std::string, std::string>> YBTableTestBase::GetScanResults(
@@ -237,6 +362,17 @@ void YBTableTestBase::FetchTSMetricsPage() {
     LOG(INFO) << "Fetching metrics from " << addr;
     ASSERT_OK(c.FetchURL(Substitute("http://$0/metrics", addr), &buf));
   }
+}
+
+void YBTableTestBase::WaitForLoadBalanceCompletion(yb::MonoDelta timeout) {
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    bool is_idle = VERIFY_RESULT(client_->IsLoadBalancerIdle());
+    return !is_idle;
+  }, timeout, "IsLoadBalancerActive"));
+
+  ASSERT_OK(WaitFor([&]() -> Result<bool> {
+    return client_->IsLoadBalancerIdle();
+  }, timeout, "IsLoadBalancerIdle"));
 }
 
 std::unique_ptr<client::YBTableCreator> YBTableTestBase::NewTableCreator() {

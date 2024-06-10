@@ -109,6 +109,7 @@ typedef struct
 	RestrictInfo *rinfo;		/* the indexqual itself */
 	int			indexcol;		/* zero-based index column number */
 	bool		varonleft;		/* true if index column is on left of qual */
+	bool		is_hashed;		/* true if the variable is hashed */
 	Oid			clause_op;		/* qual's operator OID, if relevant */
 	Node	   *other_operand;	/* non-index operand of qual's operator */
 } IndexQualInfo;
@@ -215,10 +216,17 @@ extern void estimate_hash_bucket_stats(PlannerInfo *root,
 						   Selectivity *bucketsize_frac);
 
 extern List *deconstruct_indexquals(IndexPath *path);
+
+extern int yb_batch_expr_size(PlannerInfo *root,
+							  Index path_relid,
+							  Node *batched_expr);
+
 extern void genericcostestimate(PlannerInfo *root, IndexPath *path,
 					double loop_count,
 					List *qinfos,
 					GenericCosts *costs);
+
+double get_loop_count(PlannerInfo *root, Index cur_relid, Relids outer_relids);
 
 /* Functions in array_selfuncs.c */
 

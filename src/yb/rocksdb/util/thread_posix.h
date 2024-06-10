@@ -20,15 +20,27 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#ifndef YB_ROCKSDB_UTIL_THREAD_POSIX_H
-#define YB_ROCKSDB_UTIL_THREAD_POSIX_H
 
 #pragma once
 
-#include "yb/rocksdb/env.h"
-#include "yb/rocksdb/util/thread_status_util.h"
+#include <pthread.h>
+#include <string.h>
 
-#include "yb/util/thread.h"
+#include <cstdarg>
+#include <deque>
+
+#include "yb/gutil/ref_counted.h"
+
+#include "yb/rocksdb/env.h"
+#include "yb/rocksdb/file.h"
+
+#include "yb/util/faststring.h"
+
+namespace yb {
+
+class Thread;
+
+}
 
 namespace rocksdb {
 
@@ -94,17 +106,15 @@ class ThreadPool {
   pthread_mutex_t mu_;
   pthread_cond_t bgsignal_;
   int total_threads_limit_ = 1;
-  std::vector<yb::ThreadPtr> bgthreads_;
+  std::vector<scoped_refptr<yb::Thread>> bgthreads_;
   BGQueue queue_;
   std::atomic_uint queue_len_{0};  // Queue length. Used for stats reporting
   bool exit_all_threads_ = false;
   bool low_io_priority_ = false;
-  Env::Priority priority_;
+  Env::Priority priority_ = static_cast<Env::Priority>(0);
   Env* env_ = nullptr;
 
   void SetBackgroundThreadsInternal(int num, bool allow_reduce);
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_UTIL_THREAD_POSIX_H

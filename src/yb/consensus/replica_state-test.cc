@@ -29,22 +29,23 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include "yb/consensus/replica_state.h"
 
 #include <vector>
 
 #include <gtest/gtest.h>
+
+#include "yb/consensus/consensus-test-util.h"
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus_meta.h"
-#include "yb/consensus/consensus-test-util.h"
+#include "yb/consensus/replica_state.h"
+
 #include "yb/fs/fs_manager.h"
+
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
 namespace yb {
 namespace consensus {
-
-using std::vector;
 
 // TODO: Share a test harness with ConsensusMetadataTest?
 const char* kTabletId = "TestTablet";
@@ -59,20 +60,21 @@ class RaftConsensusStateTest : public YBTest {
   void SetUp() override {
     YBTest::SetUp();
     ASSERT_OK(fs_manager_.CreateInitialFileSystemLayout());
-    ASSERT_OK(fs_manager_.Open());
+    ASSERT_OK(fs_manager_.CheckAndOpenFileSystemRoots());
+    fs_manager_.SetTabletPathByDataPath(kTabletId, fs_manager_.GetDataRootDirs()[0]);
 
     // Initialize test configuration.
     config_.set_opid_index(kInvalidOpIdIndex);
     RaftPeerPB* peer = config_.add_peers();
     peer->set_permanent_uuid(fs_manager_.uuid());
-    peer->set_member_type(RaftPeerPB::VOTER);
+    peer->set_member_type(PeerMemberType::VOTER);
 
-    std::unique_ptr<ConsensusMetadata> cmeta;
-    ASSERT_OK(ConsensusMetadata::Create(&fs_manager_, kTabletId, fs_manager_.uuid(),
-                                        config_, kMinimumTerm, &cmeta));
-    state_.reset(new ReplicaState(ConsensusOptions(), fs_manager_.uuid(), std::move(cmeta),
-                                  operation_factory_.get(), nullptr /* safe_op_id_waiter */,
-                                  nullptr /* retryable_requests */));
+    std::unique_ptr<ConsensusMetadata> cmeta = ASSERT_RESULT(ConsensusMetadata::Create(
+        &fs_manager_, kTabletId, fs_manager_.uuid(), config_, kMinimumTerm));
+    state_.reset(new ReplicaState(
+        ConsensusOptions(), fs_manager_.uuid(), std::move(cmeta), operation_factory_.get(),
+        nullptr /* safe_op_id_waiter */, nullptr /* retryable_requests */,
+        [](const OpIds&) {} /* applied_ops_tracker */));
 
     // Start up the ReplicaState.
     ReplicaState::UniqueLock lock;
@@ -83,8 +85,8 @@ class RaftConsensusStateTest : public YBTest {
  protected:
   FsManager fs_manager_;
   RaftConfigPB config_;
-  gscoped_ptr<MockOperationFactory> operation_factory_;
-  gscoped_ptr<ReplicaState> state_;
+  std::unique_ptr<MockOperationFactory> operation_factory_;
+  std::unique_ptr<ReplicaState> state_;
 };
 
 // Test that we can transition a new configuration from a pending state into a
@@ -94,7 +96,7 @@ TEST_F(RaftConsensusStateTest, TestPendingPersistent) {
   ASSERT_OK(state_->LockForConfigChange(&lock));
 
   config_.clear_opid_index();
-  ASSERT_OK(state_->SetPendingConfigUnlocked(config_));
+  ASSERT_OK(state_->SetPendingConfigUnlocked(config_, OpId()));
   ASSERT_TRUE(state_->IsConfigChangePendingUnlocked());
   ASSERT_FALSE(state_->GetPendingConfigUnlocked().has_opid_index());
   ASSERT_TRUE(state_->GetCommittedConfigUnlocked().has_opid_index());
@@ -116,13 +118,13 @@ TEST_F(RaftConsensusStateTest, TestPersistentWrites) {
   ASSERT_EQ(kInvalidOpIdIndex, state_->GetCommittedConfigUnlocked().opid_index());
 
   config_.clear_opid_index();
-  ASSERT_OK(state_->SetPendingConfigUnlocked(config_));
+  ASSERT_OK(state_->SetPendingConfigUnlocked(config_, OpId()));
   config_.set_opid_index(1);
   ASSERT_OK(state_->SetCommittedConfigUnlocked(config_));
   ASSERT_EQ(1, state_->GetCommittedConfigUnlocked().opid_index());
 
   config_.clear_opid_index();
-  ASSERT_OK(state_->SetPendingConfigUnlocked(config_));
+  ASSERT_OK(state_->SetPendingConfigUnlocked(config_, OpId()));
   config_.set_opid_index(2);
   ASSERT_OK(state_->SetCommittedConfigUnlocked(config_));
   ASSERT_EQ(2, state_->GetCommittedConfigUnlocked().opid_index());

@@ -515,6 +515,16 @@ check_transaction_read_only(bool *newval, void **extra, GucSource source)
 	return true;
 }
 
+void
+assign_transaction_read_only(bool newval, void *extra)
+{
+	XactReadOnly = newval;
+	if (YBTransactionsEnabled())
+	{
+		HandleYBStatus(YBCPgSetTransactionReadOnly(XactReadOnly));
+	}
+}
+
 /*
  * SET TRANSACTION ISOLATION LEVEL
  *
@@ -539,6 +549,13 @@ check_XactIsoLevel(char **newval, void **extra, GucSource source)
 	else if (strcmp(*newval, "read committed") == 0)
 	{
 		newXactIsoLevel = XACT_READ_COMMITTED;
+		if (!YBIsReadCommittedSupported())
+		{
+			ereport(WARNING,
+					(errmsg("read committed isolation is disabled"),
+					 errdetail("Set yb_enable_read_committed_isolation to enable. When disabled, read "
+							 "committed falls back to using repeatable read isolation.")));
+		}
 	}
 	else if (strcmp(*newval, "read uncommitted") == 0)
 	{
@@ -588,9 +605,11 @@ void
 assign_XactIsoLevel(const char *newval, void *extra)
 {
 	XactIsoLevel = *((int *) extra);
-	if (YBTransactionsEnabled()) {
-    YBCPgTxnManager_SetIsolationLevel(YBCGetPgTxnManager(), XactIsoLevel);
-  }
+	if (YBTransactionsEnabled())
+	{
+		HandleYBStatus(
+			YBCPgSetTransactionIsolationLevel(YBGetEffectivePggateIsolationLevel()));
+	}
 }
 
 const char *
@@ -610,6 +629,67 @@ show_XactIsoLevel(void)
 		default:
 			return "bogus";
 	}
+}
+
+bool
+check_yb_default_xact_isolation(int *newval, void **extra, GucSource source)
+{
+	if ((*newval == XACT_READ_COMMITTED) && !YBIsReadCommittedSupported())
+	{
+		ereport(WARNING,
+					(errmsg("read committed isolation is disabled"),
+					 errdetail("Set yb_enable_read_committed_isolation to enable. When disabled, read "
+							 "committed falls back to using repeatable read isolation.")));
+	}
+	return true;
+}
+
+const char *
+yb_fetch_effective_transaction_isolation_level(void)
+{
+	switch (XactIsoLevel)
+	{
+		case XACT_READ_UNCOMMITTED:
+			switch_fallthrough();
+		case XACT_READ_COMMITTED:
+			if (IsYBReadCommitted())
+				return "read committed";
+			switch_fallthrough();
+		case XACT_REPEATABLE_READ:
+			return "repeatable read";
+		case XACT_SERIALIZABLE:
+			return "serializable";
+		default:
+			return "bogus";
+	}
+}
+
+bool is_staleness_acceptable(int32_t staleness_ms) {
+	int32_t max_clock_skew_usec = YBGetMaxClockSkewUsec();
+	const int kMargin = 2;
+	if (staleness_ms * 1000 < kMargin * max_clock_skew_usec) {
+		GUC_check_errcode(ERRCODE_FEATURE_NOT_SUPPORTED);
+		GUC_check_errmsg("cannot enable yb_read_from_followers with a staleness of less than "
+						"%d * (max_clock_skew = %d usec)", kMargin, max_clock_skew_usec);
+		return false;
+	}
+	return true;
+}
+
+bool
+check_follower_reads(bool *newval, void **extra, GucSource source) {
+	if (*newval == false) {
+		return true;
+	}
+	return is_staleness_acceptable(yb_follower_read_staleness_ms);
+}
+
+bool
+check_follower_read_staleness_ms(int32_t *newval, void **extra, GucSource source) {
+	if (!YBReadFromFollowersEnabled()) {
+		return true;
+	}
+	return is_staleness_acceptable(*newval);
 }
 
 /*
@@ -633,6 +713,16 @@ check_transaction_deferrable(bool *newval, void **extra, GucSource source)
 	}
 
 	return true;
+}
+
+void
+assign_transaction_deferrable(bool newval, void *extra)
+{
+  XactDeferrable = newval;
+	if (YBTransactionsEnabled())
+	{
+		HandleYBStatus(YBCPgSetTransactionDeferrable(XactDeferrable));
+	}
 }
 
 /*
@@ -824,6 +914,17 @@ check_session_authorization(char **newval, void **extra, GucSource source)
 	roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(*newval));
 	if (!HeapTupleIsValid(roleTup))
 	{
+		/*
+		 * When source == PGC_S_TEST, we don't throw a hard error for a
+		 * nonexistent user name, only a NOTICE.  See comments in guc.h.
+		 */
+		if (source == PGC_S_TEST)
+		{
+			ereport(NOTICE,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("role \"%s\" does not exist", *newval)));
+			return true;
+		}
 		GUC_check_errmsg("role \"%s\" does not exist", *newval);
 		return false;
 	}
@@ -892,10 +993,23 @@ check_role(char **newval, void **extra, GucSource source)
 			return false;
 		}
 
+		/*
+		 * When source == PGC_S_TEST, we don't throw a hard error for a
+		 * nonexistent user name or insufficient privileges, only a NOTICE.
+		 * See comments in guc.h.
+		 */
+
 		/* Look up the username */
 		roleTup = SearchSysCache1(AUTHNAME, PointerGetDatum(*newval));
 		if (!HeapTupleIsValid(roleTup))
 		{
+			if (source == PGC_S_TEST)
+			{
+				ereport(NOTICE,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("role \"%s\" does not exist", *newval)));
+				return true;
+			}
 			GUC_check_errmsg("role \"%s\" does not exist", *newval);
 			return false;
 		}
@@ -913,6 +1027,14 @@ check_role(char **newval, void **extra, GucSource source)
 		if (!InitializingParallelWorker &&
 			!is_member_of_role(GetSessionUserId(), roleid))
 		{
+			if (source == PGC_S_TEST)
+			{
+				ereport(NOTICE,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission will be denied to set role \"%s\"",
+								*newval)));
+				return true;
+			}
 			GUC_check_errcode(ERRCODE_INSUFFICIENT_PRIVILEGE);
 			GUC_check_errmsg("permission denied to set role \"%s\"",
 							 *newval);

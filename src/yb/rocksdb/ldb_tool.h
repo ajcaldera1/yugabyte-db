@@ -17,8 +17,9 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef ROCKSDB_LITE
+
 #pragma once
+
 #include <string>
 #include <vector>
 #include "yb/rocksdb/db.h"
@@ -52,5 +53,3 @@ class LDBTool {
 };
 
 } // namespace rocksdb
-
-#endif  // ROCKSDB_LITE

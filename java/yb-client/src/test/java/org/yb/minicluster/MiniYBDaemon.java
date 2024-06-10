@@ -13,6 +13,7 @@
  */
 package org.yb.minicluster;
 
+import com.google.common.collect.Lists;
 import com.google.common.net.HostAndPort;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -194,7 +195,7 @@ public class MiniYBDaemon {
         (daemonIndex == NO_DAEMON_INDEX ? "" : String.valueOf(daemonIndex)) +
         LOG_PREFIX_SEPARATOR + PID_PREFIX + pidAsString + LOG_PREFIX_SEPARATOR +
         (rpcPort == NO_RPC_PORT ? "" : ":" + rpcPort) +
-        (ConfForTesting.isJenkins() || webUiUrl == null || webUiUrl.isEmpty()
+        (ConfForTesting.isCI() || webUiUrl == null || webUiUrl.isEmpty()
             ? "" // No need for a clickable web UI link on Jenkins, or if it is not defined.
             : LOG_PREFIX_SEPARATOR + webUiUrl) +
         " ";
@@ -206,13 +207,14 @@ public class MiniYBDaemon {
   }
 
   /**
-   * @param type daemon type (master / tablet server)
+   * @param type daemon type (master / tablet / yb controller server)
    * @param commandLine command line used to run the daemon
    * @param process daemon process
    */
   public MiniYBDaemon(
       MiniYBDaemonType type, int indexForLog, String[] commandLine, Process process, String bindIp,
-      int rpcPort, int webPort, int cqlWebPort, int redisWebPort, String dataDirPath) {
+      int rpcPort, int webPort, int pgsqlWebPort, int cqlWebPort, int redisWebPort,
+      String dataDirPath) {
     this.type = type;
     this.commandLine = commandLine;
     this.process = process;
@@ -221,6 +223,7 @@ public class MiniYBDaemon {
     this.rpcPort = rpcPort;
     this.webPort = webPort;
     this.cqlWebPort = cqlWebPort;
+    this.pgsqlWebPort = pgsqlWebPort;
     this.redisWebPort = redisWebPort;
     this.dataDirPath = dataDirPath;
     this.logListener = new ExternalDaemonLogErrorListener(getLogPrefix());
@@ -264,7 +267,8 @@ public class MiniYBDaemon {
   MiniYBDaemon restart() throws Exception {
     return new MiniYBDaemon(type, indexForLog, commandLine,
                             new ProcessBuilder(commandLine).redirectErrorStream(true).start(),
-                            bindIp, rpcPort, webPort, cqlWebPort, redisWebPort, dataDirPath);
+                            bindIp, rpcPort, webPort, cqlWebPort, pgsqlWebPort, redisWebPort,
+                            dataDirPath);
   }
 
   @Override
@@ -281,6 +285,7 @@ public class MiniYBDaemon {
   private final int rpcPort;
   private final int webPort;
   private final int cqlWebPort;
+  private final int pgsqlWebPort;
   private final int redisWebPort;
   private final String dataDirPath;
   private final CountDownLatch shutdownLatch = new CountDownLatch(1);
@@ -289,6 +294,10 @@ public class MiniYBDaemon {
 
   public HostAndPort getWebHostAndPort() {
     return HostAndPort.fromParts(bindIp, webPort);
+  }
+
+  public HostAndPort getHostAndPort() {
+    return HostAndPort.fromParts(bindIp, rpcPort);
   }
 
   public int getWebPort() {
@@ -308,6 +317,10 @@ public class MiniYBDaemon {
     return bindIp;
   }
 
+  public int getPgsqlWebPort() {
+    return pgsqlWebPort;
+  }
+
   void waitForShutdown() {
     try {
       if (!shutdownLatch.await(10, TimeUnit.SECONDS)) {
@@ -322,6 +335,41 @@ public class MiniYBDaemon {
   public void waitForServerStartLogMessage(long deadlineMs) throws InterruptedException {
     logListener.waitForServerStartingLogLine(deadlineMs);
     LOG.info("Saw an 'RPC server started' message from " + this);
+  }
+
+  public void terminate() throws Exception {
+    try {
+      ProcessUtil.signalProcess(process, "TERM");
+    } catch (IllegalStateException ex) {
+      // Failed to send signal, if process is not alive - it is OK, otherwise rethrow the exception.
+      if (process.isAlive()) {
+        throw ex;
+      }
+    }
+    try {
+      process.getInputStream().close();
+    } catch (IOException ex) {
+    }
+  }
+
+  /**
+   * Ping the YB Controller server.
+   * Throws an exception if ping fails.
+   */
+  public void ping() throws Exception {
+    if (this.type != MiniYBDaemonType.YBCONTROLLER) {
+      LOG.warn("This method is for YB Controller only.");
+      return;
+    }
+
+    final List<String> cmdLine = Lists.newArrayList(
+        TestUtils.findBinary("../../ybc/yb-controller-cli"),
+        "ping",
+        "--tserver_ip=" + this.bindIp,
+        "--server_port=" + this.rpcPort);
+
+    LOG.info("Pinging YB Controller server with host = {}, port = {}", this.bindIp, this.rpcPort);
+    ProcessUtil.executeSimple(cmdLine, " ");
   }
 
 }

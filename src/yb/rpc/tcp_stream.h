@@ -11,19 +11,47 @@
 // under the License.
 //
 
-#ifndef YB_RPC_TCP_STREAM_H
-#define YB_RPC_TCP_STREAM_H
+#pragma once
+
+#include <deque>
 
 #include <ev++.h>
 
-#include "yb/rpc/growable_buffer.h"
 #include "yb/rpc/stream.h"
 
 #include "yb/util/net/socket.h"
+#include "yb/util/mem_tracker.h"
 #include "yb/util/ref_cnt_buffer.h"
 
 namespace yb {
+
+class Counter;
+
 namespace rpc {
+
+struct TcpStreamSendingData {
+  typedef boost::container::small_vector<RefCntSlice, 4> SendingBytes;
+
+  TcpStreamSendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker);
+
+  size_t bytes_size() const {
+    size_t result = 0;
+    for (const auto& entry : bytes) {
+      result += entry.size();
+    }
+    return result;
+  }
+
+  void ClearBytes() {
+    bytes.clear();
+    consumption = ScopedTrackedConsumption();
+  }
+
+  OutboundDataPtr data;
+  SendingBytes bytes;
+  ScopedTrackedConsumption consumption;
+  bool skipped = false;
+};
 
 class TcpStream : public Stream {
  public:
@@ -40,19 +68,24 @@ class TcpStream : public Stream {
   static StreamFactoryPtr Factory();
 
  private:
-  CHECKED_STATUS Start(bool connect, ev::loop_ref* loop, StreamContext* context) override;
+  struct FillIovResult {
+    int len;
+    bool only_heartbeats;
+  };
+
+  Status Start(bool connect, ev::loop_ref* loop, StreamContext* context) override;
   void Close() override;
   void Shutdown(const Status& status) override;
-  size_t Send(OutboundDataPtr data) override;
-  CHECKED_STATUS TryWrite() override;
-  void Cancelled(size_t handle) override;
+  Result<size_t> Send(OutboundDataPtr data) override;
+  Status TryWrite() override;
+  bool Cancelled(size_t handle) override;
 
   bool Idle(std::string* reason_not_idle) override;
   bool IsConnected() override { return connected_; }
   void DumpPB(const DumpRunningRpcsRequestPB& req, RpcConnectionPB* resp) override;
 
-  const Endpoint& Remote() override { return remote_; }
-  const Endpoint& Local() override { return local_; }
+  const Endpoint& Remote() const override { return remote_; }
+  const Endpoint& Local() const override { return local_; }
 
   const Protocol* GetProtocol() override {
     return StaticProtocol();
@@ -60,13 +93,13 @@ class TcpStream : public Stream {
 
   void ParseReceived() override;
 
-  CHECKED_STATUS DoWrite();
+  Status DoWrite();
   void HandleOutcome(const Status& status, bool enqueue);
   void ClearSending(const Status& status);
 
   void Handler(ev::io& watcher, int revents); // NOLINT
-  CHECKED_STATUS ReadHandler();
-  CHECKED_STATUS WriteHandler(bool just_connected);
+  Status ReadHandler();
+  Status WriteHandler(bool just_connected);
 
   Result<bool> Receive();
   // Try to parse received data and process it.
@@ -75,11 +108,11 @@ class TcpStream : public Stream {
   // Updates listening events.
   void UpdateEvents();
 
-  int FillIov(iovec* out);
+  FillIovResult FillIov(iovec* out);
 
   void DelayConnectHandler(ev::timer& watcher, int revents); // NOLINT
 
-  CHECKED_STATUS DoStart(ev::loop_ref* loop, bool connect);
+  Status DoStart(ev::loop_ref* loop, bool connect);
 
   StreamReadBuffer& ReadBuffer() {
     return context_->ReadBuffer();
@@ -96,7 +129,7 @@ class TcpStream : public Stream {
   // The remote address we're talking to.
   const Endpoint remote_;
 
-  StreamContext* context_;
+  StreamContext* context_ = nullptr;
 
   // Notifies us when our socket is readable or writable.
   ev::io io_;
@@ -112,39 +145,16 @@ class TcpStream : public Stream {
 
   bool read_buffer_full_ = false;
 
-  typedef boost::container::small_vector<RefCntBuffer, 4> SendingBytes;
-
-  struct SendingData {
-    SendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker);
-
-    size_t bytes_size() const {
-      size_t result = 0;
-      for (const auto& entry : bytes) {
-        result += entry.size();
-      }
-      return result;
-    }
-
-    void ClearBytes() {
-      bytes.clear();
-      consumption = ScopedTrackedConsumption();
-    }
-
-    OutboundDataPtr data;
-    SendingBytes bytes;
-    ScopedTrackedConsumption consumption;
-    bool skipped = false;
-  };
-
-  std::deque<SendingData> sending_;
+  std::deque<TcpStreamSendingData> sending_;
   size_t data_blocks_sent_ = 0;
   size_t send_position_ = 0;
   size_t queued_bytes_to_send_ = 0;
+  size_t inbound_bytes_to_skip_ = 0;
   bool waiting_write_ready_ = false;
   MemTrackerPtr mem_tracker_;
+  scoped_refptr<Counter> bytes_sent_counter_;
+  scoped_refptr<Counter> bytes_received_counter_;
 };
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_TCP_STREAM_H

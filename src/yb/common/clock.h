@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_COMMON_CLOCK_H
-#define YB_COMMON_CLOCK_H
+#pragma once
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/common/hybrid_time.h"
@@ -37,6 +36,8 @@ class ClockBase : public RefCountedThreadSafe<ClockBase> {
   virtual ~ClockBase() {}
 };
 
-} // namespace yb
+// Returns time after wait.
+// Returns error on timeout.
+Result<HybridTime> WaitUntil(ClockBase* clock, HybridTime hybrid_time, CoarseTimePoint deadline);
 
-#endif // YB_COMMON_CLOCK_H
+} // namespace yb

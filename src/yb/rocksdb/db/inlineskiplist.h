@@ -56,11 +56,15 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
+
 #pragma once
+
 #include <assert.h>
 #include <stdlib.h>
+
 #include <atomic>
-#include "yb/rocksdb/port/port.h"
+
 #include "yb/rocksdb/util/allocator.h"
 #include "yb/rocksdb/util/random.h"
 
@@ -95,6 +99,10 @@ class InlineSkipList {
   // Like Insert, but external synchronization is not required.
   void InsertConcurrently(const char* key);
 
+  bool Erase(const char* key, Comparator cmp) {
+    return false;
+  }
+
   // Returns true iff an entry that compares equal to key is in the list.
   bool Contains(const char* key) const;
 
@@ -102,7 +110,7 @@ class InlineSkipList {
   uint64_t EstimateCount(const char* key) const;
 
   // Iteration over the contents of a skip list
-  class Iterator {
+  class Iterator final {
    public:
     // Initialize an iterator over the specified list.
     // The returned iterator is not valid.
@@ -113,31 +121,37 @@ class InlineSkipList {
     // an old one and then allocating a new one
     void SetList(const InlineSkipList* list);
 
-    // Returns true iff the iterator is positioned at a valid node.
-    bool Valid() const;
+    bool Valid() const {
+      return Entry() != nullptr;
+    }
 
     // Returns the key at the current position.
-    // REQUIRES: Valid()
-    const char* key() const;
+    const char* key() const {
+      return Entry();
+    }
+
+    // Returns the entry at the current position.
+    const char* Entry() const;
 
     // Advances to the next position.
     // REQUIRES: Valid()
-    void Next();
+    // Returns the same value as would be returned by Entry after this method is invoked.
+    const char* Next();
 
     // Advances to the previous position.
     // REQUIRES: Valid()
-    void Prev();
+    const char* Prev();
 
     // Advance to the first entry with a key >= target
-    void Seek(const char* target);
+    const char* Seek(const char* target);
 
     // Position at the first entry in list.
     // Final state of iterator is Valid() iff list is not empty.
-    void SeekToFirst();
+    const char* SeekToFirst();
 
     // Position at the last entry in list.
     // Final state of iterator is Valid() iff list is not empty.
-    void SeekToLast();
+    const char* SeekToLast();
 
    private:
     const InlineSkipList* list_;
@@ -226,8 +240,8 @@ struct InlineSkipList<Comparator>::Node {
   // Stores the height of the node in the memory location normally used for
   // next_[0].  This is used for passing data from AllocateKey to Insert.
   void StashHeight(const int height) {
-    assert(sizeof(int) <= sizeof(next_[0]));
-    memcpy(&next_[0], &height, sizeof(int));
+    static_assert(sizeof(int) <= sizeof(next_[0]), "Too small height holder");
+    memcpy(static_cast<void*>(&next_[0]), &height, sizeof(int));
   }
 
   // Retrieves the value passed to StashHeight.  Undefined after a call
@@ -293,49 +307,53 @@ inline void InlineSkipList<Comparator>::Iterator::SetList(
 }
 
 template <class Comparator>
-inline bool InlineSkipList<Comparator>::Iterator::Valid() const {
-  return node_ != nullptr;
+inline const char* InlineSkipList<Comparator>::Iterator::Entry() const {
+  return node_ != nullptr ? node_->Key() : nullptr;
 }
 
 template <class Comparator>
-inline const char* InlineSkipList<Comparator>::Iterator::key() const {
-  assert(Valid());
-  return node_->Key();
+inline const char* InlineSkipList<Comparator>::Iterator::Next() {
+  assert(Entry());
+  auto node = node_->Next(0);
+  node_ = node;
+  return node != nullptr ? node->Key() : nullptr;;
 }
 
 template <class Comparator>
-inline void InlineSkipList<Comparator>::Iterator::Next() {
-  assert(Valid());
-  node_ = node_->Next(0);
-}
-
-template <class Comparator>
-inline void InlineSkipList<Comparator>::Iterator::Prev() {
+inline const char* InlineSkipList<Comparator>::Iterator::Prev() {
   // Instead of using explicit "prev" links, we just search for the
   // last node that falls before key.
-  assert(Valid());
+  assert(Entry());
   node_ = list_->FindLessThan(node_->Key());
-  if (node_ == list_->head_) {
-    node_ = nullptr;
+  if (node_ != list_->head_) {
+    return node_->Key();
   }
+
+  node_ = nullptr;
+  return nullptr;
 }
 
 template <class Comparator>
-inline void InlineSkipList<Comparator>::Iterator::Seek(const char* target) {
+inline const char* InlineSkipList<Comparator>::Iterator::Seek(const char* target) {
   node_ = list_->FindGreaterOrEqual(target);
+  return Entry();
 }
 
 template <class Comparator>
-inline void InlineSkipList<Comparator>::Iterator::SeekToFirst() {
+inline const char* InlineSkipList<Comparator>::Iterator::SeekToFirst() {
   node_ = list_->head_->Next(0);
+  return Entry();
 }
 
 template <class Comparator>
-inline void InlineSkipList<Comparator>::Iterator::SeekToLast() {
+inline const char* InlineSkipList<Comparator>::Iterator::SeekToLast() {
   node_ = list_->FindLast();
-  if (node_ == list_->head_) {
-    node_ = nullptr;
+  if (node_ != list_->head_) {
+    return node_->Key();
   }
+
+  node_ = nullptr;
+  return nullptr;
 }
 
 template <class Comparator>

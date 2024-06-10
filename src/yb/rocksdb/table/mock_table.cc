@@ -22,12 +22,18 @@
 
 #include "yb/rocksdb/table/mock_table.h"
 
+#include <gtest/gtest.h>
+
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/table_properties.h"
 #include "yb/rocksdb/table/get_context.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
+
+#include "yb/util/status_log.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 namespace mock {
@@ -89,7 +95,7 @@ Status MockTableFactory::NewTableReader(
   return Status::OK();
 }
 
-TableBuilder* MockTableFactory::NewTableBuilder(
+std::unique_ptr<TableBuilder> MockTableFactory::NewTableBuilder(
     const TableBuilderOptions& table_builder_options, uint32_t column_family_id,
     WritableFileWriter* base_file, WritableFileWriter* data_file) const {
   // This table factory doesn't support separate files for metadata and data, because tests using
@@ -99,7 +105,7 @@ TableBuilder* MockTableFactory::NewTableBuilder(
 
   uint32_t id = GetAndWriteNextID(base_file);
 
-  return new MockTableBuilder(id, &file_system_);
+  return std::make_unique<MockTableBuilder>(id, &file_system_);
 }
 
 Status MockTableFactory::CreateMockTable(Env* env, const std::string& fname,
@@ -121,14 +127,14 @@ uint32_t MockTableFactory::GetAndWriteNextID(WritableFileWriter* file) const {
   uint32_t next_id = next_id_.fetch_add(1);
   char buf[4];
   EncodeFixed32(buf, next_id);
-  file->Append(Slice(buf, 4));
+  CHECK_OK(file->Append(Slice(buf, 4)));
   return next_id;
 }
 
 uint32_t MockTableFactory::GetIDFromFile(RandomAccessFileReader* file) const {
   char buf[4];
   Slice result;
-  file->Read(0, 4, &result, buf);
+  CHECK_OK(file->Read(0, 4, &result, buf));
   assert(result.size() == 4);
   return DecodeFixed32(buf);
 }

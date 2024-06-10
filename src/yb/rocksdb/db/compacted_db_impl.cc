@@ -18,11 +18,12 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 #include "yb/rocksdb/db/compacted_db_impl.h"
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/db/version_set.h"
+
 #include "yb/rocksdb/table/get_context.h"
+#include "yb/rocksdb/table/table_reader.h"
 
 namespace rocksdb {
 
@@ -63,8 +64,8 @@ Status CompactedDBImpl::Get(const ReadOptions& options,
                          GetContext::kNotFound, key, value, nullptr, nullptr,
                          nullptr);
   LookupKey lkey(key, kMaxSequenceNumber);
-  files_.files[FindFile(key)].fd.table_reader->Get(
-      options, lkey.internal_key(), &get_context);
+  RETURN_NOT_OK(files_.files[FindFile(key)].fd.table_reader->Get(
+      options, lkey.internal_key(), &get_context));
   if (get_context.State() == GetContext::kFound) {
     return Status::OK();
   }
@@ -94,8 +95,10 @@ std::vector<Status> CompactedDBImpl::MultiGet(const ReadOptions& options,
                              GetContext::kNotFound, keys[idx], &(*values)[idx],
                              nullptr, nullptr, nullptr);
       LookupKey lkey(keys[idx], kMaxSequenceNumber);
-      r->Get(options, lkey.internal_key(), &get_context);
-      if (get_context.State() == GetContext::kFound) {
+      auto status = r->Get(options, lkey.internal_key(), &get_context);
+      if (!status.ok()) {
+        statuses[idx] = status;
+      } else if (get_context.State() == GetContext::kFound) {
         statuses[idx] = Status::OK();
       }
     }
@@ -105,19 +108,15 @@ std::vector<Status> CompactedDBImpl::MultiGet(const ReadOptions& options,
 }
 
 Status CompactedDBImpl::Init(const Options& options) {
-  mutex_.Lock();
-  ColumnFamilyDescriptor cf(kDefaultColumnFamilyName,
-                            ColumnFamilyOptions(options));
-  Status s = Recover({ cf }, true /* read only */, false);
-  if (s.ok()) {
+  {
+    std::unique_ptr<SuperVersion> old_superversion;
+    InstrumentedMutexLock lock(&mutex_);
+    ColumnFamilyDescriptor cf(kDefaultColumnFamilyName,
+                              ColumnFamilyOptions(options));
+    RETURN_NOT_OK(Recover({ cf }, true /* read only */, false));
     cfd_ = down_cast<ColumnFamilyHandleImpl*>(DefaultColumnFamily())->cfd();
-    cfd_->InstallSuperVersion(new SuperVersion(), &mutex_);
+    old_superversion = cfd_->InstallSuperVersion(new SuperVersion(), &mutex_);
   }
-  mutex_.Unlock();
-  if (!s.ok()) {
-    return s;
-  }
-  NewThreadStatusCfInfo(cfd_);
   version_ = cfd_->GetSuperVersion()->current;
   user_comparator_ = cfd_->user_comparator();
   auto* vstorage = version_->storage_info();
@@ -174,4 +173,3 @@ Status CompactedDBImpl::Open(const Options& options,
 }
 
 }   // namespace rocksdb
-#endif  // ROCKSDB_LITE

@@ -22,7 +22,7 @@
 #include "catalog/pg_opclass.h"
 #include "storage/indexfsm.h"
 #include "storage/lmgr.h"
-#include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/syscache.h"
 
 
@@ -119,7 +119,7 @@ gistjoinvector(IndexTuple *itvec, int *len, IndexTuple *additvec, int addlen)
 }
 
 /*
- * make plain IndexTupleVector
+ * make plain IndexTuple vector
  */
 
 IndexTupleData *

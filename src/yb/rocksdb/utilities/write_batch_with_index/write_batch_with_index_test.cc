@@ -21,17 +21,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_LITE
 
 #include <memory>
 #include <map>
 #include "yb/rocksdb/db/column_family.h"
 #include "yb/rocksdb/port/stack_trace.h"
 #include "yb/rocksdb/utilities/write_batch_with_index.h"
-#include "yb/util/string_util.h"
+#include "yb/rocksdb/util/random.h"
 #include "yb/rocksdb/util/testharness.h"
+#include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/utilities/merge_operators.h"
 #include "yb/rocksdb/utilities/merge_operators/string_append/stringappend.h"
+
+#include "yb/util/string_util.h"
+#include "yb/util/test_util.h"
 
 namespace rocksdb {
 
@@ -58,10 +61,10 @@ struct Entry {
 
 struct TestHandler : public WriteBatch::Handler {
   std::map<uint32_t, std::vector<Entry>> seen;
-  Status PutCF(uint32_t column_family_id, const Slice& key, const Slice& value) override {
+  Status PutCF(uint32_t column_family_id, const SliceParts& key, const SliceParts& value) override {
     Entry e;
-    e.key = key.ToBuffer();
-    e.value = value.ToBuffer();
+    e.key = key.TheOnlyPart().ToBuffer();
+    e.value = value.TheOnlyPart().ToBuffer();
     e.type = kPutRecord;
     seen[column_family_id].push_back(e);
     return Status::OK();
@@ -86,7 +89,7 @@ struct TestHandler : public WriteBatch::Handler {
 };
 }  // anonymous namespace
 
-class WriteBatchWithIndexTest : public testing::Test {};
+class WriteBatchWithIndexTest : public RocksDBTest {};
 
 void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
                                      WriteBatchWithIndex* batch) {
@@ -137,7 +140,6 @@ void TestValueAsSecondaryIndexHelper(std::vector<Entry> entries,
       for (auto pair : data_map) {
         for (auto v : pair.second) {
           ASSERT_OK(iter->status());
-          ASSERT_TRUE(iter->Valid());
           auto write_entry = iter->Entry();
           ASSERT_EQ(pair.first, write_entry.key.ToString());
           ASSERT_EQ(v->type, write_entry.type);
@@ -517,32 +519,52 @@ typedef std::map<std::string, std::string> KVMap;
 class KVIter : public Iterator {
  public:
   explicit KVIter(const KVMap* map) : map_(map), iter_(map_->end()) {}
-  virtual bool Valid() const { return iter_ != map_->end(); }
-  virtual void SeekToFirst() { iter_ = map_->begin(); }
-  virtual void SeekToLast() {
+  const KeyValueEntry& SeekToFirst() override {
+    iter_ = map_->begin();
+    return Entry();
+  }
+  const KeyValueEntry& SeekToLast() override {
     if (map_->empty()) {
       iter_ = map_->end();
     } else {
       iter_ = map_->find(map_->rbegin()->first);
     }
+    return Entry();
   }
-  virtual void Seek(const Slice& k) { iter_ = map_->lower_bound(k.ToString()); }
-  virtual void Next() { ++iter_; }
-  virtual void Prev() {
+  const KeyValueEntry& Seek(Slice k) override {
+    iter_ = map_->lower_bound(k.ToString());
+    return Entry();
+  }
+  const KeyValueEntry& Next() override {
+    ++iter_;
+    return Entry();
+  }
+  const KeyValueEntry& Prev() override {
     if (iter_ == map_->begin()) {
       iter_ = map_->end();
-      return;
+      return Entry();
     }
     --iter_;
+    return Entry();
   }
 
-  virtual Slice key() const { return iter_->first; }
-  virtual Slice value() const { return iter_->second; }
-  virtual Status status() const { return Status::OK(); }
+  const KeyValueEntry& Entry() const override {
+    if (iter_ == map_->end()) {
+      return KeyValueEntry::Invalid();
+    }
+    entry_ = {
+      .key = iter_->first,
+      .value = iter_->second,
+    };
+    return entry_;
+  }
+
+  Status status() const override { return Status::OK(); }
 
  private:
   const KVMap* const map_;
   KVMap::const_iterator iter_;
+  mutable KeyValueEntry entry_;
 };
 
 void AssertIter(Iterator* iter, const std::string& key,
@@ -981,7 +1003,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchMerge) {
 
   std::string dbname = test::TmpDir() + "/write_batch_with_index_test";
 
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
   Status s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
 
@@ -1018,7 +1040,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchMerge) {
   }
 
   delete db;
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 TEST_F(WriteBatchWithIndexTest, TestGetFromBatchMerge2) {
@@ -1029,7 +1051,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchMerge2) {
 
   std::string dbname = test::TmpDir() + "/write_batch_with_index_test";
 
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
   Status s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
 
@@ -1078,7 +1100,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchMerge2) {
   ASSERT_TRUE(s.IsMergeInProgress());
 
   delete db;
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDB) {
@@ -1087,7 +1109,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDB) {
   options.create_if_missing = true;
   std::string dbname = test::TmpDir() + "/write_batch_with_index_test";
 
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
   Status s = DB::Open(options, dbname, &db);
   ASSERT_OK(s);
 
@@ -1122,13 +1144,13 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDB) {
   s = batch.GetFromBatchAndDB(db, read_options, "x", &value);
   ASSERT_TRUE(s.IsNotFound());
 
-  db->Delete(write_options, "x");
+  ASSERT_OK(db->Delete(write_options, "x"));
 
   s = batch.GetFromBatchAndDB(db, read_options, "x", &value);
   ASSERT_TRUE(s.IsNotFound());
 
   delete db;
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge) {
@@ -1140,7 +1162,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge) {
 
   options.merge_operator = MergeOperators::CreateFromStringId("stringappend");
 
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
   Status s = DB::Open(options, dbname, &db);
   assert(s.ok());
 
@@ -1254,7 +1276,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge) {
 
   db->ReleaseSnapshot(snapshot);
   delete db;
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge2) {
@@ -1266,7 +1288,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge2) {
 
   options.merge_operator = MergeOperators::CreateFromStringId("stringappend");
 
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
   Status s = DB::Open(options, dbname, &db);
   assert(s.ok());
 
@@ -1302,7 +1324,7 @@ TEST_F(WriteBatchWithIndexTest, TestGetFromBatchAndDBMerge2) {
   ASSERT_TRUE(s.IsNotFound());
 
   delete db;
-  DestroyDB(dbname, options);
+  ASSERT_OK(DestroyDB(dbname, options));
 }
 
 void AssertKey(std::string key, WBWIIterator* iter) {
@@ -1354,12 +1376,12 @@ TEST_F(WriteBatchWithIndexTest, MutateWhileIteratingCorrectnessTest) {
 }
 
 void AssertIterKey(std::string key, Iterator* iter) {
-  ASSERT_TRUE(iter->Valid());
+  ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(key, iter->key().ToString());
 }
 
 void AssertIterValue(std::string value, Iterator* iter) {
-  ASSERT_TRUE(iter->Valid());
+  ASSERT_TRUE(ASSERT_RESULT(iter->CheckedValid()));
   ASSERT_EQ(value, iter->value().ToString());
 }
 
@@ -1470,12 +1492,12 @@ TEST_F(WriteBatchWithIndexTest, MutateWhileIteratingBaseStressTest) {
         iter->Seek(std::string(2, c));
         break;
       case 6:
-        if (iter->Valid()) {
+        if (ASSERT_RESULT(iter->CheckedValid())) {
           iter->Next();
         }
         break;
       case 7:
-        if (iter->Valid()) {
+        if (ASSERT_RESULT(iter->CheckedValid())) {
           iter->Prev();
         }
         break;
@@ -1524,6 +1546,9 @@ static std::string PrintContents(WriteBatchWithIndex* batch,
     result.append(",");
     iter->Next();
   }
+  if (!iter->status().ok()) {
+    result.append(iter->status().ToString());
+  }
 
   delete iter;
   return result;
@@ -1553,6 +1578,9 @@ static std::string PrintContents(WriteBatchWithIndex* batch, KVMap* base_map,
     result.append(",");
 
     iter->Next();
+  }
+  if (!iter->status().ok()) {
+    result.append(iter->status().ToString());
   }
 
   delete iter;
@@ -1800,13 +1828,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main() {
-  fprintf(stderr, "SKIPPED\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

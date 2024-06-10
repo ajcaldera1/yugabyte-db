@@ -15,6 +15,7 @@
 #define EXECUTOR_H
 
 #include "executor/execdesc.h"
+#include "executor/execPartition.h"
 #include "nodes/parsenodes.h"
 #include "utils/memutils.h"
 
@@ -54,6 +55,11 @@
  * WITH/WITHOUT_OIDS tell the executor to emit tuples with or without space
  * for OIDs, respectively.  These are currently used only for CREATE TABLE AS.
  * If neither is set, the plan may or may not produce tuples including OIDs.
+ *
+ * YB_AGG_PARENT tells the plan node that the parent node is an Agg node.  This
+ * context is used to signal the plan node to make an extra effort to determine
+ * whether aggregates can be pushed down.  It should only be set for plan nodes
+ * that have no children, such as IndexOnlyScan.
  */
 #define EXEC_FLAG_EXPLAIN_ONLY	0x0001	/* EXPLAIN, no ANALYZE */
 #define EXEC_FLAG_REWIND		0x0002	/* need efficient rescan */
@@ -63,6 +69,8 @@
 #define EXEC_FLAG_WITH_OIDS		0x0020	/* force OIDs in returned tuples */
 #define EXEC_FLAG_WITHOUT_OIDS	0x0040	/* force no OIDs in returned tuples */
 #define EXEC_FLAG_WITH_NO_DATA	0x0080	/* rel scannability doesn't matter */
+
+#define EXEC_FLAG_YB_AGG_PARENT	0x8000	/* parent node is Agg */
 
 
 /* Hook for plugins to get control in ExecutorStart() */
@@ -120,7 +128,10 @@ extern ExprState *execTuplesMatchPrepare(TupleDesc desc,
 extern void execTuplesHashPrepare(int numCols,
 					  Oid *eqOperators,
 					  Oid **eqFuncOids,
-					  FmgrInfo **hashFunctions);
+					  FmgrInfo **leftHashFunctions,
+					  FmgrInfo **rightHashFunctions);
+extern ExprState *ybPrepareOuterExprsEqualFn(List *outer_exprs,
+				Oid *eqOps, PlanState *parent);
 extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 					TupleDesc inputDesc,
 					int numCols, AttrNumber *keyColIdx,
@@ -129,6 +140,18 @@ extern TupleHashTable BuildTupleHashTable(PlanState *parent,
 					long nbuckets, Size additionalsize,
 					MemoryContext tablecxt,
 					MemoryContext tempcxt, bool use_variable_hash_iv);
+extern TupleHashTable YbBuildTupleHashTableExt(PlanState *parent,
+						 TupleDesc inputDesc,
+						 int numCols, ExprState **keyColExprs,
+						 ExprState *eqExpr,
+						 Oid *eqfuncoids,
+						 FmgrInfo *hashfunctions,
+						 long nbuckets, Size additionalsize,
+						 MemoryContext metacxt,
+						 MemoryContext tablecxt,
+						 MemoryContext tempcxt,
+						 ExprContext *expr_cxt,
+						 bool use_variable_hash_iv);
 extern TupleHashTable BuildTupleHashTableExt(PlanState *parent,
 					TupleDesc inputDesc,
 					int numCols, AttrNumber *keyColIdx,
@@ -144,7 +167,8 @@ extern TupleHashEntry LookupTupleHashEntry(TupleHashTable hashtable,
 extern TupleHashEntry FindTupleHashEntry(TupleHashTable hashtable,
 				   TupleTableSlot *slot,
 				   ExprState *eqcomp,
-				   FmgrInfo *hashfunctions);
+				   FmgrInfo *hashfunctions,
+				   AttrNumber *keyColIdx);
 extern void ResetTupleHashTable(TupleHashTable hashtable);
 
 /*
@@ -184,13 +208,15 @@ extern void CheckValidResultRel(ResultRelInfo *resultRelInfo, CmdType operation)
 extern void InitResultRelInfo(ResultRelInfo *resultRelInfo,
 				  Relation resultRelationDesc,
 				  Index resultRelationIndex,
-				  Relation partition_root,
+				  ResultRelInfo *partition_root_rri,
 				  int instrument_options);
 extern ResultRelInfo *ExecGetTriggerResultRel(EState *estate, Oid relid);
 extern void ExecCleanUpTriggerState(EState *estate);
 extern bool ExecContextForcesOids(PlanState *planstate, bool *hasoids);
 extern void ExecConstraints(ResultRelInfo *resultRelInfo,
-				TupleTableSlot *slot, EState *estate);
+                            TupleTableSlot *slot,
+                            EState *estate,
+                            ModifyTableState *mtstate);
 extern bool ExecPartitionCheck(ResultRelInfo *resultRelInfo,
 				   TupleTableSlot *slot, EState *estate, bool emitError);
 extern void ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
@@ -268,6 +294,12 @@ extern ProjectionInfo *ExecBuildProjectionInfo(List *targetList,
 						TupleTableSlot *slot,
 						PlanState *parent,
 						TupleDesc inputDesc);
+extern ProjectionInfo *ExecBuildProjectionInfoExt(List *targetList,
+												  ExprContext *econtext,
+												  TupleTableSlot *slot,
+												  bool assignJunkEntries,
+												  PlanState *parent,
+												  TupleDesc inputDesc);
 extern ExprState *ExecPrepareExpr(Expr *node, EState *estate);
 extern ExprState *ExecPrepareQual(List *qual, EState *estate);
 extern ExprState *ExecPrepareCheck(List *qual, EState *estate);
@@ -439,7 +471,9 @@ extern void ExecScanReScan(ScanState *node);
 /*
  * prototypes from functions in execTuples.c
  */
-extern void ExecInitResultTupleSlotTL(EState *estate, PlanState *planstate);
+extern void ExecInitResultTypeTL(PlanState *planstate);
+extern void ExecInitResultSlot(PlanState *planstate);
+extern void ExecInitResultTupleSlotTL(PlanState *planstate);
 extern void ExecInitScanTupleSlot(EState *estate, ScanState *scanstate, TupleDesc tupleDesc);
 extern TupleTableSlot *ExecInitExtraTupleSlot(EState *estate,
 					   TupleDesc tupleDesc);
@@ -544,6 +578,9 @@ extern Datum GetAttributeByNum(HeapTupleHeader tuple, AttrNumber attrno,
 extern int	ExecTargetListLength(List *targetlist);
 extern int	ExecCleanTargetListLength(List *targetlist);
 
+extern Bitmapset *ExecGetInsertedCols(ResultRelInfo *relinfo, EState *estate);
+extern Bitmapset *ExecGetUpdatedCols(ResultRelInfo *relinfo, EState *estate);
+
 /*
  * prototypes from functions in execIndexing.c
  */
@@ -552,7 +589,13 @@ extern void ExecCloseIndices(ResultRelInfo *resultRelInfo);
 extern List *ExecInsertIndexTuples(TupleTableSlot *slot, HeapTuple tuple,
 					  EState *estate, bool noDupErr, bool *specConflict,
 					  List *arbiterIndexes);
+extern List *ExecInsertIndexTuplesOptimized(TupleTableSlot *slot, HeapTuple tuple,
+					  EState *estate, bool noDupErr, bool *specConflict,
+					  List *arbiterIndexes, List *no_update_index_list);
 extern void ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate);
+extern void ExecDeleteIndexTuplesOptimized(Datum ybctid, HeapTuple tuple, EState *estate,
+					  List *no_update_index_list);
+extern bool ContainsIndexRelation(Oid indexrelid, List *no_update_index_list);
 extern bool ExecCheckIndexConstraints(TupleTableSlot *slot, EState *estate,
 						  ItemPointer conflictTid, List *arbiterIndexes);
 extern void check_exclusion_constraint(Relation heap, Relation index,

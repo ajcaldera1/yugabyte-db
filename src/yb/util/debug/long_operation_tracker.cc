@@ -13,19 +13,19 @@
 
 #include "yb/util/debug/long_operation_tracker.h"
 
+#include <condition_variable>
 #include <mutex>
 #include <queue>
 #include <thread>
 
-#include <boost/thread/reverse_lock.hpp>
-
 #include "yb/util/debug-util.h"
 #include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb {
 
 struct LongOperationTracker::TrackedOperation {
-  int64_t thread_id;
+  ThreadIdForStack thread_id;
   const char* message;
   CoarseTimePoint start;
   // time when we should log warning
@@ -33,7 +33,8 @@ struct LongOperationTracker::TrackedOperation {
   bool complete = false;
 
   TrackedOperation(
-      int64_t thread_id_, const char* message_, CoarseTimePoint start_, CoarseTimePoint time_)
+      ThreadIdForStack thread_id_, const char* message_, CoarseTimePoint start_,
+      CoarseTimePoint time_)
       : thread_id(thread_id_), message(message_), start(start_), time(time_) {
   }
 };
@@ -53,7 +54,9 @@ struct TrackedOperationComparer {
 // operations.
 class LongOperationTrackerHelper {
  public:
-  LongOperationTrackerHelper() : thread_(std::bind(&LongOperationTrackerHelper::Execute, this)) {
+  LongOperationTrackerHelper() {
+    CHECK_OK(Thread::Create(
+        "long_operation_tracker", "tracker", &LongOperationTrackerHelper::Execute, this, &thread_));
   }
 
   LongOperationTrackerHelper(const LongOperationTrackerHelper&) = delete;
@@ -61,11 +64,13 @@ class LongOperationTrackerHelper {
 
   ~LongOperationTrackerHelper() {
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::lock_guard lock(mutex_);
       stop_ = true;
     }
     cond_.notify_one();
-    thread_.join();
+    if (thread_) {
+      thread_->Join();
+    }
   }
 
   static LongOperationTrackerHelper& Instance() {
@@ -74,11 +79,14 @@ class LongOperationTrackerHelper {
   }
 
   TrackedOperationPtr Register(const char* message, MonoDelta duration) {
+    if (IsSanitizer()) {
+      return TrackedOperationPtr();
+    }
     auto start = CoarseMonoClock::now();
     auto result = std::make_shared<LongOperationTracker::TrackedOperation>(
-        Thread::CurrentThreadId(), message, start, start + duration);
+        Thread::CurrentThreadIdForStack(), message, start, start + duration * kTimeMultiplier);
     {
-      std::lock_guard<std::mutex> lock(mutex_);
+      std::lock_guard lock(mutex_);
       queue_.push(result);
     }
 
@@ -96,22 +104,28 @@ class LongOperationTrackerHelper {
         continue;
       }
 
-      const auto& first_entry = queue_.top();
+      const CoarseTimePoint first_entry_time = queue_.top()->time;
 
       auto now = CoarseMonoClock::now();
-      if (now < first_entry->time) {
-        if (cond_.wait_for(lock, first_entry->time - now) != std::cv_status::timeout) {
+      if (now < first_entry_time) {
+        if (cond_.wait_for(lock, first_entry_time - now) != std::cv_status::timeout) {
           continue;
         }
         now = CoarseMonoClock::now();
       }
 
-      TrackedOperationPtr operation = first_entry;
+      TrackedOperationPtr operation = queue_.top();
       queue_.pop();
       if (!operation.unique()) {
         lock.unlock();
-        LOG(WARNING) << operation->message << " running for " << MonoDelta(now - operation->start)
-                     << ":\n" << DumpThreadStack(operation->thread_id);
+        auto stack = DumpThreadStack(operation->thread_id);
+        // Make sure the task did not complete while we were dumping the stack. Else we could get
+        // some other innocent stack.
+        if (!operation.unique()) {
+          LOG(WARNING) << operation->message << " running for " << MonoDelta(now - operation->start)
+                       << " in thread " << operation->thread_id << ":\n"
+                       << stack;
+        }
         lock.lock();
       }
     }
@@ -122,8 +136,8 @@ class LongOperationTrackerHelper {
 
   std::mutex mutex_;
   std::condition_variable cond_;
-  bool stop_ = false;
-  std::thread thread_;
+  bool stop_;
+  scoped_refptr<Thread> thread_;
 };
 
 } // namespace
@@ -133,6 +147,18 @@ LongOperationTracker::LongOperationTracker(const char* message, MonoDelta durati
 }
 
 LongOperationTracker::~LongOperationTracker() {
+  if (!tracked_operation_) {
+    return;
+  }
+  auto now = CoarseMonoClock::now();
+  if (now > tracked_operation_->time) {
+    LOG(WARNING) << tracked_operation_->message << " took a long time: "
+                 << MonoDelta(now - tracked_operation_->start);
+  }
+}
+
+void LongOperationTracker::Swap(LongOperationTracker* rhs) {
+  tracked_operation_.swap(rhs->tracked_operation_);
 }
 
 } // namespace yb

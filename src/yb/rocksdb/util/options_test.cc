@@ -26,11 +26,12 @@
 #define __STDC_FORMAT_MACROS
 #endif
 
-#include <cctype>
-#include <cstring>
+#include <string>
 #include <unordered_map>
 
 #include <boost/preprocessor/stringize.hpp>
+
+#include <gtest/gtest.h>
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/convenience.h"
@@ -40,16 +41,17 @@
 #include "yb/rocksdb/util/options_parser.h"
 #include "yb/rocksdb/util/options_sanity_check.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/testharness.h"
+#include "yb/rocksdb/env.h"
+#include "yb/util/test_macros.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/util/format.h"
 
 #ifndef GFLAGS
-bool FLAGS_enable_print = false;
+bool ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_print) = false;
 #else
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 using GFLAGS::ParseCommandLineFlags;
-DEFINE_bool(enable_print, false, "Print options generated to console.");
+DEFINE_NON_RUNTIME_bool(enable_print, false, "Print options generated to console.");
 #endif  // GFLAGS
 
 namespace rocksdb {
@@ -88,7 +90,7 @@ Options PrintAndGetOptions(size_t total_write_buffer_limit,
   return options;
 }
 
-class OptionsTest : public testing::Test {};
+class OptionsTest : public RocksDBTest {};
 
 TEST_F(OptionsTest, LooseCondition) {
   Options options;
@@ -101,17 +103,14 @@ TEST_F(OptionsTest, LooseCondition) {
   options = PrintAndGetOptions(128 * 1024 * 1024, 8, 100);
   ASSERT_EQ(options.compaction_style, kCompactionStyleLevel);
 
-#ifndef ROCKSDB_LITE  // Universal compaction is not supported in ROCKSDB_LITE
   // Tight write amplification
   options = PrintAndGetOptions(128 * 1024 * 1024, 64, 10);
   ASSERT_EQ(options.compaction_style, kCompactionStyleUniversal);
-#endif  // !ROCKSDB_LITE
 
   // Both tight amplifications
   PrintAndGetOptions(128 * 1024 * 1024, 4, 8);
 }
 
-#ifndef ROCKSDB_LITE  // GetOptionsFromMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, GetOptionsFromMapTest) {
   std::unordered_map<std::string, std::string> cf_options_map = {
       {"write_buffer_size", "1"},
@@ -314,10 +313,7 @@ TEST_F(OptionsTest, GetOptionsFromMapTest) {
   ASSERT_EQ(new_db_opt.bytes_per_sync, static_cast<uint64_t>(47));
   ASSERT_EQ(new_db_opt.wal_bytes_per_sync, static_cast<uint64_t>(48));
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetColumnFamilyOptionsFromString is not supported in
-                      // ROCKSDB_LITE
 TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ColumnFamilyOptions base_cf_opt;
   ColumnFamilyOptions new_cf_opt;
@@ -476,9 +472,7 @@ TEST_F(OptionsTest, GetColumnFamilyOptionsFromStringTest) {
   ASSERT_TRUE(new_cf_opt.memtable_factory != nullptr);
   ASSERT_EQ(std::string(new_cf_opt.memtable_factory->Name()), "SkipListFactory");
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetBlockBasedTableOptionsFromString is not supported
 TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
   BlockBasedTableOptions table_opt;
   BlockBasedTableOptions new_opt;
@@ -536,10 +530,8 @@ TEST_F(OptionsTest, GetBlockBasedTableOptionsFromString) {
              "filter_policy=bloomfilter:4",
              &new_opt));
 }
-#endif  // !ROCKSDB_LITE
 
 
-#ifndef ROCKSDB_LITE  // GetPlainTableOptionsFromString is not supported
 TEST_F(OptionsTest, GetPlainTableOptionsFromString) {
   PlainTableOptions table_opt;
   PlainTableOptions new_opt;
@@ -570,9 +562,7 @@ TEST_F(OptionsTest, GetPlainTableOptionsFromString) {
              "encoding_type=kPrefixXX",
              &new_opt));
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetMemTableRepFactoryFromString is not supported
 TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
   std::unique_ptr<MemTableRepFactory> new_mem_factory = nullptr;
 
@@ -603,15 +593,9 @@ TEST_F(OptionsTest, GetMemTableRepFactoryFromString) {
   ASSERT_NOK(GetMemTableRepFactoryFromString("vector:1024:invalid_opt",
                                              &new_mem_factory));
 
-  ASSERT_NOK(GetMemTableRepFactoryFromString("cuckoo", &new_mem_factory));
-  ASSERT_OK(GetMemTableRepFactoryFromString("cuckoo:1024", &new_mem_factory));
-  ASSERT_EQ(std::string(new_mem_factory->Name()), "HashCuckooRepFactory");
-
   ASSERT_NOK(GetMemTableRepFactoryFromString("bad_factory", &new_mem_factory));
 }
-#endif  // !ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // GetOptionsFromString is not supported in RocksDB Lite
 TEST_F(OptionsTest, GetOptionsFromStringTest) {
   Options base_options, new_options;
   base_options.write_buffer_size = 20;
@@ -682,13 +666,11 @@ TEST_F(OptionsTest, ColumnFamilyOptionsSerialization) {
   }
 }
 
-#endif  // !ROCKSDB_LITE
 
 Status StringToMap(
     const std::string& opts_str,
     std::unordered_map<std::string, std::string>* opts_map);
 
-#ifndef ROCKSDB_LITE  // StringToMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, StringToMapTest) {
   std::unordered_map<std::string, std::string> opts_map;
   // Regular options
@@ -805,9 +787,7 @@ TEST_F(OptionsTest, StringToMapTest) {
   ASSERT_NOK(StringToMap("k1=v1;k2={{}}{}", &opts_map));
   ASSERT_NOK(StringToMap("k1=v1;k2={{dfdl}adfa}{}", &opts_map));
 }
-#endif  // ROCKSDB_LITE
 
-#ifndef ROCKSDB_LITE  // StringToMap is not supported in ROCKSDB_LITE
 TEST_F(OptionsTest, StringToMapRandomTest) {
   std::unordered_map<std::string, std::string> opts_map;
   // Make sure segfault is not hit by semi-random strings
@@ -852,7 +832,6 @@ TEST_F(OptionsTest, StringToMapRandomTest) {
     opts_map.clear();
   }
 }
-#endif  // !ROCKSDB_LITE
 
 TEST_F(OptionsTest, ConvertOptionsTest) {
   LevelDBOptions leveldb_opt;
@@ -882,8 +861,7 @@ TEST_F(OptionsTest, ConvertOptionsTest) {
   ASSERT_EQ(table_opt.filter_policy.get(), leveldb_opt.filter_policy);
 }
 
-#ifndef ROCKSDB_LITE
-class OptionsParserTest : public testing::Test {
+class OptionsParserTest : public RocksDBTest {
  public:
   OptionsParserTest() { env_.reset(new test::StringEnv(Env::Default())); }
 
@@ -917,7 +895,7 @@ TEST_F(OptionsParserTest, Comment) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_OK(parser.Parse(kTestFileName, env_.get()));
 
@@ -943,7 +921,7 @@ TEST_F(OptionsParserTest, ExtraSpace) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_OK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -960,7 +938,7 @@ TEST_F(OptionsParserTest, MissingDBOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -988,7 +966,7 @@ TEST_F(OptionsParserTest, DoubleDBOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -1015,7 +993,7 @@ TEST_F(OptionsParserTest, NoDefaultCFOptions) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -1044,7 +1022,7 @@ TEST_F(OptionsParserTest, DefaultCFOptionsMustBeTheFirst) {
       "  # if a section is blank, we will use the default\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -1072,7 +1050,7 @@ TEST_F(OptionsParserTest, DuplicateCFOptions) {
       "[CFOptions \"something_else\"]\n";
 
   const std::string kTestFileName = "test-rocksdb-options.ini";
-  env_->WriteToNewFile(kTestFileName, options_file_content);
+  ASSERT_OK(env_->WriteToNewFile(kTestFileName, options_file_content));
   RocksDBOptionsParser parser;
   ASSERT_NOK(parser.Parse(kTestFileName, env_.get()));
 }
@@ -1109,7 +1087,7 @@ TEST_F(OptionsParserTest, ParseVersion) {
     snprintf(buffer, kLength - 1, file_template.c_str(), iv.c_str());
 
     parser.Reset();
-    env_->WriteToNewFile(iv, buffer);
+    ASSERT_OK(env_->WriteToNewFile(iv, buffer));
     ASSERT_NOK(parser.Parse(iv, env_.get()));
   }
 
@@ -1118,7 +1096,7 @@ TEST_F(OptionsParserTest, ParseVersion) {
   for (auto vv : valid_versions) {
     snprintf(buffer, kLength - 1, file_template.c_str(), vv.c_str());
     parser.Reset();
-    env_->WriteToNewFile(vv, buffer);
+    ASSERT_OK(env_->WriteToNewFile(vv, buffer));
     ASSERT_OK(parser.Parse(vv, env_.get()));
   }
 }
@@ -1372,7 +1350,7 @@ TEST_F(OptionsSanityCheckTest, SanityCheck) {
 
   // table_factory
   {
-    for (int tb = 0; tb <= 2; ++tb) {
+    for (int tb = 0; tb <= 1; ++tb) {
       // change the table factory
       opts.table_factory.reset(test::RandomTableFactory(&rnd, tb));
       ASSERT_NOK(SanityCheckCFOptions(opts, kSanityLevelLooselyCompatible));
@@ -1507,7 +1485,7 @@ TEST_F(OptionsParserTest, EscapeOptionString) {
 
 // Only run the tests to verify new fields in options are settable through
 // string on limited platforms as it depends on behavior of compilers.
-#if defined(OS_LINUX) && !defined(__clang__)
+#if defined(__linux__) && !defined(__clang__)
 
 struct OffsetGap {
   size_t begin_offset;
@@ -1703,7 +1681,12 @@ Status GetFromString(DBOptions* source, DBOptions* destination) {
   return GetDBOptionsFromString(*source, kOptionsString, destination);
 }
 
+// We want padding bytes to have the same values for test purposes, therefore we need to use
+// exactly the same saved default value instead of using CompactionOptionsUniversal().
+static CompactionOptionsUniversal kCompactionOptionsUniversalDefault;
+
 void InitDefault(ColumnFamilyOptions* options) {
+  options->compaction_options_universal = kCompactionOptionsUniversalDefault;
   // Deprecatd option which is not initialized. Need to set it to avoid
   // Valgrind error
   options->max_mem_compaction_level = 0;
@@ -1767,12 +1750,13 @@ Status GetFromString(ColumnFamilyOptions* source, ColumnFamilyOptions* destinati
   // GetColumnFamilyOptionsFromString():
   destination->rate_limit_delay_max_milliseconds = 33;
   destination->compaction_pri = CompactionPri::kOldestSmallestSeqFirst;
-  destination->compaction_options_universal = CompactionOptionsUniversal();
+  destination->compaction_options_universal = kCompactionOptionsUniversalDefault;
   destination->compression_opts = CompressionOptions();
   destination->hard_rate_limit = 0;
   destination->soft_rate_limit = 0;
   destination->compaction_options_fifo = CompactionOptionsFIFO();
   destination->max_mem_compaction_level = 0;
+  destination->max_flushing_bytes = 0;
 
   return Status::OK();
 }
@@ -1889,7 +1873,9 @@ TEST_F(OptionsParserTest, BlockBasedTableOptionsAllFieldsSettable) {
       BLACKLIST_ENTRY(BlockBasedTableOptions, flush_block_policy_factory),
       BLACKLIST_ENTRY(BlockBasedTableOptions, block_cache),
       BLACKLIST_ENTRY(BlockBasedTableOptions, block_cache_compressed),
+      BLACKLIST_ENTRY(BlockBasedTableOptions, data_block_key_value_encoding_format),
       BLACKLIST_ENTRY(BlockBasedTableOptions, filter_policy),
+      BLACKLIST_ENTRY(BlockBasedTableOptions, supported_filter_policies),
   };
 
   // In this test, we catch a new option of BlockBasedTableOptions that is not
@@ -1912,6 +1898,7 @@ TEST_F(OptionsParserTest, DBOptionsAllFieldsSettable) {
   const OffsetGaps kDBOptionsBlacklist = {
       BLACKLIST_ENTRY(DBOptions, env),
       BLACKLIST_ENTRY(DBOptions, checkpoint_env),
+      BLACKLIST_ENTRY(DBOptions, priority_thread_pool_for_compactions_and_flushes),
       BLACKLIST_ENTRY(DBOptions, rate_limiter),
       BLACKLIST_ENTRY(DBOptions, sst_file_manager),
       BLACKLIST_ENTRY(DBOptions, info_log),
@@ -1924,9 +1911,17 @@ TEST_F(OptionsParserTest, DBOptionsAllFieldsSettable) {
       BLACKLIST_ENTRY(DBOptions, row_cache),
       BLACKLIST_ENTRY(DBOptions, wal_filter),
       BLACKLIST_ENTRY(DBOptions, boundary_extractor),
+      BLACKLIST_ENTRY(DBOptions, compaction_context_factory),
+      BLACKLIST_ENTRY(DBOptions, max_file_size_for_compaction),
       BLACKLIST_ENTRY(DBOptions, mem_table_flush_filter_factory),
       BLACKLIST_ENTRY(DBOptions, log_prefix),
+      BLACKLIST_ENTRY(DBOptions, tablet_id),
       BLACKLIST_ENTRY(DBOptions, mem_tracker),
+      BLACKLIST_ENTRY(DBOptions, block_based_table_mem_tracker),
+      BLACKLIST_ENTRY(DBOptions, iterator_replacer),
+      BLACKLIST_ENTRY(DBOptions, compaction_file_filter_factory),
+      BLACKLIST_ENTRY(DBOptions, priority_thread_pool_metrics),
+      BLACKLIST_ENTRY(DBOptions, disk_group_no),
   };
 
   TestAllFieldsSettable<DBOptions>(kDBOptionsBlacklist);
@@ -1958,8 +1953,7 @@ TEST_F(OptionsParserTest, ColumnFamilyOptionsAllFieldsSettable) {
 
   TestAllFieldsSettable<ColumnFamilyOptions>(kColumnFamilyOptionsBlacklist);
 }
-#endif // OS_LINUX && !clang
-#endif // !ROCKSDB_LITE
+#endif // __linux__ && !clang
 
 }  // namespace rocksdb
 

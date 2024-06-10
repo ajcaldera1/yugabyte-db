@@ -32,6 +32,7 @@
 
 #include "yb/util/init.h"
 
+#include <signal.h>
 #include <string>
 
 #include "yb/gutil/cpu.h"
@@ -39,7 +40,8 @@
 #include "yb/gutil/strings/substitute.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
-#include "yb/util/flag_tags.h"
+#include "yb/util/errno.h"
+#include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/path_util.h"
 #include "yb/util/status.h"
@@ -51,12 +53,13 @@
 
 using std::string;
 
-DEFINE_string(fs_data_dirs, "",
+DEFINE_NON_RUNTIME_string(fs_data_dirs, "",
               "Comma-separated list of data directories. This argument must be specified.");
 TAG_FLAG(fs_data_dirs, stable);
-DEFINE_bool(stop_on_parent_termination, false,
-            "When specified, this process will terminate when parent process terminates."
-            "Linux-only.");
+
+DEFINE_NON_RUNTIME_bool(stop_on_parent_termination, false,
+    "When specified, this process will terminate when parent process terminates."
+    "Linux-only.");
 
 namespace yb {
 
@@ -71,6 +74,7 @@ Status BadCPUStatus(const base::CPU& cpu, const char* instruction_set) {
 
 Status CheckCPUFlags() {
   base::CPU cpu;
+#ifndef __aarch64__
   if (!cpu.has_sse42()) {
     return BadCPUStatus(cpu, "SSE4.2");
   }
@@ -78,7 +82,7 @@ Status CheckCPUFlags() {
   if (!cpu.has_ssse3()) {
     return BadCPUStatus(cpu, "SSSE3");
   }
-
+#endif
   return Status::OK();
 }
 
@@ -97,16 +101,38 @@ Status SetupLogDir(const std::string& server_type) {
 
     bool created = false;
     std::string out_dir;
-    RETURN_NOT_OK(SetupRootDir(Env::Default(), data_paths[0], server_type, &out_dir, &created));
+    Status s = SetupRootDir(Env::Default(), data_paths[0], server_type, &out_dir, &created);
+    if (!s.ok()) {
+      return STATUS(
+          InvalidArgument, strings::Substitute(
+          "Cannot create directory for logging, please check the --fs_data_dirs parameter "
+          "(Passed: $0). Path does not exist: $1\nDetails: $2",
+          FLAGS_fs_data_dirs, data_paths[0], s.ToString()));
+    }
     // Create the actual log dir.
     out_dir = JoinPathSegments(out_dir, "logs");
     RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(Env::Default(), out_dir, &created),
                           "Unable to create FSManager path component " + out_dir);
     // Set the log dir.
-    FLAGS_log_dir = out_dir;
+    RETURN_NOT_OK(SET_FLAG_DEFAULT_AND_CURRENT(log_dir, out_dir));
   }
   // If we have a custom specified log_dir, use that.
   return Status::OK();
+}
+
+void SetGLogHeader(const std::string& server_info) {
+  // Needed for tests that start multiple mini-masters and mini-tservers in parallel
+  static std::mutex set_glog_header_mtx;
+  std::lock_guard lock(set_glog_header_mtx);
+  google::SetApplicationFingerprint(VersionInfo::GetShortVersionString() + server_info);
+}
+
+Status InstallSignalHandler(int signum, void (*handler)(int)) {
+  struct sigaction sig_action{};
+  sig_action.sa_handler = handler;
+  return STATUS_FROM_ERRNO_IF_NONZERO_RV(
+      Format("InstallSignalHandler failed for signal $0 ($1)", signum, strsignal(signum)),
+      sigaction(signum, &sig_action, nullptr));
 }
 
 Status InitYB(const std::string &server_type, const char* argv0) {
@@ -118,7 +144,7 @@ Status InitYB(const std::string &server_type, const char* argv0) {
   RETURN_NOT_OK(CheckCPUFlags());
   RETURN_NOT_OK(SetupLogDir(server_type));
   RETURN_NOT_OK(VersionInfo::Init());
-  google::SetApplicationFingerprint(VersionInfo::GetShortVersionString());
+  SetGLogHeader();
   InitGoogleLoggingSafe(argv0);
   return Status::OK();
 }

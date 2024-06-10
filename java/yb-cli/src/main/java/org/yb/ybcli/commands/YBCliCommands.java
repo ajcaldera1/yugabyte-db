@@ -25,15 +25,16 @@ import org.springframework.shell.core.annotation.CliCommand;
 import org.springframework.shell.core.annotation.CliOption;
 import org.springframework.stereotype.Component;
 import org.yb.ColumnSchema;
-import org.yb.Common.HostPortPB;
+import org.yb.CommonNet.HostPortPB;
 import org.yb.Schema;
 import org.yb.client.AsyncYBClient;
+import org.yb.client.AsyncYBClient.AsyncYBClientBuilder;
 import org.yb.client.ChangeConfigResponse;
 import org.yb.client.GetLoadMovePercentResponse;
 import org.yb.client.GetMasterClusterConfigResponse;
 import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.IsLoadBalancedResponse;
-import org.yb.client.IsTabletServerReadyResponse;
+import org.yb.client.IsServerReadyResponse;
 import org.yb.client.LeaderStepDownResponse;
 import org.yb.client.ListMastersResponse;
 import org.yb.client.ListTablesResponse;
@@ -41,7 +42,7 @@ import org.yb.client.ListTabletServersResponse;
 import org.yb.client.ChangeLoadBalancerStateResponse;
 import org.yb.client.ModifyMasterClusterConfigBlacklist;
 import org.yb.client.YBClient;
-import org.yb.master.Master;
+import org.yb.master.MasterDdlOuterClass;
 import org.yb.util.NetUtil;
 import org.yb.util.ServerInfo;
 
@@ -84,9 +85,28 @@ public class YBCliCommands implements CommandMarker {
       @CliOption(key = { "masters", "m" },
                  mandatory = true,
                  help = "Comma separated list of masters as '<host>:<port>'")
-      final String masterAddresses) {
+      final String masterAddresses,
+      @CliOption(key = { "certFile", "cert"},
+                 help = "CA Certificate for SSL connections.")
+      final String certFile,
+      @CliOption(key = { "clientCertFile", "clientCert"},
+                 help = "Client Certificate for mTLS connections.")
+      final String clientCertFile,
+      @CliOption(key = { "clientKeyFile", "clientKey"},
+                 help = "Client Private Key for mTLS connections.")
+      final String clientKeyFile) {
     try {
-      AsyncYBClient asyncClient = new AsyncYBClient.AsyncYBClientBuilder(masterAddresses).build();
+      AsyncYBClientBuilder builder = new AsyncYBClientBuilder(masterAddresses);
+      if (certFile != null) {
+        builder.sslCertFile(certFile);
+      }
+      if (clientCertFile != null) {
+        if (clientKeyFile == null) {
+          return "ClientKey cannot be null when ClientCert is provided.";
+        }
+        builder.sslClientCertFiles(clientCertFile, clientKeyFile);
+      }
+      AsyncYBClient asyncClient = builder.build();
       ybClient = new YBClient(asyncClient);
       this.masterAddresses = masterAddresses;
       connectedToDatabase = true;
@@ -174,7 +194,7 @@ public class YBCliCommands implements CommandMarker {
       sb.append("Got " + resp.getTablesList().size() +
                 " tables [(index) keyspace name uuid type]:\n");
       int idx = 1;
-      for (Master.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
+      for (MasterDdlOuterClass.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
         sb.append("\t(" + idx + ") " + table.getNamespace().getName() + " " + table.getName() +
                   " " + table.getId().toStringUtf8() + " " + table.getTableType() + "\n");
         idx++;
@@ -186,7 +206,8 @@ public class YBCliCommands implements CommandMarker {
     }
   }
 
-  private void printTableInfo(Master.ListTablesResponsePB.TableInfo table, StringBuilder sb) {
+  private void printTableInfo(
+      MasterDdlOuterClass.ListTablesResponsePB.TableInfo table, StringBuilder sb) {
     sb.append("Keyspace: ");
     sb.append(table.getNamespace().getName());
     sb.append("\n");
@@ -231,7 +252,7 @@ public class YBCliCommands implements CommandMarker {
     StringBuilder sb = new StringBuilder();
     try {
       ListTablesResponse resp = ybClient.getTablesList();
-      for (Master.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
+      for (MasterDdlOuterClass.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
         if (table.getId().toStringUtf8().equals(uuid)) {
           printTableInfo(table, sb);
           printSchemaInfo(ybClient.getTableSchemaByUUID(uuid), sb);
@@ -266,7 +287,7 @@ public class YBCliCommands implements CommandMarker {
     StringBuilder sb = new StringBuilder();
     try {
       ListTablesResponse resp = ybClient.getTablesList();
-      for (Master.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
+      for (MasterDdlOuterClass.ListTablesResponsePB.TableInfo table : resp.getTableInfoList()) {
         if (table.getNamespace().getName().equals(keyspace) && table.getName().equals(tableName)) {
           printTableInfo(table, sb);
           printSchemaInfo(ybClient.getTableSchema(keyspace, tableName), sb);
@@ -395,31 +416,35 @@ public class YBCliCommands implements CommandMarker {
         return "Failed: " + resp.errorMessage();
       }
 
-      return "Percent completed = " + resp.getPercentCompleted();
+      return "Percent completed = " + resp.getPercentCompleted() +
+        " : Remaining = " + resp.getRemaining() + " out of Total = " + resp.getTotal();
     } catch (Exception e) {
       LOG.error("Caught exception ", e);
       return "Failed: " + e.toString() + "\n";
     }
   }
 
-  @CliCommand(value = "is_tserver_ready",
-              help = "Check if tserver is ready to serve IO requests.")
+  @CliCommand(value = "is_server_ready",
+              help = "Check if server is ready to serve IO requests.")
   public String getIsTserverReady(
       @CliOption(key = {"host", "h"},
                  mandatory = true,
-                 help = "Hostname or IP of the tserver. ") final String host,
+                 help = "Hostname or IP of the server. ") final String host,
       @CliOption(key = {"port", "p"},
                  mandatory = true,
-                 help = "RPC port number of the tserver.") final int port) {
+                 help = "RPC port number of the server.") final int port,
+      @CliOption(key = {"isTserver", "t"},
+                 mandatory = true,
+                 help = "True imples the tserver, else master.") final boolean isTserver) {
     try {
       HostAndPort hp = HostAndPort.fromParts(host, port);
-      IsTabletServerReadyResponse resp = ybClient.isTServerReady(hp);
+      IsServerReadyResponse resp = ybClient.isServerReady(hp, isTserver);
 
       if (resp.hasError()) {
-        return "Failed: tserver response error : " + resp.errorMessage();
+        return "Failed: server response error : " + resp.errorMessage();
       }
 
-      return "Tserver is ready.";
+      return "Server is ready.";
     } catch (Exception e) {
       LOG.error("Caught exception ", e);
       return "Failed: " + e.toString();

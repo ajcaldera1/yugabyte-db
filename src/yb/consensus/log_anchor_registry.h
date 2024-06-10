@@ -29,23 +29,27 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CONSENSUS_LOG_ANCHOR_REGISTRY_
-#define YB_CONSENSUS_LOG_ANCHOR_REGISTRY_
+#pragma once
 
 #include <map>
+#include <shared_mutex>
 #include <string>
+
+#include "yb/util/flags.h"
 #include <gtest/gtest_prod.h>
 
+#include "yb/consensus/log_fwd.h"
+
+#include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
-#include "yb/util/status.h"
 
 namespace yb {
 namespace log {
-
-struct LogAnchor;
 
 // This class allows callers to register their interest in (anchor) a particular
 // log index. The primary use case for this is to prevent the deletion of segments of
@@ -67,21 +71,19 @@ class LogAnchorRegistry : public RefCountedThreadSafe<LogAnchorRegistry> {
   // Before: anchor must be registered with some log index.
   // After: anchor is now registered using index 'log_index'.
   // See Register().
-  CHECKED_STATUS UpdateRegistration(int64_t log_index,
-                            const std::string& owner,
-                            LogAnchor* anchor);
+  Status UpdateRegistration(int64_t log_index, LogAnchor* anchor);
 
   // Release the anchor on a log index.
   // Note: anchor must be the original pointer passed to Register().
-  CHECKED_STATUS Unregister(LogAnchor* anchor);
+  Status Unregister(LogAnchor* anchor);
 
   // Release the anchor on a log index if it is registered.
   // Otherwise, do nothing.
-  CHECKED_STATUS UnregisterIfAnchored(LogAnchor* anchor);
+  Status UnregisterIfAnchored(LogAnchor* anchor);
 
   // Query the registry to find the earliest anchored log index in the registry.
   // Returns Status::NotFound if no anchors are currently active.
-  CHECKED_STATUS GetEarliestRegisteredLogIndex(int64_t* op_id);
+  Status GetEarliestRegisteredLogIndex(int64_t* op_id);
 
   // Simply returns the number of active anchors for use in debugging / tests.
   // This is _not_ a constant-time operation.
@@ -100,7 +102,7 @@ class LogAnchorRegistry : public RefCountedThreadSafe<LogAnchorRegistry> {
   void RegisterUnlocked(int64_t log_index, const std::string& owner, LogAnchor* anchor);
 
   // Unregister an anchor after taking the lock. See Unregister().
-  CHECKED_STATUS UnregisterUnlocked(LogAnchor* anchor);
+  Status UnregisterUnlocked(LogAnchor* anchor);
 
   AnchorMultiMap anchors_;
   mutable simple_spinlock lock_;
@@ -114,6 +116,10 @@ struct LogAnchor {
  public:
   LogAnchor();
   ~LogAnchor();
+
+  int64_t index() const {
+    return log_index;
+  }
 
  private:
   FRIEND_TEST(LogTest, TestGCWithLogRunning);
@@ -137,40 +143,5 @@ struct LogAnchor {
   DISALLOW_COPY_AND_ASSIGN(LogAnchor);
 };
 
-// Helper class that will anchor the minimum log index recorded.
-class MinLogIndexAnchorer {
- public:
-  // Construct anchorer for specified registry that will register anchors with
-  // the specified owner name.
-  MinLogIndexAnchorer(LogAnchorRegistry* registry, std::string owner);
-
-  // The destructor will unregister the anchor if it is registered.
-  ~MinLogIndexAnchorer();
-
-  // If op_id is less than the minimum index registered so far, or if no indexes
-  // are currently registered, anchor on 'log_index'.
-  void AnchorIfMinimum(int64_t log_index);
-
-  // Un-anchors the earliest index (which is the only one tracked).
-  // If no minimum is known (no anchor registered), returns OK.
-  CHECKED_STATUS ReleaseAnchor();
-
-  // Returns the first recorded log index, kInvalidOpIdIndex if there's none.
-  int64_t minimum_log_index() const;
-
- private:
-  const scoped_refptr<LogAnchorRegistry> registry_;
-  const std::string owner_;
-  LogAnchor anchor_;
-
-  // The index currently anchored, or kInvalidOpIdIndex if no anchor has yet been registered.
-  int64_t minimum_log_index_;
-  mutable simple_spinlock lock_;
-
-  DISALLOW_COPY_AND_ASSIGN(MinLogIndexAnchorer);
-};
-
 } // namespace log
 } // namespace yb
-
-#endif // YB_CONSENSUS_LOG_ANCHOR_REGISTRY_

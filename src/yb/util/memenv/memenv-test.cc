@@ -19,17 +19,19 @@
 // Modified for yb:
 // - use gtest
 
-#include <string>
 #include <memory>
 #include <unordered_set>
 #include <vector>
 
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/gutil/map-util.h"
+
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
 #include "yb/util/memenv/memenv.h"
+#include "yb/util/result.h"
 #include "yb/util/test_macros.h"
 
 using std::shared_ptr;
@@ -53,7 +55,7 @@ class MemEnvTest : public ::testing::Test {
 
 TEST_F(MemEnvTest, Basics) {
   uint64_t file_size;
-  gscoped_ptr<WritableFile> writable_file;
+  std::unique_ptr<WritableFile> writable_file;
   vector<string> children;
 
   // Create the directory.
@@ -97,8 +99,8 @@ TEST_F(MemEnvTest, Basics) {
   ASSERT_EQ(3, file_size);
 
   // Check that opening non-existent file fails.
-  gscoped_ptr<SequentialFile> seq_file;
-  gscoped_ptr<RandomAccessFile> rand_file;
+  std::unique_ptr<SequentialFile> seq_file;
+  std::unique_ptr<RandomAccessFile> rand_file;
   ASSERT_TRUE(!env_->NewSequentialFile("/dir/non_existent", &seq_file).ok());
   ASSERT_TRUE(!seq_file);
   ASSERT_TRUE(!env_->NewRandomAccessFile("/dir/non_existent", &rand_file).ok());
@@ -121,7 +123,7 @@ TEST_F(MemEnvTest, ReadWrite) {
   ASSERT_OK(env_->CreateDir("/dir"));
 
   {
-    gscoped_ptr<WritableFile> writable_file;
+    std::unique_ptr<WritableFile> writable_file;
     ASSERT_OK(env_->NewWritableFile("/dir/f", &writable_file));
     ASSERT_OK(writable_file->Append("hello "));
     ASSERT_OK(writable_file->Append("world"));
@@ -129,7 +131,7 @@ TEST_F(MemEnvTest, ReadWrite) {
 
   {
     // Read sequentially.
-    gscoped_ptr<SequentialFile> seq_file;
+    std::unique_ptr<SequentialFile> seq_file;
     ASSERT_OK(env_->NewSequentialFile("/dir/f", &seq_file));
     ASSERT_OK(seq_file->Read(5, &result, scratch)); // Read "hello".
     ASSERT_EQ(0, result.compare("hello"));
@@ -145,7 +147,7 @@ TEST_F(MemEnvTest, ReadWrite) {
 
   {
     // Random reads.
-    gscoped_ptr<RandomAccessFile> rand_file;
+    std::unique_ptr<RandomAccessFile> rand_file;
     ASSERT_OK(env_->NewRandomAccessFile("/dir/f", &rand_file));
     ASSERT_OK(rand_file->Read(6, 5, &result, scratch)); // Read "world".
     ASSERT_EQ(0, result.compare("world"));
@@ -172,7 +174,7 @@ TEST_F(MemEnvTest, Misc) {
   ASSERT_OK(env_->GetTestDirectory(&test_dir));
   ASSERT_TRUE(!test_dir.empty());
 
-  gscoped_ptr<WritableFile> writable_file;
+  std::unique_ptr<WritableFile> writable_file;
   ASSERT_OK(env_->NewWritableFile("/a/b", &writable_file));
 
   // These are no-ops, but we test they return success.
@@ -184,20 +186,20 @@ TEST_F(MemEnvTest, Misc) {
 
 TEST_F(MemEnvTest, LargeWrite) {
   const size_t kWriteSize = 300 * 1024;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kWriteSize * 2]);
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[kWriteSize * 2]);
 
   string write_data;
   for (size_t i = 0; i < kWriteSize; ++i) {
     write_data.append(1, static_cast<char>(i));
   }
 
-  gscoped_ptr<WritableFile> writable_file;
+  std::unique_ptr<WritableFile> writable_file;
   ASSERT_OK(env_->NewWritableFile("/dir/f", &writable_file));
   ASSERT_OK(writable_file->Append("foo"));
   ASSERT_OK(writable_file->Append(write_data));
   writable_file.reset();
 
-  gscoped_ptr<SequentialFile> seq_file;
+  std::unique_ptr<SequentialFile> seq_file;
   Slice result;
   ASSERT_OK(env_->NewSequentialFile("/dir/f", &seq_file));
   ASSERT_OK(seq_file->Read(3, &result, scratch.get())); // Read "foo".
@@ -267,7 +269,7 @@ TEST_F(MemEnvTest, TempFile) {
   string bad_tmpl = "foo.YYY";
 
   string path;
-  gscoped_ptr<WritableFile> file;
+  std::unique_ptr<WritableFile> file;
 
   // Ensure we don't accept a bad template.
   Status s = env_->NewTempWritableFile(WritableFileOptions(), bad_tmpl, &path, &file);
@@ -295,7 +297,7 @@ TEST_F(MemEnvTest, TempFile) {
 
 TEST_F(MemEnvTest, TestRWFile) {
   // Create the file.
-  gscoped_ptr<RWFile> file;
+  std::unique_ptr<RWFile> file;
   ASSERT_OK(env_->NewRWFile("foo", &file));
 
   // Append to it.
@@ -304,7 +306,7 @@ TEST_F(MemEnvTest, TestRWFile) {
 
   // Read from it.
   Slice result;
-  gscoped_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[kTestData.length()]);
   ASSERT_OK(file->Read(0, kTestData.length(), &result, scratch.get()));
   ASSERT_EQ(result, kTestData);
 

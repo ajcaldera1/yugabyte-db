@@ -10,15 +10,19 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_views_vtable.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+#include "yb/util/status_log.h"
 
 namespace yb {
 namespace master {
 
-YQLViewsVTable::YQLViewsVTable(const Master* const master)
-    : YQLEmptyVTable(master::kSystemSchemaViewsTableName, master, CreateSchema()) {
+YQLViewsVTable::YQLViewsVTable(const TableName& table_name,
+                               const NamespaceName& namespace_name,
+                               Master * const master)
+    : YQLEmptyVTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
 Schema YQLViewsVTable::CreateSchema() const {

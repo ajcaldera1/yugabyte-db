@@ -14,21 +14,25 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/process_context.h"
+
 #include "yb/util/logging.h"
+
+#include "yb/yql/cql/ql/ptree/parse_tree.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
+#include "yb/yql/cql/ql/util/errcodes.h"
 
 namespace yb {
 namespace ql {
 
 using std::endl;
 using std::istream;
-using std::min;
 using std::string;
 
 //--------------------------------------------------------------------------------------------------
 // ProcessContextBase
 //--------------------------------------------------------------------------------------------------
 
-ProcessContextBase::ProcessContextBase() {
+ProcessContextBase::ProcessContextBase() : error_code_(ErrorCode::SUCCESS) {
 }
 
 ProcessContextBase::~ProcessContextBase() {
@@ -46,7 +50,7 @@ MCString* ProcessContextBase::error_msgs() {
 Status ProcessContextBase::GetStatus() {
   // Erroneous index is negative while successful index is non-negative.
   if (error_code_ < ErrorCode::SUCCESS) {
-    return STATUS(QLError, error_msgs()->c_str(), Slice(), static_cast<int64_t>(error_code_));
+    return STATUS(QLError, error_msgs()->c_str(), Slice(), QLError(error_code_));
   }
   return Status::OK();
 }
@@ -177,8 +181,8 @@ Status ProcessContextBase::Error(const YBLocation& loc,
 
   // Append this error message to the context.
   error_msgs()->append(msg);
-  LOG(ERROR) << "SQL Error: " << msg;
-  return STATUS(QLError, msg.c_str(), Slice(), static_cast<int64_t>(error_code_));
+  YB_LOG_EVERY_N_SECS(WARNING, 1) << "SQL Error: " << msg;
+  return STATUS(QLError, msg.c_str(), Slice(), QLError(error_code_));
 }
 
 Status ProcessContextBase::Error(const YBLocation& loc,
@@ -266,6 +270,19 @@ ProcessContext::~ProcessContext() {
 void ProcessContext::SaveGeneratedParseTree(TreeNode::SharedPtr generated_parse_tree) {
   CHECK(parse_tree_.get() != nullptr) << "Context is not associated with a parse tree";
   parse_tree_->set_root(generated_parse_tree);
+}
+
+const std::string& ProcessContext::stmt() const {
+  return parse_tree_->stmt();
+}
+
+// Memory pool for constructing the parse tree of a statement.
+MemoryContext *ProcessContext::PTreeMem() const {
+  return parse_tree_->PTreeMem();
+}
+
+ParseTreePtr ProcessContext::AcquireParseTree() {
+  return std::move(parse_tree_);
 }
 
 }  // namespace ql

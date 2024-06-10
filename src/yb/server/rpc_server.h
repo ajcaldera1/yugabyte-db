@@ -29,21 +29,20 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_RPC_SERVER_H
-#define YB_SERVER_RPC_SERVER_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/service_pool.h"
-#include "yb/util/net/net_util.h"
-#include "yb/util/net/sockaddr.h"
-#include "yb/util/status.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
+#include "yb/util/net/net_fwd.h"
 
 namespace yb {
 namespace server {
@@ -62,14 +61,14 @@ class RpcServer {
             rpc::ConnectionContextFactoryPtr connection_context_factory);
   ~RpcServer();
 
-  CHECKED_STATUS Init(const std::shared_ptr<rpc::Messenger>& messenger);
+  Status Init(rpc::Messenger* messenger);
   // Services need to be registered after Init'ing, but before Start'ing.
   // The service's ownership will be given to a ServicePool.
-  CHECKED_STATUS RegisterService(
+  Status RegisterService(
       size_t queue_limit, rpc::ServiceIfPtr service,
       rpc::ServicePriority priority = rpc::ServicePriority::kNormal);
-  CHECKED_STATUS Bind();
-  CHECKED_STATUS Start();
+  Status Bind();
+  Status Start();
   void Shutdown();
 
   const std::vector<Endpoint>& GetBoundAddresses() const {
@@ -82,7 +81,7 @@ class RpcServer {
 
   std::string ToString() const;
 
-  const rpc::ServicePool* service_pool(const std::string& service_name) const;
+  const rpc::ServicePool* TEST_service_pool(const std::string& service_name) const;
 
  private:
   enum ServerState {
@@ -96,13 +95,13 @@ class RpcServer {
     STARTED
   };
 
-  string name_;
+  std::string name_;
 
   ServerState server_state_;
 
   const RpcServerOptions options_;
 
-  std::shared_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
 
   // Parsed addresses to bind RPC to. Set by Init().
   std::vector<Endpoint> rpc_bind_addresses_;
@@ -118,5 +117,3 @@ class RpcServer {
 
 } // namespace server
 } // namespace yb
-
-#endif // YB_SERVER_RPC_SERVER_H

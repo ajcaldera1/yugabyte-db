@@ -29,16 +29,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_INTEGRATION_TESTS_CLUSTER_VERIFIER_H
-#define YB_INTEGRATION_TESTS_CLUSTER_VERIFIER_H
+#pragma once
 
 #include <string>
 
-#include "yb/common/common.pb.h"
 #include "yb/gutil/macros.h"
 #include "yb/tools/ysck.h"
 #include "yb/util/monotime.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -88,24 +86,24 @@ class ClusterVerifier {
   // convergence.
   void CheckRowCount(const client::YBTableName& table_name,
                      ComparisonMode mode,
-                     int expected_row_count,
+                     size_t expected_row_count,
                      YBConsistencyLevel consistency = YBConsistencyLevel::STRONG);
 
   // The same as above, but retries until a timeout elapses.
   void CheckRowCountWithRetries(const client::YBTableName& table_name,
                                 ComparisonMode mode,
-                                int expected_row_count,
+                                size_t expected_row_count,
                                 const MonoDelta& timeout);
 
  private:
-  CHECKED_STATUS DoYsck();
+  Status DoYsck();
 
   // Implementation for CheckRowCount -- returns a Status instead of firing
   // gtest assertions.
-  CHECKED_STATUS DoCheckRowCount(const client::YBTableName& table_name,
-                                 ComparisonMode mode,
-                                 int expected_row_count,
-                                 YBConsistencyLevel consistency);
+  Status DoCheckRowCount(const client::YBTableName& table_name,
+                         ComparisonMode mode,
+                         size_t expected_row_count,
+                         YBConsistencyLevel consistency);
 
 
   MiniClusterBase* cluster_;
@@ -116,4 +114,3 @@ class ClusterVerifier {
 };
 
 } // namespace yb
-#endif /* YB_INTEGRATION_TESTS_CLUSTER_VERIFIER_H */

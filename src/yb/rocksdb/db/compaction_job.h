@@ -21,8 +21,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_DB_COMPACTION_JOB_H
-#define YB_ROCKSDB_DB_COMPACTION_JOB_H
 
 #pragma once
 
@@ -35,27 +33,24 @@
 #include <utility>
 #include <vector>
 
-#include "yb/gutil/thread_annotations.h"
+#include "yb/ash/wait_state_fwd.h"
 
+#include "yb/rocksdb/compaction_filter.h"
+#include "yb/rocksdb/compaction_job_stats.h"
+#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/column_family.h"
 #include "yb/rocksdb/db/compaction_iterator.h"
 #include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/flush_scheduler.h"
 #include "yb/rocksdb/db/internal_stats.h"
-#include "yb/rocksdb/db/job_context.h"
 #include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/memtable_list.h"
 #include "yb/rocksdb/db/version_edit.h"
 #include "yb/rocksdb/db/write_controller.h"
 #include "yb/rocksdb/db/write_thread.h"
-#include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/compaction_filter.h"
-#include "yb/rocksdb/compaction_job_stats.h"
-#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/memtablerep.h"
+#include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/transaction_log.h"
-#include "yb/rocksdb/table/scoped_arena_iterator.h"
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/util/event_logger.h"
 #include "yb/rocksdb/util/stop_watch.h"
@@ -73,6 +68,8 @@ class VersionSet;
 class Arena;
 class FileNumbersProvider;
 class FileNumbersHolder;
+
+YB_STRONGLY_TYPED_BOOL(ShouldDeleteCorruptedFile);
 
 class CompactionJob {
  public:
@@ -118,14 +115,16 @@ class CompactionJob {
   // kv-pairs
   void ProcessKeyValueCompaction(FileNumbersHolder* holder, SubcompactionState* sub_compact);
 
-  Status FinishCompactionOutputFile(const Status& input_status,
-                                    SubcompactionState* sub_compact);
+  Status CheckOutputFile(SubcompactionState* sub_compact);
+  Status FinishCompactionOutputFile(
+      const Status& input_status, SubcompactionState* sub_compact,
+      ShouldDeleteCorruptedFile should_delete_corrupted_file);
   Status InstallCompactionResults(const MutableCFOptions& mutable_cf_options);
   void RecordCompactionIOStats();
   Status OpenFile(const std::string table_name, uint64_t file_number,
       const std::string file_type_label, const std::string fname,
       std::unique_ptr<WritableFile>* writable_file);
-  Status OpenCompactionOutputFile(FileNumbersHolder* holder, SubcompactionState* sub_compact);
+  Status OpenCompactionOutputFile(FileNumber file_number, SubcompactionState* sub_compact);
   void CleanupCompaction();
   void UpdateCompactionJobStats(
     const InternalStats::CompactionStats& stats) const;
@@ -176,6 +175,7 @@ class CompactionJob {
 
   std::shared_ptr<Cache> table_cache_;
 
+  yb::ash::WaitStateInfoPtr wait_state_;
   EventLogger* event_logger_;
 
   bool bottommost_level_;
@@ -190,5 +190,3 @@ class CompactionJob {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_COMPACTION_JOB_H

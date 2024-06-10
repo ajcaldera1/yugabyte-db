@@ -11,15 +11,19 @@
 // under the License.
 //
 
-#ifndef YB_RPC_RPC_CALL_H
-#define YB_RPC_RPC_CALL_H
+#pragma once
+
+#include <stdint.h>
+
+#include <type_traits>
 
 #include "yb/gutil/ref_counted.h"
 
-#include "yb/util/enums.h"
-
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/outbound_data.h"
+
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
 
 namespace yb {
 
@@ -31,22 +35,25 @@ YB_DEFINE_ENUM(TransferState, (PENDING)(FINISHED)(ABORTED));
 
 class RpcCall : public OutboundData {
  public:
+  RpcCall();
+
   // This functions is invoked in reactor thread of the appropriate connection, except during
   // reactor shutdown. In case of shutdown all such final calls are sequential. Therefore, this
   // function doesn't require synchronization.
-  void Transferred(const Status& status, Connection* conn) override;
+  void Transferred(const Status& status, const ConnectionPtr& conn) override;
 
   virtual std::string LogPrefix() const {
     return "";
   }
 
- private:
-  virtual void NotifyTransferred(const Status& status, Connection* conn) = 0;
+  TransferState transfer_state() const { return transfer_state_.load(std::memory_order_acquire); }
 
-  TransferState state_ = TransferState::PENDING;
+ private:
+  virtual void NotifyTransferred(const Status& status, const ConnectionPtr& conn) = 0;
+
+  std::atomic<TransferState> transfer_state_{TransferState::PENDING};
+  const uint64_t start_time_ns_;
 };
 
 }  // namespace rpc
 }  // namespace yb
-
-#endif // YB_RPC_RPC_CALL_H

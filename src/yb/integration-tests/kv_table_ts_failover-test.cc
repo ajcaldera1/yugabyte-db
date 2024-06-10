@@ -15,33 +15,30 @@
 #include <memory>
 #include <vector>
 
-#include "yb/client/client-test-util.h"
+#include "yb/client/client.h"
+#include "yb/client/table.h"
+
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/external_mini_cluster.h"
-#include "yb/integration-tests/test_workload.h"
-#include "yb/util/metrics.h"
-#include "yb/util/test_util.h"
 #include "yb/integration-tests/load_generator.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
-DEFINE_int32(test_num_iter,
+#include "yb/util/test_util.h"
+#include "yb/util/flags.h"
+
+DEFINE_NON_RUNTIME_int32(test_num_iter,
              1,
              "Number of iterations for key-value table tablet server failover test");
 
 namespace yb {
-
-using std::unique_ptr;
-
-using client::YBClient;
-using client::YBClientBuilder;
-using client::YBTable;
-using std::shared_ptr;
 
 using integration_tests::YBTableTestBase;
 
 class KVTableTsFailoverTest : public YBTableTestBase {
  public:
   bool use_external_mini_cluster() override { return true; }
+
+  bool enable_ysql() override { return NonTsanVsTsan(true, false); }
 };
 
 TEST_F(KVTableTsFailoverTest, KillTabletServerUnderLoad) {
@@ -54,11 +51,10 @@ TEST_F(KVTableTsFailoverTest, KillTabletServerUnderLoad) {
     int value_size_bytes = 16;
     int max_write_errors = 0;
     int max_read_errors = 0;
-    bool stop_on_empty_read = true;
 
     // Create two separate clients for read and writes.
-    shared_ptr<YBClient> write_client = CreateYBClient();
-    shared_ptr<YBClient> read_client = CreateYBClient();
+    auto write_client = CreateYBClient();
+    auto read_client = CreateYBClient();
     yb::load_generator::YBSessionFactory write_session_factory(write_client.get(), &table_);
     yb::load_generator::YBSessionFactory read_session_factory(read_client.get(), &table_);
 
@@ -68,8 +64,7 @@ TEST_F(KVTableTsFailoverTest, KillTabletServerUnderLoad) {
     yb::load_generator::MultiThreadedReader reader(rows, reader_threads, &read_session_factory,
                                                    writer.InsertionPoint(), writer.InsertedKeys(),
                                                    writer.FailedKeys(), &stop_requested_flag,
-                                                   value_size_bytes, max_read_errors,
-                                                   stop_on_empty_read);
+                                                   value_size_bytes, max_read_errors);
 
     writer.Start();
     // Having separate write requires adding in write client id to the reader.

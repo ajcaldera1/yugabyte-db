@@ -16,11 +16,16 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/pt_alter_role.h"
-#include "yb/yql/cql/ql/ptree/sem_context.h"
-#include "yb/gutil/strings/substitute.h"
+
 #include "yb/util/crypt.h"
 
+#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/sem_state.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
+
 DECLARE_bool(use_cassandra_authentication);
+DEFINE_RUNTIME_bool(ycql_allow_non_authenticated_password_reset, false,
+    "If to allow non-authenticated user to reset the password.");
 
 namespace yb {
 namespace ql {
@@ -44,12 +49,14 @@ PTAlterRole::PTAlterRole(MemoryContext* memctx,
 PTAlterRole::~PTAlterRole() {
 }
 
-CHECKED_STATUS PTAlterRole::Analyze(SemContext* sem_context) {
+Status PTAlterRole::Analyze(SemContext* sem_context) {
   SemState sem_state(sem_context);
 
-  RETURN_NOT_AUTH_ENABLED(sem_context);
-  RETURN_NOT_OK(sem_context->CheckHasRolePermission(loc(), PermissionType::ALTER_PERMISSION,
-                                                    role_name()));
+  if (!FLAGS_ycql_allow_non_authenticated_password_reset) {
+    RETURN_NOT_AUTH_ENABLED(sem_context);
+    RETURN_NOT_OK(
+        sem_context->CheckHasRolePermission(loc(), PermissionType::ALTER_PERMISSION, role_name()));
+  }
 
   // Save context state, and set "this" as current column in the context.
   SymbolEntry cached_entry = *sem_context->current_processing_id();
@@ -110,7 +117,6 @@ CHECKED_STATUS PTAlterRole::Analyze(SemContext* sem_context) {
 }
 
 void PTAlterRole::PrintSemanticAnalysisResult(SemContext* sem_context) {
-
   MCString sem_output("\tAlter Role ", sem_context->PTempMem());
   sem_output = sem_output + " role_name  " + role_name() + " salted_hash = " + *salted_hash_;
   sem_output = sem_output + " login = " + (login() ? "true" : "false");

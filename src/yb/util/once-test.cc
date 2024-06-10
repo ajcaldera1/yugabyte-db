@@ -29,13 +29,10 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include "yb/gutil/bind.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/once.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/thread.h"
@@ -98,7 +95,7 @@ TEST(TestOnce, YBOnceDynamicTest) {
 static void InitOrGetInitted(Thing* t, int i) {
   if (i % 2 == 0) {
     LOG(INFO) << "Thread " << i << " initting";
-    t->Init();
+    ASSERT_OK(t->Init());
   } else {
     LOG(INFO) << "Thread " << i << " value: " << t->once_.initted();
   }

@@ -277,6 +277,20 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 					  bool *specConflict,
 					  List *arbiterIndexes)
 {
+	return ExecInsertIndexTuplesOptimized(
+	    slot, tuple, estate, noDupErr, specConflict,
+	    arbiterIndexes, NIL /* no_update_index_list */);
+}
+
+List *
+ExecInsertIndexTuplesOptimized(TupleTableSlot *slot,
+                               HeapTuple tuple,
+                               EState *estate,
+                               bool noDupErr,
+                               bool *specConflict,
+                               List *arbiterIndexes,
+                               List *no_update_index_list)
+{
 	List	   *result = NIL;
 	ResultRelInfo *resultRelInfo;
 	int			i;
@@ -287,6 +301,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 	ExprContext *econtext;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
+	bool		isYBRelation;
 
 	/*
 	 * Get information from the result relation info structure.
@@ -296,6 +311,7 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 	relationDescs = resultRelInfo->ri_IndexRelationDescs;
 	indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
 	heapRelation = resultRelInfo->ri_RelationDesc;
+	isYBRelation = IsYBRelation(heapRelation);
 
 	/*
 	 * We will use the EState's per-tuple context for evaluating predicates
@@ -317,16 +333,26 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 		IndexUniqueCheck checkUnique;
 		bool		satisfiesConstraint;
 
-		if (indexRelation == NULL)
-			continue;
+		/*
+		 * For an update command check if we need to skip index. For that purpose,
+		 * we check if the relid of the index is part of the skip list.
+		 */
+		if (indexRelation == NULL || (no_update_index_list &&
+		    list_member_oid(no_update_index_list, RelationGetRelid(indexRelation))))
+		continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
 		/*
 		 * No need to update YugaByte primary key which is intrinic part of
 		 * the base table.
+		 *
+		 * TODO(neil) The following YB check might not be needed due to later work on indexes.
+		 * We keep this check for now as this bugfix will be backported to ealier releases.
 		 */
-		if (IsYugaByteEnabled() && indexRelation->rd_index->indisprimary)
+		if (isYBRelation && indexRelation->rd_index->indisprimary)
 			continue;
 
 		/* If the index is marked as read-only, ignore it */
@@ -400,7 +426,8 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
 						 tuple,		/* heap tuple */
 						 heapRelation,	/* heap relation */
 						 checkUnique,	/* type of uniqueness check to do */
-						 indexInfo);	/* index AM may need this */
+						 indexInfo,		/* index AM may need this */
+						 false);	/* yb_shared_insert */
 
 		/*
 		 * If the index has an associated exclusion constraint, check that.
@@ -470,11 +497,20 @@ ExecInsertIndexTuples(TupleTableSlot *slot,
  *		This routine takes care of deleting index tuples
  *		from all the relations indexing the result relation
  *		when a heap tuple is updated or deleted in the result relation.
- *      This is used only for relations and indexes backed by YugaByte DB.
+ *      This is used only for relations and indexes backed by YugabyteDB.
  * ----------------------------------------------------------------
  */
 void
 ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
+{
+  ExecDeleteIndexTuplesOptimized(ybctid, tuple, estate, NIL /* no_update_index_list */);
+}
+
+void
+ExecDeleteIndexTuplesOptimized(Datum ybctid,
+                               HeapTuple tuple,
+                               EState *estate,
+                               List *no_update_index_list)
 {
 	ResultRelInfo *resultRelInfo;
 	int			i;
@@ -486,6 +522,7 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 	TupleTableSlot	*slot;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
+	bool		isYBRelation;
 
 	/*
 	 * Get information from the result relation info structure.
@@ -495,6 +532,7 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 	relationDescs = resultRelInfo->ri_IndexRelationDescs;
 	indexInfoArray = resultRelInfo->ri_IndexRelationInfo;
 	heapRelation = resultRelInfo->ri_RelationDesc;
+	isYBRelation = IsYBRelation(heapRelation);
 
 	/*
 	 * We will use the EState's per-tuple context for evaluating predicates
@@ -507,7 +545,7 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 	 * a temporary slot.
 	 */
 	slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRelation));
-	slot = ExecStoreTuple(tuple, slot, InvalidBuffer, false);
+	slot = ExecStoreHeapTuple(tuple, slot, false);
 	econtext->ecxt_scantuple = slot;
 
 	/*
@@ -519,20 +557,41 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 		Relation	indexRelation = relationDescs[i];
 		IndexInfo  *indexInfo;
 
-		if (indexRelation == NULL)
-			continue;
+		/*
+		 * For an update command check if we need to skip index.
+		 * For that purpose, we check if the relid of the index is part of the skip list.
+		 */
+		if (indexRelation == NULL || (no_update_index_list &&
+		    list_member_oid(no_update_index_list, RelationGetRelid(indexRelation))))
+		  continue;
 
 		/*
 		 * No need to update YugaByte primary key which is intrinic part of
 		 * the base table.
+		 *
+		 * TODO(neil) This function is obsolete and removed from Postgres's original code.
+		 * - We need to update YugaByte's code path to stop using this function.
+		 * - As a result, we don't need distinguish between Postgres and YugaByte here.
+		 *   I update this code only for clarity.
 		 */
-		if (IsYugaByteEnabled() && indexRelation->rd_index->indisprimary)
+		if (isYBRelation && indexRelation->rd_index->indisprimary)
 			continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
-		/* If the index is marked as read-only, ignore it */
-		if (!indexInfo->ii_ReadyForInserts)
+		/*
+		 * If the index is not ready for deletes and index backfill is enabled,
+		 * ignore it
+		 */
+		if (!*YBCGetGFlags()->ysql_disable_index_backfill && !indexRelation->rd_index->indislive)
+			continue;
+		/*
+		 * If the index is marked as read-only and index backfill is disabled,
+		 * ignore it
+		 */
+		if (*YBCGetGFlags()->ysql_disable_index_backfill && !indexInfo->ii_ReadyForInserts)
 			continue;
 
 		/* Check for partial index */
@@ -566,13 +625,14 @@ ExecDeleteIndexTuples(Datum ybctid, HeapTuple tuple, EState *estate)
 					   values,
 					   isnull);
 
+		MemoryContext oldContext = MemoryContextSwitchTo(GetPerTupleMemoryContext(estate));
 		index_delete(indexRelation, /* index relation */
 					 values,	/* array of index Datums */
 					 isnull,	/* null flags */
 					 ybctid,	/* ybctid */
 					 heapRelation,	/* heap relation */
 					 indexInfo);	/* index AM may need this */
-
+		MemoryContextSwitchTo(oldContext);
 	}
 
 	/* Drop the temporary slot */
@@ -648,6 +708,8 @@ ExecCheckIndexConstraints(TupleTableSlot *slot,
 			continue;
 
 		indexInfo = indexInfoArray[i];
+		Assert(indexInfo->ii_ReadyForInserts ==
+			   indexRelation->rd_index->indisready);
 
 		if (!indexInfo->ii_Unique && !indexInfo->ii_ExclusionOps)
 			continue;
@@ -879,7 +941,7 @@ retry:
 		 * Extract the index column values and isnull flags from the existing
 		 * tuple.
 		 */
-		ExecStoreTuple(tup, existing_slot, InvalidBuffer, false);
+		ExecStoreHeapTuple(tup, existing_slot, false);
 		FormIndexDatum(indexInfo, existing_slot, estate,
 					   existing_values, existing_isnull);
 

@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_BLOCKING_QUEUE_H
-#define YB_UTIL_BLOCKING_QUEUE_H
+#pragma once
 
 #include <unistd.h>
 
@@ -39,8 +38,7 @@
 #include <type_traits>
 #include <vector>
 
-#include "yb/gutil/basictypes.h"
-#include "yb/gutil/gscoped_ptr.h"
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/condition_variable.h"
 #include "yb/util/mutex.h"
 
@@ -84,7 +82,7 @@ class BlockingQueue {
         << "BlockingQueue holds bare pointers at destruction time";
   }
 
-  // Get an element from the queue.  Returns false if we were shut down prior to
+  // Get an element from the queue. Returns false if we were shut down prior to
   // getting the element.
   bool BlockingGet(T *out) {
     MutexLock l(lock_);
@@ -93,7 +91,7 @@ class BlockingQueue {
         *out = list_.front();
         list_.pop_front();
         decrement_size_unlocked(*out);
-        not_full_.Signal();
+        YB_PROFILE(not_full_.Signal());
         return true;
       }
       if (shutdown_) {
@@ -103,9 +101,9 @@ class BlockingQueue {
     }
   }
 
-  // Get an element from the queue.  Returns false if the queue is empty and
+  // Get an element from the queue. Returns false if the queue is empty and
   // we were shut down prior to getting the element.
-  bool BlockingGet(gscoped_ptr<T_VAL> *out) {
+  bool BlockingGet(std::unique_ptr<T_VAL> *out) {
     T t = NULL;
     bool got_element = BlockingGet(&t);
     if (!got_element) {
@@ -131,7 +129,7 @@ class BlockingQueue {
           decrement_size_unlocked(elt);
         }
         list_.clear();
-        not_full_.Signal();
+        YB_PROFILE(not_full_.Signal());
         return true;
       }
       if (shutdown_) {
@@ -159,23 +157,23 @@ class BlockingQueue {
     list_.push_back(val);
     increment_size_unlocked(val);
     l.Unlock();
-    not_empty_.Signal();
+    YB_PROFILE(not_empty_.Signal());
     return QUEUE_SUCCESS;
   }
 
   // Returns the same as the other Put() overload above.
-  // If the element was inserted, the gscoped_ptr releases its contents.
-  QueueStatus Put(gscoped_ptr<T_VAL> *val) {
+  // If the element was inserted, the std::unique_ptr releases its contents.
+  QueueStatus Put(std::unique_ptr<T_VAL> *val) {
     QueueStatus s = Put(val->get());
     if (s == QUEUE_SUCCESS) {
-      ignore_result<>(val->release());
+      val->release();
     }
     return s;
   }
 
   // Gets an element for the queue; if the queue is full, blocks until
   // space becomes available. Returns false if we were shutdown prior
-  // to enqueueing the element.
+  // to enqueuing the element.
   bool BlockingPut(const T& val) {
     MutexLock l(lock_);
     while (true) {
@@ -186,7 +184,7 @@ class BlockingQueue {
         list_.push_back(val);
         increment_size_unlocked(val);
         l.Unlock();
-        not_empty_.Signal();
+        YB_PROFILE(not_empty_.Signal());
         return true;
       }
       not_full_.Wait();
@@ -194,11 +192,11 @@ class BlockingQueue {
   }
 
   // Same as other BlockingPut() overload above. If the element was
-  // enqueued, gscoped_ptr releases its contents.
-  bool BlockingPut(gscoped_ptr<T_VAL>* val) {
+  // enqueued, std::unique_ptr releases its contents.
+  bool BlockingPut(std::unique_ptr<T_VAL>* val) {
     bool ret = Put(val->get());
     if (ret) {
-      ignore_result(val->release());
+      val->release();
     }
     return ret;
   }
@@ -211,8 +209,8 @@ class BlockingQueue {
   void Shutdown() {
     MutexLock l(lock_);
     shutdown_ = true;
-    not_full_.Broadcast();
-    not_empty_.Broadcast();
+    YB_PROFILE(not_full_.Broadcast());
+    YB_PROFILE(not_empty_.Broadcast());
   }
 
   bool empty() const {
@@ -257,5 +255,3 @@ class BlockingQueue {
 };
 
 } // namespace yb
-
-#endif  // YB_UTIL_BLOCKING_QUEUE_H

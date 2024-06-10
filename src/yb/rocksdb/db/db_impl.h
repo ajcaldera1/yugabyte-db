@@ -20,8 +20,6 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#ifndef YB_ROCKSDB_DB_DB_IMPL_H
-#define YB_ROCKSDB_DB_DB_IMPL_H
 
 #pragma once
 
@@ -35,10 +33,12 @@
 #include <utility>
 #include <vector>
 
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/column_family.h"
-#include "yb/rocksdb/db/compaction_job.h"
+#include "yb/rocksdb/db/compaction.h"
 #include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/flush_job.h"
 #include "yb/rocksdb/db/flush_scheduler.h"
 #include "yb/rocksdb/db/internal_stats.h"
 #include "yb/rocksdb/db/log_writer.h"
@@ -49,15 +49,13 @@
 #include "yb/rocksdb/db/write_controller.h"
 #include "yb/rocksdb/db/write_thread.h"
 #include "yb/rocksdb/db/writebuffer.h"
-#include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
+#include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/memtablerep.h"
+#include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/transaction_log.h"
-#include "yb/rocksdb/table/scoped_arena_iterator.h"
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/util/event_logger.h"
-#include "yb/rocksdb/util/hash.h"
 #include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/stop_watch.h"
 #include "yb/rocksdb/util/thread_local.h"
@@ -74,6 +72,7 @@ class WriteCallback;
 class FileNumbersProvider;
 struct JobContext;
 struct ExternalSstFileInfo;
+struct RocksDBPriorityThreadPoolMetrics;
 
 class DBImpl : public DB {
  public:
@@ -129,6 +128,10 @@ class DBImpl : public DB {
   using DB::NewIterator;
   virtual Iterator* NewIterator(const ReadOptions& options,
                                 ColumnFamilyHandle* column_family) override;
+  std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) override;
+
   virtual Status NewIterators(
       const ReadOptions& options,
       const std::vector<ColumnFamilyHandle*>& column_families,
@@ -169,7 +172,12 @@ class DBImpl : public DB {
   using DB::SetOptions;
   Status SetOptions(
       ColumnFamilyHandle* column_family,
-      const std::unordered_map<std::string, std::string>& options_map) override;
+      const std::unordered_map<std::string, std::string>& options_map,
+      bool dump_options = true) override;
+
+  // Set whether DB should be flushed on shutdown.
+  void SetDisableFlushOnShutdown(bool disable_flush_on_shutdown) override;
+  void StartShutdown() override;
 
   using DB::NumberLevels;
   virtual int NumberLevels(ColumnFamilyHandle* column_family) override;
@@ -195,7 +203,8 @@ class DBImpl : public DB {
 
   virtual SequenceNumber GetLatestSequenceNumber() const override;
 
-#ifndef ROCKSDB_LITE
+  uint64_t GetNextFileNumber() const override;
+
   virtual Status DisableFileDeletions() override;
   virtual Status EnableFileDeletions(bool force) override;
   virtual int IsFileDeletionsEnabled() const;
@@ -206,7 +215,7 @@ class DBImpl : public DB {
   virtual Status GetSortedWalFiles(VectorLogPtr* files) override;
 
   virtual Status GetUpdatesSince(
-      SequenceNumber seq_number, unique_ptr<TransactionLogIterator>* iter,
+      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions&
           read_options = TransactionLogIterator::ReadOptions()) override;
   virtual Status DeleteFile(std::string name) override;
@@ -217,11 +226,16 @@ class DBImpl : public DB {
 
   UserFrontierPtr GetFlushedFrontier() override;
 
-  CHECKED_STATUS ModifyFlushedFrontier(
+  Status ModifyFlushedFrontier(
       UserFrontierPtr frontier,
       FrontierModificationMode mode) override;
 
-  bool HasSomethingToFlush() override;
+  FlushAbility GetFlushAbility() override;
+
+  UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) override;
+
+  // Calculates specified frontier_type for all mem tables (active and immutable).
+  UserFrontierPtr CalcMemTableFrontier(UpdateUserValueType frontier_type) override;
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -230,6 +244,12 @@ class DBImpl : public DB {
   virtual void GetColumnFamilyMetaData(
       ColumnFamilyHandle* column_family,
       ColumnFamilyMetaData* metadata) override;
+
+  // Obtains all column family options and corresponding names,
+  // dropped columns are not included into the resulting collections.
+  virtual void GetColumnFamiliesOptions(
+      std::vector<std::string>* column_family_names,
+      std::vector<ColumnFamilyOptions>* column_family_options) override;
 
   // experimental API
   Status SuggestCompactRange(ColumnFamilyHandle* column_family,
@@ -289,7 +309,6 @@ class DBImpl : public DB {
   virtual Status AddFile(ColumnFamilyHandle* column_family,
                          const std::string& file_path, bool move_file) override;
 
-#endif  // ROCKSDB_LITE
 
   // Similar to GetSnapshot(), but also lets the db know that this snapshot
   // will be used for transaction write-conflict checking.  The DB can then
@@ -307,6 +326,9 @@ class DBImpl : public DB {
                              int output_level, uint32_t output_path_id,
                              const Slice* begin, const Slice* end,
                              bool exclusive,
+                             CompactionReason compaction_reason,
+                             uint64_t file_number_upper_bound,
+                             uint64_t input_size_limit_per_job,
                              bool disallow_trivial_move = false);
 
   // Return an internal iterator over the current state of the database.
@@ -315,7 +337,6 @@ class DBImpl : public DB {
   InternalIterator* NewInternalIterator(
       Arena* arena, ColumnFamilyHandle* column_family = nullptr);
 
-#ifndef NDEBUG
   // Extra methods (for testing) that are not in the public DB interface
   // Implemented in db_impl_debug.cc
 
@@ -381,8 +402,6 @@ class DBImpl : public DB {
   Cache* TEST_table_cache() { return table_cache_.get(); }
 
   WriteController& TEST_write_controler() { return write_controller_; }
-
-#endif  // NDEBUG
 
   // Return maximum background compaction alowed to be scheduled based on
   // compaction status.
@@ -467,7 +486,15 @@ class DBImpl : public DB {
   // Checks that source database has appropriate seqno.
   // I.e. seqno ranges of imported database does not overlap with seqno ranges of destination db.
   // And max seqno of imported database is less that active seqno of destination db.
-  CHECKED_STATUS Import(const std::string& source_dir) override;
+  Status Import(const std::string& source_dir) override;
+
+  bool AreWritesStopped();
+  bool NeedsDelay() override;
+
+  Result<std::string> GetMiddleKey() override;
+
+  // Returns a table reader for the largest SST file.
+  Result<TableReader*> TEST_GetLargestSstTableReader() override;
 
   // Used in testing to make the old memtable immutable and start writing to a new one.
   void TEST_SwitchMemtable() override;
@@ -476,14 +503,18 @@ class DBImpl : public DB {
   Env* const env_;
   Env* const checkpoint_env_;
   const std::string dbname_;
-  unique_ptr<VersionSet> versions_;
+  std::unique_ptr<VersionSet> versions_;
   const DBOptions db_options_;
-  Statistics* stats_;
-
+  std::shared_ptr<Statistics> stats_;
   InternalIterator* NewInternalIterator(const ReadOptions&,
                                         ColumnFamilyData* cfd,
                                         SuperVersion* super_version,
                                         Arena* arena);
+
+  // TODO(index_iter): consider using arena.
+  template <bool kSkipLastEntry>
+  std::unique_ptr<InternalIterator> NewInternalIndexIterator(
+      const ReadOptions&, ColumnFamilyData* cfd, SuperVersion* super_version);
 
   // Except in DB::Open(), WriteOptionsFile can only be called when:
   // 1. WriteThread::Writer::EnterUnbatched() is used.
@@ -505,11 +536,8 @@ class DBImpl : public DB {
                                    const CompactionJobStats& job_stats,
                                    int job_id);
 
-  void NewThreadStatusCfInfo(ColumnFamilyData* cfd) const;
-
-  void EraseThreadStatusCfInfo(ColumnFamilyData* cfd) const;
-
-  void EraseThreadStatusDbInfo() const;
+  void NotifyOnNoOpCompactionCompleted(const ColumnFamilyData& cfd,
+                                       const CompactionReason compaction_reason);
 
   Status WriteImpl(const WriteOptions& options, WriteBatch* updates,
                    WriteCallback* callback);
@@ -517,9 +545,7 @@ class DBImpl : public DB {
  private:
   friend class DB;
   friend class InternalStats;
-#ifndef ROCKSDB_LITE
   friend class ForwardIterator;
-#endif
   friend struct SuperVersion;
   friend class CompactedDBImpl;
 #ifndef NDEBUG
@@ -527,7 +553,20 @@ class DBImpl : public DB {
 #endif
   struct CompactionState;
 
+  struct ManualCompaction;
+
   struct WriteContext;
+
+  class ThreadPoolTask;
+
+  class CompactionTask;
+  friend class CompactionTask;
+
+  class FlushTask;
+  friend class FlushTask;
+
+  class TaskPriorityUpdater;
+  friend class TaskPriorityUpdater;
 
   Status NewDB();
 
@@ -576,16 +615,11 @@ class DBImpl : public DB {
   // Wait for memtable flushed
   Status WaitForFlushMemTable(ColumnFamilyData* cfd);
 
-  void RecordFlushIOStats();
-  void RecordCompactionIOStats();
-
-#ifndef ROCKSDB_LITE
   Status CompactFilesImpl(
       const CompactionOptions& compact_options, ColumnFamilyData* cfd,
       Version* version, const std::vector<std::string>& input_file_names,
       const int output_level, int output_path_id, JobContext* job_context,
       LogBuffer* log_buffer);
-#endif  // ROCKSDB_LITE
 
   ColumnFamilyData* GetColumnFamilyDataByName(const std::string& cf_name);
 
@@ -596,29 +630,32 @@ class DBImpl : public DB {
   static void BGWorkFlush(void* db);
   static void UnscheduleCallback(void* arg);
   void WaitAfterBackgroundError(const Status& s, const char* job_name, LogBuffer* log_buffer);
-  void BackgroundCallCompaction(void* arg);
-  void BackgroundCallFlush();
+  void BackgroundCallCompaction(
+      ManualCompaction* manual_compaction, std::unique_ptr<Compaction> compaction = nullptr,
+      CompactionTask* compaction_task = nullptr);
+  void BackgroundCallFlush(ColumnFamilyData* cfd);
   Result<FileNumbersHolder> BackgroundCompaction(
-      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer, void* m = 0);
+      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer,
+      ManualCompaction* manual_compaction = nullptr,
+      std::unique_ptr<Compaction> compaction = nullptr);
   Result<FileNumbersHolder> BackgroundFlush(
-      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer);
+      bool* made_progress, JobContext* job_context, LogBuffer* log_buffer, ColumnFamilyData* cfd);
+  void BackgroundJobComplete(const Status& s, JobContext* job_context, LogBuffer* log_buffer);
 
-  // Yugabyte: This updates the stats object to show
-  // total SST file size ticker.
-  // This is different from HandleTotalSSTFileSizes since the later
-  // looks into the version set and not necessarily computes
-  // all the live file sizes.
+  uint64_t GetCurrentVersionSstFilesSize() override;
 
-  uint64_t GetTotalSSTFileSize() override;
+  uint64_t GetCurrentVersionSstFilesUncompressedSize() override;
 
-  void SetSSTFileSizeTickers();
+  std::pair<uint64_t, uint64_t> GetCurrentVersionSstFilesAllSizes() override;
 
-  uint64_t GetUncompressedSSTFileSize() override;
+  uint64_t GetCurrentVersionDataSstFilesSize() override;
 
-  void PrintStatistics();
+  uint64_t GetCurrentVersionNumSSTFiles() override;
 
-  // dump rocksdb.stats to LOG
-  void MaybeDumpStats();
+  int GetCfdImmNumNotFlushed() override;
+
+  // Updates stats_ object with SST files size metrics.
+  void SetSSTFileTickers();
 
   // Return the minimum empty level that could hold the total data in the
   // input level. Return the input level, if such level could not be found.
@@ -632,18 +669,45 @@ class DBImpl : public DB {
 
   // helper functions for adding and removing from flush & compaction queues
   bool AddToCompactionQueue(ColumnFamilyData* cfd);
-  Compaction* PopFirstFromSmallCompactionQueue();
-  Compaction* PopFirstFromLargeCompactionQueue();
+  std::unique_ptr<Compaction> PopFirstFromSmallCompactionQueue();
+  std::unique_ptr<Compaction> PopFirstFromLargeCompactionQueue();
   bool IsEmptyCompactionQueue();
   void AddToFlushQueue(ColumnFamilyData* cfd);
   ColumnFamilyData* PopFirstFromFlushQueue();
+
+  // Compaction is marked as large based on options, so cannot be static or free function.
+  bool IsLargeCompaction(const Compaction& compaction);
 
   // helper function to call after some of the logs_ were synced
   void MarkLogsSynced(uint64_t up_to, bool synced_dir, const Status& status);
 
   const Snapshot* GetSnapshotImpl(bool is_write_conflict_boundary);
 
-  CHECKED_STATUS ApplyVersionEdit(VersionEdit* edit);
+  Status ApplyVersionEdit(VersionEdit* edit);
+
+  void SubmitCompactionOrFlushTask(std::unique_ptr<ThreadPoolTask> task);
+
+  // Returns true if we have some background work.
+  // I.e. scheduled but not complete compaction or flush.
+  // prefix is used for logging.
+  bool CheckBackgroundWorkAndLog(const char* prefix) const;
+
+  void ListenFilesChanged(std::function<void()> listener) override;
+
+  std::function<void()> GetFilesChangedListener() const;
+
+  bool HasFilesChangedListener() const;
+
+  void FilesChanged();
+
+  bool IsShuttingDown() { return shutting_down_.load(std::memory_order_acquire); }
+
+  struct TaskPriorityChange {
+    size_t task_serial_no;
+    int new_priority;
+  };
+
+  const std::string& LogPrefix() const;
 
   // table_cache_ provides its own synchronization
   std::shared_ptr<Cache> table_cache_;
@@ -659,15 +723,10 @@ class DBImpl : public DB {
   InstrumentedMutex mutex_;
 
   std::atomic<bool> shutting_down_;
-  // This condition variable is signaled on these conditions:
-  // * whenever bg_compaction_scheduled_ goes down to 0
-  // * if AnyManualCompaction, whenever a compaction finishes, even if it hasn't
-  // made any progress
-  // * whenever a compaction made any progress
-  // * whenever bg_flush_scheduled_ value decreases (i.e. whenever a flush is
-  // done, even if it didn't make any progress)
-  // * whenever there is an error in background flush or compaction
+
+  // This condition variable is signaled when state of having background work is changed.
   InstrumentedCondVar bg_cv_;
+
   uint64_t logfile_number_;
   std::deque<uint64_t>
       log_recycle_files;  // a list of log files that we can recycle
@@ -675,7 +734,7 @@ class DBImpl : public DB {
   bool log_empty_;
   ColumnFamilyHandleImpl* default_cf_handle_;
   InternalStats* default_cf_internal_stats_;
-  unique_ptr<ColumnFamilyMemTablesImpl> column_family_memtables_;
+  std::unique_ptr<ColumnFamilyMemTablesImpl> column_family_memtables_;
   struct LogFileNumberSize {
     explicit LogFileNumberSize(uint64_t _number)
         : number(_number) {}
@@ -774,6 +833,10 @@ class DBImpl : public DB {
 
   WriteThread write_thread_;
 
+#ifndef NDEBUG
+  std::atomic<int> write_waiters_{0};
+#endif
+
   WriteBatch tmp_batch_;
 
   WriteController write_controller_;
@@ -828,13 +891,18 @@ class DBImpl : public DB {
   std::deque<ColumnFamilyData*> flush_queue_;
   // invariant(column family present in compaction_queue_ <==>
   // ColumnFamilyData::pending_compaction_ == true)
-  std::deque<Compaction*> small_compaction_queue_;
-  std::deque<Compaction*> large_compaction_queue_;
+  std::deque<std::unique_ptr<Compaction>> small_compaction_queue_;
+  std::deque<std::unique_ptr<Compaction>> large_compaction_queue_;
   int unscheduled_flushes_;
   int unscheduled_compactions_;
 
   // count how many background compactions are running or have been scheduled
+  // This variable is left untouched when priority thread pool is used.
   int bg_compaction_scheduled_;
+
+  // Those tasks are managed by thread pool.
+  // And we remove them from this set, when they are processed/aborted by thread pool.
+  std::unordered_set<CompactionTask*> compaction_tasks_;
 
   // stores the total number of compactions that are currently running
   int num_total_running_compactions_;
@@ -848,6 +916,10 @@ class DBImpl : public DB {
   // stores the number of flushes are currently running
   int num_running_flushes_;
 
+  // Tracks state changes for priority thread pool tasks.
+  // Metrics are updated within the PriorityThreadPoolTask.
+  std::shared_ptr<RocksDBPriorityThreadPoolMetrics> priority_thread_pool_metrics_;
+
   // Information for a manual compaction
   struct ManualCompaction {
     ColumnFamilyData* cfd;
@@ -860,12 +932,13 @@ class DBImpl : public DB {
     bool incomplete;              // only part of requested range compacted
     bool exclusive;               // current behavior of only one manual
     bool disallow_trivial_move;   // Force actual compaction to run
+    bool has_input_size_limit;    // if true, consider the mark incompete after it's actually done
     const InternalKey* begin;     // nullptr means beginning of key range
     const InternalKey* end;       // nullptr means end of key range
     InternalKey* manual_end;      // how far we are compacting
     InternalKey tmp_storage;      // Used to keep track of compaction progress
     InternalKey tmp_storage1;     // Used to keep track of compaction progress
-    Compaction* compaction;
+    std::unique_ptr<Compaction> compaction;
   };
   std::deque<ManualCompaction*> manual_compaction_dequeue_;
 
@@ -909,9 +982,7 @@ class DBImpl : public DB {
   // The options to access storage files
   const EnvOptions env_options_;
 
-#ifndef ROCKSDB_LITE
   WalManager wal_manager_;
-#endif  // ROCKSDB_LITE
 
   // Unified interface for logging events
   EventLogger event_logger_;
@@ -928,9 +999,19 @@ class DBImpl : public DB {
   // Indicate DB was opened successfully
   bool opened_successfully_;
 
+  // Returns flush tick of the last flush of this DB.
+  int64_t last_flush_at_tick_ = 0;
+
+  // Whether DB should be flushed on shutdown.
+  std::atomic<bool> disable_flush_on_shutdown_{false};
+
+  mutable std::mutex files_changed_listener_mutex_;
+
+  std::function<void()> files_changed_listener_ GUARDED_BY(files_changed_listener_mutex_);
+
   // No copying allowed
-  DBImpl(const DBImpl&);
-  void operator=(const DBImpl&);
+  DBImpl(const DBImpl&) = delete;
+  void operator=(const DBImpl&) = delete;
 
   // Background threads call this function, which is just a wrapper around
   // the InstallSuperVersion() function. Background threads carry
@@ -947,7 +1028,6 @@ class DBImpl : public DB {
       ColumnFamilyData* cfd, SuperVersion* new_sv,
       const MutableCFOptions& mutable_cf_options);
 
-#ifndef ROCKSDB_LITE
   using DB::GetPropertiesOfAllTables;
   virtual Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                           TablePropertiesCollection* props)
@@ -956,7 +1036,12 @@ class DBImpl : public DB {
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) override;
 
-#endif  // ROCKSDB_LITE
+  // Obtains all column family options and corresponding names,
+  // dropped columns are not included into the resulting collections.
+  // REQUIREMENT: mutex_ must be held when calling this function.
+  void GetColumnFamiliesOptionsUnlocked(
+      std::vector<std::string>* column_family_names,
+      std::vector<ColumnFamilyOptions>* column_family_options);
 
   // Function that Get and KeyMayExist call with no_io true or false
   // Note: 'value_found' from KeyMayExist propagates here
@@ -992,5 +1077,3 @@ static void ClipToRange(T* ptr, V minvalue, V maxvalue) {
 }
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_DB_IMPL_H

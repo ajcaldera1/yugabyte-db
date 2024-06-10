@@ -32,24 +32,26 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include <wchar.h>
-#include <iostream>
 #include <cstddef>
 
 #include "yb/client/client.h"
+#include "yb/client/meta_data_cache.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 
 #include "yb/yql/cql/ql/test/ql-test-base.h"
+#include "yb/util/flags.h"
 
 using std::cout;
 using std::cin;
 using std::endl;
-using std::make_shared;
 using std::string;
 using yb::client::YBClientBuilder;
 
-DEFINE_bool(ybcmd_run, false, "Not to run this test unless instructed");
+DEFINE_NON_RUNTIME_bool(ybcmd_run, false, "Not to run this test unless instructed");
 
-DEFINE_string(ybcmd_master_addresses, "",
+DEFINE_NON_RUNTIME_string(ybcmd_master_addresses, "",
               "Comma-separated addresses of the existing masters ybcmd to connect to. If unset, "
               "ybcmd will start a simulated cluster instead.");
 
@@ -65,8 +67,8 @@ class TestQLCmd : public QLTestBase {
     YBClientBuilder builder;
     builder.add_master_server_addr(master_addresses);
     builder.default_rpc_timeout(MonoDelta::FromSeconds(30));
-    CHECK_OK(builder.Build(&client_));
-    metadata_cache_ = std::make_shared<client::YBMetaDataCache>(client_, false);
+    client_ = CHECK_RESULT(builder.Build());
+    metadata_cache_ = std::make_shared<client::YBMetaDataCache>(client_.get(), false);
   }
 };
 
@@ -133,12 +135,12 @@ TEST_F(TestQLCmd, TestQLCmd) {
               break;
             case ExecutedResult::Type::ROWS: {
               RowsResult* rows_result = static_cast<RowsResult*>(result.get());
-              std::unique_ptr<QLRowBlock> row_block(rows_result->GetRowBlock());
+              auto row_block = rows_result->GetRowBlock();
               cout << row_block->ToString();
               // Extract the paging state from the result (if present) and populate it in the
               // statement parameters to retrieve the next set of rows until the end is reached
               // when there is no more table id in the paging state (below).
-              CHECK_OK(params.set_paging_state(rows_result->paging_state()));
+              CHECK_OK(params.SetPagingState(rows_result->paging_state()));
               break;
             }
             case ExecutedResult::Type::SCHEMA_CHANGE:

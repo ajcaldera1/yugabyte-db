@@ -36,7 +36,9 @@
 #include "commands/cluster.h"
 #include "commands/tablecmds.h"
 #include "commands/vacuum.h"
+#include "commands/ybccmds.h"
 #include "miscadmin.h"
+#include "nodes/makefuncs.h"
 #include "optimizer/planner.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -54,6 +56,7 @@
 #include "utils/tqual.h"
 #include "utils/tuplesort.h"
 
+#include "catalog/pg_constraint.h"
 
 /*
  * This struct is used to pass around the information on tables to be
@@ -268,6 +271,9 @@ void
 cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 {
 	Relation	OldHeap;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 
 	/* Check for user-requested abort. */
 	CHECK_FOR_INTERRUPTS();
@@ -285,6 +291,16 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		return;
 
 	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(OldHeap->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
+	/*
 	 * Since we may open a new transaction for each relation, we have to check
 	 * that the relation still is what we think it is.
 	 *
@@ -298,10 +314,10 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		Form_pg_index indexForm;
 
 		/* Check that the user still owns the relation */
-		if (!pg_class_ownercheck(tableOid, GetUserId()))
+		if (!pg_class_ownercheck(tableOid, save_userid))
 		{
 			relation_close(OldHeap, AccessExclusiveLock);
-			return;
+			goto out;
 		}
 
 		/*
@@ -315,7 +331,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		if (RELATION_IS_OTHER_TEMP(OldHeap))
 		{
 			relation_close(OldHeap, AccessExclusiveLock);
-			return;
+			goto out;
 		}
 
 		if (OidIsValid(indexOid))
@@ -326,7 +342,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 			if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(indexOid)))
 			{
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				goto out;
 			}
 
 			/*
@@ -336,14 +352,14 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 			if (!HeapTupleIsValid(tuple))	/* probably can't happen */
 			{
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				goto out;
 			}
 			indexForm = (Form_pg_index) GETSTRUCT(tuple);
 			if (!indexForm->indisclustered)
 			{
 				ReleaseSysCache(tuple);
 				relation_close(OldHeap, AccessExclusiveLock);
-				return;
+				goto out;
 			}
 			ReleaseSysCache(tuple);
 		}
@@ -397,7 +413,7 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 		!RelationIsPopulated(OldHeap))
 	{
 		relation_close(OldHeap, AccessExclusiveLock);
-		return;
+		goto out;
 	}
 
 	/*
@@ -412,6 +428,13 @@ cluster_rel(Oid tableOid, Oid indexOid, bool recheck, bool verbose)
 	rebuild_relation(OldHeap, indexOid, verbose);
 
 	/* NB: rebuild_relation does heap_close() on OldHeap */
+
+out:
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 }
 
 /*
@@ -591,7 +614,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	/* Create the transient table that will receive the re-ordered data */
 	OIDNewHeap = make_new_heap(tableOid, tableSpace,
 							   relpersistence,
-							   AccessExclusiveLock);
+							   AccessExclusiveLock,
+							   true /* yb_copy_split_options */);
 
 	/* Copy the heap data into the new table in the desired order */
 	copy_heap_data(OIDNewHeap, tableOid, indexOid, verbose,
@@ -604,7 +628,8 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
 	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
 					 swap_toast_by_content, false, true,
 					 frozenXid, cutoffMulti,
-					 relpersistence);
+					 relpersistence,
+					 true /* yb_copy_split_options */);
 }
 
 
@@ -617,10 +642,11 @@ rebuild_relation(Relation OldHeap, Oid indexOid, bool verbose)
  *
  * After this, the caller should load the new heap with transferred/modified
  * data, then call finish_heap_swap to complete the operation.
+ * YB Note: In YB, this function is used during table rewrite operations.
  */
 Oid
 make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, char relpersistence,
-			  LOCKMODE lockmode)
+			  LOCKMODE lockmode, bool yb_copy_split_options)
 {
 	TupleDesc	OldHeapDesc;
 	char		NewHeapName[NAMEDATALEN];
@@ -675,6 +701,7 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, char relpersistence,
 	OIDNewHeap = heap_create_with_catalog(NewHeapName,
 										  namespaceid,
 										  NewTableSpace,
+										  InvalidOid, /* reltablegroup */
 										  InvalidOid,
 										  InvalidOid,
 										  InvalidOid,
@@ -693,8 +720,14 @@ make_new_heap(Oid OIDOldHeap, Oid NewTableSpace, char relpersistence,
 										  true,
 										  true,
 										  OIDOldHeap,
-										  NULL);
+										  NULL,
+										  false);
 	Assert(OIDNewHeap != InvalidOid);
+
+	if (IsYugaByteEnabled() && relpersistence != RELPERSISTENCE_TEMP)
+		YbRelationSetNewRelfileNode(OldHeap, OIDNewHeap,
+									yb_copy_split_options,
+									false /* is_truncate */);
 
 	ReleaseSysCache(tuple);
 
@@ -995,7 +1028,7 @@ copy_heap_data(Oid OIDNewHeap, Oid OIDOldHeap, Oid OIDOldIndex, bool verbose,
 				break;
 			case HEAPTUPLE_RECENTLY_DEAD:
 				tups_recently_dead += 1;
-				/* fall through */
+				switch_fallthrough();
 			case HEAPTUPLE_LIVE:
 				/* Live or recently dead, must copy it */
 				isdead = false;
@@ -1225,6 +1258,19 @@ swap_relation_files(Oid r1, Oid r2, bool target_is_pg_class,
 		swptmpchr = relform1->relpersistence;
 		relform1->relpersistence = relform2->relpersistence;
 		relform2->relpersistence = swptmpchr;
+
+		if (IsYugaByteEnabled())
+		{
+			/*
+			 * If this swap is happening during a REFRESH MATVIEW,
+			 * correctly mark the transient relation as a MATVIEW
+			 * so that it is dropped in YB mode.
+			 */
+			if (relform1->relkind == RELKIND_MATVIEW)
+				relform2->relkind = RELKIND_MATVIEW;
+			else if (relform2->relkind == RELKIND_MATVIEW)
+				relform1->relkind = RELKIND_MATVIEW;
+		}
 
 		/* Also swap toast links, if we're swapping by links */
 		if (!swap_toast_by_content)
@@ -1519,7 +1565,8 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 				 bool is_internal,
 				 TransactionId frozenXid,
 				 MultiXactId cutoffMulti,
-				 char newrelpersistence)
+				 char newrelpersistence,
+				 bool yb_copy_split_options)
 {
 	ObjectAddress object;
 	Oid			mapped_tables[4];
@@ -1573,7 +1620,9 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	else if (newrelpersistence == RELPERSISTENCE_PERMANENT)
 		reindex_flags |= REINDEX_REL_FORCE_INDEXES_PERMANENT;
 
-	reindex_relation(OIDOldHeap, reindex_flags, 0);
+	reindex_relation(OIDOldHeap, reindex_flags, 0,
+					 true /* is_yb_table_rewrite */,
+					 yb_copy_split_options);
 
 	/*
 	 * If the relation being rebuild is pg_class, swap_relation_files()
@@ -1617,7 +1666,8 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 * The new relation is local to our transaction and we know nothing
 	 * depends on it, so DROP_RESTRICT should be OK.
 	 */
-	performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
+	if (!(IsYugaByteEnabled() && yb_test_table_rewrite_keep_old_table))
+		performDeletion(&object, DROP_RESTRICT, PERFORM_DELETION_INTERNAL);
 
 	/* performDeletion does CommandCounterIncrement at end */
 

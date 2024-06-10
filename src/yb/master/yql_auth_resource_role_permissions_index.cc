@@ -11,37 +11,40 @@
 // under the License.
 //
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_auth_resource_role_permissions_index.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/permissions_manager.h"
+
+#include "yb/util/status_log.h"
 
 namespace yb {
 namespace master {
 
 YQLAuthResourceRolePermissionsIndexVTable::YQLAuthResourceRolePermissionsIndexVTable(
-    const Master* const master)
-    : YQLVirtualTable(master::kSystemAuthResourceRolePermissionsIndexTableName,
-                      master, CreateSchema()) {
+        const TableName& table_name, const NamespaceName& namespace_name, Master * const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLAuthResourceRolePermissionsIndexVTable::RetrieveData(
-    const QLReadRequestPB& request, std::unique_ptr<QLRowBlock>* vtable) const {
-
-  vtable->reset(new QLRowBlock(schema_));
+Result<VTableDataPtr> YQLAuthResourceRolePermissionsIndexVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<RoleInfo>> roles;
-  master_->catalog_manager()->GetAllRoles(&roles);
+  catalog_manager().permissions_manager()->GetAllRoles(&roles);
   for (const auto& rp : roles) {
     auto l = rp->LockForRead();
-    const auto& pb = l->data().pb;
+    const auto& pb = l->pb;
     for (int i = 0; i <  pb.resources_size(); i++) {
       const auto& rp = pb.resources(i);
-      QLRow& row = (*vtable)->Extend();
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(SetColumnValue(kResource, rp.canonical_resource(), &row));
       RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 

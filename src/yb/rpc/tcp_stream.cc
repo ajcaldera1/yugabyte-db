@@ -11,19 +11,34 @@
 // under the License.
 //
 
+#include <deque>
+
 #include "yb/rpc/tcp_stream.h"
 
 #include "yb/rpc/outbound_data.h"
+#include "yb/rpc/rpc_introspection.pb.h"
+#include "yb/rpc/rpc_util.h"
 
-#include "yb/util/flag_tags.h"
+#include "yb/util/errno.h"
+#include "yb/util/flags.h"
 #include "yb/util/logging.h"
+#include "yb/util/memory/memory_usage.h"
+#include "yb/util/metrics.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
 
 using namespace std::literals;
 
 DECLARE_uint64(rpc_connection_timeout_ms);
-DEFINE_test_flag(int32, TEST_delay_connect_ms, 0,
+DEFINE_test_flag(int32, delay_connect_ms, 0,
                  "Delay connect in tests for specified amount of milliseconds.");
+
+METRIC_DEFINE_simple_counter(
+  server, tcp_bytes_sent, "Bytes sent over TCP connections", yb::MetricUnit::kBytes);
+
+METRIC_DEFINE_simple_counter(
+  server, tcp_bytes_received, "Bytes received via TCP connections", yb::MetricUnit::kBytes);
 
 namespace yb {
 namespace rpc {
@@ -39,6 +54,10 @@ TcpStream::TcpStream(const StreamCreateData& data)
       remote_(data.remote) {
   if (data.mem_tracker) {
     mem_tracker_ = MemTracker::FindOrCreateTracker("Sending", data.mem_tracker);
+  }
+  if (data.metric_entity) {
+    bytes_received_counter_ = METRIC_tcp_bytes_received.Instantiate(data.metric_entity);
+    bytes_sent_counter_ = METRIC_tcp_bytes_sent.Instantiate(data.metric_entity);
   }
 }
 
@@ -58,6 +77,7 @@ Status TcpStream::Start(bool connect, ev::loop_ref* loop, StreamContext* context
   connected_ = !connect;
 
   RETURN_NOT_OK(socket_.SetNoDelay(true));
+  // These timeouts don't affect non-blocking sockets:
   RETURN_NOT_OK(socket_.SetSendTimeout(FLAGS_rpc_connection_timeout_ms * 1ms));
   RETURN_NOT_OK(socket_.SetRecvTimeout(FLAGS_rpc_connection_timeout_ms * 1ms));
 
@@ -75,7 +95,7 @@ Status TcpStream::Start(bool connect, ev::loop_ref* loop, StreamContext* context
 Status TcpStream::DoStart(ev::loop_ref* loop, bool connect) {
   if (connect) {
     auto status = socket_.Connect(remote_);
-    if (!status.ok() && !Socket::IsTemporarySocketError(status)) {
+    if (!status.ok() && !status.IsTryAgain()) {
       LOG_WITH_PREFIX(WARNING) << "Connect failed: " << status;
       return status;
     }
@@ -89,12 +109,12 @@ Status TcpStream::DoStart(ev::loop_ref* loop, bool connect) {
   int events = ev::READ | (!connected_ ? ev::WRITE : 0);
   io_.start(socket_.GetFd(), events);
 
-  DVLOG_WITH_PREFIX(4) << "Starting, listen events: " << events << ", fd: " << socket_.GetFd();
+  DVLOG_WITH_PREFIX(3) << "Starting, listen events: " << events << ", fd: " << socket_.GetFd();
 
   is_epoll_registered_ = true;
 
   if (connected_) {
-    context_->Connected();
+    RETURN_NOT_OK(context_->Connected());
   }
 
   return Status::OK();
@@ -143,11 +163,16 @@ Status TcpStream::TryWrite() {
   return result;
 }
 
-int TcpStream::FillIov(iovec* out) {
+TcpStream::FillIovResult TcpStream::FillIov(iovec* out) {
   int index = 0;
   size_t offset = send_position_;
+  bool only_heartbeats = true;
   for (auto& data : sending_) {
-    if (data.skipped || (offset == 0 && data.data && data.data->IsFinished())) {
+    const auto wrapped_data = data.data;
+    if (wrapped_data && !wrapped_data->IsHeartbeat()) {
+      only_heartbeats = false;
+    }
+    if (data.skipped || (offset == 0 && wrapped_data && wrapped_data->IsFinished())) {
       queued_bytes_to_send_ -= data.bytes_size();
       data.ClearBytes();
       data.skipped = true;
@@ -159,46 +184,58 @@ int TcpStream::FillIov(iovec* out) {
         continue;
       }
 
-      out[index].iov_base = bytes.data() + offset;
+      out[index].iov_base = const_cast<char*>(bytes.data()) + offset;
       out[index].iov_len = bytes.size() - offset;
       offset = 0;
       if (++index == kMaxIov) {
-        return index;
+        return FillIovResult{index, only_heartbeats};
       }
     }
   }
 
-  return index;
+  return FillIovResult{index, only_heartbeats};
 }
 
 Status TcpStream::DoWrite() {
+  DVLOG_WITH_PREFIX(5) << "sending_.size(): " << sending_.size();
   if (!connected_ || waiting_write_ready_ || !is_epoll_registered_) {
+    DVLOG_WITH_PREFIX(5)
+        << "connected_: " << connected_
+        << " waiting_write_ready_: " << waiting_write_ready_
+        << " is_epoll_registered_: " << is_epoll_registered_;
     return Status::OK();
   }
 
   // If we weren't waiting write to be ready, we could try to write data to socket.
   while (!sending_.empty()) {
     iovec iov[kMaxIov];
-    int iov_len = FillIov(iov);
+    auto fill_result = FillIov(iov);
 
-    context_->UpdateLastActivity();
+    if (!fill_result.only_heartbeats) {
+      context_->UpdateLastActivity();
+    }
 
-    int32_t written = 0;
-    auto status = iov_len != 0 ? socket_.Writev(iov, iov_len, &written) : Status::OK();
-    DVLOG_WITH_PREFIX(4) << "Queued writes " << queued_bytes_to_send_ << " bytes. written "
-                         << written << " . Status " << status << " sending_ .size() "
-                         << sending_.size();
+    auto result = fill_result.len != 0
+        ? socket_.Writev(iov, fill_result.len)
+        : 0;
+    DVLOG_WITH_PREFIX(4) << "Queued writes " << queued_bytes_to_send_ << " bytes. Result "
+                         << result << ", sending_.size(): " << sending_.size();
 
-    if (PREDICT_FALSE(!status.ok())) {
-      if (!Socket::IsTemporarySocketError(status)) {
-        YB_LOG_WITH_PREFIX_EVERY_N(WARNING, 50) << "Send failed: " << status;
-        return status;
+    if (PREDICT_FALSE(!result.ok())) {
+      if (!result.status().IsTryAgain()) {
+        YB_LOG_WITH_PREFIX_EVERY_N(WARNING, 50) << "Send failed: " << result.status();
+        return result.status();
       } else {
+        VLOG_WITH_PREFIX(3) << "Send temporary failed: " << result.status();
         return Status::OK();
       }
     }
 
-    send_position_ += written;
+    context_->UpdateLastWrite();
+
+    IncrementCounterBy(bytes_sent_counter_, *result);
+
+    send_position_ += *result;
     while (!sending_.empty()) {
       auto& front = sending_.front();
       size_t full_size = front.bytes_size();
@@ -228,23 +265,35 @@ void TcpStream::PopSending() {
 }
 
 void TcpStream::Handler(ev::io& watcher, int revents) {  // NOLINT
-  DVLOG_WITH_PREFIX(3) << "Handler(revents=" << revents << ")";
-  auto status = Status::OK();
+  DVLOG_WITH_PREFIX(4) << "Handler(revents=" << revents << ")";
+  Status status = Status::OK();
   if (revents & ev::ERROR) {
     status = STATUS(NetworkError, ToString() + ": Handler encountered an error");
+    VLOG_WITH_PREFIX(3) << status;
   }
 
   if (status.ok() && (revents & ev::READ)) {
     status = ReadHandler();
+    if (!status.ok()) {
+      VLOG_WITH_PREFIX(3) << "ReadHandler() returned error: " << status;
+    }
   }
 
   if (status.ok() && (revents & ev::WRITE)) {
     bool just_connected = !connected_;
     if (just_connected) {
       connected_ = true;
-      context_->Connected();
+      status = context_->Connected();
+      if (!status.ok()) {
+        VLOG_WITH_PREFIX(3) << "Connected() returned error: " << status;
+      }
     }
-    status = WriteHandler(just_connected);
+    if (status.ok()) {
+      status = WriteHandler(just_connected);
+      if (!status.ok()) {
+        VLOG_WITH_PREFIX(3) << "WriteHandler() returned error: " << status;
+      }
+    }
   }
 
   if (status.ok()) {
@@ -269,12 +318,12 @@ void TcpStream::UpdateEvents() {
 }
 
 Status TcpStream::ReadHandler() {
-  context_->UpdateLastActivity();
+  context_->UpdateLastRead();
 
   for (;;) {
     auto received = Receive();
     if (PREDICT_FALSE(!received.ok())) {
-      if (received.status().error_code() == ESHUTDOWN) {
+      if (Errno(received.status()) == ESHUTDOWN) {
         VLOG_WITH_PREFIX(1) << "Shut down by remote end.";
       } else {
         YB_LOG_WITH_PREFIX_EVERY_N(INFO, 50) << " Recv failed: " << received;
@@ -300,6 +349,7 @@ Status TcpStream::ReadHandler() {
 Result<bool> TcpStream::Receive() {
   auto iov = ReadBuffer().PrepareAppend();
   if (!iov.ok()) {
+    VLOG_WITH_PREFIX(3) << "ReadBuffer().PrepareAppend() error: " << iov.status();
     if (iov.status().IsBusy()) {
       read_buffer_full_ = true;
       return false;
@@ -308,14 +358,36 @@ Result<bool> TcpStream::Receive() {
   }
   read_buffer_full_ = false;
 
+  if (inbound_bytes_to_skip_ > 0) {
+    auto global_skip_buffer = GetGlobalSkipBuffer();
+    do {
+      VLOG_WITH_PREFIX(3) << "inbound_bytes_to_skip_: " << inbound_bytes_to_skip_;
+      auto nread = socket_.Recv(
+          global_skip_buffer.mutable_data(),
+          std::min(global_skip_buffer.size(), inbound_bytes_to_skip_));
+      if (!nread.ok()) {
+        VLOG_WITH_PREFIX(3) << "socket_.Recv() error: " << nread.status();
+        if (nread.status().IsTryAgain()) {
+          return false;
+        }
+        return nread.status();
+      }
+      IncrementCounterBy(bytes_received_counter_, *nread);
+      inbound_bytes_to_skip_ -= *nread;
+    } while (inbound_bytes_to_skip_ > 0);
+  }
+
   auto nread = socket_.Recvv(iov.get_ptr());
   if (!nread.ok()) {
-    if (Socket::IsTemporarySocketError(nread.status())) {
+    DVLOG_WITH_PREFIX(3) << "socket_.Recvv() error: " << nread.status();
+    if (nread.status().IsTryAgain()) {
       return false;
     }
     return nread.status();
   }
+  DVLOG_WITH_PREFIX(4) << "socket_.Recvv() bytes: " << *nread;
 
+  IncrementCounterBy(bytes_received_counter_, *nread);
   ReadBuffer().DataAppended(*nread);
   return *nread != 0;
 }
@@ -338,10 +410,12 @@ Result<bool> TcpStream::TryProcessReceived() {
     return false;
   }
 
-  auto result = VERIFY_RESULT(context_->ProcessReceived(
-      read_buffer.AppendedVecs(), ReadBufferFull(read_buffer.Full())));
+  auto result = VERIFY_RESULT(context_->ProcessReceived(ReadBufferFull(read_buffer.Full())));
+  DVLOG_WITH_PREFIX(5) << "context_->ProcessReceived result: " << AsString(result);
 
-  read_buffer.Consume(result.consumed, result.buffer);
+  LOG_IF(DFATAL, inbound_bytes_to_skip_ != 0)
+      << "Expected inbound_bytes_to_skip_ to be 0 instead of " << inbound_bytes_to_skip_;
+  inbound_bytes_to_skip_ = result;
   return true;
 }
 
@@ -388,23 +462,25 @@ void TcpStream::ClearSending(const Status& status) {
   queued_bytes_to_send_ = 0;
 }
 
-size_t TcpStream::Send(OutboundDataPtr data) {
+Result<size_t> TcpStream::Send(OutboundDataPtr data) {
   // In case of TcpStream handle is absolute index of data block, since stream start.
   // So it could be cacluated as index in sending_ plus number of data blocks that were already
   // transferred.
   size_t result = data_blocks_sent_ + sending_.size();
 
+  DVLOG_WITH_PREFIX(6) << "TcpStream::Send queuing: " << AsString(*data);
   // Serialize the actual bytes to be put on the wire.
   sending_.emplace_back(std::move(data), mem_tracker_);
   queued_bytes_to_send_ += sending_.back().bytes_size();
-  DVLOG_WITH_PREFIX(3) << "Added data queued_bytes_to_send_: " << queued_bytes_to_send_;
+  DVLOG_WITH_PREFIX(4) << "Queued data, sending_.size(): " << sending_.size()
+                       << ", queued_bytes_to_send_: " << queued_bytes_to_send_;
 
   return result;
 }
 
-void TcpStream::Cancelled(size_t handle) {
+bool TcpStream::Cancelled(size_t handle) {
   if (handle < data_blocks_sent_) {
-    return;
+    return false;
   }
   handle -= data_blocks_sent_;
   LOG_IF_WITH_PREFIX(DFATAL, !sending_[handle].data->IsFinished())
@@ -412,11 +488,12 @@ void TcpStream::Cancelled(size_t handle) {
   auto& entry = sending_[handle];
   if (handle == 0 && send_position_ > 0) {
     // Transfer already started, cannot drop it.
-    return;
+    return false;
   }
 
   queued_bytes_to_send_ -= entry.bytes_size();
   entry.ClearBytes();
+  return true;
 }
 
 void TcpStream::DumpPB(const DumpRunningRpcsRequestPB& req, RpcConnectionPB* resp) {
@@ -453,14 +530,18 @@ StreamFactoryPtr TcpStream::Factory() {
   return std::make_shared<TcpStreamFactory>();
 }
 
-TcpStream::SendingData::SendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker)
+TcpStreamSendingData::TcpStreamSendingData(OutboundDataPtr data_, const MemTrackerPtr& mem_tracker)
     : data(std::move(data_)) {
   data->Serialize(&bytes);
   if (mem_tracker) {
-    consumption = ScopedTrackedConsumption(mem_tracker, bytes_size());
+    size_t memory_used = sizeof(*this);
+    memory_used += DynamicMemoryUsageOf(data);
+    // We don't need to account `bytes` dynamic memory usage, because it stores RefCntBuffer
+    // instance in internal memory and RefCntBuffer instance is referring to the same dynamic memory
+    // as `data`.
+    consumption = ScopedTrackedConsumption(mem_tracker, memory_used);
   }
 }
-
 
 } // namespace rpc
 } // namespace yb

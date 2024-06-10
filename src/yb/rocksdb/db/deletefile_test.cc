@@ -21,7 +21,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_LITE
 
 #include <stdlib.h>
 
@@ -29,29 +28,40 @@
 #include <map>
 #include <string>
 
+#include <boost/function.hpp>
+
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/db_impl.h"
+#include "yb/rocksdb/db/db_test_util.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/db/write_batch_internal.h"
-#include "yb/util/string_util.h"
+#include "yb/rocksdb/util/file_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/transaction_log.h"
 
+#include "yb/util/status_log.h"
+#include "yb/util/string_util.h"
+#include "yb/util/test_macros.h"
+
+using namespace std::chrono_literals;
+
 namespace rocksdb {
 
-class DeleteFileTest : public testing::Test {
+YB_STRONGLY_TYPED_BOOL(StopOnMaxFilesDeleted);
+
+class DeleteFileTest : public RocksDBTest {
  public:
   std::string dbname_;
   Options options_;
-  DB* db_;
+  std::unique_ptr<DB> db_;
   Env* env_;
   int numlevels_;
 
   DeleteFileTest() {
-    db_ = nullptr;
+    db_.reset();
     env_ = Env::Default();
     options_.delete_obsolete_files_period_micros = 0;  // always do full purge
     options_.enable_thread_tracking = true;
@@ -64,34 +74,26 @@ class DeleteFileTest : public testing::Test {
     options_.wal_dir = dbname_ + "/wal_files";
 
     // clean up all the files that might have been there before
-    std::vector<std::string> old_files;
-    env_->GetChildren(dbname_, &old_files);
-    for (auto file : old_files) {
-      env_->DeleteFile(dbname_ + "/" + file);
-    }
-    env_->GetChildren(options_.wal_dir, &old_files);
-    for (auto file : old_files) {
-      env_->DeleteFile(options_.wal_dir + "/" + file);
-    }
-
-    DestroyDB(dbname_, options_);
+    CHECK_OK(DeleteRecursively(env_, dbname_));
+    CHECK_OK(DestroyDB(dbname_, options_));
     numlevels_ = 7;
     EXPECT_OK(ReopenDB(true));
   }
 
   Status ReopenDB(bool create) {
-    delete db_;
+    db_.reset();
     if (create) {
-      DestroyDB(dbname_, options_);
+      RETURN_NOT_OK(DestroyDB(dbname_, options_));
     }
-    db_ = nullptr;
     options_.create_if_missing = create;
-    return DB::Open(options_, dbname_, &db_);
+    DB* db;
+    auto status = DB::Open(options_, dbname_, &db);
+    db_.reset(db);
+    return status;
   }
 
   void CloseDB() {
-    delete db_;
-    db_ = nullptr;
+    db_.reset();
   }
 
   void AddKeys(int numkeys, int startkey = 0) {
@@ -124,7 +126,7 @@ class DeleteFileTest : public testing::Test {
         (*keysperlevel)[static_cast<int>(metadata[i].level)] += numkeysinfile;
       }
       fprintf(stderr, "level %d name %s smallest %s largest %s\n",
-              metadata[i].level, metadata[i].name.c_str(),
+              metadata[i].level, metadata[i].Name().c_str(),
               metadata[i].smallest.key.c_str(),
               metadata[i].largest.key.c_str());
     }
@@ -133,7 +135,7 @@ class DeleteFileTest : public testing::Test {
 
   void CreateTwoLevels() {
     AddKeys(50000, 10000);
-    DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
+    DBImpl* dbi = dbfull();
     ASSERT_OK(dbi->TEST_FlushMemTable());
     ASSERT_OK(dbi->TEST_WaitForFlushMemTable());
     for (int i = 0; i < 2; ++i) {
@@ -151,7 +153,7 @@ class DeleteFileTest : public testing::Test {
                            int required_sst,
                            int required_manifest) {
     std::vector<std::string> filenames;
-    env_->GetChildren(dir, &filenames);
+    ASSERT_OK(env_->GetChildren(dir, &filenames));
 
     int log_cnt = 0, sst_cnt = 0, manifest_cnt = 0;
     for (auto file : filenames) {
@@ -168,6 +170,18 @@ class DeleteFileTest : public testing::Test {
     ASSERT_EQ(required_manifest, manifest_cnt);
   }
 
+  DBImpl* dbfull() { return reinterpret_cast<DBImpl*>(db_.get()); }
+
+  Status FlushSync() {
+    return dbfull()->TEST_FlushMemTable(/* wait = */ true);
+  }
+
+  Result<std::vector<LiveFileMetaData>> AddFiles(int num_sst_files, int num_key_per_sst);
+
+  size_t TryDeleteFiles(
+      const std::vector<LiveFileMetaData>& files, size_t max_files_to_delete,
+      StopOnMaxFilesDeleted stop_on_max_files_deleted,
+      boost::function<bool()> stop_condition);
 };
 
 TEST_F(DeleteFileTest, AddKeysAndQueryLevels) {
@@ -188,11 +202,11 @@ TEST_F(DeleteFileTest, AddKeysAndQueryLevels) {
     level2index = 0;
   }
 
-  level1file = metadata[level1index].name;
+  level1file = metadata[level1index].Name();
   int startkey = atoi(metadata[level1index].smallest.key.c_str());
   int endkey = atoi(metadata[level1index].largest.key.c_str());
   level1keycount = (endkey - startkey + 1);
-  level2file = metadata[level2index].name;
+  level2file = metadata[level2index].Name();
   startkey = atoi(metadata[level2index].smallest.key.c_str());
   endkey = atoi(metadata[level2index].largest.key.c_str());
   level2keycount = (endkey - startkey + 1);
@@ -228,16 +242,16 @@ TEST_F(DeleteFileTest, PurgeObsoleteFilesTest) {
   compact_options.change_level = true;
   compact_options.target_level = 2;
   Slice first_slice(first), last_slice(last);
-  db_->CompactRange(compact_options, &first_slice, &last_slice);
+  ASSERT_OK(db_->CompactRange(compact_options, &first_slice, &last_slice));
   // 1 sst after compaction
   CheckFileTypeCounts(dbname_, 0, 1, 1);
 
   // this time, we keep an iterator alive
-  ReopenDB(true);
+  ASSERT_OK(ReopenDB(true));
   Iterator *itr = 0;
   CreateTwoLevels();
   itr = db_->NewIterator(ReadOptions());
-  db_->CompactRange(compact_options, &first_slice, &last_slice);
+  ASSERT_OK(db_->CompactRange(compact_options, &first_slice, &last_slice));
   // 3 sst after compaction with live iterator
   CheckFileTypeCounts(dbname_, 0, 3, 1);
   delete itr;
@@ -258,9 +272,9 @@ TEST_F(DeleteFileTest, DeleteFileWithIterator) {
 
   ASSERT_EQ((int)metadata.size(), 2);
   if (metadata[0].level == 1) {
-    level2file = metadata[1].name;
+    level2file = metadata[1].Name();
   } else {
-    level2file = metadata[0].name;
+    level2file = metadata[0].Name();
   }
 
   Status status = db_->DeleteFile(level2file);
@@ -269,7 +283,7 @@ TEST_F(DeleteFileTest, DeleteFileWithIterator) {
   ASSERT_TRUE(status.ok());
   it->SeekToFirst();
   int numKeysIterated = 0;
-  while(it->Valid()) {
+  while(ASSERT_RESULT(it->CheckedValid())) {
     numKeysIterated++;
     it->Next();
   }
@@ -281,7 +295,7 @@ TEST_F(DeleteFileTest, DeleteFileWithIterator) {
 TEST_F(DeleteFileTest, DeleteLogFiles) {
   AddKeys(10, 0);
   VectorLogPtr logfiles;
-  db_->GetSortedWalFiles(&logfiles);
+  ASSERT_OK(db_->GetSortedWalFiles(&logfiles));
   ASSERT_GT(logfiles.size(), 0UL);
   // Take the last log file which is expected to be alive and try to delete it
   // Should not succeed because live logs are not allowed to be deleted
@@ -298,10 +312,10 @@ TEST_F(DeleteFileTest, DeleteLogFiles) {
   // Call Flush again to flush out memtable and move alive log to archived log
   // and try to delete the archived log file
   FlushOptions fopts;
-  db_->Flush(fopts);
+  ASSERT_OK(db_->Flush(fopts));
   AddKeys(10, 0);
-  db_->Flush(fopts);
-  db_->GetSortedWalFiles(&logfiles);
+  ASSERT_OK(db_->Flush(fopts));
+  ASSERT_OK(db_->GetSortedWalFiles(&logfiles));
   ASSERT_GT(logfiles.size(), 0UL);
   std::unique_ptr<LogFile> archived_log = std::move(logfiles.front());
   ASSERT_EQ(archived_log->Type(), kArchivedLogFile);
@@ -345,19 +359,18 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   ASSERT_EQ("new_cf", metadata[0].column_family_name);
   ASSERT_EQ("new_cf", metadata[1].column_family_name);
   auto old_file = metadata[0].smallest.seqno < metadata[1].smallest.seqno
-                      ? metadata[0].name
-                      : metadata[1].name;
+                      ? metadata[0].Name()
+                      : metadata[1].Name();
   auto new_file = metadata[0].smallest.seqno > metadata[1].smallest.seqno
-                      ? metadata[0].name
-                      : metadata[1].name;
+                      ? metadata[0].Name()
+                      : metadata[1].Name();
   ASSERT_TRUE(db->DeleteFile(new_file).IsInvalidArgument());
   ASSERT_OK(db->DeleteFile(old_file));
 
   {
     std::unique_ptr<Iterator> itr(db->NewIterator(ReadOptions(), handles[1]));
     int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
+    for (itr->SeekToFirst(); ASSERT_RESULT(itr->CheckedValid()); itr->Next()) {
       ++count;
     }
     ASSERT_EQ(count, 1000);
@@ -371,8 +384,7 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   {
     std::unique_ptr<Iterator> itr(db->NewIterator(ReadOptions(), handles[1]));
     int count = 0;
-    for (itr->SeekToFirst(); itr->Valid(); itr->Next()) {
-      ASSERT_OK(itr->status());
+    for (itr->SeekToFirst(); ASSERT_RESULT(itr->CheckedValid()); itr->Next()) {
       ++count;
     }
     ASSERT_EQ(count, 1000);
@@ -383,20 +395,156 @@ TEST_F(DeleteFileTest, DeleteNonDefaultColumnFamily) {
   delete db;
 }
 
+Result<std::vector<LiveFileMetaData>> DeleteFileTest::AddFiles(
+    const int num_sst_files, const int num_key_per_sst) {
+  LOG(INFO) << "Writing " << num_sst_files << " SSTs";
+  for (auto num = 0; num < num_sst_files; num++) {
+    AddKeys(num_key_per_sst, 0);
+    RETURN_NOT_OK(FlushSync());
+  }
+  std::vector<LiveFileMetaData> metadata;
+  db_->GetLiveFilesMetaData(&metadata);
+  return metadata;
+}
+
+size_t DeleteFileTest::TryDeleteFiles(
+    const std::vector<LiveFileMetaData>& files, const size_t max_files_to_delete,
+    const StopOnMaxFilesDeleted stop_on_max_files_deleted, boost::function<bool()> stop_condition) {
+  size_t files_deleted = 0;
+  LOG(INFO) << "Starting file deletion loop";
+  while (!stop_condition()) {
+    for (auto& file : files) {
+      if (files_deleted >= max_files_to_delete) {
+        if (stop_on_max_files_deleted) {
+          return files_deleted;
+        }
+        // Just wait for stop condition.
+        std::this_thread::sleep_for(10ms);
+        continue;
+      }
+      if (db_->DeleteFile(file.Name()).ok()) {
+        const auto file_path = file.BaseFilePath();
+
+        std::vector<LiveFileMetaData> current_files;
+        dbfull()->GetLiveFilesMetaData(&current_files);
+        auto it = std::find_if(
+            current_files.begin(), current_files.end(),
+            [&](const auto& current_file) { return current_file.name_id == file.name_id; });
+        if (it == current_files.end()) {
+          LOG(INFO) << "Deleted file: " << file_path;
+          ++files_deleted;
+        }
+      }
+    }
+  }
+  return files_deleted;
+}
+
+namespace compaction_race {
+
+constexpr auto kMaxNumSstFiles = 3;
+constexpr auto kNumKeysPerSst = 10000;
+
+} // namespace compaction_race
+
+TEST_F(DeleteFileTest, DeleteWithManualCompaction) {
+  yb::SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::DeleteFile:DecidedToDelete", "DBImpl::RunManualCompaction"}
+  });
+
+  for (int num_sst_files = 1; num_sst_files <= compaction_race::kMaxNumSstFiles; ++num_sst_files) {
+    ASSERT_OK(ReopenDB(/* create = */ true));
+
+    auto metadata = ASSERT_RESULT(AddFiles(num_sst_files, compaction_race::kNumKeysPerSst));
+
+    yb::SyncPoint::GetInstance()->EnableProcessing();
+
+    std::atomic<bool> manual_compaction_done{false};
+    Status manual_compaction_status;
+
+    std::thread manual_compaction([this, &manual_compaction_done, &manual_compaction_status] {
+      manual_compaction_status = db_->CompactRange(
+          rocksdb::CompactRangeOptions(), /* begin = */ nullptr, /* end = */ nullptr);
+      manual_compaction_done = true;
+    });
+
+    auto files_deleted = TryDeleteFiles(
+        metadata, /* max_files_to_delete = */ 1, StopOnMaxFilesDeleted::kFalse,
+        [&manual_compaction_done] {
+          return manual_compaction_done.load(std::memory_order_acquire);
+        });
+
+    manual_compaction.join();
+    ASSERT_OK(manual_compaction_status);
+    ASSERT_EQ(files_deleted, 1);
+
+    CloseDB();
+
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearTrace();
+  }
+}
+
+TEST_F(DeleteFileTest, DeleteWithBackgroundCompaction) {
+  yb::SyncPoint::GetInstance()->LoadDependency({
+      {"DBImpl::DeleteFile:DecidedToDelete", "DBImpl::EnableAutoCompaction"},
+      {"DBImpl::SchedulePendingCompaction:Done", "VersionSet::LogAndApply:WriteManifest"},
+  });
+
+  for (int num_sst_files = 1; num_sst_files <= compaction_race::kMaxNumSstFiles; ++num_sst_files) {
+    auto listener = std::make_shared<CompactionStartedListener>();
+    options_.level0_file_num_compaction_trigger = 2;
+    options_.disable_auto_compactions = true;
+    options_.listeners.push_back(listener);
+    ASSERT_OK(ReopenDB(/* create = */ true));
+
+    auto metadata = ASSERT_RESULT(AddFiles(num_sst_files, compaction_race::kNumKeysPerSst));
+
+    const bool expect_compaction = num_sst_files > 1;
+
+    yb::SyncPoint::GetInstance()->EnableProcessing();
+
+    std::atomic<bool> pending_compaction{false};
+    std::thread enable_compactions([this, &pending_compaction] {
+      ColumnFamilyData* cfd =
+          static_cast<ColumnFamilyHandleImpl*>(db_->DefaultColumnFamily())->cfd();
+      ASSERT_OK(db_->EnableAutoCompaction({db_->DefaultColumnFamily()}));
+      {
+        dbfull()->TEST_LockMutex();
+        pending_compaction = cfd->pending_compaction();
+        dbfull()->TEST_UnlockMutex();
+      }
+      LOG(INFO) << "pending_compaction: " << pending_compaction;
+    });
+
+    auto files_deleted = TryDeleteFiles(
+        metadata, /* max_files_to_delete = */ 1, StopOnMaxFilesDeleted(!expect_compaction),
+        [this, &listener] {
+          // Stop after compaction has been started and finished.
+          return listener->GetNumCompactionsStarted() > 0 &&
+                 dbfull()->TEST_NumTotalRunningCompactions() == 0;
+        });
+
+    yb::SyncPoint::GetInstance()->DisableProcessing();
+    yb::SyncPoint::GetInstance()->ClearTrace();
+
+    enable_compactions.join();
+    EXPECT_EQ(files_deleted, 1);
+    if (!expect_compaction) {
+      EXPECT_FALSE(pending_compaction);
+      EXPECT_EQ(listener->GetNumCompactionsStarted(), 0);
+    }
+
+    ASSERT_NO_FATALS(AddKeys(10, 0));
+    ASSERT_OK(FlushSync());
+
+    CloseDB();
+  }
+}
+
 } // namespace rocksdb
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr,
-          "SKIPPED as DBImpl::DeleteFile is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

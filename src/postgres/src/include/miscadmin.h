@@ -27,6 +27,12 @@
 
 #include "pgtime.h"				/* for pg_time_t */
 
+#include "postgres.h"			/* for HeapTuple */
+#include "access/htup.h"		/* for HeapTuple */
+
+#ifndef FRONTEND
+#include "storage/proc.h"		/* for MyProc */
+#endif
 
 #define InvalidPid				(-1)
 
@@ -77,13 +83,14 @@
 
 /* in globals.c */
 /* these are marked volatile because they are set by signal handlers: */
-extern PGDLLIMPORT volatile bool InterruptPending;
-extern PGDLLIMPORT volatile bool QueryCancelPending;
-extern PGDLLIMPORT volatile bool ProcDiePending;
-extern PGDLLIMPORT volatile bool IdleInTransactionSessionTimeoutPending;
+extern PGDLLIMPORT volatile sig_atomic_t InterruptPending;
+extern PGDLLIMPORT volatile sig_atomic_t QueryCancelPending;
+extern PGDLLIMPORT volatile sig_atomic_t ProcDiePending;
+extern PGDLLIMPORT volatile sig_atomic_t IdleInTransactionSessionTimeoutPending;
 extern PGDLLIMPORT volatile sig_atomic_t ConfigReloadPending;
+extern PGDLLIMPORT volatile sig_atomic_t LogMemoryContextPending;
 
-extern volatile bool ClientConnectionLost;
+extern volatile sig_atomic_t ClientConnectionLost;
 
 /* these are marked volatile because they are examined by signal handlers: */
 extern PGDLLIMPORT volatile uint32 InterruptHoldoffCount;
@@ -128,6 +135,7 @@ do { \
 	QueryCancelHoldoffCount--; \
 } while(0)
 
+#ifdef FRONTEND
 #define START_CRIT_SECTION()  (CritSectionCount++)
 
 #define END_CRIT_SECTION() \
@@ -135,6 +143,24 @@ do { \
 	Assert(CritSectionCount > 0); \
 	CritSectionCount--; \
 } while(0)
+
+#else /* !FRONTEND */
+
+#define START_CRIT_SECTION()  \
+do { \
+	if (MyProc) \
+		MyProc->ybEnteredCriticalSection = true; \
+	CritSectionCount++; \
+} while(0)
+
+#define END_CRIT_SECTION() \
+do { \
+	Assert(CritSectionCount > 0); \
+	CritSectionCount--; \
+	if (MyProc && CritSectionCount == 0) \
+		MyProc->ybEnteredCriticalSection = false; \
+} while(0)
+#endif /* FRONTEND */
 
 
 /*****************************************************************************
@@ -149,6 +175,8 @@ extern PGDLLIMPORT bool IsPostmasterEnvironment;
 extern PGDLLIMPORT bool IsUnderPostmaster;
 extern PGDLLIMPORT bool IsBackgroundWorker;
 extern PGDLLIMPORT bool IsBinaryUpgrade;
+
+extern bool IsYsqlUpgrade;
 
 extern PGDLLIMPORT bool ExitOnAnyError;
 
@@ -184,6 +212,16 @@ extern char postgres_exec_path[];
 extern PGDLLIMPORT Oid MyDatabaseId;
 
 extern PGDLLIMPORT Oid MyDatabaseTableSpace;
+
+extern PGDLLIMPORT bool MyDatabaseColocated;
+
+extern PGDLLIMPORT Oid YbDatabaseIdForNewObjectId;
+
+extern PGDLLIMPORT bool MyColocatedDatabaseLegacy;
+
+extern PGDLLIMPORT bool YbTablegroupCatalogExists;
+
+extern PGDLLIMPORT bool YbLoginProfileCatalogsExist;
 
 /*
  * Date/Time Configuration
@@ -423,7 +461,8 @@ extern AuxProcType MyAuxProcType;
 extern void pg_split_opts(char **argv, int *argcp, const char *optstr);
 extern void InitializeMaxBackends(void);
 extern void InitPostgres(const char *in_dbname, Oid dboid, const char *username,
-			 Oid useroid, char *out_dbname, bool override_allow_connections);
+			 Oid useroid, char *out_dbname, uint64_t *session_id,
+			 bool override_allow_connections);
 extern void BaseInit(void);
 
 /* in utils/init/miscinit.c */

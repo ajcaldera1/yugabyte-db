@@ -32,12 +32,14 @@
 package org.yb.client;
 
 import com.google.protobuf.Message;
+import io.netty.buffer.ByteBuf;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
+import org.yb.master.MasterTypes;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
 
-import static org.yb.master.Master.*;
+import static org.yb.master.MasterDdlOuterClass.AlterTableRequestPB;
+import static org.yb.master.MasterDdlOuterClass.AlterTableResponsePB;
+import static org.yb.master.MasterTypes.TableIdentifierPB;
 
 /**
  * RPC used to alter a table. When it returns it doesn't mean that the table is altered,
@@ -59,11 +61,11 @@ class AlterTableRequest extends YRpc<AlterTableResponse> {
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     TableIdentifierPB tableID = TableIdentifierPB.newBuilder()
                                 .setTableName(name)
-                                .setNamespace(Master.NamespaceIdentifierPB.newBuilder()
+                                .setNamespace(MasterTypes.NamespaceIdentifierPB.newBuilder()
                                               .setName(this.keyspace))
                                 .build();
     this.builder.setTable(tableID);

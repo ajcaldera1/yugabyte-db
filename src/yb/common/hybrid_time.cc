@@ -32,16 +32,17 @@
 
 #include "yb/common/hybrid_time.h"
 
+#include <atomic>
+
+#include <boost/algorithm/string/trim.hpp>
 #include <boost/date_time/c_local_time_adjustor.hpp>
-#include <boost/date_time/posix_time/ptime.hpp>
-#include <boost/date_time/posix_time/posix_time_duration.hpp>
 #include <boost/date_time/posix_time/time_formatters.hpp>
 
+#include "yb/util/date_time.h"
 #include "yb/util/memcmpable_varint.h"
+#include "yb/util/result.h"
 
 using std::string;
-using strings::Substitute;
-using strings::SubstituteAndAppend;
 
 namespace yb {
 
@@ -124,6 +125,73 @@ Status HybridTime::FromUint64(uint64_t value) {
   return Status::OK();
 }
 
+MicrosTime HybridTime::CeilPhysicalValueMicros() const {
+  if (*this == kMin) {
+    return 0;
+  }
+  auto result = GetPhysicalValueMicros();
+  if (GetLogicalValue()) {
+    ++result;
+  }
+  return result;
+}
+
+Result<HybridTime> HybridTime::ParseHybridTime(std::string input) {
+  boost::trim(input);
+
+  HybridTime ht;
+  // The HybridTime is given in microseconds and will contain 16 chars.
+  static const std::regex int_regex("[0-9]{16}");
+  if (std::regex_match(input, int_regex)) {
+    return HybridTime::FromMicros(std::stoul(input));
+  }
+  if (!input.empty() && input[0] == '-') {
+    return HybridTime::FromMicros(
+        VERIFY_RESULT(WallClock()->Now()).time_point -
+        VERIFY_RESULT(DateTime::IntervalFromString(input.substr(1))).ToMicroseconds());
+  }
+  auto ts =
+      VERIFY_RESULT(DateTime::TimestampFromString(input, DateTime::HumanReadableInputFormat));
+  return HybridTime::FromMicros(ts.ToInt64());
+}
+
+uint64_t HybridTime::GetPhysicalValueMillis() const {
+  return GetPhysicalValueMicros() / MonoTime::kMicrosecondsPerMillisecond;
+}
+
+uint64_t HybridTime::GetPhysicalValueNanos() const {
+  // Conversion to nanoseconds here is safe from overflow since 2^kBitsForLogicalComponent is less
+  // than MonoTime::kNanosecondsPerMicrosecond. Although, we still just check for sanity.
+  uint64_t micros = GetPhysicalValueMicros();
+  CHECK_LE(micros, std::numeric_limits<uint64_t>::max() / MonoTime::kNanosecondsPerMicrosecond);
+  return micros * MonoTime::kNanosecondsPerMicrosecond;
+}
+
 const char* const HybridTime::kHybridTimeDebugStrPrefix = "HT";
+
+int CompareHybridTimesToDelta(HybridTime begin, HybridTime end, MonoDelta delta) {
+  if (end < begin) {
+    return -1;
+  }
+  // We use nanoseconds since MonoDelta has nanosecond granularity.
+  uint64_t begin_nanos = begin.GetPhysicalValueNanos();
+  uint64_t end_nanos = end.GetPhysicalValueNanos();
+  uint64_t delta_nanos = delta.ToNanoseconds();
+  if (end_nanos - begin_nanos > delta_nanos) {
+    return 1;
+  } else if (end_nanos - begin_nanos == delta_nanos) {
+    uint64_t begin_logical = begin.GetLogicalValue();
+    uint64_t end_logical = end.GetLogicalValue();
+    if (end_logical > begin_logical) {
+      return 1;
+    } else if (end_logical < begin_logical) {
+      return -1;
+    } else {
+      return 0;
+    }
+  } else {
+    return -1;
+  }
+}
 
 }  // namespace yb

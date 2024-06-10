@@ -29,15 +29,17 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_MUTEX_H
-#define YB_UTIL_MUTEX_H
+#pragma once
 
 #include <pthread.h>
-#include <glog/logging.h>
 #include <sys/types.h>
 
-#include "yb/gutil/gscoped_ptr.h"
+#include <memory>
+
+#include "yb/util/logging.h"
+
 #include "yb/gutil/macros.h"
+#include "yb/gutil/thread_annotations.h"
 
 namespace yb {
 
@@ -49,23 +51,23 @@ class StackTrace;
 //   Acquire(), TryAcquire() - the lock isn't already held.
 //   Release() - the lock is already held by this thread.
 //
-class Mutex {
+class CAPABILITY("mutex") Mutex {
  public:
   Mutex();
   ~Mutex();
 
-  void Acquire();
-  void Release();
-  bool TryAcquire();
+  void Acquire() ACQUIRE();
+  void Release() RELEASE();
+  bool TryAcquire() TRY_ACQUIRE(true);
 
-  void lock() { Acquire(); }
-  void unlock() { Release(); }
-  bool try_lock() { return TryAcquire(); }
+  void lock() ACQUIRE() { Acquire(); }
+  void unlock() RELEASE() { Release(); }
+  bool try_lock() TRY_ACQUIRE(true) { return TryAcquire(); }
 
 #ifndef NDEBUG
-  void AssertAcquired() const;
+  void AssertAcquired() const ASSERT_CAPABILITY(this);
 #else
-  void AssertAcquired() const {}
+  void AssertAcquired() const ASSERT_CAPABILITY(this) {}
 #endif
 
  private:
@@ -80,15 +82,15 @@ class Mutex {
 
   // All private data is implicitly protected by native_handle_.
   // Be VERY careful to only access members under that lock.
-  pid_t owning_tid_;
-  gscoped_ptr<StackTrace> stack_trace_;
+  uint64_t owning_tid_;
+  std::unique_ptr<StackTrace> stack_trace_;
 #endif
 
   DISALLOW_COPY_AND_ASSIGN(Mutex);
 };
 
 // A helper class that acquires the given Lock while the MutexLock is in scope.
-class MutexLock {
+class SCOPED_CAPABILITY MutexLock {
  public:
   struct AlreadyAcquired {};
 
@@ -99,7 +101,7 @@ class MutexLock {
   //   MutexLock l(lock_); // acquired
   //   ...
   // } // released
-  explicit MutexLock(Mutex& lock)
+  explicit MutexLock(Mutex& lock) ACQUIRE(lock) // NOLINT
     : lock_(&lock),
       owned_(true) {
     lock_->Acquire();
@@ -114,26 +116,26 @@ class MutexLock {
   //   MutexLock l(lock_, AlreadyAcquired());
   //   ...
   // } // released
-  MutexLock(Mutex& lock, const AlreadyAcquired&)
+  MutexLock(Mutex& lock, const AlreadyAcquired&) REQUIRES(lock) // NOLINT
     : lock_(&lock),
       owned_(true) {
     lock_->AssertAcquired();
   }
 
-  void Lock() {
+  void Lock() ACQUIRE() {
     DCHECK(!owned_);
     lock_->Acquire();
     owned_ = true;
   }
 
-  void Unlock() {
+  void Unlock() RELEASE() {
     DCHECK(owned_);
     lock_->AssertAcquired();
     lock_->Release();
     owned_ = false;
   }
 
-  ~MutexLock() {
+  ~MutexLock() RELEASE() {
     if (owned_) {
       Unlock();
     }
@@ -150,4 +152,3 @@ class MutexLock {
 };
 
 } // namespace yb
-#endif /* YB_UTIL_MUTEX_H */

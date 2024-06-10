@@ -29,12 +29,17 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_RWC_LOCK_H
-#define YB_UTIL_RWC_LOCK_H
+#pragma once
+
+#ifndef NDEBUG
+#include <unordered_map>
+#endif // NDEBUG
 
 #include "yb/gutil/macros.h"
+
 #include "yb/util/condition_variable.h"
 #include "yb/util/mutex.h"
+#include "yb/util/stack_trace.h"
 
 namespace yb {
 
@@ -124,8 +129,13 @@ class RWCLock {
   // Requires that the current thread holds the lock in Write mode.
   // Upon return, guarantees:
   // - No other thread holds the lock in any mode.
-  void UpgradeToCommitLock();
-  void CommitUnlock();
+  void UpgradeToCommitLock() ACQUIRE(lock_);
+  void CommitUnlock() RELEASE(lock_);
+
+  // If write lock was acquired in one thread and then used in another thread the below method
+  // should be invoked in a new thread.
+  // Otherwise check will fail in debug mode.
+  void WriteLockThreadChanged();
 
  private:
   // Lock which protects reader_count_ and write_locked_.
@@ -138,14 +148,20 @@ class RWCLock {
   bool write_locked_;
 
 #ifndef NDEBUG
-  static const int kBacktraceBufSize = 1024;
   int64_t last_writer_tid_;
+  ThreadIdForStack last_writer_tid_for_stack_;
   int64_t last_writelock_acquire_time_;
-  char last_writer_backtrace_[kBacktraceBufSize];
+  StackTrace last_writer_stacktrace_;
+
+  // thread id --> (thread's reader count, stack trace of first reader).
+  struct CountStack {
+    int count; // reader count
+    StackTrace stack; // stack trace of first reader
+  };
+  std::unordered_map<int64_t, CountStack> reader_stacks_;
 #endif // NDEBUG
 
   DISALLOW_COPY_AND_ASSIGN(RWCLock);
 };
 
 } // namespace yb
-#endif /* YB_UTIL_RWC_LOCK_H */

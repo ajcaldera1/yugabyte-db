@@ -15,8 +15,7 @@
 // Tree node definitions for ALTER KEYSPACE statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_ALTER_KEYSPACE_H_
-#define YB_YQL_CQL_QL_PTREE_PT_ALTER_KEYSPACE_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 #include "yb/yql/cql/ql/ptree/pt_keyspace_property.h"
@@ -37,7 +36,7 @@ class PTAlterKeyspace : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTAlterKeyspace(MemoryContext *memctx,
-                  YBLocation::SharedPtr loc,
+                  YBLocationPtr loc,
                   const MCSharedPtr<MCString>& name,
                   const PTKeyspacePropertyListNode::SharedPtr& keyspace_properties);
   virtual ~PTAlterKeyspace();
@@ -53,7 +52,7 @@ class PTAlterKeyspace : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   // Keyspace name.
@@ -72,5 +71,3 @@ class PTAlterKeyspace : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_ALTER_KEYSPACE_H_

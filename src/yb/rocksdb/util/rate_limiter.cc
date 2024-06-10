@@ -21,11 +21,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <iomanip>
+
+#include "yb/ash/wait_state.h"
+
+#include "yb/gutil/strings/human_readable.h"
+
 #include "yb/rocksdb/util/rate_limiter.h"
 #include "yb/rocksdb/env.h"
 
-namespace rocksdb {
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
 
+using yb::IOPriority;
+
+namespace rocksdb {
 
 // Pending request
 struct GenericRateLimiter::Req {
@@ -51,45 +62,79 @@ GenericRateLimiter::GenericRateLimiter(int64_t rate_bytes_per_sec,
       fairness_(fairness > 100 ? 100 : fairness),
       rnd_((uint32_t)time(nullptr)),
       leader_(nullptr) {
-  total_requests_[0] = 0;
-  total_requests_[1] = 0;
-  total_bytes_through_[0] = 0;
-  total_bytes_through_[1] = 0;
+  for (size_t q = 0; q < yb::kElementsInIOPriority; ++q) {
+    total_requests_[q] = 0;
+    total_bytes_through_[q] = 0;
+    total_bytes_requested_per_second_[q] = 0;
+    total_requests_per_second_[q] = 0;
+    unthrottled_requests_per_second_[q] = 0;
+    throttled_requests_per_second_[q] = 0;
+  }
 }
 
 GenericRateLimiter::~GenericRateLimiter() {
   MutexLock g(&request_mutex_);
   stop_ = true;
-  requests_to_wait_ = static_cast<int32_t>(queue_[Env::IO_LOW].size() +
-                                           queue_[Env::IO_HIGH].size());
-  for (auto& r : queue_[Env::IO_HIGH]) {
-    r->cv.Signal();
+  // TODO: create a convenience template for a fixed-size array indexed using an enum ?
+  // https://github.com/yugabyte/yugabyte-db/issues/13399
+  requests_to_wait_ = static_cast<int32_t>(queue_[yb::to_underlying(IOPriority::kLow)].size() +
+                                           queue_[yb::to_underlying(IOPriority::kHigh)].size());
+  for (auto& r : queue_[yb::to_underlying(IOPriority::kHigh)]) {
+    YB_PROFILE(r->cv.Signal());
   }
-  for (auto& r : queue_[Env::IO_LOW]) {
-    r->cv.Signal();
+  for (auto& r : queue_[yb::to_underlying(IOPriority::kLow)]) {
+    YB_PROFILE(r->cv.Signal());
   }
   while (requests_to_wait_ > 0) {
     exit_cv_.Wait();
   }
 }
 
-// This API allows user to dynamically change rate limiter's bytes per second.
+// This API allows user to dynamically change rate limiter's bytes per second. Returns early if the
+// new bytes_per_second matches the existing rate.
 void GenericRateLimiter::SetBytesPerSecond(int64_t bytes_per_second) {
-  assert(bytes_per_second > 0);
-  refill_bytes_per_period_.store(
-      CalculateRefillBytesPerPeriod(bytes_per_second),
-      std::memory_order_relaxed);
+  DCHECK_GT(bytes_per_second, 0);
+  auto refill_bytes_per_period_new = CalculateRefillBytesPerPeriod(bytes_per_second);
+  if (refill_bytes_per_period_new == refill_bytes_per_period_) {
+    return;
+  }
+  refill_bytes_per_period_.store(refill_bytes_per_period_new, std::memory_order_relaxed);
+  MutexLock g(&request_mutex_);
+  if (!description_for_logging_.empty()) {
+    LOG(INFO) << yb::Format("$0 rate limiter: Setting bytes_per_second to $1",
+                            description_for_logging_, bytes_per_second);
+  }
+  available_bytes_ = 0;
 }
 
-void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
+void GenericRateLimiter::Request(int64_t bytes, const yb::IOPriority priority) {
   assert(bytes <= refill_bytes_per_period_.load(std::memory_order_relaxed));
+
+  const auto pri = yb::to_underlying(priority);
+  SCOPED_WAIT_STATUS(RocksDB_RateLimiter);
 
   MutexLock g(&request_mutex_);
   if (stop_) {
     return;
   }
 
+  auto time_since_refresh = yb::MonoTime::Now() - last_refresh_;
+  if (time_since_refresh >= yb::MonoDelta::FromSeconds(1)) {
+    if (!description_for_logging_.empty()) {
+      YB_LOG_EVERY_N_SECS(INFO, 5) << ToStringUnlocked(time_since_refresh);
+    }
+    for (size_t z = 0; z < yb::kElementsInIOPriority; z++) {
+      total_bytes_requested_per_second_[z] = 0;
+      total_requests_per_second_[z] = 0;
+      unthrottled_requests_per_second_[z] = 0;
+      throttled_requests_per_second_[z] = 0;
+    }
+    last_refresh_ = yb::MonoTime::Now();
+  }
+
   ++total_requests_[pri];
+  ++total_requests_per_second_[pri];
+  total_bytes_requested_per_second_[pri] += bytes;
 
   if (available_bytes_ >= bytes) {
     // Refill thread assigns quota and notifies requests waiting on
@@ -97,12 +142,14 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
     // is waiting?
     available_bytes_ -= bytes;
     total_bytes_through_[pri] += bytes;
+    unthrottled_requests_per_second_[pri]++;
     return;
   }
 
   // Request cannot be satisfied at this moment, enqueue
   Req r(bytes, &request_mutex_);
   queue_[pri].push_back(&r);
+  throttled_requests_per_second_[pri]++;
 
   do {
     bool timedout = false;
@@ -113,10 +160,10 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
     // (3) a previous waiter at the front of queue, who got notified by
     //     previous leader
     if (leader_ == nullptr &&
-        ((!queue_[Env::IO_HIGH].empty() &&
-            &r == queue_[Env::IO_HIGH].front()) ||
-         (!queue_[Env::IO_LOW].empty() &&
-            &r == queue_[Env::IO_LOW].front()))) {
+        ((!queue_[yb::to_underlying(IOPriority::kHigh)].empty() &&
+            &r == queue_[yb::to_underlying(IOPriority::kHigh)].front()) ||
+         (!queue_[yb::to_underlying(IOPriority::kLow)].empty() &&
+            &r == queue_[yb::to_underlying(IOPriority::kLow)].front()))) {
       leader_ = &r;
       timedout = r.cv.TimedWait(next_refill_us_);
     } else {
@@ -127,21 +174,21 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
     // request_mutex_ is held from now on
     if (stop_) {
       --requests_to_wait_;
-      exit_cv_.Signal();
+      YB_PROFILE(exit_cv_.Signal());
       return;
     }
 
     // Make sure the waken up request is always the header of its queue
     assert(r.granted ||
-           (!queue_[Env::IO_HIGH].empty() &&
-            &r == queue_[Env::IO_HIGH].front()) ||
-           (!queue_[Env::IO_LOW].empty() &&
-            &r == queue_[Env::IO_LOW].front()));
+           (!queue_[yb::to_underlying(IOPriority::kHigh)].empty() &&
+            &r == queue_[yb::to_underlying(IOPriority::kHigh)].front()) ||
+           (!queue_[yb::to_underlying(IOPriority::kLow)].empty() &&
+            &r == queue_[yb::to_underlying(IOPriority::kLow)].front()));
     assert(leader_ == nullptr ||
-           (!queue_[Env::IO_HIGH].empty() &&
-            leader_ == queue_[Env::IO_HIGH].front()) ||
-           (!queue_[Env::IO_LOW].empty() &&
-            leader_ == queue_[Env::IO_LOW].front()));
+           (!queue_[yb::to_underlying(IOPriority::kHigh)].empty() &&
+            leader_ == queue_[yb::to_underlying(IOPriority::kHigh)].front()) ||
+           (!queue_[yb::to_underlying(IOPriority::kLow)].empty() &&
+            leader_ == queue_[yb::to_underlying(IOPriority::kLow)].front()));
 
     if (leader_ == &r) {
       // Waken up from TimedWait()
@@ -157,14 +204,14 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
         if (r.granted) {
           // Current leader already got granted with quota. Notify header
           // of waiting queue to participate next round of election.
-          assert((queue_[Env::IO_HIGH].empty() ||
-                    &r != queue_[Env::IO_HIGH].front()) &&
-                 (queue_[Env::IO_LOW].empty() ||
-                    &r != queue_[Env::IO_LOW].front()));
-          if (!queue_[Env::IO_HIGH].empty()) {
-            queue_[Env::IO_HIGH].front()->cv.Signal();
-          } else if (!queue_[Env::IO_LOW].empty()) {
-            queue_[Env::IO_LOW].front()->cv.Signal();
+          assert((queue_[yb::to_underlying(IOPriority::kHigh)].empty() ||
+                    &r != queue_[yb::to_underlying(IOPriority::kHigh)].front()) &&
+                 (queue_[yb::to_underlying(IOPriority::kLow)].empty() ||
+                    &r != queue_[yb::to_underlying(IOPriority::kLow)].front()));
+          if (!queue_[yb::to_underlying(IOPriority::kHigh)].empty()) {
+            YB_PROFILE(queue_[yb::to_underlying(IOPriority::kHigh)].front()->cv.Signal());
+          } else if (!queue_[yb::to_underlying(IOPriority::kLow)].empty()) {
+            YB_PROFILE(queue_[yb::to_underlying(IOPriority::kLow)].front()->cv.Signal());
           }
           // Done
           break;
@@ -187,6 +234,24 @@ void GenericRateLimiter::Request(int64_t bytes, const Env::IOPriority pri) {
   } while (!r.granted);
 }
 
+int64_t GenericRateLimiter::GetTotalBytesThrough(const IOPriority pri) const {
+  MutexLock g(&request_mutex_);
+  if (pri == IOPriority::kTotal) {
+    return total_bytes_through_[yb::to_underlying(IOPriority::kLow)] +
+           total_bytes_through_[yb::to_underlying(IOPriority::kHigh)];
+  }
+  return total_bytes_through_[yb::to_underlying(pri)];
+}
+
+int64_t GenericRateLimiter::GetTotalRequests(const IOPriority pri) const {
+  MutexLock g(&request_mutex_);
+  if (pri == IOPriority::kTotal) {
+    return total_requests_[yb::to_underlying(IOPriority::kLow)] +
+        total_requests_[yb::to_underlying(IOPriority::kHigh)];
+  }
+  return total_requests_[yb::to_underlying(pri)];
+}
+
 void GenericRateLimiter::Refill() {
   next_refill_us_ = env_->NowMicros() + refill_period_us_;
   // Carry over the left over quota from the last period
@@ -198,24 +263,67 @@ void GenericRateLimiter::Refill() {
 
   int use_low_pri_first = rnd_.OneIn(fairness_) ? 0 : 1;
   for (int q = 0; q < 2; ++q) {
-    auto use_pri = (use_low_pri_first == q) ? Env::IO_LOW : Env::IO_HIGH;
-    auto* queue = &queue_[use_pri];
+    const auto priority_index = yb::to_underlying(
+        (use_low_pri_first == q) ? IOPriority::kLow : IOPriority::kHigh);
+    auto* queue = &queue_[priority_index];
     while (!queue->empty()) {
       auto* next_req = queue->front();
       if (available_bytes_ < next_req->bytes) {
         break;
       }
       available_bytes_ -= next_req->bytes;
-      total_bytes_through_[use_pri] += next_req->bytes;
+      total_bytes_through_[priority_index] += next_req->bytes;
       queue->pop_front();
 
       next_req->granted = true;
       if (next_req != leader_) {
         // Quota granted, signal the thread
-        next_req->cv.Signal();
+        YB_PROFILE(next_req->cv.Signal());
       }
     }
   }
+}
+
+std::string GenericRateLimiter::ToStringUnlocked(yb::MonoDelta time_since_refresh) const {
+  int64_t queue_size = 0;
+  for (size_t z = 0; z < yb::kElementsInIOPriority; z++) {
+    queue_size += queue_[z].size();
+  }
+
+  auto total_bytes_requested_per_second =
+      GetPerSecondAverageUnlocked(total_bytes_requested_per_second_, time_since_refresh);
+  auto total_requests_per_second =
+      GetPerSecondAverageUnlocked(total_requests_per_second_, time_since_refresh);
+  auto unthrottled_requests_per_second =
+      GetPerSecondAverageUnlocked(unthrottled_requests_per_second_, time_since_refresh);
+  auto throttled_requests_per_second =
+      GetPerSecondAverageUnlocked(throttled_requests_per_second_, time_since_refresh);
+
+  return yb::Format(
+      "$0 rate limiter status:\navailable_bytes: $1\nqueue_size: $2\n"
+      "total_bytes_requested_per_second: $3\n"
+      "total_request_per_second: $4\nunthrottled_request_per_second: $5\n"
+      "throttled_request_per_second: $6\ntime_since_refresh: $7" ,
+      description_for_logging_, HumanReadableNum::ToString(available_bytes_), queue_size,
+      HumanReadableNum::DoubleToString(total_bytes_requested_per_second),
+      HumanReadableNum::DoubleToString(total_requests_per_second),
+      HumanReadableNum::DoubleToString(unthrottled_requests_per_second),
+      HumanReadableNum::DoubleToString(throttled_requests_per_second),
+      time_since_refresh);
+}
+
+double GenericRateLimiter::GetPerSecondAverageUnlocked(
+    const int64_t* array, yb::MonoDelta time_since_refresh) const {
+  auto sum = 0;
+  for (size_t z = 0; z < yb::kElementsInIOPriority; z++) {
+    sum += array[z];
+  }
+  return (sum + 0.0) / time_since_refresh.ToSeconds();
+}
+
+void GenericRateLimiter::EnableLoggingWithDescription(std::string description_for_logging) {
+  MutexLock g(&request_mutex_);
+  description_for_logging_ = description_for_logging;
 }
 
 RateLimiter* NewGenericRateLimiter(

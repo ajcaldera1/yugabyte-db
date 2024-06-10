@@ -11,34 +11,44 @@
 // under the License.
 //
 
+#include <algorithm>
+#include <functional>
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
+
+#include "yb/common/common.pb.h"
+#include "yb/common/entity_ids_types.h"
 
 #include "yb/consensus/consensus.pb.h"
 #include "yb/consensus/consensus.proxy.h"
-#include "yb/gutil/strings/join.h"
-#include "yb/integration-tests/mini_cluster.h"
-#include "yb/integration-tests/external_mini_cluster.h"
-#include "yb/integration-tests/cluster_verifier.h"
-#include "yb/master/master.h"
-#include "yb/master/master-test-util.h"
-#include "yb/master/sys_catalog.h"
-#include "yb/master/master.proxy.h"
-#include "yb/rpc/messenger.h"
-#include "yb/rpc/rpc_controller.h"
 
-using std::shared_ptr;
+#include "yb/gutil/algorithm.h"
+#include "yb/gutil/strings/substitute.h"
+
+#include "yb/integration-tests/external_mini_cluster.h"
+
+#include "yb/util/async_util.h"
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/result.h"
+#include "yb/util/status.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
+
 using std::string;
 using std::vector;
+using std::min;
 using strings::Substitute;
-using yb::rpc::Messenger;
-using yb::rpc::MessengerBuilder;
-using yb::consensus::ChangeConfigRequestPB;
-using yb::consensus::ChangeConfigResponsePB;
-using yb::consensus::ConsensusServiceProxy;
-using yb::consensus::RaftPeerPB;
-using yb::master::ListMastersRequestPB;
-using yb::master::ListMastersResponsePB;
 using yb::tserver::TabletServerErrorPB;
+
+using namespace std::chrono_literals;
 
 namespace yb {
 namespace master {
@@ -55,9 +65,12 @@ class MasterChangeConfigTest : public YBTest {
     YBTest::SetUp();
     ExternalMiniClusterOptions opts;
     opts.master_rpc_ports = { 0, 0, 0 }; // external mini-cluster Start() gets the free ports.
-    opts.num_masters = num_masters_ = static_cast<int>(opts.master_rpc_ports.size());
+    opts.num_masters = num_masters_ = opts.master_rpc_ports.size();
     opts.num_tablet_servers = 0;
     opts.timeout = MonoDelta::FromSeconds(30);
+    // Master failovers should not be happening concurrently with us trying to load an initial sys
+    // catalog snapshot. At least this is not supported as of 05/27/2019.
+    opts.enable_ysql = false;
     cluster_.reset(new ExternalMiniCluster(opts));
     ASSERT_OK(cluster_->Start());
 
@@ -116,8 +129,8 @@ class MasterChangeConfigTest : public YBTest {
   // API to capture the latest commit index on the master leader.
   void SetCurLogIndex();
 
-  int num_masters_;
-  int cur_log_index_;
+  size_t num_masters_;
+  int64_t cur_log_index_;
   std::unique_ptr<ExternalMiniCluster> cluster_;
 };
 
@@ -132,14 +145,9 @@ void MasterChangeConfigTest::VerifyLeaderMasterPeerCount() {
 
 void MasterChangeConfigTest::VerifyNonLeaderMastersPeerCount() {
   int num_peers = 0;
-  int leader_index = -1;
-  ASSERT_OK_PREPEND(cluster_->GetLeaderMasterIndex(&leader_index), "Leader index get failed.");
+  auto leader_index = ASSERT_RESULT(cluster_->GetLeaderMasterIndex());
 
-  if (leader_index == -1) {
-    FAIL() << "Leader index not found.";
-  }
-
-  for (int i = 0; i < num_masters_; i++) {
+  for (size_t i = 0; i < num_masters_; i++) {
     if (i == leader_index) {
       continue;
     }
@@ -149,8 +157,15 @@ void MasterChangeConfigTest::VerifyNonLeaderMastersPeerCount() {
     LOG(INFO) << "Checking non_leader " << i << " at port "
               << non_leader_master->bound_rpc_hostport().port();
     num_peers = 0;
-    Status s = cluster_->GetNumMastersAsSeenBy(non_leader_master, &num_peers);
-    ASSERT_OK_PREPEND(s, "Non-leader master number of peers lookup returned error");
+    Status s;
+    ASSERT_OK_PREPEND(
+        WaitFor(
+            [&] {
+              s = cluster_->GetNumMastersAsSeenBy(non_leader_master, &num_peers);
+              return s.ok();
+            },
+            5s * kTimeMultiplier, "Waiting master is initialized"),
+        Format("Non-leader master number of peers lookup returned error: $0", s));
     EXPECT_EQ(num_peers, num_masters_);
   }
 }
@@ -183,7 +198,7 @@ Status MasterChangeConfigTest::WaitForMasterLeaderToBeReady(
 }
 
 void MasterChangeConfigTest::SetCurLogIndex() {
-  consensus::OpId op_id;
+  OpIdPB op_id;
   ASSERT_OK(cluster_->GetLastOpIdForLeader(&op_id));
   cur_log_index_ = op_id.index();
   LOG(INFO) << "cur_log_index_ " << cur_log_index_;
@@ -191,8 +206,7 @@ void MasterChangeConfigTest::SetCurLogIndex() {
 
 TEST_F(MasterChangeConfigTest, TestAddMaster) {
   // NOTE: Not using smart pointer as ExternalMaster is derived from a RefCounted base class.
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
 
   SetCurLogIndex();
 
@@ -210,9 +224,9 @@ TEST_F(MasterChangeConfigTest, TestAddMaster) {
 }
 
 TEST_F(MasterChangeConfigTest, TestSlowRemoteBootstrapDoesNotCrashMaster) {
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
-  ASSERT_OK(cluster_->SetFlag(new_master, "inject_latency_during_remote_bootstrap_secs", "8"));
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
+  ASSERT_OK(
+      cluster_->SetFlag(new_master.get(), "TEST_inject_latency_during_remote_bootstrap_secs", "8"));
 
   SetCurLogIndex();
 
@@ -230,19 +244,14 @@ TEST_F(MasterChangeConfigTest, TestSlowRemoteBootstrapDoesNotCrashMaster) {
 }
 
 TEST_F(MasterChangeConfigTest, TestRemoveMaster) {
-  int non_leader_index = -1;
-  Status s = cluster_->GetFirstNonLeaderMasterIndex(&non_leader_index);
-  ASSERT_OK_PREPEND(s, "Non-leader master lookup returned error");
-  if (non_leader_index == -1) {
-    FAIL() << "Failed to get a non-leader master index.";
-  }
+  auto non_leader_index = ASSERT_RESULT(cluster_->GetFirstNonLeaderMasterIndex());
   ExternalMaster* remove_master = cluster_->master(non_leader_index);
 
   LOG(INFO) << "Going to remove master at port " << remove_master->bound_rpc_hostport().port();
 
   SetCurLogIndex();
 
-  s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER);
+  auto s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER);
   ASSERT_OK_PREPEND(s, "Change Config returned error");
 
   // REMOVE_SERVER causes the op index to increase by one.
@@ -255,20 +264,15 @@ TEST_F(MasterChangeConfigTest, TestRemoveMaster) {
 }
 
 TEST_F(MasterChangeConfigTest, TestRemoveDeadMaster) {
-  int non_leader_index = -1;
-  Status s = cluster_->GetFirstNonLeaderMasterIndex(&non_leader_index);
-  ASSERT_OK_PREPEND(s, "Non-leader master lookup returned error");
-  if (non_leader_index == -1) {
-    FAIL() << "Failed to get a non-leader master index.";
-  }
+  auto non_leader_index = ASSERT_RESULT(cluster_->GetFirstNonLeaderMasterIndex());
   ExternalMaster* remove_master = cluster_->master(non_leader_index);
   remove_master->Shutdown();
   LOG(INFO) << "Stopped and removing master at " << remove_master->bound_rpc_hostport().port();
 
   SetCurLogIndex();
 
-  s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER,
-                             consensus::RaftPeerPB::PRE_VOTER, true /* use_hostport */);
+  auto s = cluster_->ChangeConfig(remove_master, consensus::REMOVE_SERVER,
+                                  consensus::PeerMemberType::PRE_VOTER, true /* use_hostport */);
   ASSERT_OK_PREPEND(s, "Change Config returned error");
 
   // REMOVE_SERVER causes the op index to increase by one.
@@ -281,8 +285,7 @@ TEST_F(MasterChangeConfigTest, TestRemoveDeadMaster) {
 }
 
 TEST_F(MasterChangeConfigTest, TestRestartAfterConfigChange) {
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
 
   SetCurLogIndex();
 
@@ -310,17 +313,16 @@ TEST_F(MasterChangeConfigTest, TestRestartAfterConfigChange) {
 }
 
 TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
 
   LOG(INFO) << "New master " << new_master->bound_rpc_hostport().ToString();
 
   SetCurLogIndex();
 
   // This will disable new elections on the old masters.
-  vector<ExternalDaemon*> masters = cluster_->master_daemons();
+  vector<ExternalMaster*> masters = cluster_->master_daemons();
   for (auto master : masters) {
-    ASSERT_OK(cluster_->SetFlag(master, "do_not_start_election_test_only", "true"));
+    ASSERT_OK(cluster_->SetFlag(master, "TEST_do_not_start_election_test_only", "true"));
     // Do not let the followers commit change role - to keep their opid same as the new master,
     // and hence will vote for it.
     ASSERT_OK(cluster_->SetFlag(master, "inject_delay_commit_pre_voter_to_voter_secs", "5"));
@@ -330,9 +332,10 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   // less than the timeout sent to WaitForMasterLeaderToBeReady() below. We want the pending
   // config to be preset when the new master is deemed as leader to start the sys catalog load, but
   // would need to get that pending config committed for load to progress.
-  ASSERT_OK(cluster_->SetFlag(new_master, "inject_delay_commit_pre_voter_to_voter_secs", "5"));
+  ASSERT_OK(
+      cluster_->SetFlag(new_master.get(), "inject_delay_commit_pre_voter_to_voter_secs", "5"));
   // And don't let it start an election too soon.
-  ASSERT_OK(cluster_->SetFlag(new_master, "do_not_start_election_test_only", "true"));
+  ASSERT_OK(cluster_->SetFlag(new_master.get(), "TEST_do_not_start_election_test_only", "true"));
 
   Status s = cluster_->ChangeConfig(new_master, consensus::ADD_SERVER);
   ASSERT_OK_PREPEND(s, "Change Config returned error");
@@ -349,7 +352,7 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
   s = cluster_->StepDownMasterLeader(&dummy_err);
 
   // Now the new master should start the election process.
-  ASSERT_OK(cluster_->SetFlag(new_master, "do_not_start_election_test_only", "false"));
+  ASSERT_OK(cluster_->SetFlag(new_master.get(), "TEST_do_not_start_election_test_only", "false"));
 
   // Leader stepdown might not succeed as PRE_VOTER could still be uncommitted. Let it go through
   // as new master should get the other votes anyway once it starts the election.
@@ -357,7 +360,7 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
     ASSERT_OK_PREPEND(s,  "Leader step down failed.");
   } else {
     LOG(INFO) << "Triggering election as step down failed.";
-    ASSERT_OK_PREPEND(cluster_->StartElection(new_master), "Start Election failed");
+    ASSERT_OK_PREPEND(cluster_->StartElection(new_master.get()), "Start Election failed");
     SleepFor(MonoDelta::FromSeconds(2));
   }
 
@@ -368,16 +371,16 @@ TEST_F(MasterChangeConfigTest, TestNewLeaderWithPendingConfigLoadsSysCatalog) {
 
   // This check ensures that the sys catalog is loaded into new leader even when it has a
   // pending config change.
-  ASSERT_OK(WaitForMasterLeaderToBeReady(new_master, 8 /* timeout_sec */));
+  ASSERT_OK(WaitForMasterLeaderToBeReady(new_master.get(), 8 /* timeout_sec */));
 }
 
 TEST_F(MasterChangeConfigTest, TestChangeAllMasters) {
-  ExternalMaster* new_masters[3] = { nullptr, nullptr, nullptr };
-  ExternalMaster* remove_master = nullptr;
+  ExternalMasterPtr new_masters[3] = {nullptr, nullptr, nullptr};
+  ExternalMasterPtr remove_master = nullptr;
 
   // Create all new masters before to avoid rpc port reuse.
   for (int idx = 0; idx <= 2; idx++) {
-    cluster_->StartShellMaster(&new_masters[idx]);
+    new_masters[idx] = ASSERT_RESULT(cluster_->StartShellMaster());
   }
 
   SetCurLogIndex();
@@ -401,12 +404,11 @@ TEST_F(MasterChangeConfigTest, TestChangeAllMasters) {
 }
 
 TEST_F(MasterChangeConfigTest, TestAddPreObserverMaster) {
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
 
   SetCurLogIndex();
   ASSERT_OK_PREPEND(cluster_->ChangeConfig(new_master, consensus::ADD_SERVER,
-                                           consensus::RaftPeerPB::PRE_OBSERVER),
+                                           consensus::PeerMemberType::PRE_OBSERVER),
                     "Add Change Config returned error");
   ++num_masters_;
 
@@ -415,20 +417,19 @@ TEST_F(MasterChangeConfigTest, TestAddPreObserverMaster) {
 }
 
 TEST_F(MasterChangeConfigTest, TestWaitForChangeRoleCompletion) {
-  ExternalMaster* new_master = nullptr;
-  cluster_->StartShellMaster(&new_master);
+  auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
   ExternalMaster* leader = cluster_->GetLeaderMaster();
 
   // Ensure leader does not change.
   for (int idx = 0; idx <= 2; idx++) {
     ExternalMaster* master = cluster_->master(idx);
     if (master->bound_rpc_hostport().port() != leader->bound_rpc_hostport().port()) {
-      ASSERT_OK(cluster_->SetFlag(master, "do_not_start_election_test_only", "false"));
+      ASSERT_OK(cluster_->SetFlag(master, "TEST_do_not_start_election_test_only", "false"));
     }
   }
 
   ASSERT_OK(cluster_->SetFlag(leader,
-            "inject_delay_leader_change_role_append_secs", "8"));
+            "TEST_inject_delay_leader_change_role_append_secs", "8"));
   SetCurLogIndex();
   ASSERT_OK_PREPEND(cluster_->ChangeConfig(new_master, consensus::ADD_SERVER),
                     "Add Change Config returned error");
@@ -477,29 +478,104 @@ TEST_F(MasterChangeConfigTest, TestMulitpleLeaderRestarts) {
 }
 
 TEST_F(MasterChangeConfigTest, TestPingShellMaster) {
-  string peers = "";
   // Create a shell master as `peers` is empty (for master_addresses).
-  Result<ExternalMaster *> new_shell_master = cluster_->StartMasterWithPeers(peers);
-  ASSERT_OK(new_shell_master);
+  auto new_shell_master = ASSERT_RESULT(cluster_->StartMaster(/*peer_addrs=*/""));
   // Add the new shell master to the quorum and ensure it is still running and pingable.
   SetCurLogIndex();
-  Status s = cluster_->ChangeConfig(*new_shell_master, consensus::ADD_SERVER);
-  LOG(INFO) << "Started shell " << (*new_shell_master)->bound_rpc_hostport().ToString();
+  Status s = cluster_->ChangeConfig(new_shell_master, consensus::ADD_SERVER);
+  LOG(INFO) << "Started shell " << new_shell_master->bound_rpc_hostport().ToString();
   ASSERT_OK_PREPEND(s, "Change Config returned error : ");
   ++num_masters_;
-  ASSERT_OK(cluster_->PingMaster(*new_shell_master));
+  ASSERT_OK(cluster_->PingMaster(new_shell_master.get()));
 }
 
-// Process that stops/fails internal to external mini cluster is not allowing test to terminate.
-TEST_F(MasterChangeConfigTest, DISABLED_TestIncorrectMasterStart) {
-  string peers = cluster_->GetMasterAddresses();
-  // Master process start with master_addresses not containing a new master host/port should fail
-  // and become un-pingable.
-  Result<ExternalMaster *> new_master = cluster_->StartMasterWithPeers(peers);
-  ASSERT_OK(new_master);
-  LOG(INFO) << "Tried incorrect master " << (*new_master)->bound_rpc_hostport().ToString();
-  ASSERT_NOK(cluster_->PingMaster(*new_master));
-  (*new_master)->Shutdown();
+TEST_F(MasterChangeConfigTest, TestConcurrentAddMastersFails) {
+  auto initial_masters = cluster_->master_daemons();
+  ExternalMasterPtr second_new_master = nullptr;
+  SetCurLogIndex();
+
+  auto first_new_master = ASSERT_RESULT(cluster_->StartShellMaster());
+  // Delay rbs so that the master leader gets to process ADD_SERVER request for the second new
+  // master while the first new master is in PRE_VOTER state.
+  ASSERT_OK(cluster_->SetFlag(
+      first_new_master.get(), "TEST_inject_latency_during_remote_bootstrap_secs", "15"));
+  ASSERT_OK_PREPEND(cluster_->ChangeConfig(first_new_master, consensus::ADD_SERVER),
+                    "Change Config(ADD_SERVER) returned error: ");
+  // Just ADD_SERVER gets processed, so increment the log index only by 1.
+  cur_log_index_ += 1;
+  ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_, initial_masters, 5s));
+  ++num_masters_;
+  // Try adding the second new master. This should block until the above added master gets promoted
+  // from PRE_VOTER to VOTER.
+  auto status_future = std::async(std::launch::async, [&]() {
+    second_new_master = VERIFY_RESULT(cluster_->StartShellMaster());
+    return cluster_->ChangeConfig(second_new_master, consensus::ADD_SERVER);
+  });
+  ASSERT_TRUE(status_future.wait_for(10s) == std::future_status::timeout)
+      << "Change Config(ADD_SERVER) should have been blocked for at least 10 secs.";
+
+  // Wait for the first new master to raise a CHANGE_ROLE request.
+  cur_log_index_ += 1;
+  ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_));
+  // Now the ADD_SERVER for the second master should go through.
+  ASSERT_OK_PREPEND(status_future.get(), "Change Config(ADD_SERVER) returned error: ");
+  // Wait for the log index to be incremented by 2, one for ADD_SERVER and other for CHANGE_ROLE.
+  cur_log_index_ += 2;
+  ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_));
+  ++num_masters_;
+  VerifyLeaderMasterPeerCount();
+  VerifyNonLeaderMastersPeerCount();
+}
+
+TEST_F(MasterChangeConfigTest, TestBlockRemoveServerWhenConfigHasTransitioningServer) {
+  auto current_masters = cluster_->master_daemons();
+  const size_t num_add_masters = 2;
+  for (size_t i = 0 ; i < num_add_masters ; i++) {
+    auto new_master = ASSERT_RESULT(cluster_->StartShellMaster());
+    // Make this peer stay in the PRE_VOTER phase for a while. Setting the delay to 15 secs as the
+    // timeout for WaitForMastersToCommitUpTo is set to 30 secs. So when we finally wait below for
+    // this peer to become a VOTER (at max for 30 secs), the call wouldn't fail.
+    ASSERT_OK(cluster_->SetFlag(
+        new_master.get(), "TEST_inject_latency_during_remote_bootstrap_secs", "15"));
+
+    SetCurLogIndex();
+
+    Status s = cluster_->ChangeConfig(new_master, consensus::ADD_SERVER);
+    ASSERT_OK_PREPEND(s, "Change Config(ADD_SERVER) returned error: ");
+    // Adding a server will generate two ChangeConfig calls. One to add a server as a learner, and
+    // one to promote this server to a voter once bootstrapping is finished. Since we don't want to
+    // wait until the new peer becomes a VOTER, just wait for the log index to be incremented by 1.
+    cur_log_index_ += 1;
+    ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_, current_masters));
+    ++num_masters_;
+
+    // If we try to remove the leader master, it will initiate a leader stepdown and then remove it.
+    // But since there is a peer in transition, leader stepdown will not go through. So try removing
+    // a follower instead.
+    if (cluster_->GetLeaderMaster()->uuid() == current_masters.back()->uuid()) {
+      std::swap(current_masters.back(), current_masters.front());
+    }
+    // Even the follower removal shouldn't go through until the above added server is in transition.
+    ExternalMaster* follower_to_remove = current_masters.back();
+    auto status_future = std::async(std::launch::async, [&, follower_to_remove]() {
+      return cluster_->ChangeConfig(follower_to_remove, consensus::REMOVE_SERVER);
+    });
+    ASSERT_TRUE(status_future.wait_for(10s) == std::future_status::timeout)
+        << "Change Config(REMOVE_SERVER) should have been blocked for at least 10 secs.";
+    current_masters.pop_back();
+    // Wait for the above added server to transition from PRE_VOTER to VOTER.
+    cur_log_index_ += 1;
+    ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_, current_masters));
+    current_masters.push_back(new_master.get());
+    // Now the REMOVE_SERVER request should go through.
+    ASSERT_OK_PREPEND(status_future.get(), "Change Config(REMOVE_SERVER) returned error: ");
+    cur_log_index_ += 1;
+    ASSERT_OK(cluster_->WaitForMastersToCommitUpTo(cur_log_index_, current_masters));
+    --num_masters_;
+  }
+
+  VerifyLeaderMasterPeerCount();
+  VerifyNonLeaderMastersPeerCount();
 }
 
 } // namespace master

@@ -10,14 +10,28 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_MASTER_FLUSH_MANAGER_H
-#define YB_MASTER_FLUSH_MANAGER_H
+#pragma once
 
-#include "yb/common/entity_ids.h"
-#include "yb/master/master.pb.h"
-#include "yb/util/locks.h"
-#include "yb/util/status.h"
+#include <set>
+#include <shared_mutex>
+#include <type_traits>
+#include <unordered_set>
+#include <utility>
+
+#include "yb/util/flags.h"
+
+#include "yb/gutil/integral_types.h"
+#include "yb/gutil/ref_counted.h"
+
+#include "yb/master/leader_epoch.h"
+#include "yb/master/master_admin.fwd.h"
+#include "yb/master/master_fwd.h"
+
+#include "yb/rpc/rpc_context.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/enums.h"
+#include "yb/util/locks.h"
 
 namespace yb {
 namespace master {
@@ -29,20 +43,26 @@ class TableInfo;
 // Handle Flush-related operations.
 class FlushManager {
  public:
-  explicit FlushManager(Master* master, CatalogManager* catalog_manager)
+  explicit FlushManager(Master* master, CatalogManagerIf* catalog_manager)
       : master_(DCHECK_NOTNULL(master)),
         catalog_manager_(DCHECK_NOTNULL(catalog_manager)) {}
 
   // API to start a table flushing.
-  CHECKED_STATUS FlushTables(const FlushTablesRequestPB* req,
-                             FlushTablesResponsePB* resp);
+  Status FlushTables(const FlushTablesRequestPB* req,
+                     FlushTablesResponsePB* resp,
+                     rpc::RpcContext* rpc,
+                     const LeaderEpoch& epoch);
 
-  CHECKED_STATUS IsFlushTablesDone(const IsFlushTablesDoneRequestPB* req,
-                                   IsFlushTablesDoneResponsePB* resp);
+  Status IsFlushTablesDone(const IsFlushTablesDoneRequestPB* req,
+                           IsFlushTablesDoneResponsePB* resp);
 
   void HandleFlushTabletsResponse(const FlushRequestId& flush_id,
                                   const TabletServerId& ts_uuid,
-                                  const Status& status);
+                                  const Status& status) EXCLUDES(lock_);
+
+  void HandleFlushTabletsRpcFinish(const FlushRequestId& flush_id,
+                                   const TabletServerId& ts_uuid,
+                                   const Status& status) EXCLUDES(lock_);
 
  private:
   // Start the background task to send the FlushTablets RPC to the Tablet Server.
@@ -50,12 +70,19 @@ class FlushManager {
                                const scoped_refptr<TableInfo>& table,
                                const std::vector<TabletId>& tablet_ids,
                                const FlushRequestId& flush_id,
-                               bool is_compaction);
+                               bool is_compaction,
+                               bool regular_only,
+                               const LeaderEpoch& epoch);
+
+  void UpdateFlushRequestsUnlocked(const FlushRequestId& flush_id,
+                                   const TabletServerId& ts_uuid,
+                                   const Status& status) REQUIRES(lock_);
+
 
   void DeleteCompleteFlushRequests();
 
   Master* master_;
-  CatalogManager* catalog_manager_;
+  CatalogManagerIf* catalog_manager_;
 
   // Lock protecting the various in memory storage structures.
   typedef rw_spinlock LockType;
@@ -83,4 +110,3 @@ class FlushManager {
 
 } // namespace master
 } // namespace yb
-#endif // YB_MASTER_FLUSH_MANAGER_H

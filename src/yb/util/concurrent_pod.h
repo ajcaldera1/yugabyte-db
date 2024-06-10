@@ -11,8 +11,10 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_CONCURRENT_POD_H
-#define YB_UTIL_CONCURRENT_POD_H
+#pragma once
+
+#include "yb/gutil/dynamic_annotations.h"
+#include "yb/util/monotime.h"
 
 namespace yb {
 
@@ -26,9 +28,9 @@ class ConcurrentPod {
       : timeout_(timeout) {}
 
   void Store(const T& value) {
-    time_.store(MonoTime::Min(), std::memory_order_release);
+    time_.store(CoarseTimePoint::min(), std::memory_order_release);
     value_ = value;
-    time_.store(MonoTime::Now(), std::memory_order_release);
+    time_.store(CoarseMonoClock::now(), std::memory_order_release);
   }
 
   T Load() const {
@@ -38,8 +40,8 @@ class ConcurrentPod {
       auto result = value_;
       ANNOTATE_IGNORE_READS_END();
       auto time2 = time_.load(std::memory_order_acquire);
-      if (time1 == time2 && time1 != MonoTime::Min()) {
-        if (MonoTime::Now() > time1 + timeout_) {
+      if (time1 == time2 && time1 != CoarseTimePoint::min()) {
+        if (CoarseMonoClock::now() - time1 > timeout_) {
           return T();
         }
         return result;
@@ -49,9 +51,7 @@ class ConcurrentPod {
  private:
   const std::chrono::steady_clock::duration timeout_;
   T value_;
-  std::atomic<MonoTime> time_{MonoTime::Min() + MonoDelta::FromMilliseconds(1)};
+  std::atomic<CoarseTimePoint> time_{CoarseTimePoint()};
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_CONCURRENT_POD_H

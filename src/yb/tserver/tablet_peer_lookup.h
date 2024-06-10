@@ -29,28 +29,19 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TSERVER_TABLET_PEER_LOOKUP_H_
-#define YB_TSERVER_TABLET_PEER_LOOKUP_H_
+#pragma once
 
 #include <memory>
-#include <string>
 
-#include "yb/gutil/ref_counted.h"
-#include "yb/util/status.h"
+#include "yb/common/entity_ids_types.h"
+
+#include "yb/consensus/consensus_fwd.h"
+
+#include "yb/tablet/tablet_fwd.h"
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
-
-class HostPort;
-class NodeInstancePB;
-class ServerRegistrationPB;
-
-namespace consensus {
-class StartRemoteBootstrapRequestPB;
-} // namespace consensus
-
-namespace tablet {
-class TabletPeer;
-} // namespace tablet
 
 namespace tserver {
 
@@ -62,19 +53,15 @@ class TabletPeerLookupIf {
  public:
   virtual ~TabletPeerLookupIf() {}
 
-  virtual CHECKED_STATUS GetTabletPeer(
-      const std::string& tablet_id,
-      std::shared_ptr<tablet::TabletPeer>* tablet_peer) const = 0;
+  virtual Result<tablet::TabletPeerPtr> GetServingTablet(const TabletId& tablet_id) const = 0;
+  virtual Result<tablet::TabletPeerPtr> GetServingTablet(const Slice& tablet_id) const = 0;
 
   virtual const NodeInstancePB& NodeInstance() const = 0;
 
-  virtual CHECKED_STATUS GetRegistration(ServerRegistrationPB* reg) const = 0;
+  virtual Status GetRegistration(ServerRegistrationPB* reg) const = 0;
 
-  virtual CHECKED_STATUS StartRemoteBootstrap(
-      const consensus::StartRemoteBootstrapRequestPB& req) = 0;
+  virtual Status StartRemoteBootstrap(const consensus::StartRemoteBootstrapRequestPB& req) = 0;
 };
 
 } // namespace tserver
 } // namespace yb
-
-#endif // YB_TSERVER_TABLET_PEER_LOOKUP_H_

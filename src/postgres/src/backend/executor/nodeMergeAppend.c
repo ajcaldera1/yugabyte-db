@@ -107,9 +107,9 @@ ExecInitMergeAppend(MergeAppend *node, EState *estate, int eflags)
 
 	/*
 	 * MergeAppend nodes do have Result slots, which hold pointers to tuples,
-	 * so we have to initialize them.
+	 * so we have to initialize them.  FIXME
 	 */
-	ExecInitResultTupleSlotTL(estate, &mergestate->ps);
+	ExecInitResultTupleSlotTL(&mergestate->ps);
 
 	/*
 	 * call ExecInitNode on each of the plans to be executed and save the
@@ -136,7 +136,7 @@ ExecInitMergeAppend(MergeAppend *node, EState *estate, int eflags)
 	{
 		SortSupport sortKey = mergestate->ms_sortkeys + i;
 
-		sortKey->ssup_cxt = CurrentMemoryContext;
+		sortKey->ssup_cxt = GetCurrentMemoryContext();
 		sortKey->ssup_collation = node->collations[i];
 		sortKey->ssup_nulls_first = node->nullsFirst[i];
 		sortKey->ssup_attno = node->sortColIdx[i];

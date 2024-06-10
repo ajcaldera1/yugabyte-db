@@ -248,15 +248,27 @@ ExecCreateTableAs(CreateTableAsStmt *stmt, const char *queryString,
 	if (stmt->if_not_exists)
 	{
 		Oid			nspid;
+		Oid			oldrelid;
 
-		nspid = RangeVarGetCreationNamespace(stmt->into->rel);
+		nspid = RangeVarGetCreationNamespace(into->rel);
 
-		if (get_relname_relid(stmt->into->rel->relname, nspid))
+		oldrelid = get_relname_relid(into->rel->relname, nspid);
+		if (OidIsValid(oldrelid))
 		{
+			/*
+			 * The relation exists and IF NOT EXISTS has been specified.
+			 *
+			 * If we are in an extension script, insist that the pre-existing
+			 * object be a member of the extension, to avoid security risks.
+			 */
+			ObjectAddressSet(address, RelationRelationId, oldrelid);
+			checkMembershipInCurrentExtension(&address);
+
+			/* OK to skip */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_TABLE),
 					 errmsg("relation \"%s\" already exists, skipping",
-							stmt->into->rel->relname)));
+							into->rel->relname)));
 			return InvalidObjectAddress;
 		}
 	}
@@ -540,7 +552,7 @@ intorel_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 
 	for (attnum = 1; attnum <= intoRelationDesc->rd_att->natts; attnum++)
 		rte->insertedCols = bms_add_member(rte->insertedCols,
-										   attnum - FirstLowInvalidHeapAttributeNumber);
+										   attnum - YBGetFirstLowInvalidAttributeNumber(intoRelationDesc));
 
 	ExecCheckRTPerms(list_make1(rte), true);
 
@@ -614,15 +626,17 @@ intorel_receive(TupleTableSlot *slot, DestReceiver *self)
 
 	if (IsYBRelation(myState->rel))
 	{
-		YBCExecuteInsert(myState->rel, RelationGetDescr(myState->rel), tuple);
+		YBCExecuteInsert(myState->rel,
+						 slot,
+						 ONCONFLICT_NONE);
 	}
 	else
 	{
 		heap_insert(myState->rel,
-								tuple,
-								myState->output_cid,
-								myState->hi_options,
-								myState->bistate);
+					tuple,
+					myState->output_cid,
+					myState->hi_options,
+					myState->bistate);
 	}
 
 	/* We know this is a newly created relation, so there are no indexes */

@@ -32,13 +32,15 @@ extern CatalogIndexState CatalogOpenIndexes(Relation heapRel);
 extern void CatalogCloseIndexes(CatalogIndexState indstate);
 extern Oid	CatalogTupleInsert(Relation heapRel, HeapTuple tup);
 extern Oid CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
-						   CatalogIndexState indstate);
+						   CatalogIndexState indstate, bool yb_shared_insert);
 extern void CatalogTupleUpdate(Relation heapRel, ItemPointer otid,
 				   HeapTuple tup);
 extern void CatalogTupleUpdateWithInfo(Relation heapRel,
 						   ItemPointer otid, HeapTuple tup,
 						   CatalogIndexState indstate);
 extern void CatalogTupleDelete(Relation heapRel, HeapTuple tup);
+
+extern Oid	YBCatalogTupleInsert(Relation heapRel, HeapTuple tup, bool yb_shared_insert);
 
 
 /*
@@ -234,6 +236,9 @@ DECLARE_INDEX(pg_shdepend_reference_index, 1233, on pg_shdepend using btree(refc
 DECLARE_UNIQUE_INDEX(pg_statistic_relid_att_inh_index, 2696, on pg_statistic using btree(starelid oid_ops, staattnum int2_ops, stainherit bool_ops));
 #define StatisticRelidAttnumInhIndexId	2696
 
+DECLARE_UNIQUE_INDEX(pg_yb_tablegroup_oid_index, 8037, on pg_yb_tablegroup using btree(oid oid_ops));
+#define YbTablegroupOidIndexId  8037
+
 DECLARE_UNIQUE_INDEX(pg_tablespace_oid_index, 2697, on pg_tablespace using btree(oid oid_ops));
 #define TablespaceOidIndexId  2697
 DECLARE_UNIQUE_INDEX(pg_tablespace_spcname_index, 2698, on pg_tablespace using btree(spcname name_ops));
@@ -359,5 +364,17 @@ DECLARE_UNIQUE_INDEX(pg_subscription_subname_index, 6115, on pg_subscription usi
 
 DECLARE_UNIQUE_INDEX(pg_subscription_rel_srrelid_srsubid_index, 6117, on pg_subscription_rel using btree(srrelid oid_ops, srsubid oid_ops));
 #define SubscriptionRelSrrelidSrsubidIndexId 6117
+
+DECLARE_UNIQUE_INDEX(pg_yb_catalog_version_db_oid_index, 8012, on pg_yb_catalog_version using btree(db_oid oid_ops));
+#define YBCatalogVersionDbOidIndexId 8012
+
+DECLARE_UNIQUE_INDEX(pg_yb_profile_oid_index, 8052, on pg_yb_profile using btree(oid oid_ops));
+#define YbProfileOidIndexId 8052
+
+DECLARE_UNIQUE_INDEX(pg_yb_role_profile_oid_index, 8055, on pg_yb_role_profile using btree(oid oid_ops));
+#define YbRoleProfileOidIndexId 8055
+
+DECLARE_UNIQUE_INDEX(pg_yb_profile_prfname_index, 8057, on pg_yb_profile using btree(prfname name_ops));
+#define YbProfileRolnameIndexId	8057
 
 #endif							/* INDEXING_H */

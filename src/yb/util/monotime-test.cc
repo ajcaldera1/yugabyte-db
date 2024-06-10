@@ -30,15 +30,10 @@
 // under the License.
 //
 
-#include "yb/util/monotime.h"
-
-#include <sys/time.h>
-#include <unistd.h>
-
 #include <condition_variable>
-#include <thread>
+#include <mutex>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/util/test_util.h"
@@ -88,6 +83,14 @@ TEST(TestMonoTime, TestComparison) {
   ASSERT_TRUE(mil.LessThan(sec));
   ASSERT_TRUE(mil.MoreThan(nano));
   ASSERT_TRUE(sec.MoreThan(mil));
+
+  ASSERT_TRUE(IsInitialized(CoarseMonoClock::Now()));
+  ASSERT_FALSE(IsInitialized(CoarseTimePoint::min()));
+  ASSERT_TRUE(IsInitialized(CoarseTimePoint::max()));
+
+  ASSERT_FALSE(IsExtremeValue(CoarseMonoClock::Now()));
+  ASSERT_TRUE(IsExtremeValue(CoarseTimePoint::min()));
+  ASSERT_TRUE(IsExtremeValue(CoarseTimePoint::max()));
 }
 
 TEST(TestMonoTime, TestTimeVal) {
@@ -160,13 +163,13 @@ TEST(TestMonoTime, TestDeltaConversions) {
   // TODO: Reliably test MonoDelta::FromSeconds() considering floating-point rounding errors
 
   MonoDelta mil(MonoDelta::FromMilliseconds(500));
-  ASSERT_EQ(500 * MonoTime::kNanosecondsPerMillisecond, mil.nano_delta_);
+  ASSERT_EQ(500 * MonoTime::kNanosecondsPerMillisecond, mil.ToNanoseconds());
 
   MonoDelta micro(MonoDelta::FromMicroseconds(500));
-  ASSERT_EQ(500 * MonoTime::kNanosecondsPerMicrosecond, micro.nano_delta_);
+  ASSERT_EQ(500 * MonoTime::kNanosecondsPerMicrosecond, micro.ToNanoseconds());
 
   MonoDelta nano(MonoDelta::FromNanoseconds(500));
-  ASSERT_EQ(500, nano.nano_delta_);
+  ASSERT_EQ(500, nano.ToNanoseconds());
 }
 
 template <class Now>
@@ -224,8 +227,8 @@ TEST(TestMonoTime, ToCoarse) {
     auto converted = ToCoarse(MonoTime::Now());
     auto after = CoarseMonoClock::Now();
 
-    // Coarse mono clock has 1ms precision, so we add it to bounds.
-    const auto kPrecision = 2ms;
+    // Coarse mono clock has limited precision, so we add its resolution to bounds.
+    const auto kPrecision = ClockResolution<CoarseMonoClock>() * 2;
     ASSERT_GE(converted, before);
     ASSERT_LE(converted, after + kPrecision);
   }
@@ -234,7 +237,8 @@ TEST(TestMonoTime, ToCoarse) {
 TEST(TestMonoTime, TestOverFlow) {
   EXPECT_EXIT(MonoDelta::FromMilliseconds(std::numeric_limits<int64_t>::max()),
                                           ::testing::KilledBySignal(SIGABRT), "Check failed.*");
-  EXPECT_EXIT(MonoDelta::FromSeconds(std::numeric_limits<int64_t>::max()),
+  // We have to cast kint64max to double to avoid a warning on implicit cast that changes the value.
+  EXPECT_EXIT(MonoDelta::FromSeconds(static_cast<double>(std::numeric_limits<int64_t>::max())),
               ::testing::KilledBySignal(SIGABRT), "Check failed.*");
   EXPECT_EXIT(MonoDelta::FromMicroseconds(std::numeric_limits<int64_t>::max()),
               ::testing::KilledBySignal(SIGABRT), "Check failed.*");
@@ -261,6 +265,38 @@ TEST(TestMonoTime, TestCondition) {
     ASSERT_LE(end - start, kWaitTime + kAllowedError);
     break;
   }
+}
+
+TEST(TestMonoTime, TestSubtractDelta) {
+  MonoTime start = MonoTime::Now();
+  MonoDelta delta = MonoDelta::FromMilliseconds(100);
+  ASSERT_GT(start, start - delta);
+  MonoTime start_copy = start;
+  start_copy.SubtractDelta(delta);
+  ASSERT_EQ(start_copy, start - delta);
+  ASSERT_EQ(start_copy + delta, start);
+}
+
+TEST(TestMonoTime, ToStringRelativeToNow) {
+  auto now = CoarseMonoClock::Now();
+
+  auto t = now + 2s;
+  ASSERT_EQ(Format("$0 (2.000s from now)", t), ToStringRelativeToNow(t, now));
+  ASSERT_EQ("2.000s from now", ToStringRelativeToNowOnly(t, now));
+
+  t = now;
+  ASSERT_EQ(Format("$0 (now)", t), ToStringRelativeToNow(t, now));
+  ASSERT_EQ("now", ToStringRelativeToNowOnly(t, now));
+
+  t = now - 2s;
+  ASSERT_EQ(Format("$0 (2.000s ago)", t), ToStringRelativeToNow(t, now));
+  ASSERT_EQ("2.000s ago", ToStringRelativeToNowOnly(t, now));
+
+  ASSERT_EQ("-inf", ToStringRelativeToNow(CoarseTimePoint::min(), now));
+  ASSERT_EQ("+inf", ToStringRelativeToNow(CoarseTimePoint::max(), now));
+
+  ASSERT_EQ(ToString(t), ToStringRelativeToNow(t, CoarseTimePoint::min()));
+  ASSERT_EQ(ToString(t), ToStringRelativeToNow(t, CoarseTimePoint::max()));
 }
 
 } // namespace yb

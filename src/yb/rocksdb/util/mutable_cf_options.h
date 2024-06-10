@@ -18,8 +18,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_UTIL_MUTABLE_CF_OPTIONS_H
-#define ROCKSDB_UTIL_MUTABLE_CF_OPTIONS_H
 
 #pragma once
 
@@ -33,6 +31,7 @@ struct MutableCFOptions {
   MutableCFOptions(const Options& options, const ImmutableCFOptions& ioptions)
       : write_buffer_size(options.write_buffer_size),
         max_write_buffer_number(options.max_write_buffer_number),
+        max_flushing_bytes(options.max_flushing_bytes),
         arena_block_size(options.arena_block_size),
         memtable_prefix_bloom_bits(options.memtable_prefix_bloom_bits),
         memtable_prefix_bloom_probes(options.memtable_prefix_bloom_probes),
@@ -98,13 +97,16 @@ struct MutableCFOptions {
         max_subcompactions(1),
         max_sequential_skip_in_iterations(0),
         paranoid_file_checks(false),
-        compaction_measure_io_stats(false) {}
+        compaction_measure_io_stats(false),
+        max_file_size_for_compaction(nullptr) {}
 
   // Must be called after any change to MutableCFOptions
   void RefreshDerivedOptions(const ImmutableCFOptions& ioptions);
 
   // Get the max file size in a given level.
   uint64_t MaxFileSizeForLevel(int level) const;
+  // Get the max file size for compaction.
+  uint64_t MaxFileSizeForCompaction() const;
   // Returns maximum total overlap bytes with grandparent
   // level (i.e., level+2) before we stop building a single
   // file in level->level+1 compaction.
@@ -123,6 +125,7 @@ struct MutableCFOptions {
   // Memtable related options
   size_t write_buffer_size;
   int max_write_buffer_number;
+  size_t max_flushing_bytes = std::numeric_limits<size_t>::max();
   size_t arena_block_size;
   uint32_t memtable_prefix_bloom_bits;
   uint32_t memtable_prefix_bloom_probes;
@@ -154,7 +157,7 @@ struct MutableCFOptions {
   uint64_t max_sequential_skip_in_iterations;
   bool paranoid_file_checks;
   bool compaction_measure_io_stats;
-  uint64_t max_file_size_for_compaction;
+  std::shared_ptr<std::function<uint64_t()>> max_file_size_for_compaction;
 
   // Derived options
   // Per-level target file size.
@@ -164,5 +167,3 @@ struct MutableCFOptions {
 uint64_t MultiplyCheckOverflow(uint64_t op1, int op2);
 
 }  // namespace rocksdb
-
-#endif // ROCKSDB_UTIL_MUTABLE_CF_OPTIONS_H

@@ -36,8 +36,11 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/gutil/bind.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/util/env.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread_restrictions.h"
 
@@ -122,6 +125,20 @@ TEST_F(ThreadTest, TestCallOnExit) {
   ASSERT_EQ("hello 1, hello 2", s);
 }
 
+TEST_F(ThreadTest, TestThreadNameWithoutPadding) {
+  ThreadPtr t;
+  string name = string(25, 'a');
+  t = CHECK_RESULT(Thread::Make("test", name, [](){}));
+  ASSERT_EQ(t->name(), name);
+}
+
+TEST_F(ThreadTest, TestThreadNameWithPadding) {
+  ThreadPtr t;
+  string name = string(5, 'a');
+  t = CHECK_RESULT(Thread::Make("test", name, [](){}));
+  ASSERT_EQ(t->name(), name + string(10, Thread::kPaddingChar));
+}
+
 // The following tests only run in debug mode, since thread restrictions are no-ops
 // in release builds.
 #ifndef NDEBUG
@@ -139,7 +156,7 @@ TEST_F(ThreadTest, TestThreadRestrictions_IO) {
   // Disallow IO - doing IO should crash the process.
   ASSERT_DEATH({
       ThreadRestrictions::SetIOAllowed(false);
-      ignore_result(Env::Default()->FileExists("/"));
+      Env::Default()->FileExists("/");
     },
     "Function marked as IO-only was called from a thread that disallows IO");
 }
@@ -159,8 +176,8 @@ TEST_F(ThreadTest, TestThreadRestrictions_Waiting) {
   // Disallow waiting - blocking on a latch should crash the process.
   ASSERT_DEATH({
       ThreadRestrictions::SetWaitAllowed(false);
-      CountDownLatch l(0);
-      l.Wait();
+      CountDownLatch l(1);
+      l.WaitFor(std::chrono::seconds(1s));
     },
     "Waiting is not allowed to be used on this thread");
 }

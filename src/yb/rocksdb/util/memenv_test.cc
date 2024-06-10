@@ -17,7 +17,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
 #include <memory>
 #include <string>
@@ -26,10 +25,15 @@
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/testharness.h"
+#include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/test_util.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
-class MemEnvTest : public testing::Test {
+class MemEnvTest : public RocksDBTest {
  public:
   Env* env_;
   const EnvOptions soptions_;
@@ -108,7 +112,7 @@ TEST_F(MemEnvTest, ReadWrite) {
   unique_ptr<SequentialFile> seq_file;
   unique_ptr<RandomAccessFile> rand_file;
   Slice result;
-  char scratch[100];
+  uint8_t scratch[100];
 
   ASSERT_OK(env_->CreateDir("/dir"));
 
@@ -168,7 +172,7 @@ TEST_F(MemEnvTest, Misc) {
 
 TEST_F(MemEnvTest, LargeWrite) {
   const size_t kWriteSize = 300 * 1024;
-  char* scratch = new char[kWriteSize * 2];
+  uint8_t* scratch = new uint8_t[kWriteSize * 2];
 
   std::string write_data;
   for (size_t i = 0; i < kWriteSize; ++i) {
@@ -204,13 +208,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr, "SKIPPED as MemEnv is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

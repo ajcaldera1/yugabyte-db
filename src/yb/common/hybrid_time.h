@@ -32,20 +32,21 @@
 
 // Portions Copyright (c) YugaByte, Inc.
 
-#ifndef YB_COMMON_HYBRID_TIME_H_
-#define YB_COMMON_HYBRID_TIME_H_
+#pragma once
 
 #include <inttypes.h>
 
-#include <string>
 #include <limits>
+#include <string>
 
-#include "yb/util/enums.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/faststring.h"
 #include "yb/util/monotime.h"
 #include "yb/util/physical_time.h"
-#include "yb/util/status.h"
 
 namespace yb {
+
+class Slice;
 
 // An alias for the raw in-memory representation of a HybridTime.
 using HybridTimeRepr = uint64_t;
@@ -86,6 +87,8 @@ class HybridTime {
 
   // Hybrid times are converted to debug strings as <this_string_constant>(<hybrid_time_value>).
   static const char* const kHybridTimeDebugStrPrefix;
+
+  static const size_t SizeOfHybridTimeRepr = sizeof(HybridTimeRepr);
 
   // ----------------------------------------------------------------------------------------------
   // Constructors / static factories
@@ -155,10 +158,27 @@ class HybridTime {
     return AddMicroseconds(millis * MonoTime::kMicrosecondsPerMillisecond);
   }
 
+  HybridTime AddSeconds(int64_t seconds) const {
+    return AddMicroseconds(seconds * MonoTime::kMicrosecondsPerSecond);
+  }
+
+  HybridTime AddDelta(MonoDelta delta) const {
+    return AddMicroseconds(delta.ToMicroseconds());
+  }
+
   // Sets this hybrid time from 'value'
-  CHECKED_STATUS FromUint64(uint64_t value);
+  Status FromUint64(uint64_t value);
+
+  static HybridTime FromPB(uint64_t value) {
+    return value ? HybridTime(value) : HybridTime();
+  }
 
   HybridTimeRepr value() const { return v; }
+
+  // Returns this HybridTime if valid, otherwise returns the one provided.
+  HybridTime GetValueOr(const HybridTime& other) const {
+    return is_valid() ? *this : other;
+  }
 
   bool is_special() const {
     switch (v) {
@@ -169,8 +189,6 @@ class HybridTime {
       default:
         return false;
     }
-    LOG(FATAL) << "Should never happen";
-    return false;  // Never reached.
   }
 
   bool operator <(const HybridTime& other) const {
@@ -193,6 +211,11 @@ class HybridTime {
   inline MicrosTime GetPhysicalValueMicros() const {
     return v >> kBitsForLogicalComponent;
   }
+
+  uint64_t GetPhysicalValueMillis() const;
+  uint64_t GetPhysicalValueNanos() const;
+
+  MicrosTime CeilPhysicalValueMicros() const;
 
   inline int64_t PhysicalDiff(const HybridTime& other) const {
     return static_cast<int64_t>(GetPhysicalValueMicros() - other.GetPhysicalValueMicros());
@@ -222,6 +245,12 @@ class HybridTime {
   // It is slower than default one.
   static void TEST_SetPrettyToString(bool flag);
 
+  // Acceptable system time formats:
+  //  1. HybridTime Timestamp (in Microseconds)
+  //  2. Interval
+  //  3. Human readable string
+  static Result<HybridTime> ParseHybridTime(std::string input);
+
  private:
 
   HybridTimeRepr v;
@@ -245,6 +274,11 @@ inline int HybridTime::CompareTo(const HybridTime &other) const {
   return 0;
 }
 
+// Given two hybrid times, determines whether the delta between end and begin them is higher,
+// lower or equal to the given delta and returns 1, -1 and 0 respectively. Note that if end <
+// begin we return -1.
+int CompareHybridTimesToDelta(HybridTime begin, HybridTime end, MonoDelta delta);
+
 inline std::ostream &operator <<(std::ostream &o, const HybridTime &hybridTime) {
   return o << hybridTime.ToString();
 }
@@ -260,5 +294,3 @@ inline HybridTime operator "" _usec_ht(unsigned long long microseconds) { // NOL
 using hybrid_time_literals::operator"" _usec_ht;
 
 }  // namespace yb
-
-#endif  // YB_COMMON_HYBRID_TIME_H_

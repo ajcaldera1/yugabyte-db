@@ -14,6 +14,7 @@ package org.yb.cql;
 
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
+import com.google.common.collect.ImmutableList;
 import org.junit.Test;
 import org.yb.client.TestUtils;
 
@@ -26,9 +27,12 @@ import static org.yb.AssertionWrappers.assertEquals;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestCollectionTypes extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestCollectionTypes.class);
 
   private String createTableStmt(String tableName, String keyType, String elemType)
       throws Exception {
@@ -362,20 +366,13 @@ public class TestCollectionTypes extends BaseCQLTest {
     String update_template = "UPDATE " + tableName + " SET %s = %s WHERE h = 1 and r = 1";
 
     //-------------------------------- Testing Map Update ------------------------------------\\
-    String update_stmt1 = String.format(update_template, "vm", "{11 : 'abcd', 12 : 'efgh'}");
+    String update_stmt1 =
+        String.format(update_template, "vm", "{11 : 'abcd', 12 : 'efgh', 13: 'xyza', 14: 'pqrs'}");
     session.execute(update_stmt1);
 
     // checking update result
-    row = runSelect(select_stmt1).next();
-    assertEquals(1, row.getInt(0));
-    assertEquals(1, row.getInt(1));
-    // Checking Map Value
-    map_value = row.getMap(2, Integer.class, String.class);
-    assertEquals(2, map_value.size());
-    assertTrue(map_value.containsKey(11));
-    assertEquals("abcd", map_value.get(11));
-    assertTrue(map_value.containsKey(12));
-    assertEquals("efgh", map_value.get(12));
+    assertQuery(select_stmt1,
+        "Row[1, 1, {11=abcd, 12=efgh, 13=xyza, 14=pqrs}, [a, b, c], [1.5, 2.0, 3.5]]");
 
     //-------------------------------- Testing Set Update ------------------------------------\\
     String update_stmt2 = String.format(update_template, "vs", "{'x', 'y'}");
@@ -390,23 +387,46 @@ public class TestCollectionTypes extends BaseCQLTest {
     assertTrue(set_value.contains("y"));
 
     //-------------------------------- Testing List Update -----------------------------------\\
-    String update_stmt3 = String.format(update_template, "vl", "[2, 2.5, 3.0]");
+    String update_stmt3 = String.format(update_template, "vl", "[2, 2.5, 3.0, 3.5, 4.0, 4.5]");
     session.execute(update_stmt3);
     // checking update result
     row = runSelect(select_stmt1).next();
     assertEquals(1, row.getInt(0));
     assertEquals(1, row.getInt(1));
     list_value = row.getList(4, Double.class);
-    assertEquals(3, list_value.size());
+    assertEquals(6, list_value.size());
     assertEquals(2.0, list_value.get(0), 0.0 /* delta */);
     assertEquals(2.5, list_value.get(1), 0.0 /* delta */);
     assertEquals(3.0, list_value.get(2), 0.0 /* delta */);
+    assertEquals(3.5, list_value.get(3), 0.0 /* delta */);
+    assertEquals(4.0, list_value.get(4), 0.0 /* delta */);
+    assertEquals(4.5, list_value.get(5), 0.0 /* delta */);
 
     //------------------------------------------------------------------------------------------
     // Testing Delete -- basic functionality
     //------------------------------------------------------------------------------------------
 
-    // collections cannot be primary keys so not much to be checked here -- just plain delete
+    String delete_template = "DELETE %s FROM " + tableName + " WHERE h = 1 and r = 1";
+
+    //-------------------------------- Testing Map Delete ------------------------------------\\
+    String delete_stmt1 = String.format(delete_template, "vm[11], vm[13]");
+    session.execute(delete_stmt1);
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {12=efgh, 14=pqrs}, [x, y], [2.0, 2.5, 3.0, 3.5, 4.0, 4.5]]");
+
+    //-------------------------------- Testing List Delete ------------------------------------\\
+    String delete_stmt2 = String.format(delete_template, "vl[2], vl[4]");
+    session.execute(delete_stmt2);
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {12=efgh, 14=pqrs}, [x, y], [2.0, 2.5, 3.5, 4.5]]");
+
+    // 3.5 and 4.5 should now be at index 2 and 3 respectively after the previous statement.
+    String delete_stmt3 = String.format(delete_template, "vl[2], vl[3]");
+    session.execute(delete_stmt3);
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {12=efgh, 14=pqrs}, [x, y], [2.0, 2.5]]");
+
+    //-------------------------------- Testing Basic Delete ------------------------------------\\
     String delete_stmt = "DELETE FROM " + tableName + " WHERE h = 1 and r = 2";
     session.execute(delete_stmt);
 
@@ -473,6 +493,16 @@ public class TestCollectionTypes extends BaseCQLTest {
         "{'a', 'b'}", "[1.0, 'y', 3.0]");
     runInvalidStmt(insert_stmt6);
 
+    // testing NULL in collections
+    for (List<String> values : Arrays.asList(Arrays.asList("{null : 'a'}", "{'a'}", "[1.0]"),
+                                             Arrays.asList("{1 : null}", "{'a'}", "[1.0]"),
+                                             Arrays.asList("{1 : 'a'}", "{null}", "[1.0]"),
+                                             Arrays.asList("{1 : 'a'}", "{'a'}", "[null]"))) {
+      runInvalidStmt(
+          String.format(insert_template, 1, 2, values.get(0), values.get(1), values.get(2)),
+          "null is not supported inside collections");
+    }
+
     //------------------------------------------------------------------------------------------
     // Testing Invalid Updates
     //------------------------------------------------------------------------------------------
@@ -507,6 +537,39 @@ public class TestCollectionTypes extends BaseCQLTest {
     String update_stmt7 = String.format(update_template, "vs", "{'x', 'y'}") +
         " IF vl < [1.0, 2.0, 4.0]";
     runInvalidStmt(update_stmt7);
+
+    // testing NULL in collections
+    update_template = "UPDATE " + tableName + " SET %s WHERE h = 1 and r = 1";
+    String update_template2 = "UPDATE " + tableName + " SET vm = {1:'a'} WHERE %s";
+
+    for (String expr : ImmutableList.of(
+        "vm = {null : 'a'}", "vm = {1 : null}", "vs = {null}", "vl = [null]")) {
+      runInvalidStmt(String.format(update_template, expr),
+                     "null is not supported inside collections");
+
+      runInvalidStmt(String.format(update_template2, expr),
+                     "null is not supported inside collections");
+    }
+
+    runInvalidStmt("UPDATE " + tableName + " SET vm = {1 : 'a'} WHERE h IN (1)",
+                   "Operator not supported for write operations");
+
+    runInvalidStmt("UPDATE " + tableName + " SET vs = { } IF vm = {}",
+                   "Missing partition key");
+
+    //------------------------------------------------------------------------------------------
+    // Testing Invalid Deletes
+    //------------------------------------------------------------------------------------------
+    String delete_stmt = "DELETE FROM " + tableName + " WHERE %s";
+
+    for (String expr : ImmutableList.of(
+        "vm = {null : 'a'}", "vm = {1 : null}", "vs = {null}", "vl = [null]")) {
+      runInvalidStmt(String.format(delete_stmt, expr),
+                     "null is not supported inside collections");
+    }
+
+    runInvalidStmt("DELETE FROM " + tableName + " IF h = 1",
+                   "syntax error, unexpected IF_P");
 
     // Done -- cleaning up
     dropTable(tableName);
@@ -625,6 +688,9 @@ public class TestCollectionTypes extends BaseCQLTest {
     map_input.put(4, "x");
     map_input.put(5, "y");
     map_input.put(6, "z");
+    map_input.put(7, "a");
+    map_input.put(8, "b");
+    map_input.put(9, "c");
     set_input.clear();
     set_input.add("f");
     set_input.add("e");
@@ -633,6 +699,9 @@ public class TestCollectionTypes extends BaseCQLTest {
     list_input.add(2.0);
     list_input.add(3.0);
     list_input.add(4.0);
+    list_input.add(5.0);
+    list_input.add(6.0);
+    list_input.add(7.0);
 
     //--------------------------- Testing Update By Position ---------------------------------\\
     // updating the values
@@ -679,9 +748,153 @@ public class TestCollectionTypes extends BaseCQLTest {
     assertEquals(list_input, row.getList(4, Double.class));
 
     //------------------------------------------------------------------------------------------
-    // SELECT and DELETE statements do not require additional tests for binds because
+    // Testing Delete with Bind
+    //------------------------------------------------------------------------------------------
+
+    //--------------------------- Testing Delete By Position ---------------------------------\\
+    String delete_stmt = "DELETE vm[?], vl[?] FROM " + tableName + " WHERE h = ? AND r = ?;";
+    session.execute(delete_stmt, 4, 1, 1, 1);
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {5=y, 6=z, 7=a, 8=b, 9=c}, [d, e, f], [2.0, 4.0, 5.0, 6.0, 7.0]]");
+
+    //----------------------------- Testing Delete By Name -----------------------------------\\
+    session.execute(delete_stmt, new HashMap<String, Object>() {{
+        put("key(vm)", 6);
+        put("idx(vl)", 1);
+        put("h", 1);
+        put("r", 1);
+      }});
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {5=y, 7=a, 8=b, 9=c}, [d, e, f], [2.0, 5.0, 6.0, 7.0]]");
+
+    //--------------------------- Testing Delete By Named Markers -----------------------------\\
+    String del_stmt2 = "DELETE vm[:mk], vl[:li] FROM " + tableName + " WHERE h = :hv AND r = :rv;";
+    session.execute(del_stmt2, new HashMap<String, Object>() {{
+        put("mk", 8);
+        put("li", 2);
+        put("hv", 1);
+        put("rv", 1);
+      }});
+    assertQuery(String.format("SELECT * from %s where h = 1 and r = 1", tableName),
+        "Row[1, 1, {5=y, 7=a, 9=c}, [d, e, f], [2.0, 5.0, 7.0]]");
+
+    //------------------------------------------------------------------------------------------
+    // SELECT statements do not require additional tests for binds because
     // collections cannot be primary keys and do not support comparison operations
     //------------------------------------------------------------------------------------------
   }
 
+  @Test
+  public void TestCollectionLiterals() throws Exception {
+    String tableNameIntBlob = "test_collection_literals_int_blob";
+    String tableNameBlobBlob = "test_collection_literals_blob_blob";
+
+    createCollectionTable(tableNameIntBlob, "int", "blob");
+    createCollectionTable(tableNameBlobBlob, "blob", "blob");
+
+    String insertTemplateIntBlob = "INSERT INTO " + tableNameIntBlob +
+        " (h, r, vm, vs, vl) VALUES (%d, %d, %s, %s, %s);";
+    String insertTemplateBlobBlob = "INSERT INTO " + tableNameBlobBlob +
+        " (h, r, vm, vs, vl) VALUES (%d, %d, %s, %s, %s);";
+
+    // Insert with valid literals.
+    String insertStmt;
+    insertStmt = String.format(insertTemplateIntBlob, 1, 1,
+                                "{ 1 : 0x01, 2 : textAsBlob('2'), 3 : intAsBlob(3) }",
+                                "{ 1, 2, 3 }",
+                                "[ 0x01, textAsBlob('a'), intAsBlob(3) ]");
+    execute(insertStmt);
+
+    insertStmt = String.format(insertTemplateBlobBlob, 1, 1,
+                                "{ 0x01 : 0x01, 0x02 : textAsBlob('2'), 0x03 : intAsBlob(3) }",
+                                "{ 0x01, textAsBlob('a'), intAsBlob(3) }",
+                                "[ 0x01, textAsBlob('a'), intAsBlob(3) ]");
+    execute(insertStmt);
+
+    // Incorrect use of collection literals in SELECT fields.
+    runInvalidQuery(String.format("SELECT { 1 : 1 } FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT { 1 : r } FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT { r : 1 } FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT [ 1 ] FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT [ r ] FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT { 1 } FROM %s", tableNameIntBlob));
+    runInvalidQuery(String.format("SELECT { r } FROM %s", tableNameIntBlob));
+
+    // Incorrect use of collection literals in WHERE clause.
+    String selectTemplate = "SELECT * FROM %s WHERE %s IN (%s)";
+    runInvalidQuery(String.format(selectTemplate, tableNameIntBlob, "vm",
+                                  "{ 1 : 0x01, 2 : textAsBlob('2'), 3 : intAsBlob(3) }"));
+    runInvalidQuery(String.format(selectTemplate, tableNameBlobBlob, "vs",
+                                  "{ 0x01, textAsBlob('a'), intAsBlob(3) }"));
+    runInvalidQuery(String.format(selectTemplate, tableNameIntBlob, "vl",
+                                  "[ 0x01, textAsBlob('a'), intAsBlob(3) ]"));
+
+    // Insert with invalid MAP literals.
+    insertStmt = String.format(insertTemplateIntBlob, 1, 2,
+                               "{ 1 : 1 }", null, null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 3,
+                               "{ r : 0x01 }", null, null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 4,
+                               "{ 1 : intAsBlob(r) }", null, null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 5,
+                               "{ 1 : cast(1 as blob) }", null, null);
+    runInvalidStmt(insertStmt);
+
+    // Insert with invalid SET literals.
+    insertStmt = String.format(insertTemplateBlobBlob, 1, 6,
+                               null, "{ 1 }", null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 7,
+                               null, "{ r }", null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateBlobBlob, 1, 8,
+                               null, "{ intAsBlob(r) }", null);
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateBlobBlob, 1, 9,
+                               null, "{ cast(1 as blob) }", null);
+    runInvalidStmt(insertStmt);
+
+    // Insert with invalid LIST literals.
+    insertStmt = String.format(insertTemplateIntBlob, 1, 10,
+                               null, null, "[ 1 ]");
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 11,
+                               null, null, "[ r ]");
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 12,
+                               null, null, "[ intAsBlob(r) ]");
+    runInvalidStmt(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 1, 13,
+                               null, null, "[ cast(r as blob) ]");
+    runInvalidStmt(insertStmt);
+
+    // Insert with mismatch datatype.
+    insertStmt = String.format(insertTemplateIntBlob, 2, 1,
+                               "{ textAsBlob('2') : 2 }", null, null);
+    runInvalidQuery(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 2, 2,
+                               "{ intAsBlob(3) : 3 }", null, null);
+    runInvalidQuery(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 2, 3,
+                               null, "{ textAsBlob('a') }", null);
+    runInvalidQuery(insertStmt);
+
+    insertStmt = String.format(insertTemplateIntBlob, 2, 4,
+                               null, "{ intAsBlob(3) }", null);
+    runInvalidQuery(insertStmt);
+  }
 }

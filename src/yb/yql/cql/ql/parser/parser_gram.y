@@ -65,6 +65,8 @@
 %code requires {
 #include <stdbool.h>
 
+#include "yb/bfql/bfunc_names.h"
+
 #include "yb/common/common.pb.h"
 #include "yb/gutil/macros.h"
 
@@ -76,6 +78,7 @@
 #include "yb/yql/cql/ql/ptree/pt_use_keyspace.h"
 #include "yb/yql/cql/ql/ptree/pt_alter_keyspace.h"
 #include "yb/yql/cql/ql/ptree/pt_alter_table.h"
+#include "yb/yql/cql/ql/ptree/pt_column_definition.h"
 #include "yb/yql/cql/ql/ptree/pt_create_table.h"
 #include "yb/yql/cql/ql/ptree/pt_create_type.h"
 #include "yb/yql/cql/ql/ptree/pt_create_index.h"
@@ -83,6 +86,7 @@
 #include "yb/yql/cql/ql/ptree/pt_alter_role.h"
 #include "yb/yql/cql/ql/ptree/pt_grant_revoke.h"
 #include "yb/yql/cql/ql/ptree/pt_truncate.h"
+#include "yb/yql/cql/ql/ptree/pt_dml_using_clause.h"
 #include "yb/yql/cql/ql/ptree/pt_drop.h"
 #include "yb/yql/cql/ql/ptree/pt_type.h"
 #include "yb/yql/cql/ql/ptree/pt_name.h"
@@ -90,11 +94,15 @@
 #include "yb/yql/cql/ql/ptree/pt_bcall.h"
 #include "yb/yql/cql/ql/ptree/pt_select.h"
 #include "yb/yql/cql/ql/ptree/pt_insert.h"
+#include "yb/yql/cql/ql/ptree/pt_insert_json_clause.h"
 #include "yb/yql/cql/ql/ptree/pt_insert_values_clause.h"
 #include "yb/yql/cql/ql/ptree/pt_explain.h"
 #include "yb/yql/cql/ql/ptree/pt_delete.h"
 #include "yb/yql/cql/ql/ptree/pt_update.h"
 #include "yb/yql/cql/ql/ptree/pt_transaction.h"
+
+DECLARE_bool(cql_raise_index_where_clause_error);
+DECLARE_bool(ycql_suppress_group_by_error);
 
 namespace yb {
 namespace ql {
@@ -120,6 +128,7 @@ typedef PTConstInt::SharedPtr          PConstInt;
 typedef PTCollectionExpr::SharedPtr    PCollectionExpr;
 typedef PTCollection::SharedPtr        PCollection;
 typedef PTInsertValuesClause::SharedPtr     PInsertValuesClause;
+typedef PTInsertJsonClause::SharedPtr       PInsertJsonClause;
 typedef PTSelectStmt::SharedPtr        PSelectStmt;
 typedef PTTableRef::SharedPtr          PTableRef;
 typedef PTTableRefListNode::SharedPtr  PTableRefListNode;
@@ -129,11 +138,14 @@ typedef PTAssign::SharedPtr            PAssign;
 typedef PTKeyspaceProperty::SharedPtr     PKeyspaceProperty;
 typedef PTKeyspacePropertyListNode::SharedPtr     PKeyspacePropertyListNode;
 typedef PTKeyspacePropertyMap::SharedPtr  PKeyspacePropertyMap;
-typedef PTDmlUsingClause::SharedPtr     PDmlUsingClause;
-typedef PTDmlUsingClauseElement::SharedPtr     PDmlUsingClauseElement;
+typedef PTDmlUsingClausePtr     PDmlUsingClause;
+typedef PTDmlUsingClauseElementPtr     PDmlUsingClauseElement;
 typedef PTTableProperty::SharedPtr     PTableProperty;
 typedef PTTablePropertyListNode::SharedPtr     PTablePropertyListNode;
 typedef PTTablePropertyMap::SharedPtr  PTablePropertyMap;
+typedef PTDmlWriteProperty::SharedPtr     PDmlWriteProperty;
+typedef PTDmlWritePropertyListNode::SharedPtr     PDmlWritePropertyListNode;
+typedef PTDmlWritePropertyMap::SharedPtr  PDmlWritePropertyMap;
 
 typedef PTTypeField::SharedPtr         PTypeField;
 typedef PTTypeFieldListNode::SharedPtr PTypeFieldListNode;
@@ -141,6 +153,7 @@ typedef PTTypeFieldListNode::SharedPtr PTypeFieldListNode;
 typedef PTAssignListNode::SharedPtr    PAssignListNode;
 
 typedef PTName::SharedPtr              PName;
+typedef PTIndexColumnPtr       PIndexColumn;
 typedef PTQualifiedName::SharedPtr     PQualifiedName;
 typedef PTQualifiedNameListNode::SharedPtr PQualifiedNameListNode;
 
@@ -191,6 +204,7 @@ using namespace yb::ql;
 
 #define PARSER_INVALID(loc) parser_->Error(loc, ErrorCode::SQL_STATEMENT_INVALID)
 #define PARSER_UNSUPPORTED(loc) parser_->Error(loc, ErrorCode::FEATURE_NOT_SUPPORTED)
+#define PARSER_UNSUPPORTED_MSG(loc, msg) parser_->Error(loc, msg, ErrorCode::FEATURE_NOT_SUPPORTED)
 #define PARSER_NOCODE(loc) parser_->Error(loc, ErrorCode::FEATURE_NOT_YET_IMPLEMENTED)
 
 #define PARSER_CQL_INVALID(loc) parser_->Error(loc, ErrorCode::CQL_STATEMENT_INVALID)
@@ -275,8 +289,10 @@ using namespace yb::ql;
 
 %type <PInsertValuesClause>     values_clause
 
+%type <PInsertJsonClause>       json_clause
+
 %type <PExpr>             // Expression clause. These expressions are used in a specific context.
-                          if_clause
+                          if_clause opt_if_clause
                           where_clause opt_where_clause
                           where_or_current_clause opt_where_or_current_clause
                           limit_clause select_limit_value
@@ -287,7 +303,7 @@ using namespace yb::ql;
 
                           // Create table clauses.
                           OptTableElementList TableElementList
-                          ColQualList NestedColumnList columnList
+                          ColQualList NestedColumnList columnList index_column_list
 
                           // Alter table commands.
                           addColumnDefList dropColumnList alterPropertyList
@@ -301,7 +317,7 @@ using namespace yb::ql;
                           a_expr b_expr ctext_expr c_expr AexprConst bindvar
                           collection_expr target_el in_expr
                           func_expr func_application func_arg_expr
-                          inactive_a_expr inactive_c_expr
+                          inactive_a_expr inactive_c_expr implicit_row
 
 %type <PRoleOption>       RoleOption
 
@@ -310,7 +326,7 @@ using namespace yb::ql;
 %type <PCollectionExpr>   // An expression for CQL collections:
                           //  - Map/Set/List/Tuple/Frozen/User-Defined Types.
                           map_elems map_expr set_elems set_expr list_elems list_expr
-                          tuple_elems tuple_expr
+                          in_operand_elems in_operand tuple_elems
 
 %type <PExprListNode>     // A list of expressions.
                           target_list opt_target_list
@@ -361,11 +377,16 @@ using namespace yb::ql;
 %type <PTablePropertyListNode>   opt_table_options table_property table_properties orderingList
                           opt_index_options
 
+%type <PDmlWriteProperty>    write_dml_property_map_list_element
+%type <PDmlWritePropertyMap> write_dml_property_map_list write_dml_property_map
+%type <PDmlWritePropertyListNode>   opt_write_dml_properties write_dml_property write_dml_properties
+
 %type <PTypeField>         TypeField
 %type <PTypeFieldListNode> TypeFieldList
 
 // Name nodes.
 %type <PName>             indirection_el
+%type <PIndexColumn>      index_column
 
 %type <PQualifiedNameListNode>  insert_column_list any_name_list relation_expr_list
 
@@ -384,7 +405,7 @@ using namespace yb::ql;
 %type <KeywordType>       unreserved_keyword type_func_name_keyword
 %type <KeywordType>       col_name_keyword reserved_keyword
 
-%type <PBool>             boolean opt_else_clause opt_returns_clause
+%type <PBool>             boolean opt_else_clause opt_returns_clause opt_json_clause_default_null
 
 //--------------------------------------------------------------------------------------------------
 // Inactive tree node declarations (%type).
@@ -405,13 +426,13 @@ using namespace yb::ql;
                           ExistingIndex OptTableSpace OptConsTableSpace opt_provider
                           security_label opt_existing_window_name property_name
 
-%type <PBool>             opt_if_not_exists xml_whitespace_option constraints_set_mode opt_varying
-                          opt_timezone opt_no_inherit opt_ordinality opt_instead opt_unique
-                          opt_concurrently opt_verbose opt_full opt_freeze opt_default opt_recheck
-                          copy_from opt_program all_or_distinct opt_trusted opt_restart_seqs
-                          opt_or_replace opt_grant_grant_option /* opt_grant_admin_option */
-                          opt_nowait opt_if_exists opt_with_data opt_allow_filtering
-                          TriggerForSpec TriggerForType
+%type <PBool>             opt_deferred opt_if_not_exists xml_whitespace_option constraints_set_mode
+                          opt_varying opt_timezone opt_no_inherit opt_ordinality opt_instead
+                          opt_unique opt_concurrently opt_verbose opt_full opt_freeze opt_default
+                          opt_recheck copy_from opt_program all_or_distinct opt_trusted
+                          opt_restart_seqs opt_or_replace opt_grant_grant_option
+                          /* opt_grant_admin_option */ opt_nowait opt_if_exists opt_with_data
+                          opt_allow_filtering TriggerForSpec TriggerForType
 
 %type <PInt64>            TableLikeOptionList TableLikeOption key_actions key_delete key_match
                           key_update key_action ConstraintAttributeSpec ConstraintAttributeElem
@@ -440,7 +461,7 @@ using namespace yb::ql;
                           AlterOwnerStmt AlterSeqStmt AlterSystemStmt InactiveAlterTableStmt
                           AlterTblSpcStmt AlterExtensionStmt AlterExtensionContentsStmt
                           AlterForeignTableStmt AlterCompositeTypeStmt AlterUserStmt
-                          AlterUserMappingStmt AlterUserSetStmt
+                          AlterUserSetStmt
                           AlterPolicyStmt AlterDefaultPrivilegesStmt
                           DefACLAction AnalyzeStmt ClosePortalStmt ClusterStmt CommentStmt
                           ConstraintsSetStmt CopyStmt CreateAsStmt CreateCastStmt
@@ -449,13 +470,13 @@ using namespace yb::ql;
                           CreateSeqStmt CreateTableSpaceStmt
                           CreateFdwStmt CreateForeignServerStmt CreateForeignTableStmt
                           CreateAssertStmt CreateTransformStmt CreateTrigStmt CreateEventTrigStmt
-                          CreateUserStmt CreateUserMappingStmt CreatePolicyStmt
+                          CreateUserStmt CreatePolicyStmt
                           CreatedbStmt DeclareCursorStmt DefineStmt DiscardStmt DoStmt
                           DropOpClassStmt DropOpFamilyStmt DropPLangStmt
                           DropAssertStmt DropTrigStmt DropRuleStmt DropCastStmt
                           DropPolicyStmt DropUserStmt DropdbStmt DropTableSpaceStmt DropFdwStmt
                           DropTransformStmt
-                          DropForeignServerStmt DropUserMappingStmt FetchStmt
+                          DropForeignServerStmt FetchStmt
                           ImportForeignSchemaStmt
                           ListenStmt LoadStmt LockStmt NotifyStmt PreparableStmt
                           CreateFunctionStmt AlterFunctionStmt ReindexStmt RemoveAggrStmt
@@ -508,7 +529,6 @@ using namespace yb::ql;
                           def_arg
                           func_table
                           ExclusionWhereClause
-                          case_expr case_arg when_clause case_default
                           NumericOnly
                           index_elem
                           joined_table
@@ -518,7 +538,7 @@ using namespace yb::ql;
                           copy_generic_opt_arg copy_generic_opt_arg_list_item
                           copy_generic_opt_elem
                           var_value zone_value
-                          auth_ident RoleSpec opt_granted_by
+                          RoleSpec opt_granted_by
                           TableLikeClause
                           OptTableSpaceOwner
                           xml_attribute_el
@@ -561,8 +581,8 @@ using namespace yb::ql;
                           locked_rels_list extract_list overlay_list position_list substr_list
                           trim_list opt_interval interval_second OptSeqOptList SeqOptList
                           rowsfrom_item rowsfrom_list opt_col_def_list ExclusionConstraintList
-                          ExclusionConstraintElem row explicit_row implicit_row
-                          type_list when_clause_list NumericOnly_list
+                          ExclusionConstraintElem row explicit_row
+                          type_list NumericOnly_list
                           func_alias_clause generic_option_list alter_generic_option_list
                           copy_generic_opt_list copy_generic_opt_arg_list
                           copy_options constraints_set_list xml_attribute_list
@@ -587,9 +607,10 @@ using namespace yb::ql;
                           CHARACTER CHARACTERISTICS CHECK CHECKPOINT CLASS CLOSE CLUSTER CLUSTERING
                           COALESCE COLLATE COLLATION COLUMN COMMENT COMMENTS COMMIT COMMITTED
                           COMPACT CONCURRENTLY CONFIGURATION CONFLICT CONNECTION CONSTRAINT
-                          CONSTRAINTS CONTENT_P CONTINUE_P CONVERSION_P COPY COST COUNTER COVERING
-                          CREATE CROSS CSV CUBE CURRENT_P CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE
-                          CURRENT_SCHEMA CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
+                          CONSTRAINTS CONTAINS CONTENT_P CONTINUE_P CONVERSION_P COPY COST COUNTER
+                          COVERING CREATE CROSS CSV CUBE CURRENT_P CURRENT_CATALOG CURRENT_DATE
+                          CURRENT_ROLE CURRENT_SCHEMA CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER
+                          CURSOR CYCLE
 
                           DATA_P DATE DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT
                           DEFAULTS DEFERRABLE DEFERRED DEFINER DELETE_P
@@ -612,7 +633,7 @@ using namespace yb::ql;
                           INITIALLY INLINE_P INNER_P INOUT INPUT_P INSENSITIVE INSERT INSTEAD
                           INT_P INTEGER INTERSECT INTERVAL INTO INVOKER IS ISNULL ISOLATION
 
-                          JOIN JSONB
+                          JOIN JSON JSONB
 
                           KEY KEYSPACE KEYSPACES
 
@@ -640,7 +661,7 @@ using namespace yb::ql;
                           RESTART RESTRICT RETURNING RETURNS REVOKE RIGHT ROLE ROLES ROLLBACK ROLLUP
                           ROW ROWS RULE
 
-                          SAVEPOINT SCHEMA SCHEME SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE
+                          SAVEPOINT SCHEMA SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE
                           SEQUENCES SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF
 
                           SHARE SHOW SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SQL_P STABLE
@@ -653,7 +674,7 @@ using namespace yb::ql;
                           TYPE_P TYPES_P PARTITION_HASH
 
                           UNBOUNDED UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN UNLISTEN
-                          UNLOGGED UNTIL UPDATE USE USER USING UUID
+                          UNLOGGED UNSET UNTIL UPDATE USE USER USING UUID
 
                           VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARINT
                           VARYING VERBOSE VERSION_P VIEW VIEWS VOLATILE
@@ -694,10 +715,14 @@ using namespace yb::ql;
 // looking one token ahead). NOT_LA exists so that productions such as NOT LIKE can be given the
 // same precedence as LIKE; otherwise they'd effectively have the same precedence as NOT, at least
 // with respect to their left-hand subexpression. NULLS_LA and WITH_LA are needed to make the
-// grammar LALR(1).
+// grammar LALR(1). (Look Ahead Left to Right parser.)
 //
-// OFFSET_LA is added to support OFFSET clause in SELECT.
-%token                    NOT_LA NULLS_LA WITH_LA OFFSET_LA
+// All *_LA tokens can be inserted into the grammer stack only manually - it's done in
+// the LexProcessor::Scan() method in the scanner.cc module.
+// OFFSET_LA and GROUP_LA were added to support using of these keywords as regular column names.
+// - OFFSET_LA is used to support OFFSET clause in SELECT statement
+// - GROUP_LA is used to support GROUP BY clause in SELECT statement
+%token                    NOT_LA NULLS_LA WITH_LA OFFSET_LA GROUP_LA
 
 %token                    SCAN_ERROR "incomprehensible_character_pattern"
 %token END                0 "end_of_file"
@@ -715,6 +740,7 @@ using namespace yb::ql;
 %nonassoc   BETWEEN IN_P LIKE ILIKE SIMILAR NOT_LA
 %nonassoc   ESCAPE                                  // ESCAPE must be just above LIKE/ILIKE/SIMILAR.
 %left       POSTFIXOP                                                 // dummy for postfix Op rules.
+%nonassoc   CONTAINS KEY
 
 // To support target_el without AS, we must give IDENT an explicit priority
 // between POSTFIXOP and Op.  We can safely assign the same priority to
@@ -767,6 +793,9 @@ using namespace yb::ql;
 // kluge to keep xml_whitespace_option from causing shift/reduce conflicts.
 %right    PRESERVE STRIP_P
 %right    IF_P
+
+// assigning precedence higher than KEY to avoid shift/reduce conflict in CONTAINS KEY
+%nonassoc SCONST
 
 //--------------------------------------------------------------------------------------------------
 // Logging.
@@ -911,9 +940,14 @@ stmt:
   | IndexStmt {
     $$ = $1;
   }
-  | SelectStmt {
+  | SelectStmt { // SelectStmt rule is used to define a tuple (collection of data),
+                 // so it might be either SELECT statement or VALUES clause.
     if ($1 != nullptr) {
-      parser_->SetBindVariables(static_cast<PTDmlStmt*>($1.get()));
+      if ($1->IsDml()) {
+        parser_->SetBindVariables(static_cast<PTDmlStmt*>($1.get()));
+      } else { // PTInsertValuesClause, etc.
+        PARSER_UNSUPPORTED(@1);
+      }
     }
     $$ = $1;
   }
@@ -1371,19 +1405,45 @@ opt_column_list:
 ;
 
 NestedColumnList:
-  columnElem {
+  index_column {
     $$ = MAKE_NODE(@1, PTListNode, $1);
   }
-  | NestedColumnList ',' columnElem {
+  | NestedColumnList ',' index_column {
     $1->Append($3);
     $$ = $1;
   }
   | '(' NestedColumnList ')' {
     $$ = MAKE_NODE(@1, PTListNode, $2);
   }
-  | '(' NestedColumnList ')' ',' columnElem {
+  | '(' NestedColumnList ')' ',' index_column {
     $$ = MAKE_NODE(@1, PTListNode, $2);
     $$->Append($5);
+  }
+;
+
+// This can be "a_expr", but as of now, we only allow column_ref and json attributes.
+index_column:
+  columnref {
+    // A columnref expression refers to a previously defined column.
+    if (!$1->name()->IsSimpleName()) {
+      PARSER_ERROR_MSG(@0, INVALID_ARGUMENTS, "Cannot use qualified name in this context");
+    }
+    $$ = MAKE_NODE(@1, PTIndexColumn, $1->name()->column_name(), $1);
+  }
+  | columnref json_ref {
+    // Declare an index column here as generic expressions are not mapped to any pre-defined column.
+    PTExpr::SharedPtr expr = MAKE_NODE(@1, PTJsonColumnWithOperators, $1->name(), $2);
+    $$ = MAKE_NODE(@1, PTIndexColumn, parser_->MakeString(expr->QLName().c_str()), expr);
+  }
+;
+
+index_column_list:
+  index_column {
+    $$ = MAKE_NODE(@1, PTListNode, $1);
+  }
+  | index_column_list ',' index_column {
+    $1->Append($3);
+    $$ = $1;
   }
 ;
 
@@ -1400,10 +1460,6 @@ columnList:
 columnElem:
   ColId {
     $$ = MAKE_NODE(@1, PTName, $1);
-  }
-  | ColId json_ref {
-    PTQualifiedName::SharedPtr name_node = MAKE_NODE(@1, PTQualifiedName, $1);
-    $$ = MAKE_NODE(@1, PTJsonColumnWithOperators, name_node, $2);
   }
 ;
 
@@ -1600,10 +1656,6 @@ table_property:
   | COMPACT STORAGE {
     $$ = MAKE_NODE(@1, PTTablePropertyListNode);
   }
-  | PARTITION SCHEME OF qualified_name {
-    PTTableProperty::SharedPtr pt_table_property = MAKE_NODE(@4, PTTableProperty, $4);
-    $$ = MAKE_NODE(@1, PTTablePropertyListNode, pt_table_property);
-  }
 ;
 
 property_map:
@@ -1656,7 +1708,14 @@ orderingList:
 
 column_ordering:
   ColId opt_asc_desc {
-    $$ = MAKE_NODE(@1, PTTableProperty, $1, PTOrderBy::Direction($2));
+    PTQualifiedName::SharedPtr name_node = MAKE_NODE(@1, PTQualifiedName, $1);
+    PTExpr::SharedPtr expr = MAKE_NODE(@1, PTRef, name_node);
+    $$ = MAKE_NODE(@1, PTTableProperty, expr, PTOrderBy::Direction($2));
+  }
+  | ColId json_ref opt_asc_desc {
+    PTQualifiedName::SharedPtr name_node = MAKE_NODE(@1, PTQualifiedName, $1);
+    PTExpr::SharedPtr expr = MAKE_NODE(@1, PTJsonColumnWithOperators, name_node, $2);
+    $$ = MAKE_NODE(@1, PTTableProperty, expr, PTOrderBy::Direction($3));
   }
 ;
 
@@ -1785,13 +1844,13 @@ DropStmt:
     PTQualifiedName::SharedPtr name_node = MAKE_NODE(@1, PTQualifiedName, $5);
     PTQualifiedNameListNode::SharedPtr list_node = MAKE_NODE(
       @1, PTQualifiedNameListNode, name_node);
-    $$ = MAKE_NODE(@1, PTDropStmt, OBJECT_ROLE, list_node, true);
+    $$ = MAKE_NODE(@1, PTDropStmt, ObjectType::ROLE, list_node, true);
   }
   | DROP ROLE role_name {
     PTQualifiedName::SharedPtr name_node = MAKE_NODE(@1, PTQualifiedName, $3);
     PTQualifiedNameListNode::SharedPtr list_node = MAKE_NODE(
       @1, PTQualifiedNameListNode, name_node);
-    $$ = MAKE_NODE(@1, PTDropStmt, OBJECT_ROLE, list_node, false);
+    $$ = MAKE_NODE(@1, PTDropStmt, ObjectType::ROLE, list_node, false);
   }
   | DROP DOMAIN_P type_name_list opt_drop_behavior {
     PARSER_CQL_INVALID_MSG(@2, "DROP DOMAIN statement not supported");
@@ -1817,26 +1876,26 @@ drop_type:
 ;
 
 cql_drop_type:
-  TABLE                           { $$ = OBJECT_TABLE; }
-  | SCHEMA                        { $$ = OBJECT_SCHEMA; }
-  | KEYSPACE                      { $$ = OBJECT_SCHEMA; }
-  | TYPE_P                        { $$ = OBJECT_TYPE; }
-  | INDEX                         { $$ = OBJECT_INDEX; }
+  TABLE                           { $$ = ObjectType::TABLE; }
+  | SCHEMA                        { $$ = ObjectType::SCHEMA; }
+  | KEYSPACE                      { $$ = ObjectType::SCHEMA; }
+  | TYPE_P                        { $$ = ObjectType::TYPE; }
+  | INDEX                         { $$ = ObjectType::INDEX; }
 ;
 
 ql_drop_type:
-  SEQUENCE                        { $$ = OBJECT_SEQUENCE; }
-  | VIEW                          { $$ = OBJECT_VIEW; }
-  | MATERIALIZED VIEW             { $$ = OBJECT_MATVIEW; }
-  | FOREIGN TABLE                 { $$ = OBJECT_FOREIGN_TABLE; }
-  | EVENT TRIGGER                 { $$ = OBJECT_EVENT_TRIGGER; }
-  | COLLATION                     { $$ = OBJECT_COLLATION; }
-  | CONVERSION_P                  { $$ = OBJECT_CONVERSION; }
-  | EXTENSION                     { $$ = OBJECT_EXTENSION; }
-  | TEXT_P SEARCH PARSER          { $$ = OBJECT_TSPARSER; }
-  | TEXT_P SEARCH DICTIONARY      { $$ = OBJECT_TSDICTIONARY; }
-  | TEXT_P SEARCH TEMPLATE        { $$ = OBJECT_TSTEMPLATE; }
-  | TEXT_P SEARCH CONFIGURATION   { $$ = OBJECT_TSCONFIGURATION; }
+  SEQUENCE                        { $$ = ObjectType::SEQUENCE; }
+  | VIEW                          { $$ = ObjectType::VIEW; }
+  | MATERIALIZED VIEW             { $$ = ObjectType::MATVIEW; }
+  | FOREIGN TABLE                 { $$ = ObjectType::FOREIGN_TABLE; }
+  | EVENT TRIGGER                 { $$ = ObjectType::EVENT_TRIGGER; }
+  | COLLATION                     { $$ = ObjectType::COLLATION; }
+  | CONVERSION_P                  { $$ = ObjectType::CONVERSION; }
+  | EXTENSION                     { $$ = ObjectType::EXTENSION; }
+  | TEXT_P SEARCH PARSER          { $$ = ObjectType::TSPARSER; }
+  | TEXT_P SEARCH DICTIONARY      { $$ = ObjectType::TSDICTIONARY; }
+  | TEXT_P SEARCH TEMPLATE        { $$ = ObjectType::TSTEMPLATE; }
+  | TEXT_P SEARCH CONFIGURATION   { $$ = ObjectType::TSCONFIGURATION; }
 ;
 
 any_name_list:
@@ -2120,13 +2179,13 @@ select_clause:
 // NOTE: only the leftmost component SelectStmt should have INTO.
 // However, this is not checked by the grammar; parse analysis must check it.
 simple_select:
-  SELECT opt_all_clause target_list into_clause from_clause opt_where_clause
+  SELECT opt_all_clause target_list into_clause from_clause opt_where_clause opt_if_clause
   group_clause having_clause opt_window_clause {
-    $$ = MAKE_NODE(@1, PTSelectStmt, false, $3, $5, $6, $7, $8, nullptr, nullptr, nullptr);
+    $$ = MAKE_NODE(@1, PTSelectStmt, false, $3, $5, $6, $7, $8, $9, nullptr, nullptr, nullptr);
   }
-  | SELECT distinct_clause target_list into_clause from_clause opt_where_clause
+  | SELECT distinct_clause target_list into_clause from_clause opt_where_clause opt_if_clause
   group_clause having_clause opt_window_clause {
-    $$ = MAKE_NODE(@1, PTSelectStmt, true, $3, $5, $6, $7, $8, nullptr, nullptr, nullptr);
+    $$ = MAKE_NODE(@1, PTSelectStmt, true, $3, $5, $6, $7, $8, $9, nullptr, nullptr, nullptr);
   }
   | TABLE relation_expr {
     PARSER_UNSUPPORTED(@1);
@@ -2150,6 +2209,32 @@ values_clause:
     PARSER_NOCODE(@2);
     $1->Append($3);
     $$ = $1;
+  }
+;
+
+// Sconst parsing is delayed
+json_clause:
+  JSON Sconst opt_json_clause_default_null {
+    PTConstText::SharedPtr json_expr = MAKE_NODE(@2, PTConstText, $2);
+    $$ = MAKE_NODE(@1, PTInsertJsonClause, json_expr, $3);
+  }
+  | JSON bindvar opt_json_clause_default_null {
+    if ($2 != nullptr) {
+      parser_->AddBindVariable(static_cast<PTBindVar*>($2.get()));
+    }
+    $$ = MAKE_NODE(@1, PTInsertJsonClause, $2, $3);
+  }
+;
+
+opt_json_clause_default_null:
+  /* EMPTY */ {
+    $$ = true;
+  }
+  | DEFAULT NULL_P {
+    $$ = true;
+  }
+  | DEFAULT UNSET {
+    $$ = false;
   }
 ;
 
@@ -2438,7 +2523,12 @@ group_clause:
   /*EMPTY*/ {
     $$ = nullptr;
   }
-  | GROUP_P BY group_by_list {
+  | GROUP_LA BY group_by_list {
+    if(!FLAGS_ycql_suppress_group_by_error)
+      PARSER_UNSUPPORTED_MSG(@1,
+        "This is not recommended but this error can be suppressed by setting " \
+        "ycql_suppress_group_by_error flag to false. When set to false, " \
+        "the error will be suppressed but the GROUP BY clause will be ignored.");
     $$ = $3;
   }
 ;
@@ -2561,6 +2651,11 @@ InsertStmt:
   opt_using_ttl_timestamp_clause opt_returns_clause
   {
     $$ = MAKE_NODE(@2, PTInsertStmt, $3, $5, $7, $8, $9, $10, $11);
+  }
+  | INSERT INTO insert_target json_clause opt_on_conflict opt_using_ttl_timestamp_clause
+  opt_returns_clause
+  {
+    $$ = MAKE_NODE(@2, PTInsertStmt, $3, nullptr, $4, nullptr, false, $6, $7);
   }
   | INSERT INTO insert_target DEFAULT VALUES opt_on_conflict returning_clause {
     PARSER_CQL_INVALID_MSG(@4, "DEFAULT VALUES feature is not supported");
@@ -2715,12 +2810,13 @@ DELETE_P opt_target_list FROM relation_expr_opt_alias opt_using_ttl_timestamp_cl
 
 UpdateStmt:
   UPDATE relation_expr_opt_alias opt_using_ttl_timestamp_clause SET set_clause_list
-  opt_where_or_current_clause opt_returns_clause {
-    $$ = MAKE_NODE(@1, PTUpdateStmt, $2, $5, $6, nullptr, false, $3, $7);
+  opt_where_or_current_clause opt_returns_clause opt_write_dml_properties {
+    $$ = MAKE_NODE(@1, PTUpdateStmt, $2, $5, $6, nullptr, false, $3, $7, $8);
   }
   | UPDATE relation_expr_opt_alias opt_using_ttl_timestamp_clause SET
-  set_clause_list opt_where_or_current_clause if_clause opt_else_clause opt_returns_clause {
-    $$ = MAKE_NODE(@1, PTUpdateStmt, $2, $5, $6, $7, $8, $3, $9);
+  set_clause_list opt_where_or_current_clause if_clause opt_else_clause opt_returns_clause
+  opt_write_dml_properties {
+    $$ = MAKE_NODE(@1, PTUpdateStmt, $2, $5, $6, $7, $8, $3, $9, $10);
   }
 ;
 
@@ -2795,6 +2891,60 @@ set_target_list:
   set_target {
   }
   | set_target_list ',' set_target {
+  }
+;
+
+opt_write_dml_properties:
+  /*EMPTY*/ {
+    $$ = nullptr;
+  }
+  | WITH write_dml_properties {
+    $$ = $2;
+  }
+;
+
+write_dml_properties:
+  write_dml_property {
+    $$ = $1;
+  }
+  | write_dml_properties AND write_dml_property {
+    $1->AppendList($3);
+    $$ = $1;
+  }
+;
+
+write_dml_property:
+  property_name '=' write_dml_property_map {
+    $3->SetPropertyName($1);
+    $$ = MAKE_NODE(@1, PTDmlWritePropertyListNode, $3);
+  }
+;
+
+write_dml_property_map:
+  '{' write_dml_property_map_list '}' {
+    $$ = $2;
+  }
+;
+
+write_dml_property_map_list:
+  write_dml_property_map_list_element {
+    $$ = MAKE_NODE(@1, PTDmlWritePropertyMap);
+    $$->AppendMapElement($1);
+  }
+  | write_dml_property_map_list ',' write_dml_property_map_list_element {
+    $1->AppendMapElement($3);
+    $$ = $1;
+  }
+;
+
+write_dml_property_map_list_element:
+  Sconst ':' TRUE_P {
+    PTConstBool::SharedPtr pt_constbool = MAKE_NODE(@3, PTConstBool, true);
+    $$ = MAKE_NODE(@1, PTDmlWriteProperty, $1, pt_constbool);
+  }
+  | Sconst ':' FALSE_P {
+    PTConstBool::SharedPtr pt_constbool = MAKE_NODE(@3, PTConstBool, false);
+    $$ = MAKE_NODE(@1, PTDmlWriteProperty, $1, pt_constbool);
   }
 ;
 
@@ -3070,6 +3220,11 @@ if_clause:
   IF_P a_expr                   { $$ = $2; }
 ;
 
+opt_if_clause:
+  /*EMPTY*/                     { $$ = nullptr; }
+  | if_clause                   { $$ = $1; }
+;
+
 /* variant for UPDATE and DELETE */
 opt_where_or_current_clause:
   /*EMPTY*/                     { $$ = nullptr; }
@@ -3209,6 +3364,12 @@ a_expr:
   }
   | a_expr NOT_EQUALS a_expr {
     $$ = MAKE_NODE(@1, PTRelation2, ExprOperator::kRelation2, QL_OP_NOT_EQUAL, $1, $3);
+  }
+  | a_expr CONTAINS KEY a_expr {
+    $$ = MAKE_NODE(@1, PTRelation2, ExprOperator::kRelation2, QL_OP_CONTAINS_KEY, $1, $4);
+  }
+  | a_expr CONTAINS a_expr {
+    $$ = MAKE_NODE(@1, PTRelation2, ExprOperator::kRelation2, QL_OP_CONTAINS, $1, $3);
   }
   | a_expr LIKE a_expr {
     PARSER_CQL_INVALID(@2);
@@ -3424,6 +3585,9 @@ c_expr:
   | func_expr {
     $$ = $1;
   }
+  | implicit_row {
+    $$ = $1;
+  }
   | inactive_c_expr {
     PARSER_UNSUPPORTED(@1);
   }
@@ -3431,8 +3595,6 @@ c_expr:
 
 inactive_c_expr:
   PARAM opt_indirection {
-  }
-  | case_expr {
   }
   | select_with_parens      %prec UMINUS {
   }
@@ -3443,8 +3605,6 @@ inactive_c_expr:
   | ARRAY select_with_parens {
   }
   | explicit_row {
-  }
-  | implicit_row {
   }
   | GROUPING '(' expr_list ')' {
   }
@@ -3506,7 +3666,7 @@ func_application:
     $$ = MAKE_NODE(@1, PTPartitionHash, name, $3);
   }
   | CAST '(' a_expr AS Typename ')' {
-    if ($5->ql_type() && !$5->ql_type()->IsParametric()) {
+    if ($5 && $5->ql_type() && !$5->ql_type()->IsParametric()) {
       PTExprListNode::SharedPtr args = MAKE_NODE(@1, PTExprListNode);
       args->Append($3);
       args->Append(PTExpr::CreateConst(PTREE_MEM, PTREE_LOC(@5), $5));
@@ -3566,8 +3726,6 @@ func_expr_common_subexpr:
   | CURRENT_USER {
   }
   | SESSION_USER {
-  }
-  | USER {
   }
   | CURRENT_CATALOG {
   }
@@ -3710,10 +3868,6 @@ within_group_clause:
   /*EMPTY*/ {
     $$ = nullptr;
   }
-  | WITHIN GROUP_P '(' sort_clause ')' {
-    PARSER_UNSUPPORTED(@1);
-    $$ = nullptr;
-  }
 ;
 
 filter_clause:
@@ -3835,13 +3989,8 @@ frame_bound:
 // without conflicting with the parenthesized a_expr production.  Without the
 // ROW keyword, there must be more than one a_expr inside the parens.
 row:
-  ROW '(' expr_list ')' {
-    $$ = $3;
-  }
-  | ROW '(' ')' {
-  }
-  | '(' expr_list ',' a_expr ')' {
-  }
+  explicit_row {}
+  | implicit_row {}
 ;
 
 explicit_row:
@@ -3852,8 +4001,21 @@ explicit_row:
   }
 ;
 
+tuple_elems:
+  a_expr {
+    $$ = MAKE_NODE(@1, PTCollectionExpr, DataType::TUPLE);
+    $$->AddElement($1);
+  }
+  | tuple_elems ',' a_expr {
+    $1->AddElement($3);
+    $$ = $1;
+  }
+;
+
 implicit_row:
-  '(' expr_list ',' a_expr ')' {
+  '(' tuple_elems ',' a_expr ')' {
+    $2->AddElement($4);
+    $$ = $2;
   }
 ;
 
@@ -4046,39 +4208,6 @@ trim_list:
   }
   | expr_list {
   }
-;
-
-// Define SQL-style CASE clause.
-// - Full specification
-//  CASE WHEN a = b THEN c ... ELSE d END
-// - Implicit argument
-//  CASE a WHEN b THEN c ... ELSE d END
-case_expr:
-   CASE case_arg when_clause_list case_default END_P {
-   }
-;
-
-when_clause_list:
-  // There must be at least one.
-  when_clause {
-  }
-  | when_clause_list when_clause {
-  }
-;
-
-when_clause:
-  WHEN a_expr THEN a_expr {
-  }
-;
-
-case_default:
-  ELSE a_expr                   { $$ = nullptr; }
-  | /*EMPTY*/                   { $$ = nullptr; }
-;
-
-case_arg:
-  a_expr                        { $$ = nullptr; }
-  | /*EMPTY*/                   { $$ = nullptr; }
 ;
 
 bindvar:
@@ -4309,23 +4438,23 @@ list_expr:
   }
 ;
 
-tuple_elems:
-  tuple_elems ',' a_expr {
+in_operand_elems:
+  in_operand_elems ',' a_expr {
     $1->AddElement($3);
     $$ = $1;
   }
   | a_expr {
-    $$ = MAKE_NODE(@1, PTCollectionExpr, DataType::TUPLE);
+    $$ = MAKE_NODE(@1, PTCollectionExpr, DataType::LIST);
     $$->AddElement($1);
   }
 ;
 
-tuple_expr:
-  '(' tuple_elems ')' {
+in_operand:
+  '(' in_operand_elems ')' {
     $$ = $2;
   }
   | '(' ')' {
-    $$ = MAKE_NODE(@1, PTCollectionExpr, DataType::TUPLE);
+    $$ = MAKE_NODE(@1, PTCollectionExpr, DataType::LIST);
   }
 ;
 
@@ -4347,11 +4476,13 @@ collection_expr:
 ;
 
 in_expr:
-  tuple_expr {
+  in_operand {
+    $1->set_is_in_operand();
     $$ = $1;
   }
   | bindvar {
     if ($1 != nullptr) {
+      $1->set_is_in_operand();
       parser_->AddBindVariable(static_cast<PTBindVar*>($1.get()));
     }
     $$ = $1;
@@ -4411,7 +4542,7 @@ AexprConst:
 ;
 
 Iconst: ICONST {
-  auto val = util::CheckedStoll($1->c_str());
+  auto val = CheckedStoll($1->c_str());
   if (!val.ok()) {
     PARSER_CQL_INVALID_MSG(@1, "invalid integer");
   } else {
@@ -4525,19 +4656,27 @@ Typename:
 
 ParametricTypename:
   MAP '<' Typename ',' Typename '>' {
-    $$ = MAKE_NODE(@1, PTMap, $3, $5);
+    if ($3 != nullptr && $5 != nullptr) {
+      $$ = MAKE_NODE(@1, PTMap, $3, $5);
+    }
   }
   | SET '<' Typename '>' {
-    $$ = MAKE_NODE(@1, PTSet, $3);
+      if ($3 != nullptr) {
+        $$ = MAKE_NODE(@1, PTSet, $3);
+      }
   }
   | LIST '<' Typename '>' {
-    $$ = MAKE_NODE(@1, PTList, $3);
+      if ($3 != nullptr) {
+        $$ = MAKE_NODE(@1, PTList, $3);
+      }
   }
   | TUPLE '<' type_name_list '>' {
     PARSER_UNSUPPORTED(@1);
   }
   | FROZEN '<' Typename '>' {
-    $$ = MAKE_NODE(@1, PTFrozen, $3);
+      if ($3 != nullptr) {
+        $$ = MAKE_NODE(@1, PTFrozen, $3);
+      }
   }
 ;
 
@@ -4939,6 +5078,7 @@ unreserved_keyword:
   | CONFLICT { $$ = $1; }
   | CONNECTION { $$ = $1; }
   | CONSTRAINTS { $$ = $1; }
+  | CONTAINS { $$ = $1; }
   | CONTENT_P { $$ = $1; }
   | CONTINUE_P { $$ = $1; }
   | CONVERSION_P { $$ = $1; }
@@ -4998,7 +5138,6 @@ unreserved_keyword:
   | HOLD { $$ = $1; }
   | HOUR_P { $$ = $1; }
   | IDENTITY_P { $$ = $1; }
-  | IF_P { $$ = $1; }
   | IMMEDIATE { $$ = $1; }
   | IMMUTABLE { $$ = $1; }
   | IMPLICIT_P { $$ = $1; }
@@ -5104,7 +5243,6 @@ unreserved_keyword:
   | ROWS { $$ = $1; }
   | RULE { $$ = $1; }
   | SAVEPOINT { $$ = $1; }
-  | SCHEME { $$ = $1; }
   | SCROLL { $$ = $1; }
   | SEARCH { $$ = $1; }
   | SECOND_P { $$ = $1; }
@@ -5156,8 +5294,10 @@ unreserved_keyword:
   | UNKNOWN { $$ = $1; }
   | UNLISTEN { $$ = $1; }
   | UNLOGGED { $$ = $1; }
+  | UNSET { $$ = $1; }
   | UNTIL { $$ = $1; }
   | UPDATE { $$ = $1; }
+  | USER { $$ = $1; }
   | VACUUM { $$ = $1; }
   | VALID { $$ = $1; }
   | VALIDATE { $$ = $1; }
@@ -5168,6 +5308,7 @@ unreserved_keyword:
   | VIEW { $$ = $1; }
   | VIEWS { $$ = $1; }
   | VOLATILE { $$ = $1; }
+  | WHEN { $$ = $1; }
   | WHITESPACE_P { $$ = $1; }
   | WITHIN { $$ = $1; }
   | WITHOUT { $$ = $1; }
@@ -5207,8 +5348,10 @@ col_name_keyword:
   | FLOAT_P { $$ = $1; }
   | FROZEN { $$ = $1; }
   | GREATEST { $$ = $1; }
+  | GROUP_P { $$ = $1; }
   | GROUPING { $$ = $1; }
   | INET { $$ = $1; }
+  | JSON { $$ = $1; }
   | JSONB { $$ = $1; }
   | INOUT { $$ = $1; }
   | INT_P { $$ = $1; }
@@ -5336,8 +5479,8 @@ reserved_keyword:
   | FOREIGN { $$ = $1; }
   | FROM { $$ = $1; }
   | GRANT { $$ = $1; }
-  | GROUP_P { $$ = $1; }
   | HAVING { $$ = $1; }
+  | IF_P { $$ = $1; }
   | IN_P { $$ = $1; }
   | INFINITY { $$ = $1; }
   | INITIALLY { $$ = $1; }
@@ -5377,10 +5520,8 @@ reserved_keyword:
   | UNION { $$ = $1; }
   | UNIQUE { $$ = $1; }
   | USE { $$ = $1; }
-  | USER { $$ = $1; }
   | USING { $$ = $1; }
   | VARIADIC { $$ = $1; }
-  | WHEN { $$ = $1; }
   | WHERE { $$ = $1; }
   | WINDOW { $$ = $1; }
   | WITH { $$ = $1; }
@@ -5414,7 +5555,6 @@ inactive_stmt:
   | AlterCompositeTypeStmt
   | AlterTSConfigurationStmt
   | AlterTSDictionaryStmt
-  | AlterUserMappingStmt
   | AlterUserSetStmt
   | AlterUserStmt
   | AnalyzeStmt
@@ -5446,7 +5586,6 @@ inactive_stmt:
   | CreateTrigStmt
   | CreateEventTrigStmt
   | CreateUserStmt
-  | CreateUserMappingStmt
   | CreatedbStmt
   | DeallocateStmt
   | DeclareCursorStmt
@@ -5467,7 +5606,6 @@ inactive_stmt:
   | DropTransformStmt
   | DropTrigStmt
   | DropUserStmt
-  | DropUserMappingStmt
   | DropdbStmt
   | ExecuteStmt
   | FetchStmt
@@ -5620,8 +5758,6 @@ CreateOptRoleElem:
   | ROLE role_list {
   }
   | IN_P ROLE role_list {
-  }
-  | IN_P GROUP_P role_list {
   }
 ;
 
@@ -6048,17 +6184,11 @@ alter_table_cmd:
   /* ALTER TABLE <name> ENABLE TRIGGER ALL */
   | ENABLE_P TRIGGER ALL {
   }
-  /* ALTER TABLE <name> ENABLE TRIGGER USER */
-  | ENABLE_P TRIGGER USER {
-  }
   /* ALTER TABLE <name> DISABLE TRIGGER <trig> */
   | DISABLE_P TRIGGER name {
   }
   /* ALTER TABLE <name> DISABLE TRIGGER ALL */
   | DISABLE_P TRIGGER ALL {
-  }
-  /* ALTER TABLE <name> DISABLE TRIGGER USER */
-  | DISABLE_P TRIGGER USER {
   }
   /* ALTER TABLE <name> ENABLE RULE <rule> */
   | ENABLE_P RULE name {
@@ -6933,54 +7063,6 @@ import_qualification:
 
 /*****************************************************************************
  *
- *    QUERY:
- *             CREATE USER MAPPING FOR auth_ident SERVER name [OPTIONS]
- *
- *****************************************************************************/
-
-CreateUserMappingStmt:
-  CREATE USER MAPPING FOR auth_ident SERVER name create_generic_options {
-  }
-;
-
-/* User mapping authorization identifier */
-auth_ident:
-  RoleSpec {
-    // $$ = $1;
-  }
-  | USER {
-    // $$ = makeRoleSpec(ROLESPEC_CURRENT_USER, @1);
-  }
-;
-
-/*****************************************************************************
- *
- *    QUERY :
- *        DROP USER MAPPING FOR auth_ident SERVER name
- *
- ****************************************************************************/
-
-DropUserMappingStmt:
-  DROP USER MAPPING FOR auth_ident SERVER name {
-  }
-  |  DROP USER MAPPING IF_P EXISTS FOR auth_ident SERVER name {
-  }
-;
-
-/*****************************************************************************
- *
- *    QUERY :
- *        ALTER USER MAPPING FOR auth_ident SERVER name OPTIONS
- *
- ****************************************************************************/
-
-AlterUserMappingStmt:
-  ALTER USER MAPPING FOR auth_ident SERVER name alter_generic_options {
-  }
-;
-
-/*****************************************************************************
- *
  *    QUERIES:
  *        CREATE POLICY name ON table [FOR cmd] [TO role, ...]
  *          [USING (qual)] [WITH CHECK (with_check)]
@@ -7563,27 +7645,27 @@ CommentStmt:
 ;
 
 comment_type:
-  COLUMN                          { $$ = OBJECT_COLUMN; }
-  | DATABASE                      { $$ = OBJECT_DATABASE; }
-  | SCHEMA                        { $$ = OBJECT_SCHEMA; }
-  | INDEX                         { $$ = OBJECT_INDEX; }
-  | SEQUENCE                      { $$ = OBJECT_SEQUENCE; }
-  | TABLE                         { $$ = OBJECT_TABLE; }
-  | VIEW                          { $$ = OBJECT_VIEW; }
-  | MATERIALIZED VIEW             { $$ = OBJECT_MATVIEW; }
-  | COLLATION                     { $$ = OBJECT_COLLATION; }
-  | CONVERSION_P                  { $$ = OBJECT_CONVERSION; }
-  | TABLESPACE                    { $$ = OBJECT_TABLESPACE; }
-  | EXTENSION                     { $$ = OBJECT_EXTENSION; }
-  | ROLE                          { $$ = OBJECT_ROLE; }
-  | FOREIGN TABLE                 { $$ = OBJECT_FOREIGN_TABLE; }
-  | SERVER                        { $$ = OBJECT_FOREIGN_SERVER; }
-  | FOREIGN DATA_P WRAPPER        { $$ = OBJECT_FDW; }
-  | EVENT TRIGGER                 { $$ = OBJECT_EVENT_TRIGGER; }
-  | TEXT_P SEARCH CONFIGURATION   { $$ = OBJECT_TSCONFIGURATION; }
-  | TEXT_P SEARCH DICTIONARY      { $$ = OBJECT_TSDICTIONARY; }
-  | TEXT_P SEARCH PARSER          { $$ = OBJECT_TSPARSER; }
-  | TEXT_P SEARCH TEMPLATE        { $$ = OBJECT_TSTEMPLATE; }
+  COLUMN                          { $$ = ObjectType::COLUMN; }
+  | DATABASE                      { $$ = ObjectType::DATABASE; }
+  | SCHEMA                        { $$ = ObjectType::SCHEMA; }
+  | INDEX                         { $$ = ObjectType::INDEX; }
+  | SEQUENCE                      { $$ = ObjectType::SEQUENCE; }
+  | TABLE                         { $$ = ObjectType::TABLE; }
+  | VIEW                          { $$ = ObjectType::VIEW; }
+  | MATERIALIZED VIEW             { $$ = ObjectType::MATVIEW; }
+  | COLLATION                     { $$ = ObjectType::COLLATION; }
+  | CONVERSION_P                  { $$ = ObjectType::CONVERSION; }
+  | TABLESPACE                    { $$ = ObjectType::TABLESPACE; }
+  | EXTENSION                     { $$ = ObjectType::EXTENSION; }
+  | ROLE                          { $$ = ObjectType::ROLE; }
+  | FOREIGN TABLE                 { $$ = ObjectType::FOREIGN_TABLE; }
+  | SERVER                        { $$ = ObjectType::FOREIGN_SERVER; }
+  | FOREIGN DATA_P WRAPPER        { $$ = ObjectType::FDW; }
+  | EVENT TRIGGER                 { $$ = ObjectType::EVENT_TRIGGER; }
+  | TEXT_P SEARCH CONFIGURATION   { $$ = ObjectType::TSCONFIGURATION; }
+  | TEXT_P SEARCH DICTIONARY      { $$ = ObjectType::TSDICTIONARY; }
+  | TEXT_P SEARCH PARSER          { $$ = ObjectType::TSPARSER; }
+  | TEXT_P SEARCH TEMPLATE        { $$ = ObjectType::TSTEMPLATE; }
 ;
 
 comment_text:
@@ -7623,17 +7705,17 @@ opt_provider:
 ;
 
 security_label_type:
-  COLUMN                        { $$ = OBJECT_COLUMN; }
-  | DATABASE                    { $$ = OBJECT_DATABASE; }
-  | EVENT TRIGGER               { $$ = OBJECT_EVENT_TRIGGER; }
-  | FOREIGN TABLE               { $$ = OBJECT_FOREIGN_TABLE; }
-  | SCHEMA                      { $$ = OBJECT_SCHEMA; }
-  | SEQUENCE                    { $$ = OBJECT_SEQUENCE; }
-  | TABLE                       { $$ = OBJECT_TABLE; }
-  | ROLE                        { $$ = OBJECT_ROLE; }
-  | TABLESPACE                  { $$ = OBJECT_TABLESPACE; }
-  | VIEW                        { $$ = OBJECT_VIEW; }
-  | MATERIALIZED VIEW           { $$ = OBJECT_MATVIEW; }
+  COLUMN                        { $$ = ObjectType::COLUMN; }
+  | DATABASE                    { $$ = ObjectType::DATABASE; }
+  | EVENT TRIGGER               { $$ = ObjectType::EVENT_TRIGGER; }
+  | FOREIGN TABLE               { $$ = ObjectType::FOREIGN_TABLE; }
+  | SCHEMA                      { $$ = ObjectType::SCHEMA; }
+  | SEQUENCE                    { $$ = ObjectType::SEQUENCE; }
+  | TABLE                       { $$ = ObjectType::TABLE; }
+  | ROLE                        { $$ = ObjectType::ROLE; }
+  | TABLESPACE                  { $$ = ObjectType::TABLESPACE; }
+  | VIEW                        { $$ = ObjectType::VIEW; }
+  | MATERIALIZED VIEW           { $$ = ObjectType::MATVIEW; }
 ;
 
 security_label:
@@ -7708,34 +7790,34 @@ opt_from_in:
 GrantStmt:
   GRANT permissions ON ALL KEYSPACES TO role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::ALL_KEYSPACES, nullptr, role_node);
   }
   | GRANT permissions ON KEYSPACE ColId TO role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
     PTQualifiedName::SharedPtr keyspace_node = MAKE_NODE(@1, PTQualifiedName, $5);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::KEYSPACE, keyspace_node, role_node);
   }
   | GRANT permissions ON TABLE qualified_name TO role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::TABLE, $5, role_node);
   }
   | GRANT permissions ON qualified_name TO role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $6);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::TABLE, $4, role_node);
   }
   | GRANT permissions ON ALL ROLES TO role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::ALL_ROLES, nullptr , role_node);
   }
   | GRANT permissions ON ROLE role_name TO role_name {
     PTQualifiedName::SharedPtr to_role_node = MAKE_NODE(@1, PTQualifiedName, $7);
     PTQualifiedName::SharedPtr on_role_node = MAKE_NODE(@1, PTQualifiedName, $5);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::GRANT,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::GRANT,
                    $2, ResourceType::ROLE, on_role_node, to_role_node);
   }
 ;
@@ -7743,34 +7825,34 @@ GrantStmt:
 RevokeStmt:
   REVOKE permissions ON ALL KEYSPACES FROM role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::ALL_KEYSPACES, nullptr, role_node);
   }
   | REVOKE permissions ON KEYSPACE ColId FROM role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
     PTQualifiedName::SharedPtr keyspace_node = MAKE_NODE(@1, PTQualifiedName, $5);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::KEYSPACE, keyspace_node, role_node);
   }
   | REVOKE permissions ON TABLE qualified_name FROM role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::TABLE, $5, role_node);
   }
   | REVOKE permissions ON qualified_name FROM role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $6);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::TABLE, $4, role_node);
   }
   | REVOKE permissions ON ALL ROLES FROM role_name {
     PTQualifiedName::SharedPtr role_node = MAKE_NODE(@1, PTQualifiedName, $7);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::ALL_ROLES, nullptr , role_node);
   }
   | REVOKE permissions ON ROLE role_name FROM role_name {
     PTQualifiedName::SharedPtr to_role_node = MAKE_NODE(@1, PTQualifiedName, $7);
     PTQualifiedName::SharedPtr on_role_node = MAKE_NODE(@1, PTQualifiedName, $5);
-    $$ = MAKE_NODE(@1, PTGrantRevokePermission, GrantRevokeStatementType::REVOKE,
+    $$ = MAKE_NODE(@1, PTGrantRevokePermission, client::GrantRevokeStatementType::REVOKE,
                    $2, ResourceType::ROLE, on_role_node, to_role_node);
   }
 ;
@@ -7908,8 +7990,6 @@ grantee_list:
 grantee:
   RoleSpec {
   }
-  | GROUP_P RoleSpec {
-  }
 ;
 
 opt_grant_grant_option:
@@ -7943,13 +8023,13 @@ GrantRoleStmt:
 
 GrantRoleStmt:
   GRANT role_name TO role_name {
-    $$ = MAKE_NODE(@1, PTGrantRevokeRole, GrantRevokeStatementType::GRANT, $2, $4);
+    $$ = MAKE_NODE(@1, PTGrantRevokeRole, client::GrantRevokeStatementType::GRANT, $2, $4);
   }
 ;
 
 RevokeRoleStmt:
   REVOKE role_name FROM role_name {
-    $$ = MAKE_NODE(@1, PTGrantRevokeRole, GrantRevokeStatementType::REVOKE, $2, $4);
+    $$ = MAKE_NODE(@1, PTGrantRevokeRole, client::GrantRevokeStatementType::REVOKE, $2, $4);
   }
 ;
 
@@ -8029,16 +8109,29 @@ defacl_privilege_target:
  *****************************************************************************/
 
 IndexStmt:
-  CREATE opt_unique INDEX opt_concurrently opt_index_name ON qualified_name
+  CREATE opt_deferred opt_unique INDEX opt_concurrently opt_index_name ON qualified_name
   access_method_clause '(' index_params ')' opt_include_clause OptTableSpace opt_where_clause
   opt_index_options {
-    $$ = MAKE_NODE(@1, PTCreateIndex, $2, $5, $7, $10, false, $15, $12);
+    if ($15 && FLAGS_cql_raise_index_where_clause_error) {
+       // WHERE is not supported.
+       PARSER_UNSUPPORTED(@1);
+    }
+    $$ = MAKE_NODE(@1, PTCreateIndex, $2, $3, $6, $8, $11, false, $16, $13, $15);
   }
-  | CREATE opt_unique INDEX opt_concurrently IF_P NOT_LA EXISTS opt_index_name ON qualified_name
-  access_method_clause '(' index_params ')' opt_include_clause OptTableSpace opt_where_clause
-  opt_index_options {
-    $$ = MAKE_NODE(@1, PTCreateIndex, $2, $8, $10, $13, true, $18, $15);
+  | CREATE opt_deferred opt_unique INDEX opt_concurrently IF_P NOT_LA EXISTS opt_index_name ON
+  qualified_name access_method_clause '(' index_params ')' opt_include_clause OptTableSpace
+  opt_where_clause opt_index_options {
+    if ($18 && FLAGS_cql_raise_index_where_clause_error) {
+       // WHERE is not supported.
+       PARSER_UNSUPPORTED(@1);
+    }
+    $$ = MAKE_NODE(@1, PTCreateIndex, $2, $3, $9, $11, $14, true, $19, $16, $18);
   }
+;
+
+opt_deferred:
+  DEFERRED                          { $$ = true; }
+  | /*EMPTY*/                       { $$ = false; }
 ;
 
 opt_unique:
@@ -8085,10 +8178,10 @@ opt_include_clause:
   /*EMPTY*/ {
     $$ = nullptr;
   }
-  | INCLUDE '(' columnList ')' {
+  | INCLUDE '(' index_column_list ')' {
     $$ = $3;
   }
-  | COVERING '(' columnList ')' {
+  | COVERING '(' index_column_list ')' {
     $$ = $3;
   }
 ;
@@ -8647,8 +8740,6 @@ RenameStmt:
   | ALTER FOREIGN DATA_P WRAPPER name RENAME TO name {
   }
   | ALTER FUNCTION function_with_argtypes RENAME TO name {
-  }
-  | ALTER GROUP_P RoleId RENAME TO RoleId {
   }
   | ALTER opt_procedural LANGUAGE name RENAME TO name {
   }

@@ -16,12 +16,12 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_ROCKSDB_UTILITIES_STACKABLE_DB_H
-#define YB_ROCKSDB_UTILITIES_STACKABLE_DB_H
 
 #pragma once
 #include <string>
 #include "yb/rocksdb/db.h"
+
+#include "yb/util/result.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -260,7 +260,6 @@ class StackableDB : public DB {
     return db_->SyncWAL();
   }
 
-#ifndef ROCKSDB_LITE
 
   virtual Status DisableFileDeletions() override {
     return db_->DisableFileDeletions();
@@ -278,11 +277,15 @@ class StackableDB : public DB {
     return db_->GetFlushedFrontier();
   }
 
-  CHECKED_STATUS ModifyFlushedFrontier(
+  Status ModifyFlushedFrontier(
       UserFrontierPtr values,
       FrontierModificationMode mode) override {
     return db_->ModifyFlushedFrontier(std::move(values), mode);
   }
+
+  yb::Result<std::string> GetMiddleKey() override {
+    return db_->GetMiddleKey();
+  };
 
   virtual void GetColumnFamilyMetaData(
       ColumnFamilyHandle *column_family,
@@ -290,7 +293,12 @@ class StackableDB : public DB {
     db_->GetColumnFamilyMetaData(column_family, cf_meta);
   }
 
-#endif  // ROCKSDB_LITE
+  virtual void GetColumnFamiliesOptions(
+      std::vector<std::string>* column_family_names,
+      std::vector<ColumnFamilyOptions>* column_family_options) override {
+    db_->GetColumnFamiliesOptions(column_family_names, column_family_options);
+  }
+
 
   virtual Status GetLiveFiles(std::vector<std::string>& vec, uint64_t* mfs,
                               bool flush_memtable = true) override {
@@ -299,6 +307,10 @@ class StackableDB : public DB {
 
   virtual SequenceNumber GetLatestSequenceNumber() const override {
     return db_->GetLatestSequenceNumber();
+  }
+
+  virtual uint64_t GetNextFileNumber() const override {
+    return db_->GetNextFileNumber();
   }
 
   virtual Status GetSortedWalFiles(VectorLogPtr* files) override {
@@ -315,9 +327,9 @@ class StackableDB : public DB {
 
   using DB::SetOptions;
   virtual Status SetOptions(ColumnFamilyHandle* column_family_handle,
-                            const std::unordered_map<std::string, std::string>&
-                                new_options) override {
-    return db_->SetOptions(column_family_handle, new_options);
+                            const std::unordered_map<std::string, std::string>& new_options,
+                            bool dump_options) override {
+    return db_->SetOptions(column_family_handle, new_options, dump_options);
   }
 
   using DB::GetPropertiesOfAllTables;
@@ -335,7 +347,7 @@ class StackableDB : public DB {
   }
 
   virtual Status GetUpdatesSince(
-      SequenceNumber seq_number, unique_ptr<TransactionLogIterator>* iter,
+      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions& read_options) override {
     return db_->GetUpdatesSince(seq_number, iter, read_options);
   }
@@ -349,5 +361,3 @@ class StackableDB : public DB {
 };
 
 } //  namespace rocksdb
-
-#endif // YB_ROCKSDB_UTILITIES_STACKABLE_DB_H

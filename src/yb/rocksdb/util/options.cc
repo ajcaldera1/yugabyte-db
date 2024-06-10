@@ -31,12 +31,11 @@
 #include <inttypes.h>
 #include <limits>
 
-#include <gflags/gflags.h>
-
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/env.h"
+#include "yb/rocksdb/filter_policy.h"
 #include "yb/rocksdb/sst_file_manager.h"
 #include "yb/rocksdb/memtablerep.h"
 #include "yb/rocksdb/merge_operator.h"
@@ -48,16 +47,6 @@
 #include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/util/compression.h"
 #include "yb/rocksdb/util/statistics.h"
-#include "yb/rocksdb/util/xfunc.h"
-
-DEFINE_int32(memstore_size_mb, 128,
-             "Max size (in mb) of the memstore, before needing to flush.");
-
-DEFINE_int32(num_reserved_small_compaction_threads, -1, "Number of reserved small compaction "
-             "threads. It allows splitting small vs. large compactions.");
-
-DEFINE_bool(enable_ondisk_compression, true,
-            "Determines whether SSTable compression is enabled or not.");
 
 namespace rocksdb {
 
@@ -102,19 +91,22 @@ ImmutableCFOptions::ImmutableCFOptions(const Options& options)
       optimize_filters_for_hits(options.optimize_filters_for_hits),
       listeners(options.listeners),
       row_cache(options.row_cache),
-      mem_tracker(options.mem_tracker) {}
+      mem_tracker(options.mem_tracker),
+      block_based_table_mem_tracker(options.block_based_table_mem_tracker),
+      iterator_replacer(options.iterator_replacer),
+      compaction_file_filter_factory(options.compaction_file_filter_factory.get()),
+      priority_thread_pool_metrics(options.priority_thread_pool_metrics) {}
 
 ColumnFamilyOptions::ColumnFamilyOptions()
     : comparator(BytewiseComparator()),
       merge_operator(nullptr),
       compaction_filter(nullptr),
       compaction_filter_factory(nullptr),
-      write_buffer_size(FLAGS_memstore_size_mb << 20), // Option expects bytes.
+      write_buffer_size(4_MB),  // Option expects bytes.
       max_write_buffer_number(2),
       min_write_buffer_number_to_merge(1),
       max_write_buffer_number_to_maintain(0),
-      compression(Snappy_Supported() && FLAGS_enable_ondisk_compression ?
-                  kSnappyCompression : kNoCompression),
+      compression(Snappy_Supported() ? kSnappyCompression : kNoCompression),
       prefix_extractor(nullptr),
       num_levels(7),
       level0_file_num_compaction_trigger(4),
@@ -259,7 +251,7 @@ DBOptions::DBOptions()
       delete_obsolete_files_period_micros(6ULL * 60 * 60 * 1000000),
       base_background_compactions(-1),
       max_background_compactions(1),
-      num_reserved_small_compaction_threads(FLAGS_num_reserved_small_compaction_threads),
+      num_reserved_small_compaction_threads(-1),
       compaction_size_threshold_bytes(std::numeric_limits<uint64_t>::max()),
       max_subcompactions(1),
       max_background_flushes(1),
@@ -271,7 +263,7 @@ DBOptions::DBOptions()
       table_cache_numshardbits(4),
       WAL_ttl_seconds(0),
       WAL_size_limit_MB(0),
-      manifest_preallocation_size(4 * 1024 * 1024),
+      manifest_preallocation_size(64 * 1024),
       allow_os_buffer(true),
       allow_mmap_reads(false),
       allow_mmap_writes(false),
@@ -299,9 +291,7 @@ DBOptions::DBOptions()
       skip_stats_update_on_db_open(false),
       wal_recovery_mode(WALRecoveryMode::kTolerateCorruptedTailRecords),
       row_cache(nullptr),
-#ifndef ROCKSDB_LITE
       wal_filter(nullptr),
-#endif  // ROCKSDB_LITE
       fail_if_options_file_error(false) {
 }
 
@@ -424,10 +414,8 @@ void DBOptions::Dump(Logger* log) const {
       RHEADER(log, "                               Options.row_cache: None");
     }
   RHEADER(log, "                           Options.initial_seqno: %" PRIu64, initial_seqno);
-#ifndef ROCKSDB_LITE
   RHEADER(log, "       Options.wal_filter: %s",
       wal_filter ? wal_filter->Name() : "None");
-#endif  // ROCKDB_LITE
 }  // DBOptions::Dump
 
 void ColumnFamilyOptions::Dump(Logger* log) const {
@@ -520,6 +508,9 @@ void ColumnFamilyOptions::Dump(Logger* log) const {
       compaction_pri);
   RHEADER(log, " Options.compaction_options_universal.size_ratio: %u",
       compaction_options_universal.size_ratio);
+  RHEADER(log, "Options.compaction_options_universal."
+          "always_include_size_threshold: %" ROCKSDB_PRIszt,
+          compaction_options_universal.always_include_size_threshold);
   RHEADER(log, "Options.compaction_options_universal.min_merge_width: %u",
       compaction_options_universal.min_merge_width);
   RHEADER(log, "Options.compaction_options_universal.max_merge_width: %u",
@@ -624,7 +615,6 @@ Options::PrepareForBulkLoad() {
   return this;
 }
 
-#ifndef ROCKSDB_LITE
 // Optimization functions
 ColumnFamilyOptions* ColumnFamilyOptions::OptimizeForPointLookup(
     uint64_t block_cache_size_mb) {
@@ -693,7 +683,6 @@ DBOptions* DBOptions::IncreaseParallelism(int total_threads) {
   return this;
 }
 
-#endif  // !ROCKSDB_LITE
 
 const ReadOptions ReadOptions::kDefault;
 
@@ -709,8 +698,6 @@ ReadOptions::ReadOptions()
       prefix_same_as_start(false),
       pin_data(false),
       query_id(rocksdb::kDefaultQueryId) {
-  XFUNC_TEST("", "managed_options", managed_options, xf_manage_options,
-             reinterpret_cast<ReadOptions*>(this));
 }
 
 ReadOptions::ReadOptions(bool cksum, bool cache)
@@ -725,8 +712,12 @@ ReadOptions::ReadOptions(bool cksum, bool cache)
       prefix_same_as_start(false),
       pin_data(false),
       query_id(rocksdb::kDefaultQueryId) {
-  XFUNC_TEST("", "managed_options", managed_options, xf_manage_options,
-             reinterpret_cast<ReadOptions*>(this));
+}
+
+std::atomic<int64_t> flush_tick_(1);
+
+int64_t FlushTick() {
+  return flush_tick_.fetch_add(1, std::memory_order_acq_rel);
 }
 
 }  // namespace rocksdb

@@ -15,10 +15,10 @@
 // Tree node definitions for expression.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_BCALL_H_
-#define YB_YQL_CQL_QL_PTREE_PT_BCALL_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/bfql/gen_opcodes.h"
 
 namespace yb {
 namespace ql {
@@ -34,7 +34,7 @@ class PTBcall : public PTExpr {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTBcall(MemoryContext *memctx,
-          YBLocation::SharedPtr loc,
+          YBLocationPtr loc,
           const MCSharedPtr<MCString>& name,
           PTExprListNode::SharedPtr args);
   virtual ~PTBcall();
@@ -46,10 +46,10 @@ class PTBcall : public PTExpr {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
   // Access API for arguments.
-  const MCList<PTExpr::SharedPtr>& args() const {
+  const MCList<PTExprPtr>& args() const {
     return args_->node_list();
   }
 
@@ -75,54 +75,22 @@ class PTBcall : public PTExpr {
   }
 
   // BCall result set column type in QL format.
-  virtual void rscol_type_PB(QLTypePB *pb_type) const override {
-    if (aggregate_opcode() == bfql::TSOpcode::kAvg) {
-      // Tablets return a map of (count, sum),
-      // so that the average can be calculated across all tablets.
-      QLType::CreateTypeMap(INT64, args_->node_list().front()->ql_type()->main())
-          ->ToQLTypePB(pb_type);
-      return;
-    }
-    ql_type()->ToQLTypePB(pb_type);
-  }
+  void rscol_type_PB(QLTypePB *pb_type) const override;
 
-  virtual CHECKED_STATUS CheckOperator(SemContext *sem_context) override;
+  virtual Status CheckOperator(SemContext *sem_context) override;
 
-  virtual CHECKED_STATUS CheckCounterUpdateSupport(SemContext *sem_context) const override;
+  virtual Status CheckCounterUpdateSupport(SemContext *sem_context) const override;
 
-  virtual string QLName() const override {
-    string arg_names;
-    string keyspace;
+  Status CheckOperatorAfterArgAnalyze(SemContext *sem_context);
 
-    // cql_cast() is displayed as "cast(<col> as <type>)".
-    if (strcmp(name_->c_str(), bfql::kCqlCastFuncName) == 0) {
-      CHECK_GE(args_->size(), 2);
-      const string column_name = args_->element(0)->QLName();
-      const string type =  QLType::ToCQLString(args_->element(1)->ql_type()->type_info()->type());
-      return strings::Substitute("cast($0 as $1)", column_name, type);
-    }
+  void CollectReferencedIndexColnames(MCSet<std::string> *col_names) const override;
 
-    for (auto arg : args_->node_list()) {
-      if (!arg_names.empty()) {
-        arg_names += ", ";
-      }
-      arg_names += arg->QLName();
-    }
-    if (IsAggregateCall()) {
-      // count(*) is displayed as "count".
-      if (arg_names.empty()) {
-        return name_->c_str();
-      }
-      keyspace += "system.";
-    }
-    return strings::Substitute("$0$1($2)", keyspace, name_->c_str(), arg_names);
-  }
+  std::string QLName(
+      qlexpr::QLNameOption option = qlexpr::QLNameOption::kUserOriginalName) const override;
+  bool IsAggregateCall() const override;
+  yb::bfql::TSOpcode aggregate_opcode() const override;
 
-  virtual bool IsAggregateCall() const override;
-  virtual yb::bfql::TSOpcode aggregate_opcode() const override {
-    return is_server_operator_ ? static_cast<yb::bfql::TSOpcode>(bfopcode_)
-                               : yb::bfql::TSOpcode::kNoOp;
-  }
+  virtual bool HaveColumnRef() const override;
 
  private:
   // Builtin function name.
@@ -153,7 +121,7 @@ class PTToken : public PTBcall {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTToken(MemoryContext *memctx,
-          YBLocation::SharedPtr loc,
+          YBLocationPtr loc,
           const MCSharedPtr<MCString>& name,
           PTExprListNode::SharedPtr args) : PTBcall(memctx, loc, name, args) { }
 
@@ -166,10 +134,10 @@ class PTToken : public PTBcall {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
   // Check if token call is well formed before analyzing it
-  virtual CHECKED_STATUS CheckOperator(SemContext *sem_context) override;
+  virtual Status CheckOperator(SemContext *sem_context) override;
 
   bool is_partition_key_ref() const {
     return is_partition_key_ref_;
@@ -197,7 +165,7 @@ class PTPartitionHash : public PTToken {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTPartitionHash(MemoryContext *memctx,
-                  YBLocation::SharedPtr loc,
+                  YBLocationPtr loc,
                   const MCSharedPtr<MCString>& name,
                   PTExprListNode::SharedPtr args) : PTToken(memctx, loc, name, args) { }
 
@@ -217,5 +185,3 @@ class PTPartitionHash : public PTToken {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_BCALL_H_

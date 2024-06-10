@@ -21,11 +21,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BUILDER_H
-#define YB_ROCKSDB_TABLE_BLOCK_BUILDER_H
+#pragma once
 
 #include <stdint.h>
 #include <vector>
+
+#include "yb/rocksdb/types.h"
+
 #include "yb/util/slice.h"
 
 namespace rocksdb {
@@ -36,6 +38,7 @@ class BlockBuilder {
   void operator=(const BlockBuilder&) = delete;
 
   explicit BlockBuilder(int block_restart_interval,
+                        KeyValueEncodingFormat key_value_encoding_format,
                         bool use_delta_encoding = true);
 
   // Reset the contents as if the BlockBuilder was just constructed.
@@ -65,8 +68,9 @@ class BlockBuilder {
   }
 
  private:
-  const int          block_restart_interval_;
-  const bool         use_delta_encoding_;
+  const int block_restart_interval_;
+  const bool use_delta_encoding_;
+  const KeyValueEncodingFormat key_value_encoding_format_;
 
   std::string           buffer_;    // Destination buffer
   std::vector<uint32_t> restarts_;  // Restart points
@@ -76,5 +80,3 @@ class BlockBuilder {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_TABLE_BLOCK_BUILDER_H

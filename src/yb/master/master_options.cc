@@ -32,19 +32,17 @@
 
 #include "yb/master/master_options.h"
 
-#include <glog/logging.h>
-#include <gflags/gflags.h>
+#include "yb/util/logging.h"
 
 #include "yb/master/master.h"
-#include "yb/util/flag_tags.h"
-
-using std::make_shared;
-using std::vector;
+#include "yb/server/server_base_options.h"
+#include "yb/util/flags.h"
+#include "yb/util/result.h"
 
 namespace yb {
 namespace master {
 
-DEFINE_string(master_addresses, "",
+DEFINE_UNKNOWN_string(master_addresses, "",
     "Comma-separated list of the host/port RPC addresses of the peer masters. This is needed "
     "for initial cluster create, and is recreated from persisted metadata on master restart."
     "This flag also defaults to empty, which is overloaded to be able to either: "
@@ -52,22 +50,22 @@ DEFINE_string(master_addresses, "",
     "b) allow for a master to be restarted gracefully and get its peer list from the "
     "local cmeta file of the last committed config, if local instance file is present.");
 TAG_FLAG(master_addresses, experimental);
-DEFINE_uint64(master_replication_factor, 0,
+DEFINE_UNKNOWN_uint64(master_replication_factor, 0,
     "Number of master replicas. By default it is detected based on master_addresses option, but "
     "could be specified explicitly together with passing one or more master service domain name and"
     " port through master_addresses for masters auto-discovery when running on Kubernetes.");
 
 // NOTE: This flag is deprecated.
-DEFINE_bool(create_cluster, false,
+DEFINE_UNKNOWN_bool(create_cluster, false,
   "(DEPRECATED). This flag was earlier used to distinguish if the master process is "
   "being started to create a cluster or if this just a restart.");
 TAG_FLAG(create_cluster, hidden);
 
 const char* MasterOptions::kServerType = "master";
 
-MasterOptions::MasterOptions(server::MasterAddressesPtr master_addresses) {
+MasterOptions::MasterOptions(server::MasterAddressesPtr master_addresses)
+    : ServerBaseOptions(kMasterDefaultPort) {
   server_type = kServerType;
-  rpc_opts.default_port = kMasterDefaultPort;
 
   SetMasterAddresses(master_addresses);
 }

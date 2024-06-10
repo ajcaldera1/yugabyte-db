@@ -21,10 +21,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef NDEBUG
-
 #include "yb/rocksdb/db/db_impl.h"
-#include "yb/rocksdb/util/thread_status_updater.h"
+#include "yb/rocksdb/db/version_set.h"
 
 namespace rocksdb {
 
@@ -103,7 +101,9 @@ Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
        cfd->ioptions()->compaction_style == kCompactionStyleFIFO)
           ? level
           : level + 1;
-  return RunManualCompaction(cfd, level, output_level, 0, begin, end, true,
+  return RunManualCompaction(cfd, level, output_level, /* output_path_id */ 0, begin, end,
+                             /* exclusive */ true, CompactionReason::kManualCompaction,
+                             /* file_number_upper_bound */ 0, /* input_size_limit_per_job */ 0,
                              disallow_trivial_move);
 }
 
@@ -188,4 +188,3 @@ Status DBImpl::TEST_GetAllImmutableCFOptions(
 }
 
 }  // namespace rocksdb
-#endif  // NDEBUG

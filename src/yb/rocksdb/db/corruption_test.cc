@@ -21,13 +21,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_LITE
-
 #include <inttypes.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+
+#include <memory>
+
+#include <gtest/gtest.h>
 
 #include "yb/rocksdb/db.h"
 
@@ -43,11 +45,19 @@
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
+#include "yb/rocksutil/yb_rocksdb_logger.h"
+
+#include "yb/util/test_macros.h"
+#include "yb/util/test_util.h"
+
+using std::unique_ptr;
+using std::shared_ptr;
+
 namespace rocksdb {
 
 static const int kValueSize = 1000;
 
-class CorruptionTest : public testing::Test {
+class CorruptionTest : public RocksDBTest {
  public:
   test::ErrorEnv env_;
   std::string dbname_;
@@ -59,10 +69,11 @@ class CorruptionTest : public testing::Test {
     tiny_cache_ = NewLRUCache(100);
     options_.env = &env_;
     dbname_ = test::TmpDir() + "/corruption_test";
-    DestroyDB(dbname_, options_);
+    CHECK_OK(DestroyDB(dbname_, options_));
 
     db_ = nullptr;
     options_.create_if_missing = true;
+    options_.info_log = std::make_shared<yb::YBRocksDBLogger>(options_.log_prefix);
     BlockBasedTableOptions table_options;
     table_options.block_size_deviation = 0;  // make unit test pass for now
     options_.table_factory.reset(NewBlockBasedTableFactory(table_options));
@@ -72,7 +83,7 @@ class CorruptionTest : public testing::Test {
 
   ~CorruptionTest() {
      delete db_;
-     DestroyDB(dbname_, Options());
+     CHECK_OK(DestroyDB(dbname_, Options()));
   }
 
   void CloseDb() {
@@ -109,7 +120,7 @@ class CorruptionTest : public testing::Test {
     for (int i = 0; i < n; i++) {
       if (flush_every != 0 && i != 0 && i % flush_every == 0) {
         DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-        dbi->TEST_FlushMemTable();
+        ASSERT_OK(dbi->TEST_FlushMemTable());
       }
       // if ((i % 100) == 0) fprintf(stderr, "@ %d of %d\n", i, n);
       Slice key = Key(i, &key_space);
@@ -119,7 +130,7 @@ class CorruptionTest : public testing::Test {
     }
   }
 
-  void Check(int min_expected, int max_expected) {
+  Status Check(int min_expected, int max_expected) {
     uint64_t next_expected = 0;
     uint64_t missed = 0;
     int bad_keys = 0;
@@ -149,13 +160,19 @@ class CorruptionTest : public testing::Test {
         correct++;
       }
     }
+    // We still can have corruption error even with option to not verify checksums because
+    // metadata could be corrupted or due to index block reader always verifying checksums.
+    SCHECK_FORMAT(
+        iter->status().ok() || iter->status().IsCorruption(), InternalError,
+        "Expected OK or corruption error, but got: $0", iter->status());
     delete iter;
 
     fprintf(stderr,
       "expected=%d..%d; got=%d; bad_keys=%d; bad_values=%d; missed=%" PRIu64 "\n",
             min_expected, max_expected, correct, bad_keys, bad_values, missed);
-    ASSERT_LE(min_expected, correct);
-    ASSERT_GE(max_expected, correct);
+    SCHECK_LE(min_expected, correct, InternalError, "Number of correct keys is too low");
+    SCHECK_GE(max_expected, correct, InternalError, "Number of correct keys is too high");
+    return Status::OK();
   }
 
   // Corrupts specified number of bytes in SST starting at specified offset.
@@ -163,7 +180,7 @@ class CorruptionTest : public testing::Test {
   // space where data files go first and metadata file goes after data files.
   // This method doesn't support the case when area to be corrupted spans both base and data file.
   // We have assert to avoid such cases, since they are not required for tests as of 2017-03-09.
-  void CorruptFile(const std::string& base_fname, int offset, int bytes_to_corrupt) {
+  void CorruptSST(const std::string& base_fname, int offset, int bytes_to_corrupt) {
     std::string fname;
 
     {
@@ -208,15 +225,7 @@ class CorruptionTest : public testing::Test {
       }
     }
 
-    // Do it
-    std::string contents;
-    Status s = ReadFileToString(Env::Default(), fname, &contents);
-    ASSERT_TRUE(s.ok()) << s.ToString();
-    for (int i = 0; i < bytes_to_corrupt; i++) {
-      contents[i + offset] ^= 0x80;
-    }
-    s = WriteStringToFile(Env::Default(), contents, fname);
-    ASSERT_TRUE(s.ok()) << s.ToString();
+    ASSERT_OK(yb::CorruptFile(fname, offset, bytes_to_corrupt, yb::CorruptionType::kXor55));
   }
 
   void Corrupt(FileType filetype, int offset, int bytes_to_corrupt) {
@@ -237,7 +246,7 @@ class CorruptionTest : public testing::Test {
     }
     ASSERT_TRUE(!fname.empty()) << filetype;
 
-    CorruptFile(fname, offset, bytes_to_corrupt);
+    CorruptSST(fname, offset, bytes_to_corrupt);
   }
 
   // corrupts exactly one file at level `level`. if no file found at level,
@@ -247,7 +256,7 @@ class CorruptionTest : public testing::Test {
     db_->GetLiveFilesMetaData(&metadata);
     for (const auto& m : metadata) {
       if (m.level == level) {
-        CorruptFile(dbname_ + "/" + m.name, offset, bytes_to_corrupt);
+        CorruptSST(dbname_ + m.Name(), offset, bytes_to_corrupt);
         return;
       }
     }
@@ -291,7 +300,7 @@ class CorruptionTest : public testing::Test {
 
 TEST_F(CorruptionTest, Recovery) {
   Build(100);
-  Check(100, 100);
+  ASSERT_OK(Check(100, 100));
 #ifdef OS_WIN
   // On Wndows OS Disk cache does not behave properly
   // We do not call FlushBuffers on every Flush. If we do not close
@@ -309,7 +318,7 @@ TEST_F(CorruptionTest, Recovery) {
   Reopen(&options_);
 
   // The 64 records in the first two log blocks are completely lost.
-  Check(36, 36);
+  ASSERT_OK(Check(36, 36));
 }
 
 TEST_F(CorruptionTest, RecoverWriteError) {
@@ -344,12 +353,12 @@ TEST_F(CorruptionTest, NewFileErrorDuringWrite) {
 TEST_F(CorruptionTest, TableFile) {
   Build(100);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-  dbi->TEST_FlushMemTable();
-  dbi->TEST_CompactRange(0, nullptr, nullptr);
-  dbi->TEST_CompactRange(1, nullptr, nullptr);
+  ASSERT_OK(dbi->TEST_FlushMemTable());
+  ASSERT_OK(dbi->TEST_CompactRange(0, nullptr, nullptr));
+  ASSERT_OK(dbi->TEST_CompactRange(1, nullptr, nullptr));
 
   Corrupt(kTableFile, 100, 1);
-  Check(99, 99);
+  ASSERT_OK(Check(99, 99));
 }
 
 TEST_F(CorruptionTest, TableFileIndexData) {
@@ -360,21 +369,21 @@ TEST_F(CorruptionTest, TableFileIndexData) {
   // build 2 tables, flush at 5000
   Build(10000, 5000);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-  dbi->TEST_FlushMemTable();
+  ASSERT_OK(dbi->TEST_FlushMemTable());
 
   // Corrupt top level index block of an entire file.
   Corrupt(kTableFile, -1000, 500);
   Reopen();
   // one full file should be readable, since only one was corrupted
   // the other file should be fully non-readable, since index was corrupted
-  Check(5000, 5000);
+  ASSERT_OK(Check(5000, 5000));
 }
 
 TEST_F(CorruptionTest, MissingDescriptor) {
   Build(1000);
   RepairDB();
   Reopen();
-  Check(1000, 1000);
+  ASSERT_OK(Check(1000, 1000));
 }
 
 TEST_F(CorruptionTest, SequenceNumberRecovery) {
@@ -401,8 +410,8 @@ TEST_F(CorruptionTest, SequenceNumberRecovery) {
 TEST_F(CorruptionTest, CorruptedDescriptor) {
   ASSERT_OK(db_->Put(WriteOptions(), "foo", "hello"));
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-  dbi->TEST_FlushMemTable();
-  dbi->TEST_CompactRange(0, nullptr, nullptr);
+  ASSERT_OK(dbi->TEST_FlushMemTable());
+  ASSERT_OK(dbi->TEST_CompactRange(0, nullptr, nullptr));
 
   Corrupt(kDescriptorFile, 0, 1000);
   Status s = TryReopen();
@@ -420,17 +429,17 @@ TEST_F(CorruptionTest, CompactionInputError) {
   Reopen(&options);
   Build(10);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-  dbi->TEST_FlushMemTable();
-  dbi->TEST_CompactRange(0, nullptr, nullptr);
-  dbi->TEST_CompactRange(1, nullptr, nullptr);
+  ASSERT_OK(dbi->TEST_FlushMemTable());
+  ASSERT_OK(dbi->TEST_CompactRange(0, nullptr, nullptr));
+  ASSERT_OK(dbi->TEST_CompactRange(1, nullptr, nullptr));
   ASSERT_EQ(1, Property("rocksdb.num-files-at-level2"));
 
   Corrupt(kTableFile, 100, 1);
-  Check(9, 9);
+  ASSERT_OK(Check(9, 9));
 
   // Force compactions by writing lots of values
   Build(10000);
-  Check(10000, 10000);
+  ASSERT_OK(Check(10000, 10000));
 }
 
 TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
@@ -443,12 +452,12 @@ TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
 
   // Fill levels >= 1
   for (int level = 1; level < dbi->NumberLevels(); level++) {
-    dbi->Put(WriteOptions(), "", "begin");
-    dbi->Put(WriteOptions(), "~", "end");
-    dbi->TEST_FlushMemTable();
+    ASSERT_OK(dbi->Put(WriteOptions(), "", "begin"));
+    ASSERT_OK(dbi->Put(WriteOptions(), "~", "end"));
+    ASSERT_OK(dbi->TEST_FlushMemTable());
     for (int comp_level = 0; comp_level < dbi->NumberLevels() - level;
          ++comp_level) {
-      dbi->TEST_CompactRange(comp_level, nullptr, nullptr);
+      ASSERT_OK(dbi->TEST_CompactRange(comp_level, nullptr, nullptr));
     }
   }
 
@@ -456,12 +465,12 @@ TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
 
   dbi = reinterpret_cast<DBImpl*>(db_);
   Build(10);
-  dbi->TEST_FlushMemTable();
-  dbi->TEST_WaitForCompact();
+  ASSERT_OK(dbi->TEST_FlushMemTable());
+  ASSERT_OK(dbi->TEST_WaitForCompact());
   ASSERT_EQ(1, Property("rocksdb.num-files-at-level0"));
 
   CorruptTableFileAtLevel(0, 100, 1);
-  Check(9, 9);
+  ASSERT_OK(Check(9, 9));
 
   // Write must eventually fail because of corrupted table
   Status s;
@@ -481,7 +490,7 @@ TEST_F(CorruptionTest, CompactionInputErrorParanoid) {
 TEST_F(CorruptionTest, UnrelatedKeys) {
   Build(10);
   DBImpl* dbi = reinterpret_cast<DBImpl*>(db_);
-  dbi->TEST_FlushMemTable();
+  ASSERT_OK(dbi->TEST_FlushMemTable());
   Corrupt(kTableFile, 100, 1);
 
   std::string tmp1, tmp2;
@@ -489,7 +498,7 @@ TEST_F(CorruptionTest, UnrelatedKeys) {
   std::string v;
   ASSERT_OK(db_->Get(ReadOptions(), Key(1000, &tmp1), &v));
   ASSERT_EQ(Value(1000, &tmp2).ToString(), v);
-  dbi->TEST_FlushMemTable();
+  ASSERT_OK(dbi->TEST_FlushMemTable());
   ASSERT_OK(db_->Get(ReadOptions(), Key(1000, &tmp1), &v));
   ASSERT_EQ(Value(1000, &tmp2).ToString(), v);
 }
@@ -506,23 +515,23 @@ TEST_F(CorruptionTest, FileSystemStateCorrupted) {
     std::vector<LiveFileMetaData> metadata;
     dbi->GetLiveFilesMetaData(&metadata);
     ASSERT_GT(metadata.size(), size_t(0));
-    std::string filename = dbname_ + metadata[0].name;
+    std::string filename = dbname_ + metadata[0].Name();
 
     delete db_;
     db_ = nullptr;
 
     if (iter == 0) {  // corrupt file size
       unique_ptr<WritableFile> file;
-      env_.NewWritableFile(filename, &file, EnvOptions());
-      file->Append(Slice("corrupted sst"));
+      ASSERT_OK(env_.NewWritableFile(filename, &file, EnvOptions()));
+      ASSERT_OK(file->Append(Slice("corrupted sst")));
       file.reset();
     } else {  // delete the file
-      env_.DeleteFile(filename);
+      ASSERT_OK(env_.DeleteFile(filename));
     }
 
     Status x = TryReopen(&options);
     ASSERT_TRUE(x.IsCorruption());
-    DestroyDB(dbname_, options_);
+    ASSERT_OK(DestroyDB(dbname_, options_));
     Reopen(&options);
   }
 }
@@ -531,15 +540,6 @@ TEST_F(CorruptionTest, FileSystemStateCorrupted) {
 
 int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
+  google::ParseCommandLineNonHelpFlags(&argc, &argv, /* remove_flags */ true);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr, "SKIPPED as RepairDB() is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

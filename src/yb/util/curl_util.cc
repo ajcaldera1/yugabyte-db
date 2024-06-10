@@ -32,7 +32,17 @@
 
 #include "yb/util/curl_util.h"
 
-#include <glog/logging.h>
+#include <curl/curl.h>
+
+#include <vector>
+
+#include "yb/util/logging.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/faststring.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status.h"
 
 using std::string;
 
@@ -58,6 +68,12 @@ size_t WriteCallback(void* buffer, size_t size, size_t nmemb, void* user_ptr) {
 
 } // anonymous namespace
 
+CurlGlobalInitializer::CurlGlobalInitializer() {
+  CHECK_EQ(curl_global_init(CURL_GLOBAL_ALL), CURLE_OK);
+}
+
+CurlGlobalInitializer::~CurlGlobalInitializer() { curl_global_cleanup(); }
+
 EasyCurl::EasyCurl() {
   curl_ = curl_easy_init();
   CHECK(curl_) << "Could not init curl";
@@ -67,26 +83,31 @@ EasyCurl::~EasyCurl() {
   curl_easy_cleanup(curl_);
 }
 
-Status EasyCurl::FetchURL(const string& url, faststring* buf) {
-  return DoRequest(url, boost::none, boost::none, buf);
+Status EasyCurl::FetchURL(const string& url,
+                          faststring* buf,
+                          int64_t timeout_sec,
+                          const std::vector<std::string>& headers) {
+  return DoRequest(url, boost::none, boost::none, timeout_sec, buf, headers);
 }
 
-Status EasyCurl::PostToURL(const string& url,
-                           const string& post_data,
-                           faststring* dst) {
-  return DoRequest(url, post_data, string("application/x-www-form-urlencoded"), dst);
+Status EasyCurl::PostToURL(
+    const string& url, const string& post_data, faststring* dst, int64_t timeout_sec) {
+  return DoRequest(url, post_data, string("application/x-www-form-urlencoded"), timeout_sec, dst,
+                   {} /* headers */);
 }
 
-Status EasyCurl::PostToURL(const string& url,
-                           const string& post_data,
-                           const string& content_type,
-                           faststring* dst) {
-  return DoRequest(url, post_data, content_type, dst);
+Status EasyCurl::PostToURL(
+    const string& url,
+    const string& post_data,
+    const string& content_type,
+    faststring* dst,
+    int64_t timeout_sec) {
+  return DoRequest(url, post_data, content_type, timeout_sec, dst, {} /* headers */);
 }
 
 string EasyCurl::EscapeString(const string& data) {
   string escaped_str;
-  auto str = curl_easy_escape(curl_, data.c_str(), data.length());
+  auto str = curl_easy_escape(curl_, data.c_str(), narrow_cast<int>(data.length()));
   if (str) {
     escaped_str = str;
     curl_free(str);
@@ -94,16 +115,39 @@ string EasyCurl::EscapeString(const string& data) {
   return escaped_str;
 }
 
-Status EasyCurl::DoRequest(const string& url,
-                           const boost::optional<const string>& post_data,
-                           const boost::optional<const string>& content_type,
-                           faststring* dst) {
+Status EasyCurl::DoRequest(
+    const string& url,
+    const boost::optional<const string>& post_data,
+    const boost::optional<const string>& content_type,
+    int64_t timeout_sec,
+    faststring* dst,
+    const std::vector<std::string>& headers) {
   CHECK_NOTNULL(dst)->clear();
 
+  // Add headers if specified.
+  struct curl_slist* curl_headers = nullptr;
+  auto clean_up_curl_slist = ScopeExit([&]() {
+    curl_slist_free_all(curl_headers);
+  });
+
+  for (const auto& header : headers) {
+    curl_headers = CHECK_NOTNULL(curl_slist_append(curl_headers, header.c_str()));
+  }
+  RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, curl_headers)));
+
   RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_URL, url.c_str())));
+  if (return_headers_) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HEADER, 1)));
+  }
   RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, WriteCallback)));
   RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_WRITEDATA,
                                                 static_cast<void *>(dst))));
+  if (!ca_cert_.empty()) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_CAINFO, ca_cert_.c_str())));
+  }
+  if (follow_redirects_) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 1)));
+  }
 
   typedef std::unique_ptr<curl_slist, std::function<void(curl_slist*)>> CurlSlistPtr;
   CurlSlistPtr http_header_list;
@@ -123,6 +167,10 @@ Status EasyCurl::DoRequest(const string& url,
 
     RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_HTTPHEADER,
                                                   http_header_list.get())));
+  }
+
+  if (timeout_sec > 0) {
+    RETURN_NOT_OK(TranslateError(curl_easy_setopt(curl_, CURLOPT_TIMEOUT, timeout_sec)));
   }
 
   if (post_data) {

@@ -17,10 +17,8 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_TABLE_ADAPTIVE_TABLE_FACTORY_H
-#define ROCKSDB_TABLE_ADAPTIVE_TABLE_FACTORY_H
+#pragma once
 
-#ifndef ROCKSDB_LITE
 
 #include <string>
 #include "yb/rocksdb/options.h"
@@ -31,8 +29,6 @@ namespace rocksdb {
 
 struct EnvOptions;
 
-using std::unique_ptr;
-class RandomAccessFile;
 class WritableFile;
 class Table;
 class TableBuilder;
@@ -44,17 +40,17 @@ class AdaptiveTableFactory : public TableFactory {
   explicit AdaptiveTableFactory(
       std::shared_ptr<TableFactory> table_factory_to_write,
       std::shared_ptr<TableFactory> block_based_table_factory,
-      std::shared_ptr<TableFactory> plain_table_factory,
-      std::shared_ptr<TableFactory> cuckoo_table_factory);
+      std::shared_ptr<TableFactory> plain_table_factory);
 
   const char* Name() const override { return "AdaptiveTableFactory"; }
 
   Status NewTableReader(const TableReaderOptions& table_reader_options,
-                        unique_ptr<RandomAccessFileReader>&& file,
+                        std::unique_ptr<RandomAccessFileReader>&& file,
                         uint64_t file_size,
-                        unique_ptr<TableReader>* table) const override;
+                        std::unique_ptr<TableReader>* table) const override;
 
-  TableBuilder *NewTableBuilder(const TableBuilderOptions &table_builder_options,
+  std::unique_ptr<TableBuilder> NewTableBuilder(
+      const TableBuilderOptions &table_builder_options,
       uint32_t column_family_id,
       WritableFileWriter *base_file,
       WritableFileWriter *data_file = nullptr) const override;
@@ -73,10 +69,6 @@ class AdaptiveTableFactory : public TableFactory {
   std::shared_ptr<TableFactory> table_factory_to_write_;
   std::shared_ptr<TableFactory> block_based_table_factory_;
   std::shared_ptr<TableFactory> plain_table_factory_;
-  std::shared_ptr<TableFactory> cuckoo_table_factory_;
 };
 
 }  // namespace rocksdb
-#endif  // ROCKSDB_LITE
-
-#endif  // ROCKSDB_TABLE_ADAPTIVE_TABLE_FACTORY_H

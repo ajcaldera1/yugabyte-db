@@ -39,37 +39,26 @@
 // and Google friendly API.
 //
 
-#ifndef UTIL_GTL_STL_UTIL_H_
-#define UTIL_GTL_STL_UTIL_H_
+#pragma once
 
 #include <stddef.h>
 #include <string.h>  // for memcpy
+
 #include <algorithm>
-using std::copy;
-using std::max;
-using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 #include <cassert>
 #include <deque>
-using std::deque;
 #include <functional>
-using std::binary_function;
-using std::less;
-#include <iterator>
-using std::back_insert_iterator;
-using std::iterator_traits;
-#include <memory>
+#include <optional>
+#include <set>
 #include <string>
-using std::string;
+#include <unordered_map>
 #include <vector>
-using std::vector;
 
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
-#include "yb/gutil/algorithm.h"
+
+namespace yb {
 
 // Sort and remove duplicates of an STL vector or deque.
 template<class T>
@@ -92,8 +81,8 @@ template<class T> void STLClearObject(T* obj) {
 // Specialization for deque. Same as STLClearObject but doesn't call reserve
 // since deque doesn't have reserve.
 template <class T, class A>
-void STLClearObject(deque<T, A>* obj) {
-  deque<T, A> tmp;
+void STLClearObject(std::deque<T, A>* obj) {
+  std::deque<T, A> tmp;
   tmp.swap(*obj);
 }
 
@@ -109,7 +98,7 @@ template <class T> inline void STLClearIfBig(T* obj, size_t limit = 1<<20) {
 
 // Specialization for deque, which doesn't implement capacity().
 template <class T, class A>
-inline void STLClearIfBig(deque<T, A>* obj, size_t limit = 1<<20) {
+inline void STLClearIfBig(std::deque<T, A>* obj, size_t limit = 1<<20) {
   if (obj->size() >= limit) {
     STLClearObject(obj);
   } else {
@@ -229,7 +218,7 @@ void STLDeleteContainerPairSecondPointers(ForwardIterator begin,
 }
 
 template<typename T>
-inline void STLAssignToVector(vector<T>* vec,
+inline void STLAssignToVector(std::vector<T>* vec,
                               const T* ptr,
                               size_t n) {
   vec->resize(n);
@@ -240,7 +229,7 @@ inline void STLAssignToVector(vector<T>* vec,
 // Not faster; but we need the specialization so the function works at all
 // on the vector<bool> specialization.
 template<>
-inline void STLAssignToVector(vector<bool>* vec,
+inline void STLAssignToVector(std::vector<bool>* vec,
                               const bool* ptr,
                               size_t n) {
   vec->clear();
@@ -257,7 +246,7 @@ inline void STLAssignToVector(vector<bool>* vec,
 //      STLAssignToVectorChar(&vec, ptr, size);
 //      STLAssignToString(&str, ptr, size);
 
-inline void STLAssignToVectorChar(vector<char>* vec,
+inline void STLAssignToVectorChar(std::vector<char>* vec,
                                   const char* ptr,
                                   size_t n) {
   STLAssignToVector(vec, ptr, n);
@@ -281,7 +270,7 @@ struct InternalStringRepGCC4 {
 // "*str" as a result of resizing may be left uninitialized, rather
 // than being filled with '0' bytes.  Typically used when code is then
 // going to overwrite the backing store of the string with known data.
-inline void STLStringResizeUninitialized(string* s, size_t new_size) {
+inline void STLStringResizeUninitialized(std::string* s, size_t new_size) {
   if (sizeof(*s) == sizeof(InternalStringRepGCC4)) {
     if (new_size > s->capacity()) {
       s->reserve(new_size);
@@ -306,17 +295,17 @@ inline void STLStringResizeUninitialized(string* s, size_t new_size) {
 
 // Returns true if the string implementation supports a resize where
 // the new characters added to the string are left untouched.
-inline bool STLStringSupportsNontrashingResize(const string& s) {
+inline bool STLStringSupportsNontrashingResize(const std::string& s) {
   return (sizeof(s) == sizeof(InternalStringRepGCC4));
 }
 
-inline void STLAssignToString(string* str, const char* ptr, size_t n) {
+inline void STLAssignToString(std::string* str, const char* ptr, size_t n) {
   STLStringResizeUninitialized(str, n);
   if (n == 0) return;
   memcpy(&*str->begin(), ptr, n);
 }
 
-inline void STLAppendToString(string* str, const char* ptr, size_t n) {
+inline void STLAppendToString(std::string* str, const char* ptr, size_t n) {
   if (n == 0) return;
   size_t old_size = str->size();
   STLStringResizeUninitialized(str, old_size + n);
@@ -333,7 +322,7 @@ inline void STLAppendToString(string* str, const char* ptr, size_t n) {
 // change this as well.
 
 template<typename T, typename Allocator>
-inline T* vector_as_array(vector<T, Allocator>* v) {
+inline T* vector_as_array(std::vector<T, Allocator>* v) {
 # ifdef NDEBUG
   return &*v->begin();
 # else
@@ -342,7 +331,7 @@ inline T* vector_as_array(vector<T, Allocator>* v) {
 }
 
 template<typename T, typename Allocator>
-inline const T* vector_as_array(const vector<T, Allocator>* v) {
+inline const T* vector_as_array(const std::vector<T, Allocator>* v) {
 # ifdef NDEBUG
   return &*v->begin();
 # else
@@ -362,7 +351,7 @@ inline const T* vector_as_array(const vector<T, Allocator>* v) {
 // contiguous is officially part of the C++11 standard [string.require]/5.
 // According to Matt Austern, this should already work on all current C++98
 // implementations.
-inline char* string_as_array(string* str) {
+inline char* string_as_array(std::string* str) {
   // DO NOT USE const_cast<char*>(str->data())! See the unittest for why.
   return str->empty() ? NULL : &*str->begin();
 }
@@ -466,7 +455,7 @@ class TemplatedElementDeleter : public BaseDeleter {
       : container_ptr_(ptr) {
   }
 
-  virtual ~TemplatedElementDeleter<STLContainer>() {
+  virtual ~TemplatedElementDeleter() {
     STLDeleteElements(container_ptr_);
   }
 
@@ -506,7 +495,7 @@ class TemplatedValueDeleter : public BaseDeleter {
       : container_ptr_(ptr) {
   }
 
-  virtual ~TemplatedValueDeleter<STLContainer>() {
+  virtual ~TemplatedValueDeleter() {
     STLDeleteValues(container_ptr_);
   }
 
@@ -533,30 +522,6 @@ class ValueDeleter {
   BaseDeleter *deleter_;
 
   DISALLOW_EVIL_CONSTRUCTORS(ValueDeleter);
-};
-
-
-// STLElementDeleter and STLValueDeleter are similar to ElementDeleter and
-// ValueDeleter, except that:
-// - The classes are templated, making them less convenient to use.
-// - Their destructors are not virtual, making them potentially more efficient.
-// New code should typically use ElementDeleter and ValueDeleter unless
-// efficiency is a large concern.
-
-template<class STLContainer> class STLElementDeleter {
- public:
-  STLElementDeleter<STLContainer>(STLContainer *ptr) : container_ptr_(ptr) {}
-  ~STLElementDeleter<STLContainer>() { STLDeleteElements(container_ptr_); }
- private:
-  STLContainer *container_ptr_;
-};
-
-template<class STLContainer> class STLValueDeleter {
- public:
-  STLValueDeleter<STLContainer>(STLContainer *ptr) : container_ptr_(ptr) {}
-  ~STLValueDeleter<STLContainer>() { STLDeleteValues(container_ptr_); }
- private:
-  STLContainer *container_ptr_;
 };
 
 
@@ -696,156 +661,6 @@ bool STLIncludes(const SortedSTLContainerA &a,
                        b.begin(), b.end());
 }
 
-// Functors that compose arbitrary unary and binary functions with a
-// function that "projects" one of the members of a pair.
-// Specifically, if p1 and p2, respectively, are the functions that
-// map a pair to its first and second, respectively, members, the
-// table below summarizes the functions that can be constructed:
-//
-// * UnaryOperate1st<pair>(f) returns the function x -> f(p1(x))
-// * UnaryOperate2nd<pair>(f) returns the function x -> f(p2(x))
-// * BinaryOperate1st<pair>(f) returns the function (x,y) -> f(p1(x),p1(y))
-// * BinaryOperate2nd<pair>(f) returns the function (x,y) -> f(p2(x),p2(y))
-//
-// A typical usage for these functions would be when iterating over
-// the contents of an STL map. For other sample usage, see the unittest.
-
-template<typename Pair, typename UnaryOp>
-class UnaryOperateOnFirst
-    : public std::unary_function<Pair, typename UnaryOp::result_type> {
- public:
-  UnaryOperateOnFirst() {
-  }
-
-  UnaryOperateOnFirst(const UnaryOp& f) : f_(f) {  // TODO(user): explicit?
-  }
-
-  typename UnaryOp::result_type operator()(const Pair& p) const {
-    return f_(p.first);
-  }
-
- private:
-  UnaryOp f_;
-};
-
-template<typename Pair, typename UnaryOp>
-UnaryOperateOnFirst<Pair, UnaryOp> UnaryOperate1st(const UnaryOp& f) {
-  return UnaryOperateOnFirst<Pair, UnaryOp>(f);
-}
-
-template<typename Pair, typename UnaryOp>
-class UnaryOperateOnSecond
-    : public std::unary_function<Pair, typename UnaryOp::result_type> {
- public:
-  UnaryOperateOnSecond() {
-  }
-
-  UnaryOperateOnSecond(const UnaryOp& f) : f_(f) {  // TODO(user): explicit?
-  }
-
-  typename UnaryOp::result_type operator()(const Pair& p) const {
-    return f_(p.second);
-  }
-
- private:
-  UnaryOp f_;
-};
-
-template<typename Pair, typename UnaryOp>
-UnaryOperateOnSecond<Pair, UnaryOp> UnaryOperate2nd(const UnaryOp& f) {
-  return UnaryOperateOnSecond<Pair, UnaryOp>(f);
-}
-
-template<typename Pair, typename BinaryOp>
-class BinaryOperateOnFirst
-    : public std::binary_function<Pair, Pair, typename BinaryOp::result_type> {
- public:
-  BinaryOperateOnFirst() {
-  }
-
-  BinaryOperateOnFirst(const BinaryOp& f) : f_(f) {  // TODO(user): explicit?
-  }
-
-  typename BinaryOp::result_type operator()(const Pair& p1,
-                                            const Pair& p2) const {
-    return f_(p1.first, p2.first);
-  }
-
- private:
-  BinaryOp f_;
-};
-
-// TODO(user): explicit?
-template<typename Pair, typename BinaryOp>
-BinaryOperateOnFirst<Pair, BinaryOp> BinaryOperate1st(const BinaryOp& f) {
-  return BinaryOperateOnFirst<Pair, BinaryOp>(f);
-}
-
-template<typename Pair, typename BinaryOp>
-class BinaryOperateOnSecond
-    : public std::binary_function<Pair, Pair, typename BinaryOp::result_type> {
- public:
-  BinaryOperateOnSecond() {
-  }
-
-  BinaryOperateOnSecond(const BinaryOp& f) : f_(f) {
-  }
-
-  typename BinaryOp::result_type operator()(const Pair& p1,
-                                            const Pair& p2) const {
-    return f_(p1.second, p2.second);
-  }
-
- private:
-  BinaryOp f_;
-};
-
-template<typename Pair, typename BinaryOp>
-BinaryOperateOnSecond<Pair, BinaryOp> BinaryOperate2nd(const BinaryOp& f) {
-  return BinaryOperateOnSecond<Pair, BinaryOp>(f);
-}
-
-// Functor that composes a binary functor h from an arbitrary binary functor
-// f and two unary functors g1, g2, so that:
-//
-// BinaryCompose1(f, g) returns function (x, y) -> f(g(x), g(y))
-// BinaryCompose2(f, g1, g2) returns function (x, y) -> f(g1(x), g2(y))
-//
-// This is a generalization of the BinaryOperate* functors for types other
-// than pairs.
-//
-// For sample usage, see the unittest.
-//
-// F has to be a model of AdaptableBinaryFunction.
-// G1 and G2 have to be models of AdabtableUnaryFunction.
-template<typename F, typename G1, typename G2>
-class BinaryComposeBinary : public binary_function<typename G1::argument_type,
-                                                   typename G2::argument_type,
-                                                   typename F::result_type> {
- public:
-  BinaryComposeBinary(F f, G1 g1, G2 g2) : f_(f), g1_(g1), g2_(g2) { }
-
-  typename F::result_type operator()(typename G1::argument_type x,
-                                     typename G2::argument_type y) const {
-    return f_(g1_(x), g2_(y));
-  }
-
- private:
-  F f_;
-  G1 g1_;
-  G2 g2_;
-};
-
-template<typename F, typename G>
-BinaryComposeBinary<F, G, G> BinaryCompose1(F f, G g) {
-  return BinaryComposeBinary<F, G, G>(f, g, g);
-}
-
-template<typename F, typename G1, typename G2>
-BinaryComposeBinary<F, G1, G2> BinaryCompose2(F f, G1 g1, G2 g2) {
-  return BinaryComposeBinary<F, G1, G2>(f, g1, g2);
-}
-
 // This is a wrapper for an STL allocator which keeps a count of the
 // active bytes allocated by this class of allocators.  This is NOT
 // THREAD SAFE.  This should only be used in situations where you can
@@ -854,11 +669,10 @@ BinaryComposeBinary<F, G1, G2> BinaryCompose2(F f, G1 g1, G2 g2) {
 template <typename T, typename Alloc = std::allocator<T> >
 class STLCountingAllocator : public Alloc {
  public:
-  typedef typename Alloc::pointer pointer;
-  typedef typename Alloc::size_type size_type;
+  using size_type = typename Alloc::size_type;
 
   STLCountingAllocator() : bytes_used_(NULL) { }
-  STLCountingAllocator(int64* b) : bytes_used_(b) {}  // TODO(user): explicit?
+  explicit STLCountingAllocator(int64* b) : bytes_used_(b) {}
 
   // Constructor used for rebinding
   template <class U>
@@ -867,23 +681,23 @@ class STLCountingAllocator : public Alloc {
         bytes_used_(x.bytes_used()) {
   }
 
-  pointer allocate(size_type n, std::allocator<void>::const_pointer hint = 0) {
+  T* allocate(size_type n) {
     assert(bytes_used_ != NULL);
     *bytes_used_ += n * sizeof(T);
-    return Alloc::allocate(n, hint);
+    return Alloc::allocate(n);
   }
 
-  void deallocate(pointer p, size_type n) {
+  void deallocate(T* p, size_type n) {
     Alloc::deallocate(p, n);
     assert(bytes_used_ != NULL);
     *bytes_used_ -= n * sizeof(T);
   }
 
   // Rebind allows an allocator<T> to be used for a different type
-  template <class U> struct rebind {
-    typedef STLCountingAllocator<U,
-                                 typename Alloc::template
-                                 rebind<U>::other> other;
+  template <class U>
+  struct rebind {
+    using other = STLCountingAllocator<
+        U, typename std::allocator_traits<Alloc>::template rebind_alloc<U>>;
   };
 
   int64* bytes_used() const { return bytes_used_; }
@@ -962,14 +776,14 @@ bool SortedRangesHaveIntersection(InputIterator1 begin1, InputIterator1 end1,
   return false;
 }
 
-// release_ptr is intended to help remove systematic use of gscoped_ptr
+// release_ptr is intended to help remove systematic use of std::unique_ptr
 // in cases like:
 //
 // vector<Foo *> v;
 // ElementDeleter d(&v);
 // ... {
 //   int remove_idx = f(v);
-//   gscoped_ptr<Foo> t(v[remove_idx]);
+//   std::unique_ptr<Foo> t(v[remove_idx]);
 //   v[remove_idx] = NULL;  // Save from deleter.
 //   return t.release();
 // }
@@ -987,5 +801,107 @@ template<typename T> T* release_ptr(T **ptr) {
   return tmp;
 }
 
+template<typename T>
+std::set<T> VectorToSet(const std::vector<T>& v) {
+  return std::set<T>(v.begin(), v.end());
+}
 
-#endif  // UTIL_GTL_STL_UTIL_H_
+template <class Predicate, class Collection>
+void EraseIf(const Predicate& predicate, Collection* collection) {
+  collection->erase(std::remove_if(collection->begin(), collection->end(), predicate),
+                    collection->end());
+}
+
+template <class Value, class Collection>
+bool Erase(const Value& value, Collection* collection) {
+  auto it = std::find(collection->begin(), collection->end(), value);
+  if (it == collection->end()) {
+    return false;
+  }
+
+  collection->erase(it);
+  return true;
+}
+
+template <class Collection1, class Collection2>
+void MoveCollection(Collection1* source, Collection2* destination) {
+  destination->reserve(destination->size() + source->size());
+  std::move(source->begin(), source->end(), std::back_inserter(*destination));
+}
+
+template <class Collection>
+void Unique(Collection* collection) {
+  collection->erase(std::unique(collection->begin(), collection->end()), collection->end());
+}
+
+template <class Collection, class Predicate>
+void Unique(Collection* collection, Predicate predicate) {
+  collection->erase(std::unique(collection->begin(), collection->end(), predicate),
+                    collection->end());
+}
+
+template <class Key, class Value, class Map>
+void MakeAtMost(const Key& key, const Value& value, Map* map) {
+  auto it = map->find(key);
+  if (it == map->end()) {
+    map->emplace(key, value);
+  } else {
+    it->second = std::min(it->second, value);
+  }
+}
+
+template <class T>
+const T* OptionalToPointer(const std::optional<T>& opt) {
+  return opt ? &*opt : nullptr;
+}
+
+template <class T>
+T* OptionalToPointer(std::optional<T>* opt) {
+  return *opt ? &**opt : nullptr;
+}
+
+struct StringHash {
+  using HashType = std::hash<std::string_view>;
+  using is_transparent = void;
+
+  size_t operator()(const char* str) const {
+    return HashType()(str);
+  }
+
+  size_t operator()(std::string_view str) const {
+    return HashType()(str);
+  }
+
+  size_t operator()(const std::string& str) const {
+    return HashType()(str);
+  }
+};
+
+template<class T>
+struct PointerEqual {
+  using is_transparent = void;
+
+  bool operator()(const T* l, const T* r) const {
+    return std::equal_to<const T*>{}(l, r);
+  }
+};
+
+template<class T>
+struct PointerHash {
+  using is_transparent = void;
+
+  size_t operator()(const T* value) const {
+    return std::hash<const T*>{}(value);
+  }
+};
+
+template <class Value>
+using UnorderedStringMap = std::unordered_map<std::string, Value, StringHash, std::equal_to<void>>;
+
+} // namespace yb
+
+// For backward compatibility
+using yb::STLAppendToString;
+using yb::STLAssignToString;
+using yb::STLStringResizeUninitialized;
+using yb::string_as_array;

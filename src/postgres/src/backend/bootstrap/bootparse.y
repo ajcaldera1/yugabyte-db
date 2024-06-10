@@ -73,7 +73,7 @@ static MemoryContext per_line_ctx = NULL;
 static void
 do_start(void)
 {
-	Assert(CurrentMemoryContext == CurTransactionContext);
+	Assert(GetCurrentMemoryContext() == CurTransactionContext);
 	/* First time through, create the per-line working context */
 	if (per_line_ctx == NULL)
 		per_line_ctx = AllocSetContextCreate(CurTransactionContext,
@@ -132,6 +132,7 @@ static int num_columns_read = 0;
 %token <kw> XDECLARE YBDECLARE INDEX ON USING XBUILD INDICES PRIMARY UNIQUE XTOAST
 %token <kw> OBJ_ID XBOOTSTRAP XSHARED_RELATION XWITHOUT_OIDS XROWTYPE_OID
 %token <kw> XFORCE XNOT XNULL
+%token <kw> YBCHECKINITDBDONE
 
 %start TopLevel
 
@@ -157,6 +158,7 @@ Boot_Query :
 		| Boot_DeclarePrimaryIndexStmt
 		| Boot_DeclareToastStmt
 		| Boot_BuildIndsStmt
+    | Boot_CheckInitDbDone
 		;
 
 Boot_OpenStmt:
@@ -164,11 +166,6 @@ Boot_OpenStmt:
 				{
 					do_start();
 					boot_openrel($2);
-                    if (IsYugaByteEnabled())
-					{
-						/* Buffer the inserts into the table */
-						YBCStartBufferingWriteOperations();
-					}
 					do_end();
 				}
 		;
@@ -178,11 +175,6 @@ Boot_CloseStmt:
 				{
 					do_start();
 					closerel($2);
-                    if (IsYugaByteEnabled())
-					{
-						/* End the buffering of inserts and flush them */
-						YBCFlushBufferedWriteOperations();
-					}
 					do_end();
 				}
 		;
@@ -270,6 +262,7 @@ Boot_CreateStmt:
 						boot_reldesc = heap_create($2,
 												   PG_CATALOG_NAMESPACE,
 												   shared_relation ? GLOBALTABLESPACE_OID : 0,
+												   InvalidOid, /* reltablegroup */
 												   $3,
 												   InvalidOid,
 												   tupdesc,
@@ -287,6 +280,7 @@ Boot_CreateStmt:
 						id = heap_create_with_catalog($2,
 													  PG_CATALOG_NAMESPACE,
 													  shared_relation ? GLOBALTABLESPACE_OID : 0,
+													  InvalidOid, /* reltablegroup */
 													  $3,
 													  $7,
 													  InvalidOid,
@@ -305,26 +299,14 @@ Boot_CreateStmt:
 													  true,
 													  false,
 													  InvalidOid,
-													  NULL);
+													  NULL,
+													  false);
 						elog(DEBUG4, "relation created with OID %u", id);
 					}
 
 					if (IsYugaByteEnabled())
 					{
 						YBCCreateSysCatalogTable($2, $3, tupdesc, shared_relation, $13);
-
-						/*
-						 * Start buffering for pg_proc, pg_type, pg_attribute and pg_class
-						 * explicitly. They are not opened explicitly in the generated
-						 * postgres.bki so we need to start buffering here.
-						 */
-						if ($3 == ProcedureRelationId ||
-							$3 == TypeRelationId      ||
-							$3 == AttributeRelationId ||
-							$3 == RelationRelationId)
-						{
-							YBCStartBufferingWriteOperations();
-						}
 					}
 
                     do_end();
@@ -601,6 +583,13 @@ boot_column_val:
 			{ InsertOneNull(num_columns_read++); }
 		;
 
+Boot_CheckInitDbDone:
+      YBCHECKINITDBDONE
+      {
+				if (YBIsInitDbAlreadyDone())
+					exit(YB_INITDB_ALREADY_DONE_EXIT_CODE);
+			}
+
 boot_ident:
 		  ID			{ $$ = $1; }
 		| OPEN			{ $$ = pstrdup($1); }
@@ -624,6 +613,7 @@ boot_ident:
 		| XFORCE		{ $$ = pstrdup($1); }
 		| XNOT			{ $$ = pstrdup($1); }
 		| XNULL			{ $$ = pstrdup($1); }
+		| YBCHECKINITDBDONE { $$ = pstrdup($1); }
 		;
 %%
 

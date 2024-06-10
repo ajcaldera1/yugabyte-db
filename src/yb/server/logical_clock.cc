@@ -32,7 +32,7 @@
 
 #include "yb/server/logical_clock.h"
 
-#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/bind.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/status.h"
@@ -47,8 +47,10 @@ METRIC_DEFINE_gauge_uint64(server, logical_clock_hybrid_time,
                            "Logical clock hybrid time.");
 
 using base::subtle::Atomic64;
-using base::subtle::Barrier_AtomicIncrement;
-using base::subtle::NoBarrier_CompareAndSwap;
+
+Status LogicalClock::Init() {
+  return Status::OK();
+}
 
 HybridTimeRange LogicalClock::NowRange() {
   auto result = HybridTime(++now_);
@@ -85,4 +87,3 @@ void LogicalClock::RegisterMetrics(const scoped_refptr<MetricEntity>& metric_ent
 
 }  // namespace server
 }  // namespace yb
-

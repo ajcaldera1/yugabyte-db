@@ -1,9 +1,13 @@
 // Copyright (c) YugaByte, Inc.
 
-#ifndef YB_CONSENSUS_LEADER_LEASE_H
-#define YB_CONSENSUS_LEADER_LEASE_H
+#pragma once
+
+#include "yb/util/flags.h"
 
 #include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+#include "yb/util/monotime.h"
+#include "yb/util/physical_time.h"
 
 DECLARE_int32(leader_lease_duration_ms);
 DECLARE_int32(ht_lease_duration_ms);
@@ -26,7 +30,7 @@ struct LeaseTraits<CoarseTimePoint> {
 template <>
 struct LeaseTraits<MicrosTime> {
   static MicrosTime NoneValue() {
-    return HybridTime::kMin.GetPhysicalValueMicros();
+    return 0;
   }
 };
 
@@ -73,5 +77,3 @@ typedef LeaseData<MicrosTime> PhysicalComponentLease;
 
 } // namespace consensus
 } // namespace yb
-
-#endif // YB_CONSENSUS_LEADER_LEASE_H

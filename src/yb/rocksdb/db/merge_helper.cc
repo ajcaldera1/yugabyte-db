@@ -21,15 +21,17 @@
 #include "yb/rocksdb/db/merge_helper.h"
 
 #include <stdio.h>
+
 #include <string>
 
-#include "yb/rocksdb/db/dbformat.h"
+#include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/comparator.h"
-#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/merge_operator.h"
 #include "yb/rocksdb/table/internal_iterator.h"
 #include "yb/rocksdb/util/perf_context_imp.h"
 #include "yb/rocksdb/util/statistics.h"
+
+#include "yb/util/stats/perf_step_timer.h"
 
 namespace rocksdb {
 
@@ -194,6 +196,8 @@ Status MergeHelper::MergeUntil(InternalIterator* iter,
           !FilterMerge(orig_ikey.user_key, value_slice)) {
         if (original_key_is_iter) {
           // this is just an optimization that saves us one memcpy
+          // Ignore use-after-move warning since original_key_is_iter is only true on the
+          // first iteration. NOLINTNEXTLINE(bugprone-use-after-move).
           keys_.push_front(std::move(original_key));
         } else {
           keys_.push_front(iter->key().ToString());
@@ -315,7 +319,6 @@ bool MergeHelper::FilterMerge(const Slice& user_key, const Slice& value_slice) {
   }
   bool to_delete =
       compaction_filter_->FilterMergeOperand(level_, user_key, value_slice);
-  total_filter_time_ += filter_timer_.ElapsedNanosSafe();
   return to_delete;
 }
 

@@ -50,6 +50,7 @@
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
 #include "commands/tablecmds.h"
+#include "commands/defrem.h"
 #include "commands/event_trigger.h"
 #include "commands/trigger.h"
 #include "executor/executor.h"
@@ -59,6 +60,7 @@
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
 #include "parser/parser.h"
+#include "parser/parse_utilcmd.h"
 #include "rewrite/rewriteManip.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -78,8 +80,10 @@
 #include "utils/tqual.h"
 
 /*  YB includes. */
+#include "commands/progress.h"
 #include "commands/ybccmds.h"
 #include "pg_yb_utils.h"
+#include "pgstat.h"
 
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_index_pg_class_oid = InvalidOid;
@@ -116,7 +120,7 @@ static TupleDesc ConstructTupleDescriptor(Relation heapRelation,
 						 Oid *classObjectId);
 static void InitializeAttributeOids(Relation indexRelation,
 						int numatts, Oid indexoid);
-static void AppendAttributeTuples(Relation indexRelation, int numatts);
+static void AppendAttributeTuples(Relation indexRelation, int numatts, bool yb_relisshared);
 static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 					Oid parentIndexId,
 					IndexInfo *indexInfo,
@@ -127,10 +131,23 @@ static void UpdateIndexRelation(Oid indexoid, Oid heapoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready);
+					bool isready,
+					bool yb_relisshared);
 static void index_update_stats(Relation rel,
 				   bool hasindex,
 				   double reltuples);
+static double IndexBuildHeapRangeScanInternal(Relation heapRelation,
+											  Relation indexRelation,
+											  IndexInfo *indexInfo,
+											  bool allow_sync,
+											  bool anyvisible,
+											  BlockNumber start_blockno,
+											  BlockNumber numblocks,
+											  IndexBuildCallback callback,
+											  void *callback_state,
+											  HeapScanDesc scan,
+											  YbBackfillInfo *bfinfo,
+											  YbPgExecOutParam *bfresult);
 static void IndexCheckExclusion(Relation heapRelation,
 					Relation indexRelation,
 					IndexInfo *indexInfo);
@@ -191,6 +208,20 @@ relationHasPrimaryKey(Relation rel)
 	list_free(indexoidlist);
 
 	return result;
+}
+
+/*
+ * YBRelationHasPrimaryKey
+ *		See whether an existing relation has a primary key.
+ *
+ * Caller must have suitable lock on the relation.
+ *
+ * Note: It is just a wrapper over the relationHasPrimaryKey function above.
+ */
+bool
+YBRelationHasPrimaryKey(Relation rel)
+{
+	return relationHasPrimaryKey(rel);
 }
 
 /*
@@ -272,6 +303,7 @@ index_check_primary_key(Relation heapRel,
 
 			cmd->subtype = AT_SetNotNull;
 			cmd->name = pstrdup(NameStr(attform->attname));
+			cmd->yb_is_add_primary_key = true;
 			cmds = lappend(cmds, cmd);
 		}
 
@@ -543,7 +575,7 @@ InitializeAttributeOids(Relation indexRelation,
  * ----------------------------------------------------------------
  */
 static void
-AppendAttributeTuples(Relation indexRelation, int numatts)
+AppendAttributeTuples(Relation indexRelation, int numatts, bool yb_relisshared)
 {
 	Relation	pg_attribute;
 	CatalogIndexState indstate;
@@ -573,7 +605,7 @@ AppendAttributeTuples(Relation indexRelation, int numatts)
 		Assert(attr->attnum == i + 1);
 		Assert(attr->attcacheoff == -1);
 
-		InsertPgAttributeTuple(pg_attribute, attr, indstate);
+		InsertPgAttributeTuple(pg_attribute, attr, indstate, yb_relisshared);
 	}
 
 	CatalogCloseIndexes(indstate);
@@ -599,7 +631,8 @@ UpdateIndexRelation(Oid indexoid,
 					bool isexclusion,
 					bool immediate,
 					bool isvalid,
-					bool isready)
+					bool isready,
+					bool yb_relisshared)
 {
 	int2vector *indkey;
 	oidvector  *indcollation;
@@ -693,7 +726,7 @@ UpdateIndexRelation(Oid indexoid,
 	/*
 	 * insert the tuple into the pg_index catalog
 	 */
-	CatalogTupleInsert(pg_index, tuple);
+	YBCatalogTupleInsert(pg_index, tuple, yb_relisshared && !IsBootstrapProcessingMode());
 
 	/*
 	 * close the relation and free the tuple
@@ -769,7 +802,12 @@ index_create(Relation heapRelation,
 			 bits16 constr_flags,
 			 bool allow_system_table_mods,
 			 bool is_internal,
-			 Oid *constraintId)
+			 Oid *constraintId,
+			 OptSplit *split_options,
+			 const bool skip_index_backfill,
+			 bool is_colocated,
+			 Oid tablegroupId,
+			 Oid colocationId)
 {
 	Oid			heapRelationId = RelationGetRelid(heapRelation);
 	Relation	pg_class;
@@ -844,8 +882,11 @@ index_create(Relation heapRelation,
 	/*
 	 * We cannot allow indexing a shared relation after initdb (because
 	 * there's no way to make the entry in other databases' pg_class).
+	 *
+	 * YB NOTE:
+	 * Not totally true anymore, we're using a hacky way to do that.
 	 */
-	if (shared_relation && !IsBootstrapProcessingMode())
+	if (shared_relation && !IsBootstrapProcessingMode() && !IsYsqlUpgrade)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("shared indexes cannot be created after initdb")));
@@ -921,7 +962,7 @@ index_create(Relation heapRelation,
 	if (!OidIsValid(indexRelationId))
 	{
 		/* Use binary-upgrade override for pg_class.oid/relfilenode? */
-		if (IsBinaryUpgrade)
+		if (IsBinaryUpgrade && !yb_binary_restore)
 		{
 			if (!OidIsValid(binary_upgrade_next_index_pg_class_oid))
 				ereport(ERROR,
@@ -930,6 +971,12 @@ index_create(Relation heapRelation,
 
 			indexRelationId = binary_upgrade_next_index_pg_class_oid;
 			binary_upgrade_next_index_pg_class_oid = InvalidOid;
+		}
+		else if (IsYBRelation(heapRelation) && IsCatalogRelation(heapRelation))
+		{
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_OBJECT_DEFINITION),
+					 errmsg("system index must have an explicit OID")));
 		}
 		else
 		{
@@ -946,6 +993,7 @@ index_create(Relation heapRelation,
 	indexRelation = heap_create(indexRelationName,
 								namespaceId,
 								tableSpaceId,
+								tablegroupId,
 								indexRelationId,
 								relFileNode,
 								indexTupDesc,
@@ -966,8 +1014,18 @@ index_create(Relation heapRelation,
 		YBCCreateIndex(indexRelationName,
 					   indexInfo,
 					   indexTupDesc,
+					   coloptions,
+					   reloptions,
 					   indexRelationId,
-					   heapRelation);
+					   heapRelation,
+					   split_options,
+					   skip_index_backfill,
+					   is_colocated,
+					   tablegroupId,
+					   colocationId,
+					   tableSpaceId,
+					   InvalidOid /* pgTableId */,
+					   InvalidOid /* oldRelfileNodeId */);
 	}
 
 	/*
@@ -987,6 +1045,28 @@ index_create(Relation heapRelation,
 	indexRelation->rd_rel->relam = accessMethodObjectId;
 	indexRelation->rd_rel->relhasoids = false;
 	indexRelation->rd_rel->relispartition = OidIsValid(parentIndexRelid);
+
+	/*
+	 * YSQL upgrade notes:
+	 * -------------------
+	 * At this point, reloptions no longer affects the index
+	 * creation process, the only remaining use for them is to be
+	 * stored in pg_class. ybTransformRelOptions has already
+	 * removed all temporary reloptions.
+	 *
+	 * We want system tables and indexes to not have any reloptions
+	 * stored to imitate BKI processing, so we don't allow any reloption
+	 * not removed by ybTransformRelOptions.
+	 */
+	if (IsYsqlUpgrade && IsCatalogRelation(heapRelation) &&
+		reloptions != (Datum) 0)
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+				 errmsg("unsuppored reloptions were used for a system index "
+				        "during YSQL upgrade"),
+				 errhint("Only a small subset is allowed due to BKI restrictions.")));
+	}
 
 	/*
 	 * store index's pg_class entry
@@ -1010,7 +1090,7 @@ index_create(Relation heapRelation,
 	/*
 	 * append ATTRIBUTE tuples for the index
 	 */
-	AppendAttributeTuples(indexRelation, indexInfo->ii_NumIndexAttrs);
+	AppendAttributeTuples(indexRelation, indexInfo->ii_NumIndexAttrs, shared_relation);
 
 	/* ----------------
 	 *	  update pg_index
@@ -1026,7 +1106,8 @@ index_create(Relation heapRelation,
 						isprimary, is_exclusion,
 						(constr_flags & INDEX_CONSTR_CREATE_DEFERRABLE) == 0,
 						!concurrent && !invalid,
-						!concurrent);
+						!concurrent,
+						shared_relation);
 
 	/*
 	 * Register relcache invalidation on the indexes' heap relation, to
@@ -1051,6 +1132,10 @@ index_create(Relation heapRelation,
 	 *
 	 * During bootstrap we can't register any dependencies, and we don't try
 	 * to make a constraint either.
+	 *
+	 * YB NOTE:
+	 * For system relations, we only need to record a pin dependency,
+	 * nothing else.
 	 */
 	if (!IsBootstrapProcessingMode())
 	{
@@ -1061,126 +1146,133 @@ index_create(Relation heapRelation,
 		myself.objectId = indexRelationId;
 		myself.objectSubId = 0;
 
-		if ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0)
+		if (IsYBRelation(heapRelation) && IsCatalogRelation(heapRelation))
 		{
-			char		constraintType;
-			ObjectAddress localaddr;
-
-			if (isprimary)
-				constraintType = CONSTRAINT_PRIMARY;
-			else if (indexInfo->ii_Unique)
-				constraintType = CONSTRAINT_UNIQUE;
-			else if (is_exclusion)
-				constraintType = CONSTRAINT_EXCLUSION;
-			else
-			{
-				elog(ERROR, "constraint must be PRIMARY, UNIQUE or EXCLUDE");
-				constraintType = 0; /* keep compiler quiet */
-			}
-
-			localaddr = index_constraint_create(heapRelation,
-												indexRelationId,
-												parentConstraintId,
-												indexInfo,
-												indexRelationName,
-												constraintType,
-												constr_flags,
-												allow_system_table_mods,
-												is_internal);
-			if (constraintId)
-				*constraintId = localaddr.objectId;
+			YbRecordPinDependency(&myself, shared_relation);
 		}
 		else
 		{
-			bool		have_simple_col = false;
-			DependencyType deptype;
-
-			deptype = OidIsValid(parentIndexRelid) ? DEPENDENCY_INTERNAL_AUTO : DEPENDENCY_AUTO;
-
-			/* Create auto dependencies on simply-referenced columns */
-			for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+			if ((flags & INDEX_CREATE_ADD_CONSTRAINT) != 0)
 			{
-				if (indexInfo->ii_IndexAttrNumbers[i] != 0)
+				char		constraintType;
+				ObjectAddress localaddr;
+
+				if (isprimary)
+					constraintType = CONSTRAINT_PRIMARY;
+				else if (indexInfo->ii_Unique)
+					constraintType = CONSTRAINT_UNIQUE;
+				else if (is_exclusion)
+					constraintType = CONSTRAINT_EXCLUSION;
+				else
+				{
+					elog(ERROR, "constraint must be PRIMARY, UNIQUE or EXCLUDE");
+					constraintType = 0; /* keep compiler quiet */
+				}
+
+				localaddr = index_constraint_create(heapRelation,
+													indexRelationId,
+													parentConstraintId,
+													indexInfo,
+													indexRelationName,
+													constraintType,
+													constr_flags,
+													allow_system_table_mods,
+													is_internal);
+				if (constraintId)
+					*constraintId = localaddr.objectId;
+			}
+			else
+			{
+				bool		have_simple_col = false;
+				DependencyType deptype;
+
+				deptype = OidIsValid(parentIndexRelid) ? DEPENDENCY_INTERNAL_AUTO : DEPENDENCY_AUTO;
+
+				/* Create auto dependencies on simply-referenced columns */
+				for (i = 0; i < indexInfo->ii_NumIndexAttrs; i++)
+				{
+					if (indexInfo->ii_IndexAttrNumbers[i] != 0)
+					{
+						referenced.classId = RelationRelationId;
+						referenced.objectId = heapRelationId;
+						referenced.objectSubId = indexInfo->ii_IndexAttrNumbers[i];
+
+						recordDependencyOn(&myself, &referenced, deptype);
+
+						have_simple_col = true;
+					}
+				}
+
+				/*
+				 * If there are no simply-referenced columns, give the index an
+				 * auto dependency on the whole table.  In most cases, this will
+				 * be redundant, but it might not be if the index expressions and
+				 * predicate contain no Vars or only whole-row Vars.
+				 */
+				if (!have_simple_col)
 				{
 					referenced.classId = RelationRelationId;
 					referenced.objectId = heapRelationId;
-					referenced.objectSubId = indexInfo->ii_IndexAttrNumbers[i];
+					referenced.objectSubId = 0;
 
 					recordDependencyOn(&myself, &referenced, deptype);
-
-					have_simple_col = true;
 				}
 			}
 
-			/*
-			 * If there are no simply-referenced columns, give the index an
-			 * auto dependency on the whole table.  In most cases, this will
-			 * be redundant, but it might not be if the index expressions and
-			 * predicate contain no Vars or only whole-row Vars.
-			 */
-			if (!have_simple_col)
+			/* Store dependency on parent index, if any */
+			if (OidIsValid(parentIndexRelid))
 			{
 				referenced.classId = RelationRelationId;
-				referenced.objectId = heapRelationId;
+				referenced.objectId = parentIndexRelid;
 				referenced.objectSubId = 0;
 
-				recordDependencyOn(&myself, &referenced, deptype);
+				recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL_AUTO);
 			}
-		}
 
-		/* Store dependency on parent index, if any */
-		if (OidIsValid(parentIndexRelid))
-		{
-			referenced.classId = RelationRelationId;
-			referenced.objectId = parentIndexRelid;
-			referenced.objectSubId = 0;
-
-			recordDependencyOn(&myself, &referenced, DEPENDENCY_INTERNAL_AUTO);
-		}
-
-		/* Store dependency on collations */
-		/* The default collation is pinned, so don't bother recording it */
-		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
-		{
-			if (OidIsValid(collationObjectId[i]) &&
-				collationObjectId[i] != DEFAULT_COLLATION_OID)
+			/* Store dependency on collations */
+			/* The default collation is pinned, so don't bother recording it */
+			for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
 			{
-				referenced.classId = CollationRelationId;
-				referenced.objectId = collationObjectId[i];
+				if (OidIsValid(collationObjectId[i]) &&
+					collationObjectId[i] != DEFAULT_COLLATION_OID)
+				{
+					referenced.classId = CollationRelationId;
+					referenced.objectId = collationObjectId[i];
+					referenced.objectSubId = 0;
+
+					recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
+				}
+			}
+
+			/* Store dependency on operator classes */
+			for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
+			{
+				referenced.classId = OperatorClassRelationId;
+				referenced.objectId = classObjectId[i];
 				referenced.objectSubId = 0;
 
 				recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
 			}
-		}
 
-		/* Store dependency on operator classes */
-		for (i = 0; i < indexInfo->ii_NumIndexKeyAttrs; i++)
-		{
-			referenced.classId = OperatorClassRelationId;
-			referenced.objectId = classObjectId[i];
-			referenced.objectSubId = 0;
+			/* Store dependencies on anything mentioned in index expressions */
+			if (indexInfo->ii_Expressions)
+			{
+				recordDependencyOnSingleRelExpr(&myself,
+												(Node *) indexInfo->ii_Expressions,
+												heapRelationId,
+												DEPENDENCY_NORMAL,
+												DEPENDENCY_AUTO, false);
+			}
 
-			recordDependencyOn(&myself, &referenced, DEPENDENCY_NORMAL);
-		}
-
-		/* Store dependencies on anything mentioned in index expressions */
-		if (indexInfo->ii_Expressions)
-		{
-			recordDependencyOnSingleRelExpr(&myself,
-											(Node *) indexInfo->ii_Expressions,
-											heapRelationId,
-											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
-		}
-
-		/* Store dependencies on anything mentioned in predicate */
-		if (indexInfo->ii_Predicate)
-		{
-			recordDependencyOnSingleRelExpr(&myself,
-											(Node *) indexInfo->ii_Predicate,
-											heapRelationId,
-											DEPENDENCY_NORMAL,
-											DEPENDENCY_AUTO, false);
+			/* Store dependencies on anything mentioned in predicate */
+			if (indexInfo->ii_Predicate)
+			{
+				recordDependencyOnSingleRelExpr(&myself,
+												(Node *) indexInfo->ii_Predicate,
+												heapRelationId,
+												DEPENDENCY_NORMAL,
+												DEPENDENCY_AUTO, false);
+			}
 		}
 	}
 	else
@@ -1240,6 +1332,11 @@ index_create(Relation heapRelation,
 	}
 	else
 	{
+		if (IsYugaByteEnabled() && !concurrent && !invalid &&
+			yb_test_block_index_phase[0] != '\0')
+			YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+										"backfill",
+										"non-concurrent index backfill");
 		index_build(heapRelation, indexRelation, indexInfo, isprimary, false,
 					true);
 	}
@@ -1249,6 +1346,13 @@ index_create(Relation heapRelation,
 	 * of transaction.  Closing the heap is caller's responsibility.
 	 */
 	index_close(indexRelation, NoLock);
+
+	if (IsYugaByteEnabled() && !concurrent && !invalid &&
+		yb_test_block_index_phase[0] != '\0')
+		YbTestGucBlockWhileStrEqual(&yb_test_block_index_phase,
+									"postbackfill",
+									"operations after a non-concurrent "
+									"index backfill");
 
 	return indexRelationId;
 }
@@ -1705,9 +1809,10 @@ index_drop(Oid indexId, bool concurrent)
 
 	/*
 	 * Schedule physical removal of the files (if any)
-	 * If YugaByte is enabled, there aren't any physical files to remove.
+	 * If the relation is a Yugabyte relation, there aren't any physical files to
+	 * remove.
 	 */
-	if (!IsYugaByteEnabled() &&
+	if (!IsYBRelation(userIndexRelation) &&
 		userIndexRelation->rd_rel->relkind != RELKIND_PARTITIONED_INDEX)
 		RelationDropStorage(userIndexRelation);
 
@@ -1859,7 +1964,7 @@ BuildIndexInfo(Relation index)
 	/* set up for possible use by index AM */
 	ii->ii_Am = index->rd_rel->relam;
 	ii->ii_AmCache = NULL;
-	ii->ii_Context = CurrentMemoryContext;
+	ii->ii_Context = GetCurrentMemoryContext();
 
 	return ii;
 }
@@ -2007,8 +2112,9 @@ BuildSpeculativeIndexInfo(Relation index, IndexInfo *ii)
 	 */
 	Assert(ii->ii_Unique);
 
-	if (index->rd_rel->relam != BTREE_AM_OID)
-		elog(ERROR, "unexpected non-btree speculative unique index");
+	if (index->rd_rel->relam != BTREE_AM_OID &&
+		index->rd_rel->relam != LSM_AM_OID)
+		elog(ERROR, "unexpected non-btree/lsm speculative unique index");
 
 	ii->ii_UniqueOps = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
 	ii->ii_UniqueProcs = (Oid *) palloc(sizeof(Oid) * indnkeyatts);
@@ -2218,7 +2324,7 @@ index_update_stats(Relation rel,
 
 	if (reltuples >= 0)
 	{
-		BlockNumber relpages = IsYugaByteEnabled() ? 0 : RelationGetNumberOfBlocks(rel);
+		BlockNumber relpages = IsYBRelation(rel) ? 0 : RelationGetNumberOfBlocks(rel);
 		BlockNumber relallvisible;
 
 		if (rd_rel->relkind != RELKIND_INDEX)
@@ -2248,7 +2354,8 @@ index_update_stats(Relation rel,
 	 */
 	if (dirty)
 	{
-		heap_inplace_update(pg_class, tuple);
+		heap_inplace_update(pg_class, tuple,
+							rd_rel->relisshared && !IsBootstrapProcessingMode());
 		/* the above sends a cache inval message */
 	}
 	else
@@ -2340,11 +2447,15 @@ index_build(Relation heapRelation,
 						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
 	save_nestlevel = NewGUCNestLevel();
 
+	if (IsYugaByteEnabled())
+		pgstat_progress_update_param(PROGRESS_CREATEIDX_PHASE,
+									 YB_PROGRESS_CREATEIDX_BACKFILLING);
+
 	/*
 	 * Call the access method's build procedure
 	 */
 	stats = indexRelation->rd_amroutine->ambuild(heapRelation, indexRelation,
-	                        indexInfo);
+							indexInfo);
 	Assert(PointerIsValid(stats));
 
 	/*
@@ -2419,11 +2530,24 @@ index_build(Relation heapRelation,
 	}
 
 	/*
-	 * Update heap and index pg_class rows
+	 * Sanity check to ensure concurrent index builds don't reach this
+	 * code-path. In YB, we don't compute stats during a concurrent index build
+	 * so we shouldn't update them here.
 	 */
+	if (IsYugaByteEnabled())
+		Assert(!indexInfo->ii_Concurrent);
+
+	/*
+	 * Update heap and index pg_class rows
+	 *
+	 * YB TODO(fizaa): Properly update reltuples for the indexed table
+	 * (see GH #16506). Currently, we don't compute this statistic during a
+	 * non-concurrent index build so we should not update it here.
+	 */
+
 	index_update_stats(heapRelation,
 					   true,
-					   stats->heap_tuples);
+					   IsYBRelation(heapRelation) ? -1 : stats->heap_tuples);
 
 	index_update_stats(indexRelation,
 					   false,
@@ -2440,6 +2564,86 @@ index_build(Relation heapRelation,
 	 */
 	if (indexInfo->ii_ExclusionOps != NULL)
 		IndexCheckExclusion(heapRelation, indexRelation, indexInfo);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+}
+
+/*
+ * index_backfill - invoke access-method-specific index backfill procedure
+ *
+ * This is mainly a copy of index_build.  index_build is used for
+ * non-multi-stage index creation; index_backfill is used for multi-stage index
+ * creation.
+ */
+void
+index_backfill(Relation heapRelation,
+			   Relation indexRelation,
+			   IndexInfo *indexInfo,
+			   bool isprimary,
+			   YbBackfillInfo *bfinfo,
+			   YbPgExecOutParam *bfresult)
+{
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
+
+	/*
+	 * sanity checks
+	 */
+	Assert(RelationIsValid(indexRelation));
+	Assert(PointerIsValid(indexRelation->rd_amroutine));
+	Assert(PointerIsValid(indexRelation->rd_amroutine->yb_ambackfill));
+
+	ereport(DEBUG1,
+			(errmsg("backfilling index \"%s\" on table \"%s\"",
+					RelationGetRelationName(indexRelation),
+					RelationGetRelationName(heapRelation))));
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
+	/*
+	 * Call the access method's build procedure
+	 */
+	indexRelation->rd_amroutine->yb_ambackfill(heapRelation,
+											   indexRelation,
+											   indexInfo,
+											   bfinfo,
+											   bfresult);
+
+	/*
+	 * I don't think we should be backfilling unlogged indexes.
+	 */
+	Assert(indexRelation->rd_rel->relpersistence != RELPERSISTENCE_UNLOGGED);
+
+	/*
+	 * Update heap and index pg_class rows
+	 * TODO(jason): properly update reltuples.  They can't be set here because
+	 * this backfill func is called for each backfill chunk request from
+	 * master, and we need some way to sum up the tuple numbers.  We also don't
+	 * even collect stats properly for heapRelation anyway, at the moment.
+	 */
+	index_update_stats(heapRelation,
+					   true,
+					   -1);
+
+	index_update_stats(indexRelation,
+					   false,
+					   -1);
+
+	/* Make the updated catalog row versions visible */
+	CommandCounterIncrement();
 
 	/* Roll back any GUC changes executed by index functions */
 	AtEOXact_GUC(false, save_nestlevel);
@@ -2488,16 +2692,6 @@ IndexBuildHeapScan(Relation heapRelation,
 								   callback, callback_state, scan);
 }
 
-/*
- * As above, except that instead of scanning the complete heap, only the given
- * number of blocks are scanned.  Scan to end-of-rel can be signalled by
- * passing InvalidBlockNumber as numblocks.  Note that restricting the range
- * to scan cannot be done when requesting syncscan.
- *
- * When "anyvisible" mode is requested, all tuples visible to any transaction
- * are indexed and counted as live, including those inserted or deleted by
- * transactions that are still in progress.
- */
 double
 IndexBuildHeapRangeScan(Relation heapRelation,
 						Relation indexRelation,
@@ -2509,6 +2703,67 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 						IndexBuildCallback callback,
 						void *callback_state,
 						HeapScanDesc scan)
+{
+	return IndexBuildHeapRangeScanInternal(heapRelation,
+										   indexRelation,
+										   indexInfo,
+										   allow_sync,
+										   anyvisible,
+										   start_blockno,
+										   numblocks,
+										   callback,
+										   callback_state,
+										   scan,
+										   NULL, /* bfinfo */
+										   NULL /* bfresult */);
+}
+
+double
+IndexBackfillHeapRangeScan(Relation heapRelation,
+						   Relation indexRelation,
+						   IndexInfo *indexInfo,
+						   IndexBuildCallback callback,
+						   void *callback_state,
+						   YbBackfillInfo *bfinfo,
+						   YbPgExecOutParam *bfresult)
+{
+	return IndexBuildHeapRangeScanInternal(heapRelation,
+										   indexRelation,
+										   indexInfo,
+										   true /* allow_sync */,
+										   false /* any_visible */,
+										   0 /* start_blockno */,
+										   InvalidBlockNumber /* num_blocks */,
+										   callback,
+										   callback_state,
+										   NULL /* scan */,
+										   bfinfo,
+										   bfresult);
+}
+
+/*
+ * As above, except that instead of scanning the complete heap, only the given
+ * number of blocks are scanned.  Scan to end-of-rel can be signalled by
+ * passing InvalidBlockNumber as numblocks.  Note that restricting the range
+ * to scan cannot be done when requesting syncscan.
+ *
+ * When "anyvisible" mode is requested, all tuples visible to any transaction
+ * are indexed and counted as live, including those inserted or deleted by
+ * transactions that are still in progress.
+ */
+static double
+IndexBuildHeapRangeScanInternal(Relation heapRelation,
+								Relation indexRelation,
+								IndexInfo *indexInfo,
+								bool allow_sync,
+								bool anyvisible,
+								BlockNumber start_blockno,
+								BlockNumber numblocks,
+								IndexBuildCallback callback,
+								void *callback_state,
+								HeapScanDesc scan,
+								YbBackfillInfo *bfinfo,
+								YbPgExecOutParam *bfresult)
 {
 	bool		is_system_catalog;
 	bool		checking_uniqueness;
@@ -2525,6 +2780,8 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 	TransactionId OldestXmin;
 	BlockNumber root_blkno = InvalidBlockNumber;
 	OffsetNumber root_offsets[MaxHeapTuplesPerPage];
+	MemoryContext oldcontext = GetCurrentMemoryContext();
+	int			yb_tuples_done = 0;
 
 	/*
 	 * sanity checks
@@ -2593,6 +2850,21 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 									NULL,	/* scan key */
 									true,	/* buffer access strategy OK */
 									allow_sync);	/* syncscan OK? */
+		if (IsYBRelation(heapRelation))
+		{
+			YBCPgExecParameters *exec_params = &estate->yb_exec_params;
+			if (bfinfo)
+			{
+				if (bfinfo->bfinstr)
+					exec_params->bfinstr = pstrdup(bfinfo->bfinstr);
+				exec_params->backfill_read_time = bfinfo->read_time;
+				exec_params->partition_key = pstrdup(bfinfo->row_bounds->partition_key);
+				exec_params->out_param = bfresult;
+				exec_params->is_index_backfill = true;
+			}
+
+			scan->ybscan->exec_params = exec_params;
+		}
 	}
 	else
 	{
@@ -2611,8 +2883,8 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 	/*
 	 * Must call GetOldestXmin() with SnapshotAny.  Should never call
 	 * GetOldestXmin() with MVCC snapshot. (It's especially worth checking
-	 * this for parallel builds, since ambuild routines that support parallel
-	 * builds must work these details out for themselves.)
+	 * this for parallel builds, since yb_ambackfill routines that support
+	 * parallel builds must work these details out for themselves.)
 	 */
 	Assert(snapshot == SnapshotAny || IsMVCCSnapshot(snapshot));
 	Assert(snapshot == SnapshotAny ? TransactionIdIsValid(OldestXmin) :
@@ -2631,12 +2903,15 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 
 	reltuples = 0;
 
+	if (IsYBRelation(indexRelation))
+		MemoryContextSwitchTo(econtext->ecxt_per_tuple_memory);
+
 	/*
 	 * Scan all tuples in the base relation.
 	 */
 	while ((heapTuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
 	{
-	  bool    tupleIsAlive;
+		bool    tupleIsAlive;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -2644,284 +2919,289 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 		 * Skip handling of HOT-chained tuples which does not apply to YugaByte-based
 		 * tables.
 		 */
-		if (!IsYugaByteEnabled())
+		if (!IsYBRelation(heapRelation))
 		{
-      /*
-       * When dealing with a HOT-chain of updated tuples, we want to index
-       * the values of the live tuple (if any), but index it under the TID
-       * of the chain's root tuple.  This approach is necessary to preserve
-       * the HOT-chain structure in the heap. So we need to be able to find
-       * the root item offset for every tuple that's in a HOT-chain.  When
-       * first reaching a new page of the relation, call
-       * heap_get_root_tuples() to build a map of root item offsets on the
-       * page.
-       *
-       * It might look unsafe to use this information across buffer
-       * lock/unlock.  However, we hold ShareLock on the table so no
-       * ordinary insert/update/delete should occur; and we hold pin on the
-       * buffer continuously while visiting the page, so no pruning
-       * operation can occur either.
-       *
-       * Also, although our opinions about tuple liveness could change while
-       * we scan the page (due to concurrent transaction commits/aborts),
-       * the chain root locations won't, so this info doesn't need to be
-       * rebuilt after waiting for another transaction.
-       *
-       * Note the implied assumption that there is no more than one live
-       * tuple per HOT-chain --- else we could create more than one index
-       * entry pointing to the same root tuple.
-       */
-      if (scan->rs_cblock != root_blkno)
-      {
-        Page    page = BufferGetPage(scan->rs_cbuf);
+			/*
+			 * When dealing with a HOT-chain of updated tuples, we want to index
+			 * the values of the live tuple (if any), but index it under the TID
+			 * of the chain's root tuple.  This approach is necessary to preserve
+			 * the HOT-chain structure in the heap. So we need to be able to find
+			 * the root item offset for every tuple that's in a HOT-chain.  When
+			 * first reaching a new page of the relation, call
+			 * heap_get_root_tuples() to build a map of root item offsets on the
+			 * page.
+			 *
+			 * It might look unsafe to use this information across buffer
+			 * lock/unlock.  However, we hold ShareLock on the table so no
+			 * ordinary insert/update/delete should occur; and we hold pin on the
+			 * buffer continuously while visiting the page, so no pruning
+			 * operation can occur either.
+			 *
+			 * Also, although our opinions about tuple liveness could change while
+			 * we scan the page (due to concurrent transaction commits/aborts),
+			 * the chain root locations won't, so this info doesn't need to be
+			 * rebuilt after waiting for another transaction.
+			 *
+			 * Note the implied assumption that there is no more than one live
+			 * tuple per HOT-chain --- else we could create more than one index
+			 * entry pointing to the same root tuple.
+			 */
+			if (scan->rs_cblock != root_blkno)
+			{
+				Page    page = BufferGetPage(scan->rs_cbuf);
 
-        LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
-        heap_get_root_tuples(page, root_offsets);
-        LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
+				heap_get_root_tuples(page, root_offsets);
+				LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
 
-        root_blkno = scan->rs_cblock;
-      }
+				root_blkno = scan->rs_cblock;
+			}
 
-      if (snapshot == SnapshotAny)
-      {
-        /* do our own time qual check */
-        bool    indexIt;
-        TransactionId xwait;
+			if (snapshot == SnapshotAny)
+			{
+				/* do our own time qual check */
+				bool    indexIt;
+				TransactionId xwait;
 
-        recheck:
+				recheck:
 
-        /*
-         * We could possibly get away with not locking the buffer here,
-         * since caller should hold ShareLock on the relation, but let's
-         * be conservative about it.  (This remark is still correct even
-         * with HOT-pruning: our pin on the buffer prevents pruning.)
-         */
-        LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
+				/*
+				 * We could possibly get away with not locking the buffer here,
+				 * since caller should hold ShareLock on the relation, but let's
+				 * be conservative about it.  (This remark is still correct even
+				 * with HOT-pruning: our pin on the buffer prevents pruning.)
+				 */
+				LockBuffer(scan->rs_cbuf, BUFFER_LOCK_SHARE);
 
-        /*
-         * The criteria for counting a tuple as live in this block need to
-         * match what analyze.c's acquire_sample_rows() does, otherwise
-         * CREATE INDEX and ANALYZE may produce wildly different reltuples
-         * values, e.g. when there are many recently-dead tuples.
-         */
-          switch (HeapTupleSatisfiesVacuum(heapTuple, OldestXmin,
-                                           scan->rs_cbuf))
-          {
-            case HEAPTUPLE_DEAD:
-              /* Definitely dead, we can ignore it */
-            indexIt = false;
-            tupleIsAlive = false;
-            break;
-          case HEAPTUPLE_LIVE:
-            /* Normal case, index and unique-check it */
-            indexIt = true;
-            tupleIsAlive = true;
-            /* Count it as live, too */
-            reltuples += 1;
-            break;
-          case HEAPTUPLE_RECENTLY_DEAD:
+				/*
+				 * The criteria for counting a tuple as live in this block need to
+				 * match what analyze.c's acquire_sample_rows() does, otherwise
+				 * CREATE INDEX and ANALYZE may produce wildly different reltuples
+				 * values, e.g. when there are many recently-dead tuples.
+				 */
+				switch (HeapTupleSatisfiesVacuum(heapTuple, OldestXmin,
+												scan->rs_cbuf))
+				{
+					case HEAPTUPLE_DEAD:
+						/* Definitely dead, we can ignore it */
+						indexIt = false;
+						tupleIsAlive = false;
+						break;
+					case HEAPTUPLE_LIVE:
+						/* Normal case, index and unique-check it */
+						indexIt = true;
+						tupleIsAlive = true;
+						/* Count it as live, too */
+						reltuples += 1;
+						break;
+					case HEAPTUPLE_RECENTLY_DEAD:
+						/*
+						 * If tuple is recently deleted then we must index it
+						 * anyway to preserve MVCC semantics.  (Pre-existing
+						 * transactions could try to use the index after we finish
+						 * building it, and may need to see such tuples.)
+						 *
+						 * However, if it was HOT-updated then we must only index
+						 * the live tuple at the end of the HOT-chain.  Since this
+						 * breaks semantics for pre-existing snapshots, mark the
+						 * index as unusable for them.
+						 *
+						 * We don't count recently-dead tuples in reltuples, even
+						 * if we index them; see acquire_sample_rows().
+						 */
+						if (HeapTupleIsHotUpdated(heapTuple))
+						{
+							indexIt = false;
+							/* mark the index as unsafe for old snapshots */
+							indexInfo->ii_BrokenHotChain = true;
+						}
+						else
+							indexIt = true;
+						/* In any case, exclude the tuple from unique-checking */
+						tupleIsAlive = false;
+						break;
+					case HEAPTUPLE_INSERT_IN_PROGRESS:
+						/*
+						 * In "anyvisible" mode, this tuple is visible and we
+						 * don't need any further checks.
+						 */
+						if (anyvisible)
+						{
+							indexIt = true;
+							tupleIsAlive = true;
+							reltuples += 1;
+							break;
+						}
 
-            /*
-             * If tuple is recently deleted then we must index it
-             * anyway to preserve MVCC semantics.  (Pre-existing
-             * transactions could try to use the index after we finish
-             * building it, and may need to see such tuples.)
-             *
-             * However, if it was HOT-updated then we must only index
-             * the live tuple at the end of the HOT-chain.  Since this
-             * breaks semantics for pre-existing snapshots, mark the
-             * index as unusable for them.
-             *
-             * We don't count recently-dead tuples in reltuples, even
-             * if we index them; see acquire_sample_rows().
-             */
-            if (HeapTupleIsHotUpdated(heapTuple))
-            {
-              indexIt = false;
-              /* mark the index as unsafe for old snapshots */
-              indexInfo->ii_BrokenHotChain = true;
-            }
-            else
-              indexIt = true;
-            /* In any case, exclude the tuple from unique-checking */
-            tupleIsAlive = false;
-            break;
-          case HEAPTUPLE_INSERT_IN_PROGRESS:
+						/*
+						 * Since caller should hold ShareLock or better, normally
+						 * the only way to see this is if it was inserted earlier
+						 * in our own transaction.  However, it can happen in
+						 * system catalogs, since we tend to release write lock
+						 * before commit there.  Give a warning if neither case
+						 * applies.
+						 */
+						xwait = HeapTupleHeaderGetXmin(heapTuple->t_data);
+						if (!TransactionIdIsCurrentTransactionId(xwait))
+						{
+							if (!is_system_catalog)
+								elog(WARNING, "concurrent insert in progress within table \"%s\"",
+									RelationGetRelationName(heapRelation));
 
-            /*
-             * In "anyvisible" mode, this tuple is visible and we
-             * don't need any further checks.
-             */
-            if (anyvisible)
-            {
-              indexIt = true;
-              tupleIsAlive = true;
-              reltuples += 1;
-              break;
-            }
+							/*
+							 * If we are performing uniqueness checks, indexing
+							 * such a tuple could lead to a bogus uniqueness
+							 * failure.  In that case we wait for the inserting
+							 * transaction to finish and check again.
+							 */
+							if (checking_uniqueness)
+							{
+								/*
+								 * Must drop the lock on the buffer before we wait
+								 */
+								LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+								XactLockTableWait(xwait, heapRelation,
+												&heapTuple->t_self,
+												XLTW_InsertIndexUnique);
+								CHECK_FOR_INTERRUPTS();
+								goto recheck;
+							}
+							else
+							{
+								/*
+								 * For consistency with acquire_sample_rows(), count
+								 * HEAPTUPLE_INSERT_IN_PROGRESS tuples as live only
+								 * when inserted by our own transaction.
+								 */
+								reltuples += 1;
+							}
+						}
 
-            /*
-             * Since caller should hold ShareLock or better, normally
-             * the only way to see this is if it was inserted earlier
-             * in our own transaction.  However, it can happen in
-             * system catalogs, since we tend to release write lock
-             * before commit there.  Give a warning if neither case
-             * applies.
-             */
-            xwait = HeapTupleHeaderGetXmin(heapTuple->t_data);
-            if (!TransactionIdIsCurrentTransactionId(xwait))
-            {
-              if (!is_system_catalog)
-                elog(WARNING, "concurrent insert in progress within table \"%s\"",
-                     RelationGetRelationName(heapRelation));
+						/*
+						 * We must index such tuples, since if the index build
+						 * commits then they're good.
+						 */
+						indexIt = true;
+						tupleIsAlive = true;
+						break;
+					case HEAPTUPLE_DELETE_IN_PROGRESS:
 
-              /*
-               * If we are performing uniqueness checks, indexing
-               * such a tuple could lead to a bogus uniqueness
-               * failure.  In that case we wait for the inserting
-               * transaction to finish and check again.
-               */
-              if (checking_uniqueness)
-              {
-                /*
-                 * Must drop the lock on the buffer before we wait
-                 */
-                LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
-                XactLockTableWait(xwait, heapRelation,
-                                  &heapTuple->t_self,
-                                  XLTW_InsertIndexUnique);
-                CHECK_FOR_INTERRUPTS();
-                goto recheck;
-              }
-              else
-              {
-                /*
-                 * For consistency with acquire_sample_rows(), count
-                 * HEAPTUPLE_INSERT_IN_PROGRESS tuples as live only
-                 * when inserted by our own transaction.
-                 */
-                reltuples += 1;
-              }
-            }
+						/*
+						 * As with INSERT_IN_PROGRESS case, this is unexpected
+						 * unless it's our own deletion or a system catalog; but
+						 * in anyvisible mode, this tuple is visible.
+						 */
+						if (anyvisible)
+						{
+							indexIt = true;
+							tupleIsAlive = false;
+							reltuples += 1;
+							break;
+						}
 
-            /*
-             * We must index such tuples, since if the index build
-             * commits then they're good.
-             */
-            indexIt = true;
-            tupleIsAlive = true;
-            break;
-          case HEAPTUPLE_DELETE_IN_PROGRESS:
+						xwait = HeapTupleHeaderGetUpdateXid(heapTuple->t_data);
+						if (!TransactionIdIsCurrentTransactionId(xwait))
+						{
+							if (!is_system_catalog)
+								elog(WARNING, "concurrent delete in progress within table \"%s\"",
+									RelationGetRelationName(heapRelation));
 
-            /*
-             * As with INSERT_IN_PROGRESS case, this is unexpected
-             * unless it's our own deletion or a system catalog; but
-             * in anyvisible mode, this tuple is visible.
-             */
-            if (anyvisible)
-            {
-              indexIt = true;
-              tupleIsAlive = false;
-              reltuples += 1;
-              break;
-            }
+							/*
+							 * If we are performing uniqueness checks, assuming
+							 * the tuple is dead could lead to missing a
+							 * uniqueness violation.  In that case we wait for the
+							 * deleting transaction to finish and check again.
+							 *
+							 * Also, if it's a HOT-updated tuple, we should not
+							 * index it but rather the live tuple at the end of
+							 * the HOT-chain.  However, the deleting transaction
+							 * could abort, possibly leaving this tuple as live
+							 * after all, in which case it has to be indexed. The
+							 * only way to know what to do is to wait for the
+							 * deleting transaction to finish and check again.
+							 */
+							if (checking_uniqueness ||
+								HeapTupleIsHotUpdated(heapTuple))
+							{
+								/*
+								 * Must drop the lock on the buffer before we wait
+								 */
+								LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+								XactLockTableWait(xwait, heapRelation,
+												&heapTuple->t_self,
+												XLTW_InsertIndexUnique);
+								CHECK_FOR_INTERRUPTS();
+								goto recheck;
+							}
 
-            xwait = HeapTupleHeaderGetUpdateXid(heapTuple->t_data);
-            if (!TransactionIdIsCurrentTransactionId(xwait))
-            {
-              if (!is_system_catalog)
-                elog(WARNING, "concurrent delete in progress within table \"%s\"",
-                     RelationGetRelationName(heapRelation));
+							/*
+							 * Otherwise index it but don't check for uniqueness,
+							 * the same as a RECENTLY_DEAD tuple.
+							 */
+							indexIt = true;
 
-              /*
-               * If we are performing uniqueness checks, assuming
-               * the tuple is dead could lead to missing a
-               * uniqueness violation.  In that case we wait for the
-               * deleting transaction to finish and check again.
-               *
-               * Also, if it's a HOT-updated tuple, we should not
-               * index it but rather the live tuple at the end of
-               * the HOT-chain.  However, the deleting transaction
-               * could abort, possibly leaving this tuple as live
-               * after all, in which case it has to be indexed. The
-               * only way to know what to do is to wait for the
-               * deleting transaction to finish and check again.
-               */
-              if (checking_uniqueness ||
-                  HeapTupleIsHotUpdated(heapTuple))
-              {
-                /*
-                 * Must drop the lock on the buffer before we wait
-                 */
-                LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
-                XactLockTableWait(xwait, heapRelation,
-                                  &heapTuple->t_self,
-                                  XLTW_InsertIndexUnique);
-                CHECK_FOR_INTERRUPTS();
-                goto recheck;
-              }
+							/*
+							 * Count HEAPTUPLE_DELETE_IN_PROGRESS tuples as live,
+							 * if they were not deleted by the current
+							 * transaction.  That's what acquire_sample_rows()
+							 * does, and we want the behavior to be consistent.
+							 */
+							reltuples += 1;
+						}
+						else if (HeapTupleIsHotUpdated(heapTuple))
+						{
+							/*
+							 * It's a HOT-updated tuple deleted by our own xact.
+							 * We can assume the deletion will commit (else the
+							 * index contents don't matter), so treat the same as
+							 * RECENTLY_DEAD HOT-updated tuples.
+							 */
+							indexIt = false;
+							/* mark the index as unsafe for old snapshots */
+							indexInfo->ii_BrokenHotChain = true;
+						}
+						else
+						{
+							/*
+							 * It's a regular tuple deleted by our own xact. Index
+							 * it, but don't check for uniqueness nor count in
+							 * reltuples, the same as a RECENTLY_DEAD tuple.
+							 */
+							indexIt = true;
+						}
+						/* In any case, exclude the tuple from unique-checking */
+						tupleIsAlive = false;
+						break;
+					default:
+						elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
+						indexIt = tupleIsAlive = false; /* keep compiler quiet */
+						break;
+				}
 
-              /*
-               * Otherwise index it but don't check for uniqueness,
-               * the same as a RECENTLY_DEAD tuple.
-               */
-              indexIt = true;
+				LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
 
-              /*
-               * Count HEAPTUPLE_DELETE_IN_PROGRESS tuples as live,
-               * if they were not deleted by the current
-               * transaction.  That's what acquire_sample_rows()
-               * does, and we want the behavior to be consistent.
-               */
-              reltuples += 1;
-            }
-            else if (HeapTupleIsHotUpdated(heapTuple))
-            {
-              /*
-               * It's a HOT-updated tuple deleted by our own xact.
-               * We can assume the deletion will commit (else the
-               * index contents don't matter), so treat the same as
-               * RECENTLY_DEAD HOT-updated tuples.
-               */
-              indexIt = false;
-              /* mark the index as unsafe for old snapshots */
-              indexInfo->ii_BrokenHotChain = true;
-            }
-            else
-            {
-              /*
-               * It's a regular tuple deleted by our own xact. Index
-               * it, but don't check for uniqueness nor count in
-               * reltuples, the same as a RECENTLY_DEAD tuple.
-               */
-              indexIt = true;
-            }
-            /* In any case, exclude the tuple from unique-checking */
-            tupleIsAlive = false;
-            break;
-          default:
-            elog(ERROR, "unexpected HeapTupleSatisfiesVacuum result");
-            indexIt = tupleIsAlive = false; /* keep compiler quiet */
-            break;
-        }
+				if (!indexIt)
+					continue;
+			}
+			else
+			{
+				/* heap_getnext did the time qual check */
+				tupleIsAlive = true;
+				reltuples += 1;
+			}
+		}
+		else
+		{
+			/* In YugaByte mode DocDB will only send live tuples. */
+			tupleIsAlive = true;
+			reltuples += 1;
+		}
 
-        LockBuffer(scan->rs_cbuf, BUFFER_LOCK_UNLOCK);
-
-        if (!indexIt)
-          continue;
-      }
-      else
-      {
-        /* heap_getnext did the time qual check */
-        tupleIsAlive = true;
-        reltuples += 1;
-      }
-    }
-
-		MemoryContextReset(econtext->ecxt_per_tuple_memory);
+		if (!IsYBRelation(indexRelation))
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 		/* Set up for predicate or expression evaluation */
-		ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
+		ExecStoreHeapTuple(heapTuple, slot, false);
 
 		/*
 		 * In a partial index, discard tuples that don't satisfy the
@@ -2930,7 +3210,12 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 		if (predicate != NULL)
 		{
 			if (!ExecQual(predicate, econtext))
+			{
+				if (IsYBRelation(indexRelation) && !indexInfo->ii_Concurrent)
+					pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+												 ++yb_tuples_done);
 				continue;
+			}
 		}
 
 		/*
@@ -2984,7 +3269,18 @@ IndexBuildHeapRangeScan(Relation heapRelation,
 			callback(indexRelation, heapTuple, values, isnull, tupleIsAlive,
 					 callback_state);
 		}
+
+		if (IsYBRelation(indexRelation))
+		{
+			MemoryContextReset(econtext->ecxt_per_tuple_memory);
+			if (!indexInfo->ii_Concurrent)
+				pgstat_progress_update_param(PROGRESS_CREATEIDX_TUPLES_DONE,
+											 ++yb_tuples_done);
+		}
 	}
+
+	if (IsYBRelation(indexRelation))
+		MemoryContextSwitchTo(oldcontext);
 
 	heap_endscan(scan);
 
@@ -3071,7 +3367,7 @@ IndexCheckExclusion(Relation heapRelation,
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 		/* Set up for predicate or expression evaluation */
-		ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
+		ExecStoreHeapTuple(heapTuple, slot, false);
 
 		/*
 		 * In a partial index, ignore tuples that don't satisfy the predicate.
@@ -3190,7 +3486,17 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
 
 	/* Open and lock the parent heap relation */
 	heapRelation = heap_open(heapId, ShareUpdateExclusiveLock);
-	/* And the target index relation */
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
+
 	indexRelation = index_open(indexId, RowExclusiveLock);
 
 	/*
@@ -3202,16 +3508,6 @@ validate_index(Oid heapId, Oid indexId, Snapshot snapshot)
 
 	/* mark build is concurrent just for consistency */
 	indexInfo->ii_Concurrent = true;
-
-	/*
-	 * Switch to the table owner's userid, so that any index functions are run
-	 * as that user.  Also lock down security-restricted operations and
-	 * arrange to make GUC variable changes local to this command.
-	 */
-	GetUserIdAndSecContext(&save_userid, &save_sec_context);
-	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
-						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
-	save_nestlevel = NewGUCNestLevel();
 
 	/*
 	 * Scan the index and gather up all the TIDs into a tuplesort object.
@@ -3393,12 +3689,12 @@ validate_index_heapscan(Relation heapRelation,
 		 * For YugaByte tables, there is no need to find the root tuple. Just
 		 * insert the fetched tuple.
 		 */
-		if (IsYugaByteEnabled())
+		if (IsYBRelation(heapRelation))
 		{
 			MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 			/* Set up for predicate or expression evaluation */
-			ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(heapTuple, slot, false);
 
 			/*
 			 * In a partial index, discard tuples that don't satisfy the
@@ -3429,7 +3725,8 @@ validate_index_heapscan(Relation heapRelation,
 						 heapRelation,
 						 indexInfo->ii_Unique ?
 						 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
-						 indexInfo);
+						 indexInfo,
+						 false /* yb_shared_insert */);
 
 			state->tups_inserted += 1;
 			continue;
@@ -3538,7 +3835,7 @@ validate_index_heapscan(Relation heapRelation,
 			MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 			/* Set up for predicate or expression evaluation */
-			ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(heapTuple, slot, false);
 
 			/*
 			 * In a partial index, discard tuples that don't satisfy the
@@ -3587,7 +3884,8 @@ validate_index_heapscan(Relation heapRelation,
 						 heapRelation,
 						 indexInfo->ii_Unique ?
 						 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
-						 indexInfo);
+						 indexInfo,
+						 false /* yb_shared_insert */);
 
 			state->tups_inserted += 1;
 		}
@@ -3609,18 +3907,10 @@ validate_index_heapscan(Relation heapRelation,
  * index_set_state_flags - adjust pg_index state flags
  *
  * This is used during CREATE/DROP INDEX CONCURRENTLY to adjust the pg_index
- * flags that denote the index's state.  Because the update is not
- * transactional and will not roll back on error, this must only be used as
- * the last step in a transaction that has not made any transactional catalog
- * updates!
+ * flags that denote the index's state.
  *
- * Note that heap_inplace_update does send a cache inval message for the
+ * Note that CatalogTupleUpdate() sends a cache invalidation message for the
  * tuple, so other sessions will hear about the update as soon as we commit.
- *
- * NB: In releases prior to PostgreSQL 9.4, the use of a non-transactional
- * update here would have been unsafe; now that MVCC rules apply even for
- * system catalog scans, we could potentially use a transactional update here
- * instead.
  */
 void
 index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
@@ -3628,9 +3918,6 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 	Relation	pg_index;
 	HeapTuple	indexTuple;
 	Form_pg_index indexForm;
-
-	/* Assert that current xact hasn't done any transactional updates */
-	Assert(GetTopTransactionIdIfAny() == InvalidTransactionId);
 
 	/* Open pg_index and fetch a writable copy of the index's tuple */
 	pg_index = heap_open(IndexRelationId, RowExclusiveLock);
@@ -3690,8 +3977,8 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 			break;
 	}
 
-	/* ... and write it back in-place */
-	heap_inplace_update(pg_index, indexTuple);
+ 	/* ... and update it */
+ 	CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
 
 	heap_close(pg_index, RowExclusiveLock);
 }
@@ -3728,11 +4015,15 @@ IndexGetRelation(Oid indexId, bool missing_ok)
  */
 void
 reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
-			  int options)
+			  int options, bool is_yb_table_rewrite,
+			  bool yb_copy_split_options)
 {
 	Relation	iRel,
 				heapRelation;
 	Oid			heapId;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 	IndexInfo  *indexInfo;
 	volatile bool skipped_constraint = false;
 	PGRUsage	ru0;
@@ -3745,6 +4036,16 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 	 */
 	heapId = IndexGetRelation(indexId, false);
 	heapRelation = heap_open(heapId, ShareLock);
+
+	/*
+	 * Switch to the table owner's userid, so that any index functions are run
+	 * as that user.  Also lock down security-restricted operations and
+	 * arrange to make GUC variable changes local to this command.
+	 */
+	GetUserIdAndSecContext(&save_userid, &save_sec_context);
+	SetUserIdAndSecContext(heapRelation->rd_rel->relowner,
+						   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+	save_nestlevel = NewGUCNestLevel();
 
 	/*
 	 * Open the target index relation and get an exclusive lock on it, to
@@ -3768,6 +4069,57 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot reindex temporary tables of other sessions")));
+
+	/*
+	 * YB pk indexes share the same storage as their tables, so it is not
+	 * possible to reindex them. However, this code-path may be internally
+	 * invoked by table rewrite, and we need to reset the index's reltuples.
+	 */
+	if (!is_yb_table_rewrite && iRel->rd_index->indisprimary &&
+		IsYBRelation(iRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex nontemporary pk indexes"),
+				 errdetail("Primary key indexes share the same storage as their"
+						   " table for Yugabyte-backed relations.")));
+
+	/*
+	 * Supporting shared index could be complicated, so skip for now.
+	 */
+	if (iRel->rd_rel->relisshared)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex shared system indexes")));
+
+	/*
+	 * Since YB REINDEX currently doesn't take locks, it is not a safe
+	 * operation.  Chance of failure or corruption is relatively high.
+	 * Mitigate negative affects by making it a two-step process:
+	 * 1. run the reindex on nonpublic index
+	 * 2. make the index public
+	 * In case (1) fails (e.g. duplicate key violation), things can be fixed or
+	 * changed then reindexed again.  After manually checking the reindex has
+	 * no corruption (since the index build is not online), (2) can be done.
+	 *
+	 * Checking indisvalid helps catch reindex on public index, but it is not
+	 * foolproof.  For example, the index could be made public while the
+	 * reindex is happening.
+	 *
+	 * indisvalid and indisready should be true for best chance of avoiding
+	 * corruption.
+	 *
+	 * NOTE: reindex is permitted internally on public indexes when the indexed
+	 * table is being rewritten.
+	 */
+	if (!is_yb_table_rewrite && IndexIsValid(iRel->rd_index)
+		&& IsYBRelation(iRel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot reindex public indexes"),
+				 errdetail("For safety, indexes should not be serving reads"
+						   " during REINDEX."),
+				 errhint("Run UPDATE pg_index SET indisvalid = false WHERE"
+						 " indexrelid = '<index_name>'::regclass.")));
 
 	/*
 	 * Also check for active uses of the index in the current transaction; we
@@ -3800,9 +4152,15 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 			indexInfo->ii_ExclusionStrats = NULL;
 		}
 
-		/* We'll build a new physical relation for the index */
-		RelationSetNewRelfilenode(iRel, persistence, InvalidTransactionId,
-								  InvalidMultiXactId);
+		if (IsYugaByteEnabled() && IsSystemRelation(heapRelation))
+			YbTruncate(iRel);
+		else
+		{
+			/* We'll build a new physical relation for the index */
+			RelationSetNewRelfilenode(iRel, persistence, InvalidTransactionId,
+									  InvalidMultiXactId,
+									  yb_copy_split_options);
+		}
 
 		/* Initialize the index and rebuild */
 		/* Note: we do not need to re-establish pkey setting */
@@ -3903,6 +4261,12 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 				 errdetail_internal("%s",
 									pg_rusage_show(&ru0))));
 
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
+
 	/* Close rels, but keep locks */
 	index_close(iRel, NoLock);
 	heap_close(heapRelation, NoLock);
@@ -3944,7 +4308,8 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
  * index rebuild.
  */
 bool
-reindex_relation(Oid relid, int flags, int options)
+reindex_relation(Oid relid, int flags, int options, bool is_yb_table_rewrite,
+				 bool yb_copy_split_options)
 {
 	Relation	rel;
 	Oid			toast_relid;
@@ -4046,12 +4411,29 @@ reindex_relation(Oid relid, int flags, int options)
 		foreach(indexId, indexIds)
 		{
 			Oid			indexOid = lfirst_oid(indexId);
-
+			Relation iRel = index_open(indexOid, AccessExclusiveLock);
 			if (is_pg_class)
 				RelationSetIndexList(rel, doneIndexes, InvalidOid);
-
-			reindex_index(indexOid, !(flags & REINDEX_REL_CHECK_CONSTRAINTS),
-						  persistence, options);
+			if (IsYBRelation(iRel))
+			{
+				if (!is_yb_table_rewrite && !iRel->rd_index->indisprimary)
+					/*
+					* Drop the old DocDB table associated with this index.
+					* This is only required for secondary indexes, because a
+					* primary index in YB doesn't have a DocDB table separate
+					* from the base relation's table.
+					* If this is a table rewrite, the indexes on the table
+					* will automatically be dropped when the table is dropped.
+					* Note: The drop isn't finalized until after the txn
+					* commits/aborts.
+					*/
+					YBCDropIndex(iRel);
+			}
+			index_close(iRel, AccessExclusiveLock);
+			reindex_index(indexOid,
+							!(flags & REINDEX_REL_CHECK_CONSTRAINTS),
+							persistence, options, is_yb_table_rewrite,
+							yb_copy_split_options);
 
 			CommandCounterIncrement();
 
@@ -4086,7 +4468,9 @@ reindex_relation(Oid relid, int flags, int options)
 	 * still hold the lock on the master table.
 	 */
 	if ((flags & REINDEX_REL_PROCESS_TOAST) && OidIsValid(toast_relid))
-		result |= reindex_relation(toast_relid, flags, options);
+		result |= reindex_relation(toast_relid, flags, options,
+								   false /* is_yb_table_rewrite */,
+								   yb_copy_split_options);
 
 	return result;
 }

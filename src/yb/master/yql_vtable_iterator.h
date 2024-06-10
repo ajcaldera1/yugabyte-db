@@ -11,39 +11,44 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_VTABLE_ITERATOR_H
-#define YB_MASTER_YQL_VTABLE_ITERATOR_H
+#pragma once
 
-#include "yb/common/ql_rowwise_iterator_interface.h"
-#include "yb/common/ql_scanspec.h"
-#include "yb/docdb/doc_key.h"
+#include "yb/common/ql_protocol.pb.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
 
 namespace yb {
 namespace master {
 
 // An iterator over a YQLVirtualTable.
-class YQLVTableIterator : public common::YQLRowwiseIteratorIf {
+class YQLVTableIterator : public docdb::YQLRowwiseIteratorIf {
  public:
-  explicit YQLVTableIterator(const std::unique_ptr<QLRowBlock> vtable);
+  // hashed_column_values - is used to filter rows, i.e. if hashed_column_values is not empty
+  // only rows starting with specified hashed columns will be iterated.
+  YQLVTableIterator(
+      std::shared_ptr<qlexpr::QLRowBlock> vtable,
+      const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values);
+
   virtual ~YQLVTableIterator();
 
-  void SkipRow() override;
+  Result<bool> DoFetchNext(
+      qlexpr::QLTableRow* table_row,
+      const dockv::ReaderProjection* projection,
+      qlexpr::QLTableRow* static_row,
+      const dockv::ReaderProjection* static_projection) override;
 
-  Result<bool> HasNext() const override;
+  Result<bool> PgFetchNext(dockv::PgTableRow* table_row) override;
 
   std::string ToString() const override;
 
-  const Schema &schema() const override;
-
-  HybridTime RestartReadHt() override { return HybridTime::kInvalid; }
+  Result<HybridTime> RestartReadHt() override;
 
  private:
-  CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) override;
+  void Advance(bool increment);
 
-  std::unique_ptr<QLRowBlock> vtable_;
-  size_t vtable_index_;
+  std::shared_ptr<qlexpr::QLRowBlock> vtable_;
+  size_t vtable_index_ = 0;
+  const google::protobuf::RepeatedPtrField<QLExpressionPB>& hashed_column_values_;
 };
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_VTABLE_ITERATOR_H

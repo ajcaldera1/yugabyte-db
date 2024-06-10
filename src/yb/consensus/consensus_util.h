@@ -11,10 +11,22 @@
 // under the License.
 //
 
-#ifndef YB_CONSENSUS_CONSENSUS_UTIL_H
-#define YB_CONSENSUS_CONSENSUS_UTIL_H
+#pragma once
+
+#include <float.h>
+
+#include <chrono>
+#include <sstream>
+#include <string>
+#include <type_traits>
+
+#include <boost/mpl/and.hpp>
 
 #include "yb/util/enums.h"
+#include "yb/util/format.h"
+#include "yb/util/math_util.h"
+#include "yb/util/tostring.h"
+#include "yb/util/type_traits.h"
 
 namespace yb {
 namespace consensus {
@@ -31,7 +43,9 @@ YB_DEFINE_ENUM(
     // empty. This is used during heartbeats from leader to peers.
     (kAlwaysSend));
 
+inline std::string MakeTabletLogPrefix(const std::string& tablet_id, const std::string& peer_id) {
+  return Format("T $0 P $1: ", tablet_id, peer_id);
+}
+
 }  // namespace consensus
 }  // namespace yb
-
-#endif // YB_CONSENSUS_CONSENSUS_UTIL_H

@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_METRICS_H
-#define YB_UTIL_METRICS_H
+#pragma once
 
 /////////////////////////////////////////////////////
 // YB Metrics
@@ -39,7 +38,7 @@
 // Summary
 // ------------------------------------------------------------
 //
-// This API provides a basic set of metrics primitives along the lines of the Code Hale's
+// This API provides a basic set of metrics primitives along the lines of the Coda Hale's
 // metrics library along with JSON formatted output of running metrics.
 //
 // The metrics system has a few main concepts in its data model:
@@ -52,7 +51,7 @@
 // Metric prototypes are defined statically using the METRIC_DEFINE_*(...) macros. This
 // allows us to easily enumerate a full list of every metric that might be emitted from a
 // server, thus allowing auto-generation of metric metadata for integration with
-// monitoring systems such as Cloudera Manager.
+// monitoring systems such as Prometheus.
 //
 // Metric Entity Prototypes
 // ------------------------
@@ -67,7 +66,7 @@
 // -----------------------
 // Each defined Metric Entity Type serves as a prototype allowing instantiation of a
 // MetricEntity object. Each instance then has its own unique set of metrics. For
-// example, in the case of YB, we define a Metric Entity Type called 'tablet', and the
+// example, we define a Metric Entity Type called 'tablet', and the
 // Tablet Server instantiates one MetricEntity instance per tablet that it hosts.
 //
 // MetricEntity instances are instantiated within a MetricRegistry, and each instance is
@@ -238,31 +237,32 @@
 //
 /////////////////////////////////////////////////////
 
-#include <algorithm>
-#include <mutex>
-#include <string>
-#include <sstream>
-#include <unordered_map>
-#include <vector>
+#include <stdint.h>
 
-#include <gtest/gtest_prod.h>
+#include <cstdint>
+#include <cstdlib>
+#include <set>
+#include <string>
+
 #include <boost/preprocessor/cat.hpp>
 #include <boost/preprocessor/stringize.hpp>
+#include "yb/util/flags.h"
 
-#include "yb/gutil/bind.h"
-#include "yb/gutil/callback.h"
+#include <gtest/gtest_prod.h>
+
 #include "yb/gutil/casts.h"
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/ref_counted.h"
-#include "yb/gutil/singleton.h"
+#include "yb/gutil/integral_types.h"
 
+#include "yb/util/metrics_fwd.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/aggregate_stats.h"
 #include "yb/util/atomic.h"
+#include "yb/util/hdr_histogram.h"
 #include "yb/util/jsonwriter.h"
-#include "yb/util/locks.h"
+#include "yb/util/metrics_writer.h"
 #include "yb/util/monotime.h"
-#include "yb/util/status.h"
+#include "yb/util/shared_lock.h"
 #include "yb/util/striped64.h"
-#include "yb/util/strongly_typed_bool.h"
 
 // Define a new entity type.
 //
@@ -273,53 +273,93 @@
 
 // Convenience macros to define metric prototypes.
 // See the documentation at the top of this file for example usage.
-#define METRIC_DEFINE_counter(entity, name, label, unit, desc)   \
+#define METRIC_DEFINE_counter_with_level(entity, name, label, unit, desc, level)   \
   ::yb::CounterPrototype BOOST_PP_CAT(METRIC_, name)(                        \
       ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity), \
                                       BOOST_PP_STRINGIZE(name), \
                                       label, \
                                       unit, \
-                                      desc))
+                                      desc, \
+                                      level))
 
-#define METRIC_DEFINE_gauge(type, entity, name, label, unit, desc, ...) \
+#define METRIC_DEFINE_counter(entity, name, label, unit, desc)   \
+  METRIC_DEFINE_counter_with_level(entity, name, label, unit, desc, yb::MetricLevel::kInfo)
+
+#define METRIC_DEFINE_simple_counter(entity, name, label, unit) \
+    METRIC_DEFINE_counter(entity, name, label, unit, label)
+
+#define METRIC_DEFINE_lag_with_level(entity, name, label, desc, level, ...) \
+  ::yb::MillisLagPrototype BOOST_PP_CAT(METRIC_, name)( \
+      ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity), \
+                                      BOOST_PP_STRINGIZE(name), \
+                                      label, \
+                                      yb::MetricUnit::kMilliseconds, \
+                                      desc, \
+                                      level, \
+                                      ## __VA_ARGS__))
+
+#define METRIC_DEFINE_lag(entity, name, label, desc, ...) \
+  METRIC_DEFINE_lag_with_level(entity, name, label, desc, yb::MetricLevel::kInfo, ## __VA_ARGS__)
+
+#define METRIC_DEFINE_gauge(type, entity, name, label, unit, desc, level, ...) \
   ::yb::GaugePrototype<type> BOOST_PP_CAT(METRIC_, name)(         \
       ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity), \
                                       BOOST_PP_STRINGIZE(name), \
                                       label, \
                                       unit, \
                                       desc, \
+                                      level, \
                                       ## __VA_ARGS__))
 
 #define METRIC_DEFINE_gauge_string(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(std::string, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(std::string, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_bool(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(bool, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(bool, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_int32(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(int32_t, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(int32_t, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_uint32(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(uint32_t, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(uint32_t, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_int64(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(int64, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(int64, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_uint64(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(uint64_t, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(uint64_t, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
+#define METRIC_DEFINE_simple_gauge_uint64(entity, name, label, unit, ...) \
+    METRIC_DEFINE_gauge(uint64_t, entity, name, label, unit, label, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 #define METRIC_DEFINE_gauge_double(entity, name, label, unit, desc, ...) \
-    METRIC_DEFINE_gauge(double, entity, name, label, unit, desc, ## __VA_ARGS__)
+    METRIC_DEFINE_gauge(double, entity, name, label, unit, desc, \
+        yb::MetricLevel::kInfo, ## __VA_ARGS__)
 
-#define METRIC_DEFINE_histogram(entity, name, label, unit, desc, max_val, num_sig_digits) \
-  ::yb::HistogramPrototype BOOST_PP_CAT(METRIC_, name)(                                   \
-      ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity), \
-                                      BOOST_PP_STRINGIZE(name), \
-                                      label, \
-                                      unit, \
-                                      desc), \
-      max_val, \
-      num_sig_digits)
+#define METRIC_DEFINE_histogram(                                               \
+    entity, name, label, unit, desc, max_val, num_sig_digits)                  \
+  ::yb::HistogramPrototype BOOST_PP_CAT(METRIC_, name)(                        \
+      ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity),              \
+                                      BOOST_PP_STRINGIZE(name), label, unit,   \
+                                      desc,                                    \
+                                      yb::MetricLevel::kInfo),                 \
+      max_val, num_sig_digits)
+
+#define METRIC_DEFINE_event_stats(entity, name, label, unit, desc, ...)   \
+  ::yb::EventStatsPrototype BOOST_PP_CAT(METRIC_, name)(                  \
+      ::yb::MetricPrototype::CtorArgs(BOOST_PP_STRINGIZE(entity),              \
+                                      BOOST_PP_STRINGIZE(name), label, unit,   \
+                                      desc,                                    \
+                                      yb::MetricLevel::kInfo,                  \
+                                      ## __VA_ARGS__))
 
 // The following macros act as forward declarations for entity types and metric prototypes.
 #define METRIC_DECLARE_entity(name) \
   extern ::yb::MetricEntityPrototype METRIC_ENTITY_##name
 #define METRIC_DECLARE_counter(name)                             \
   extern ::yb::CounterPrototype METRIC_##name
+#define METRIC_DECLARE_lag(name) \
+  extern ::yb::LagPrototype METRIC_##name
 #define METRIC_DECLARE_gauge_string(name) \
   extern ::yb::GaugePrototype<std::string> METRIC_##name
 #define METRIC_DECLARE_gauge_bool(name) \
@@ -336,6 +376,8 @@
   extern ::yb::GaugePrototype<double> METRIC_##name
 #define METRIC_DECLARE_histogram(name) \
   extern ::yb::HistogramPrototype METRIC_##name
+#define METRIC_DECLARE_event_stats(name) \
+  extern ::yb::EventStatsPrototype METRIC_##name
 
 #if defined(__APPLE__)
 #define METRIC_DEFINE_gauge_size(entity, name, label, unit, desc, ...) \
@@ -348,39 +390,14 @@
 #define METRIC_DECLARE_gauge_size METRIC_DECLARE_gauge_uint64
 #endif
 
-namespace yb {
-
-class Counter;
-class CounterPrototype;
-
-template<typename T>
-class AtomicGauge;
-template<typename T>
-class FunctionGauge;
-class Gauge;
-template<typename T>
-class GaugePrototype;
-
-class Metric;
-class MetricEntityPrototype;
-class MetricPrototype;
-class MetricRegistry;
-
-class HdrHistogram;
-class Histogram;
-class HistogramPrototype;
-class HistogramSnapshotPB;
-
-class MetricEntity;
-class PrometheusWriter;
-} // namespace yb
-
 // Forward-declare the generic 'server' entity type.
 // We have to do this here below the forward declarations, but not
 // in the yb namespace.
 METRIC_DECLARE_entity(server);
 
 namespace yb {
+
+class JsonWriter;
 
 // Unit types to be used with metrics.
 // As additional units are required, add them to this enum and also to Name().
@@ -409,259 +426,37 @@ struct MetricUnit {
     kTasks,
     kMessages,
     kContextSwitches,
+    kFiles,
+    kKeys,
   };
   static const char* Name(Type unit);
 };
 
 class MetricType {
  public:
-  enum Type { kGauge, kCounter, kHistogram };
+  enum Type { kGauge, kCounter, kHistogram, kEventStats, kLag };
   static const char* Name(Type t);
+  static const char* PrometheusType(Type t);
  private:
   static const char* const kGaugeType;
   static const char* const kCounterType;
   static const char* const kHistogramType;
+  static const char* const kEventStatsType;
 };
-
-struct MetricJsonOptions {
-  MetricJsonOptions() :
-    include_raw_histograms(false),
-    include_schema_info(false) {
-  }
-
-  // Include the raw histogram values and counts in the JSON output.
-  // This allows consumers to do cross-server aggregation or window
-  // data over time.
-  // Default: false
-  bool include_raw_histograms;
-
-  // Include the metrics "schema" information (i.e description, label,
-  // unit, etc).
-  // Default: false
-  bool include_schema_info;
-};
-
-class MetricEntityPrototype {
- public:
-  explicit MetricEntityPrototype(const char* name);
-  ~MetricEntityPrototype();
-
-  const char* name() const { return name_; }
-
-  // Find or create an entity with the given ID within the provided 'registry'.
-  scoped_refptr<MetricEntity> Instantiate(
-      MetricRegistry* registry,
-      const std::string& id) const {
-    return Instantiate(registry, id, std::unordered_map<std::string, std::string>());
-  }
-
-  // If the entity already exists, then 'initial_attrs' will replace all existing
-  // attributes.
-  scoped_refptr<MetricEntity> Instantiate(
-      MetricRegistry* registry,
-      const std::string& id,
-      const std::unordered_map<std::string, std::string>& initial_attrs) const;
-
- private:
-  const char* const name_;
-
-  DISALLOW_COPY_AND_ASSIGN(MetricEntityPrototype);
-};
-
-class MetricEntity : public RefCountedThreadSafe<MetricEntity> {
- public:
-  typedef std::unordered_map<const MetricPrototype*, scoped_refptr<Metric> > MetricMap;
-  typedef std::unordered_map<std::string, std::string> AttributeMap;
-  typedef std::function<void (JsonWriter* writer, const MetricJsonOptions& opts)>
-    ExternalJsonMetricsCb;
-  typedef std::function<void (PrometheusWriter* writer)>
-    ExternalPrometheusMetricsCb;
-
-  scoped_refptr<Counter> FindOrCreateCounter(const CounterPrototype* proto);
-  scoped_refptr<Histogram> FindOrCreateHistogram(const HistogramPrototype* proto);
-
-  template<typename T>
-  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(const GaugePrototype<T>* proto,
-                                                  const T& initial_value);
-
-  template<typename T>
-  scoped_refptr<AtomicGauge<T>> FindOrCreateGauge(std::unique_ptr<GaugePrototype<T>> proto,
-                                                  const T& initial_value);
-
-  template<typename T>
-  scoped_refptr<FunctionGauge<T> > FindOrCreateFunctionGauge(const GaugePrototype<T>* proto,
-                                                             const Callback<T()>& function);
-
-  // Return the metric instantiated from the given prototype, or NULL if none has been
-  // instantiated. Primarily used by tests trying to read metric values.
-  scoped_refptr<Metric> FindOrNull(const MetricPrototype& prototype) const;
-
-  const std::string& id() const { return id_; }
-
-  // See MetricRegistry::WriteAsJson()
-  CHECKED_STATUS WriteAsJson(JsonWriter* writer,
-                     const std::vector<std::string>& requested_metrics,
-                     const MetricJsonOptions& opts) const;
-
-  CHECKED_STATUS WriteForPrometheus(PrometheusWriter* writer) const;
-
-  const MetricMap& UnsafeMetricsMapForTests() const { return metric_map_; }
-
-  // Mark that the given metric should never be retired until the metric
-  // registry itself destructs. This is useful for system metrics such as
-  // tcmalloc, etc, which should live as long as the process itself.
-  void NeverRetire(const scoped_refptr<Metric>& metric);
-
-  // Scan the metrics map for metrics needing retirement, removing them as necessary.
-  //
-  // Metrics are retired when they are no longer referenced outside of the metrics system
-  // itself. Additionally, we only retire a metric that has been in this state for
-  // at least FLAGS_metrics_retirement_age_ms milliseconds.
-  void RetireOldMetrics();
-
-  // Replaces all attributes for this entity.
-  // Any attributes currently set, but not in 'attrs', are removed.
-  void SetAttributes(const AttributeMap& attrs);
-
-  // Set a particular attribute. Replaces any current value.
-  void SetAttribute(const std::string& key, const std::string& val);
-
-  size_t num_metrics() const {
-    std::lock_guard<simple_spinlock> l(lock_);
-    return metric_map_.size();
-  }
-
-  void AddExternalJsonMetricsCb(const ExternalJsonMetricsCb &external_metrics_cb) {
-    std::lock_guard<simple_spinlock> l(lock_);
-    external_json_metrics_cbs_.push_back(external_metrics_cb);
-  }
-
-  void AddExternalPrometheusMetricsCb(const ExternalPrometheusMetricsCb&external_metrics_cb) {
-    std::lock_guard<simple_spinlock> l(lock_);
-    external_prometheus_metrics_cbs_.push_back(external_metrics_cb);
-  }
-
-  const MetricEntityPrototype& prototype() const { return *prototype_; }
-
-  void Remove(const MetricPrototype* proto);
-
- private:
-  friend class MetricRegistry;
-  friend class RefCountedThreadSafe<MetricEntity>;
-
-  MetricEntity(const MetricEntityPrototype* prototype, std::string id,
-               AttributeMap attributes);
-  ~MetricEntity();
-
-  // Ensure that the given metric prototype is allowed to be instantiated
-  // within this entity. This entity's type must match the expected entity
-  // type defined within the metric prototype.
-  void CheckInstantiation(const MetricPrototype* proto) const;
-
-  const MetricEntityPrototype* const prototype_;
-  const std::string id_;
-
-  mutable simple_spinlock lock_;
-
-  // Map from metric name to Metric object. Protected by lock_.
-  MetricMap metric_map_;
-
-  // The key/value attributes. Protected by lock_
-  AttributeMap attributes_;
-
-  // The set of metrics which should never be retired. Protected by lock_.
-  std::vector<scoped_refptr<Metric> > never_retire_metrics_;
-
-  // Callbacks fired each time WriteAsJson is called.
-  std::vector<ExternalJsonMetricsCb> external_json_metrics_cbs_;
-
-  // Callbacks fired each time WriteForPrometheus is called.
-  std::vector<ExternalPrometheusMetricsCb> external_prometheus_metrics_cbs_;
-};
-
-typedef scoped_refptr<MetricEntity> MetricEntityPtr;
-
-class PrometheusWriter {
- public:
-  explicit PrometheusWriter(std::stringstream* output)
-    : output_(output),
-      timestamp_(std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now().time_since_epoch()).count()) {}
-
-  template<typename T>
-  CHECKED_STATUS WriteSingleEntry(
-      const MetricEntity::AttributeMap& attr, const std::string& name, const T& value) {
-    auto it = attr.find("table_id");
-    if (it != attr.end()) {
-      // For tablet level metrics, we roll up on the table level.
-      if (per_table_attributes_.find(it->second) == per_table_attributes_.end()) {
-        // If it's the first time we see this table, create the aggregate structures.
-        per_table_attributes_[it->second] = attr;
-        per_table_values_[it->second];
-      } else {
-        per_table_values_[it->second][name] += value;
-      }
-    } else {
-      // For non-tablet level metrics, export them directly.
-      RETURN_NOT_OK(FlushSingleEntry(attr, name, value));
-    }
-    return Status::OK();
-  }
-
-  CHECKED_STATUS FlushAggregatedValues() {
-    for (const auto& entry : per_table_values_) {
-      const auto& attrs = per_table_attributes_[entry.first];
-      for (const auto& metric_entry : entry.second) {
-        RETURN_NOT_OK(FlushSingleEntry(attrs, metric_entry.first, metric_entry.second));
-      }
-    }
-    return Status::OK();
-  }
-
- private:
-  template<typename T>
-  CHECKED_STATUS FlushSingleEntry(
-      const MetricEntity::AttributeMap& attr, const std::string& name, const T& value) {
-    *output_ << name;
-    size_t total_elements = attr.size();
-    if (total_elements > 0) {
-      *output_ << "{";
-      for (const auto& entry : attr) {
-        *output_ << entry.first << "=\"" << entry.second << "\"";
-        if (--total_elements > 0) {
-          *output_ << ",";
-        }
-      }
-      *output_ << "}";
-    }
-    *output_ << " " << value;
-    *output_ << " " << timestamp_;
-    *output_ << std::endl;
-    return Status::OK();
-  }
-
-  // Map from table_id to attributes
-  std::map<std::string, MetricEntity::AttributeMap> per_table_attributes_;
-  // Map from table_id to map of metric_name to value
-  std::map<std::string, std::map<std::string, double>> per_table_values_;
-  // Output stream
-  std::stringstream* output_;
-  // Timestamp for all metrics belonging to this writer instance.
-  int64_t timestamp_;
-};
-
-
 
 // Base class to allow for putting all metrics into a single container.
 // See documentation at the top of this file for information on metrics ownership.
 class Metric : public RefCountedThreadSafe<Metric> {
  public:
   // All metrics must be able to render themselves as JSON.
-  virtual CHECKED_STATUS WriteAsJson(JsonWriter* writer,
+  virtual Status WriteAsJson(JsonWriter* writer,
                              const MetricJsonOptions& opts) const = 0;
 
-  virtual CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const = 0;
+  virtual Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const = 0;
 
   const MetricPrototype* prototype() const { return prototype_; }
 
@@ -685,6 +480,8 @@ class Metric : public RefCountedThreadSafe<Metric> {
   DISALLOW_COPY_AND_ASSIGN(Metric);
 };
 
+using MetricPtr = scoped_refptr<Metric>;
+
 // Registry of all the metrics for a server.
 //
 // This aggregates the MetricEntity objects associated with the server.
@@ -695,7 +492,8 @@ class MetricRegistry {
 
   scoped_refptr<MetricEntity> FindOrCreateEntity(const MetricEntityPrototype* prototype,
                                                  const std::string& id,
-                                                 const MetricEntity::AttributeMap& initial_attrs);
+                                                 const MetricEntity::AttributeMap& initial_attrs,
+                                                 std::shared_ptr<MemTracker> mem_tracker = nullptr);
 
   // Writes metrics in this registry to 'writer'.
   //
@@ -707,11 +505,21 @@ class MetricRegistry {
   //
   // See the MetricJsonOptions struct definition above for options changing the
   // output of this function.
-  CHECKED_STATUS WriteAsJson(JsonWriter* writer,
-                     const std::vector<std::string>& requested_metrics,
+  Status WriteAsJson(JsonWriter* writer,
                      const MetricJsonOptions& opts) const;
 
-  CHECKED_STATUS WriteForPrometheus(PrometheusWriter* writer) const;
+  // Writes metrics in this registry to 'writer'.
+  //
+  // 'requested_metrics' is a set of substrings to match metric names against,
+  // where '*' matches all metrics.
+  //
+  // The string matching can either match an entity ID or a metric name.
+  // If it matches an entity ID, then all metrics for that entity will be printed.
+  //
+  // See the MetricPrometheusOptions struct definition above for options changing the
+  // output of this function.
+  Status WriteForPrometheus(PrometheusWriter* writer,
+                            const MetricPrometheusOptions& opts) const;
 
   // For each registered entity, retires orphaned metrics. If an entity has no more
   // metrics and there are no external references, entities are removed as well.
@@ -721,59 +529,41 @@ class MetricRegistry {
 
   // Return the number of entities in this registry.
   size_t num_entities() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return entities_.size();
   }
 
+  void tablets_shutdown_insert(std::string id) {
+    std::lock_guard l(tablets_shutdown_lock_);
+    tablets_shutdown_.insert(id);
+  }
+
+  void tablets_shutdown_erase(std::string id) {
+    std::lock_guard l(tablets_shutdown_lock_);
+    (void)tablets_shutdown_.erase(id);
+  }
+
+  bool tablets_shutdown_find(std::string id) const {
+    SharedLock<std::shared_timed_mutex> l(tablets_shutdown_lock_);
+    return tablets_shutdown_.find(id) != tablets_shutdown_.end();
+  }
+
+  void get_all_prototypes(std::set<std::string>&) const;
+
  private:
   typedef std::unordered_map<std::string, scoped_refptr<MetricEntity> > EntityMap;
-  EntityMap entities_;
+  EntityMap entities_ GUARDED_BY(lock_);
+
+  mutable std::shared_timed_mutex tablets_shutdown_lock_;
+
+  // Set of tablets that have been shutdown. Protected by tablets_shutdown_lock_.
+  std::set<std::string> tablets_shutdown_;
+
+  // Returns whether a tablet has been shutdown.
+  bool TabletHasBeenShutdown(const scoped_refptr<MetricEntity> entity) const;
 
   mutable simple_spinlock lock_;
   DISALLOW_COPY_AND_ASSIGN(MetricRegistry);
-};
-
-// Registry of all of the metric and entity prototypes that have been
-// defined.
-//
-// Prototypes are typically defined as static variables in different compilation
-// units, and their constructors register themselves here. The registry is then
-// used in order to dump metrics metadata to generate a Cloudera Manager MDL
-// file.
-//
-// This class is thread-safe.
-class MetricPrototypeRegistry {
- public:
-  // Get the singleton instance.
-  static MetricPrototypeRegistry* get();
-
-  // Dump a JSON document including all of the registered entity and metric
-  // prototypes.
-  void WriteAsJson(JsonWriter* writer) const;
-
-  CHECKED_STATUS WriteForPrometheus(PrometheusWriter* writer) const;
-
-  // Convenience wrapper around WriteAsJson(...). This dumps the JSON information
-  // to stdout and then exits.
-  void WriteAsJsonAndExit() const;
- private:
-  friend class Singleton<MetricPrototypeRegistry>;
-  friend class MetricPrototype;
-  friend class MetricEntityPrototype;
-  MetricPrototypeRegistry() {}
-  ~MetricPrototypeRegistry() {}
-
-  // Register a metric prototype in the registry.
-  void AddMetric(const MetricPrototype* prototype);
-
-  // Register a metric entity prototype in the registry.
-  void AddEntity(const MetricEntityPrototype* prototype);
-
-  mutable simple_spinlock lock_;
-  std::vector<const MetricPrototype*> metrics_;
-  std::vector<const MetricEntityPrototype*> entities_;
-
-  DISALLOW_COPY_AND_ASSIGN(MetricPrototypeRegistry);
 };
 
 enum PrototypeFlags {
@@ -784,6 +574,17 @@ enum PrototypeFlags {
 
 class MetricPrototype {
  public:
+  struct OptionalArgs {
+    OptionalArgs(uint32_t flags = 0,
+                 AggregationFunction aggregation_function = AggregationFunction::kSum)
+      : flags_(flags),
+        aggregation_function_(aggregation_function) {
+    }
+
+    const uint32_t flags_;
+    const AggregationFunction aggregation_function_;
+  };
+
   // Simple struct to aggregate the arguments common to all prototypes.
   // This makes constructor chaining a little less tedious.
   struct CtorArgs {
@@ -792,13 +593,16 @@ class MetricPrototype {
              const char* label,
              MetricUnit::Type unit,
              const char* description,
-             uint32_t flags = 0)
+             MetricLevel level,
+             OptionalArgs optional_args = OptionalArgs())
       : entity_type_(entity_type),
         name_(name),
         label_(label),
         unit_(unit),
         description_(description),
-        flags_(flags) {
+        level_(level),
+        flags_(optional_args.flags_),
+        aggregation_function_(optional_args.aggregation_function_) {
     }
 
     const char* const entity_type_;
@@ -806,7 +610,9 @@ class MetricPrototype {
     const char* const label_;
     const MetricUnit::Type unit_;
     const char* const description_;
+    const MetricLevel level_;
     const uint32_t flags_;
+    const AggregationFunction aggregation_function_;
   };
 
   const char* entity_type() const { return args_.entity_type_; }
@@ -814,6 +620,8 @@ class MetricPrototype {
   const char* label() const { return args_.label_; }
   MetricUnit::Type unit() const { return args_.unit_; }
   const char* description() const { return args_.description_; }
+  MetricLevel level() const { return args_.level_; }
+  AggregationFunction aggregation_function() const { return args_.aggregation_function_; }
   virtual MetricType::Type type() const = 0;
 
   // Writes the fields of this prototype to the given JSON writer.
@@ -843,14 +651,14 @@ class GaugePrototype : public MetricPrototype {
   scoped_refptr<AtomicGauge<T> > Instantiate(
       const scoped_refptr<MetricEntity>& entity,
       const T& initial_value) const {
-    return entity->FindOrCreateGauge(this, initial_value);
+    return entity->FindOrCreateMetric<AtomicGauge<T>>(this, initial_value);
   }
 
   // Instantiate a gauge that is backed by the given callback.
   scoped_refptr<FunctionGauge<T> > InstantiateFunctionGauge(
       const scoped_refptr<MetricEntity>& entity,
       const Callback<T()>& function) const {
-    return entity->FindOrCreateFunctionGauge(this, function);
+    return entity->FindOrCreateMetric<FunctionGauge<T>>(this, function);
   }
 
   virtual MetricType::Type type() const override {
@@ -877,7 +685,7 @@ class Gauge : public Metric {
   }
 
   virtual ~Gauge() {}
-  virtual CHECKED_STATUS WriteAsJson(JsonWriter* w,
+  virtual Status WriteAsJson(JsonWriter* w,
                              const MetricJsonOptions& opts) const override;
  protected:
   virtual void WriteValue(JsonWriter* writer) const = 0;
@@ -893,8 +701,11 @@ class StringGauge : public Gauge {
   std::string value() const;
   void set_value(const std::string& value);
 
-  CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const override;
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override;
  protected:
   virtual void WriteValue(JsonWriter* writer) const override;
  private:
@@ -933,9 +744,20 @@ class AtomicGauge : public Gauge {
     IncrementBy(-amount);
   }
 
-  CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const override {
-    return writer->WriteSingleEntry(attr, prototype_->name(), value());
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override {
+    if (prototype_->level() < opts.level) {
+      return Status::OK();
+    }
+
+    return writer->WriteSingleEntry(attr, prototype_->name(), value(),
+                                    prototype()->aggregation_function(),
+                                    aggregation_levels,
+                                    MetricType::PrometheusType(prototype_->type()),
+                                    prototype_->description());
   }
 
  protected:
@@ -961,54 +783,6 @@ void DecrementGauge(const scoped_refptr<AtomicGauge<T>>& gauge) {
   }
 }
 
-// Utility class to automatically detach FunctionGauges when a class destructs.
-//
-// Because FunctionGauges typically access class instance state, it's important to ensure
-// that they are detached before the class destructs. One approach is to make all
-// FunctionGauge instances be members of the class, and then call gauge_->Detach() in your
-// class's destructor. However, it's easy to forget to do this, which would lead to
-// heap-use-after-free bugs. This type of bug is easy to miss in unit tests because the
-// tests don't always poll metrics. Using a FunctionGaugeDetacher member instead makes
-// the detaching automatic and thus less error-prone.
-//
-// Example usage:
-//
-// METRIC_define_gauge_int64(my_metric, MetricUnit::kOperations, "My metric docs");
-// class MyClassWithMetrics {
-//  public:
-//   MyClassWithMetrics(const scoped_refptr<MetricEntity>& entity) {
-//     METRIC_my_metric.InstantiateFunctionGauge(entity,
-//       Bind(&MyClassWithMetrics::ComputeMyMetric, Unretained(this)))
-//       ->AutoDetach(&metric_detacher_);
-//   }
-//   ~MyClassWithMetrics() {
-//   }
-//
-//   private:
-//    int64_t ComputeMyMetric() {
-//      // Compute some metric based on instance state.
-//    }
-//    FunctionGaugeDetacher metric_detacher_;
-// };
-class FunctionGaugeDetacher {
- public:
-  FunctionGaugeDetacher();
-  ~FunctionGaugeDetacher();
-
- private:
-  template<typename T>
-  friend class FunctionGauge;
-
-  void OnDestructor(const Closure& c) {
-    callbacks_.push_back(c);
-  }
-
-  std::vector<Closure> callbacks_;
-
-  DISALLOW_COPY_AND_ASSIGN(FunctionGaugeDetacher);
-};
-
-
 // A Gauge that calls back to a function to get its value.
 //
 // This metric type should be used in cases where it is difficult to keep a running
@@ -1023,7 +797,7 @@ template <typename T>
 class FunctionGauge : public Gauge {
  public:
   T value() const {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return function_.Run();
   }
 
@@ -1035,7 +809,7 @@ class FunctionGauge : public Gauge {
   // This should be used during destruction. If you want a settable
   // Gauge, use a normal Gauge instead of a FunctionGauge.
   void DetachToConstant(T v) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     function_ = Bind(&FunctionGauge::Return, v);
   }
 
@@ -1048,9 +822,12 @@ class FunctionGauge : public Gauge {
 
   // Automatically detach this gauge when the given 'detacher' destructs.
   // After detaching, the metric will return 'value' in perpetuity.
-  void AutoDetach(FunctionGaugeDetacher* detacher, T value = T()) {
-    detacher->OnDestructor(Bind(&FunctionGauge<T>::DetachToConstant,
-                                this, value));
+  void AutoDetach(std::shared_ptr<void>* detacher, T value = T()) {
+    auto old_value = *detacher;
+    *detacher = std::shared_ptr<void>(nullptr,
+        [self = make_scoped_refptr(this), value, old_value](auto) {
+      self->DetachToConstant(value);
+    });
   }
 
   // Automatically detach this gauge when the given 'detacher' destructs.
@@ -1062,14 +839,27 @@ class FunctionGauge : public Gauge {
   // In typical usage (see the FunctionGaugeDetacher class documentation) this means you
   // should declare the detacher member after all other class members that might be
   // accessed by the gauge function implementation.
-  void AutoDetachToLastValue(FunctionGaugeDetacher* detacher) {
-    detacher->OnDestructor(Bind(&FunctionGauge<T>::DetachToCurrentValue,
-                                this));
+  void AutoDetachToLastValue(std::shared_ptr<void>* detacher) {
+    auto old_value = *detacher;
+    *detacher = std::shared_ptr<void>(nullptr, [self = make_scoped_refptr(this), old_value](auto) {
+      self->DetachToCurrentValue();
+    });
   }
 
-  CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const override {
-    return writer->WriteSingleEntry(attr, prototype_->name(), value());
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override {
+    if (prototype_->level() < opts.level) {
+      return Status::OK();
+    }
+
+    return writer->WriteSingleEntry(attr, prototype_->name(), value(),
+                                    prototype()->aggregation_function(),
+                                    aggregation_levels,
+                                    MetricType::PrometheusType(prototype_->type()),
+                                    prototype_->description());
   }
 
  private:
@@ -1093,7 +883,7 @@ class CounterPrototype : public MetricPrototype {
   explicit CounterPrototype(const MetricPrototype::CtorArgs& args)
     : MetricPrototype(args) {
   }
-  scoped_refptr<Counter> Instantiate(const scoped_refptr<MetricEntity>& entity);
+  scoped_refptr<Counter> Instantiate(const scoped_refptr<MetricEntity>& entity) const;
 
   virtual MetricType::Type type() const override { return MetricType::kCounter; }
 
@@ -1112,11 +902,14 @@ class Counter : public Metric {
   int64_t value() const;
   void Increment();
   void IncrementBy(int64_t amount);
-  virtual CHECKED_STATUS WriteAsJson(JsonWriter* w,
+  virtual Status WriteAsJson(JsonWriter* w,
                              const MetricJsonOptions& opts) const override;
 
-  CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const override;
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override;
 
  private:
   FRIEND_TEST(MetricsTest, SimpleCounterTest);
@@ -1124,22 +917,114 @@ class Counter : public Metric {
   friend class MetricEntity;
 
   explicit Counter(const CounterPrototype* proto);
+  explicit Counter(std::unique_ptr<CounterPrototype> proto);
 
   LongAdder value_;
   DISALLOW_COPY_AND_ASSIGN(Counter);
 };
 
-inline void IncrementCounter(const scoped_refptr<Counter>& counter) {
+using CounterPtr = scoped_refptr<Counter>;
+
+class MillisLagPrototype : public MetricPrototype {
+ public:
+  explicit MillisLagPrototype(const MetricPrototype::CtorArgs& args) : MetricPrototype(args) {
+  }
+  scoped_refptr<MillisLag> Instantiate(const scoped_refptr<MetricEntity>& entity) const;
+
+  virtual MetricType::Type type() const override { return MetricType::kLag; }
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(MillisLagPrototype);
+};
+
+// Metric used to calculate the lag of a specific metric.
+// The metric is in charge of updating the metric timestamp, and this method
+// will be in charge of calculating the lag by doing now() - metric_timestamp_.
+class MillisLag : public Metric {
+ public:
+  virtual int64_t lag_ms() const {
+    return std::max(static_cast<int64_t>(0),
+        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()) - timestamp_ms_);
+  }
+  virtual void UpdateTimestampInMilliseconds(int64_t timestamp) {
+    timestamp_ms_ = timestamp;
+  }
+  virtual Status WriteAsJson(JsonWriter* w,
+      const MetricJsonOptions& opts) const override;
+  virtual Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override;
+
+ private:
+  friend class MetricEntity;
+  friend class AtomicMillisLag;
+  friend class MetricsTest;
+
+  explicit MillisLag(const MillisLagPrototype* proto);
+
+  int64_t timestamp_ms_;
+};
+
+class AtomicMillisLag : public MillisLag {
+ public:
+  explicit AtomicMillisLag(const MillisLagPrototype* proto);
+
+  int64_t lag_ms() const override {
+    return std::max(static_cast<int64_t>(0),
+        static_cast<int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count()) -
+                atomic_timestamp_ms_.load(std::memory_order_acquire));
+  }
+
+  void UpdateTimestampInMilliseconds(int64_t timestamp) override {
+    atomic_timestamp_ms_.store(timestamp, std::memory_order_release);
+  }
+
+  Status WriteAsJson(JsonWriter* w,
+                     const MetricJsonOptions& opts) const override;
+
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override {
+    if (prototype_->level() < opts.level) {
+      return Status::OK();
+    }
+
+    return writer->WriteSingleEntry(attr, prototype_->name(), this->lag_ms(),
+                                    prototype()->aggregation_function(),
+                                    aggregation_levels,
+                                    MetricType::PrometheusType(prototype_->type()),
+                                    prototype_->description());
+  }
+
+ protected:
+  std::atomic<int64_t> atomic_timestamp_ms_;
+ private:
+  DISALLOW_COPY_AND_ASSIGN(AtomicMillisLag);
+};
+
+inline void IncrementCounter(const CounterPtr& counter) {
   if (counter) {
     counter->Increment();
+  }
+}
+
+inline void IncrementCounterBy(const CounterPtr& counter, int64_t amount) {
+  if (counter) {
+    counter->IncrementBy(amount);
   }
 }
 
 class HistogramPrototype : public MetricPrototype {
  public:
   HistogramPrototype(const MetricPrototype::CtorArgs& args,
-                     uint64_t max_trackable_value, int num_sig_digits);
-  scoped_refptr<Histogram> Instantiate(const scoped_refptr<MetricEntity>& entity);
+                     uint64_t max_trackable_value = 1, int num_sig_digits = 0);
+  scoped_refptr<Histogram> Instantiate(const scoped_refptr<MetricEntity>& entity) const;
 
   uint64_t max_trackable_value() const { return max_trackable_value_; }
   int num_sig_digits() const { return num_sig_digits_; }
@@ -1151,58 +1036,161 @@ class HistogramPrototype : public MetricPrototype {
   DISALLOW_COPY_AND_ASSIGN(HistogramPrototype);
 };
 
-class Histogram : public Metric {
+class EventStatsPrototype : public MetricPrototype {
+ public:
+  explicit EventStatsPrototype(const MetricPrototype::CtorArgs& args);
+  scoped_refptr<EventStats> Instantiate(const scoped_refptr<MetricEntity>& entity) const;
+
+  virtual MetricType::Type type() const override { return MetricType::kEventStats; }
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(EventStatsPrototype);
+};
+
+template<typename Stats>
+class BaseStats : public Metric {
  public:
   // Increment the histogram for the given value.
   // 'value' must be non-negative.
-  void Increment(int64_t value);
+  void Increment(int64_t value) {
+    static_cast<Stats*>(this)->mutable_underlying()->Increment(value);
+  }
 
   // Increment the histogram for the given value by the given amount.
   // 'value' and 'amount' must be non-negative.
-  void IncrementBy(int64_t value, int64_t amount);
+  void IncrementBy(int64_t value, int64_t amount) {
+    static_cast<Stats*>(this)->mutable_underlying()->IncrementBy(value, amount);
+  }
 
   // Return the total number of values added to the histogram (via Increment()
   // or IncrementBy()).
-  uint64_t TotalCount() const;
+  uint64_t TotalCount() const {
+    return static_cast<const Stats*>(this)->underlying()->TotalCount();
+  }
 
-  virtual CHECKED_STATUS WriteAsJson(JsonWriter* w,
-                             const MetricJsonOptions& opts) const override;
+  // Return the total sum of values added to the histogram (via Increment()
+  // or IncrementBy()).
+  uint64_t TotalSum() const {
+    return static_cast<const Stats*>(this)->underlying()->TotalSum();
+  }
 
-  CHECKED_STATUS WriteForPrometheus(
-      PrometheusWriter* writer, const MetricEntity::AttributeMap& attr) const override;
+  uint64_t MinValue() const {
+    return static_cast<const Stats*>(this)->underlying()->MinValue();
+  }
+  uint64_t MaxValue() const {
+    return static_cast<const Stats*>(this)->underlying()->MaxValue();
+  }
+  double MeanValue() const {
+    return static_cast<const Stats*>(this)->underlying()->MeanValue();
+  }
 
-  // Returns a snapshot of this histogram including the bucketed values and counts.
-  CHECKED_STATUS GetHistogramSnapshotPB(HistogramSnapshotPB* snapshot,
-                                const MetricJsonOptions& opts) const;
+  void Reset() const;
 
+  Status WriteAsJson(
+      JsonWriter* w, const MetricJsonOptions& opts) const override;
+
+  Status WriteForPrometheus(
+      PrometheusWriter* writer,
+      const MetricEntity::AttributeMap& attr,
+      const MetricPrometheusOptions& opts,
+      const AggregationLevels aggregation_levels) const override;
+
+ protected:
+  explicit BaseStats(const MetricPrototype* proto): Metric(proto) {}
+  explicit BaseStats(std::unique_ptr<MetricPrototype> proto): Metric(std::move(proto)) {}
+
+  // Returns a snapshot of this histogram.
+  // Resets mean/min/max, but not the total count/sum.
+  Status GetAndResetHistogramSnapshotPB(HistogramSnapshotPB* snapshot,
+                                        const MetricJsonOptions& opts) const;
+
+ private:
+  DISALLOW_COPY_AND_ASSIGN(BaseStats);
+};
+
+class Histogram : public BaseStats<Histogram> {
+ public:
   uint64_t CountInBucketForValueForTests(uint64_t value) const;
-  uint64_t MinValueForTests() const;
-  uint64_t MaxValueForTests() const;
-  double MeanValueForTests() const;
+
+  // Returns a pointer to the underlying histogram. The implementation of HdrHistogram
+  // is thread safe.
+  const HdrHistogram* underlying() const { return histogram_.get(); }
+
+  size_t DynamicMemoryUsage() const { return histogram_->DynamicMemoryUsage() + sizeof(*this); }
+
+ protected:
+  HdrHistogram* mutable_underlying() { return histogram_.get(); }
+
+  Status WritePercentilesForPrometheus(
+      PrometheusWriter* writer,
+      MetricEntity::AttributeMap attr,
+      const AggregationLevels aggregation_levels) const;
+
+  // Returns a snapshot of this histogram.
+  // Resets mean/min/max, but not the total count/sum.
+  Status GetAndResetHistogramSnapshotPB(HistogramSnapshotPB* snapshot,
+                                        const MetricJsonOptions& opts) const;
 
  private:
   FRIEND_TEST(MetricsTest, SimpleHistogramTest);
+  FRIEND_TEST(MetricsTest, ResetHistogramTest);
+  friend class BaseStats<Histogram>;
   friend class MetricEntity;
   explicit Histogram(const HistogramPrototype* proto);
+  explicit Histogram(std::unique_ptr<HistogramPrototype> proto);
 
-  const gscoped_ptr<HdrHistogram> histogram_;
+  const std::unique_ptr<HdrHistogram> histogram_;
   DISALLOW_COPY_AND_ASSIGN(Histogram);
 };
 
-inline void IncrementHistogram(const scoped_refptr<Histogram>& histogram, int64_t value) {
-  if (histogram) {
-    histogram->Increment(value);
+using HistogramPtr = scoped_refptr<Histogram>;
+
+class EventStats : public BaseStats<EventStats> {
+ public:
+  const AggregateStats* underlying() const { return stats_.get(); }
+
+  void Add(const AggregateStats& other) { stats_->Add(other); }
+
+  size_t DynamicMemoryUsage() const { return stats_->DynamicMemoryUsage() + sizeof(*this); }
+
+ protected:
+  AggregateStats* mutable_underlying() { return stats_.get(); }
+
+  Status WritePercentilesForPrometheus(
+      PrometheusWriter* writer,
+      MetricEntity::AttributeMap attr,
+      const AggregationLevels aggregation_levels) const;
+
+ private:
+  FRIEND_TEST(MetricsTest, SimpleEventStatsTest);
+  FRIEND_TEST(MetricsTest, ResetEventStatsTest);
+  friend class BaseStats<EventStats>;
+  friend class MetricEntity;
+  explicit EventStats(const EventStatsPrototype* proto);
+  explicit EventStats(std::unique_ptr<EventStatsPrototype> proto);
+
+  const std::unique_ptr<AggregateStats> stats_;
+  DISALLOW_COPY_AND_ASSIGN(EventStats);
+};
+
+using EventStatsPtr = scoped_refptr<EventStats>;
+
+template<typename Stats>
+inline void IncrementStats(const scoped_refptr<Stats>& stats, int64_t value) {
+  if (stats) {
+    stats->Increment(value);
   }
 }
 
 YB_STRONGLY_TYPED_BOOL(Auto);
 
 // Measures a duration while in scope. Adds this duration to specified histogram on destruction.
+template<typename Stats>
 class ScopedLatencyMetric {
  public:
   // If 'latency_hist' is NULL, this turns into a no-op.
   // automatic - automatically update histogram when object is destroyed.
-  explicit ScopedLatencyMetric(const scoped_refptr<Histogram>& latency_hist,
+  explicit ScopedLatencyMetric(const scoped_refptr<Stats>& latency_stats,
                                Auto automatic = Auto::kTrue);
 
   ScopedLatencyMetric(ScopedLatencyMetric&& rhs);
@@ -1217,7 +1205,7 @@ class ScopedLatencyMetric {
   void Finish();
 
  private:
-  scoped_refptr<Histogram> latency_hist_;
+  scoped_refptr<Stats> latency_stats_;
   MonoTime time_started_;
   Auto auto_;
 };
@@ -1226,91 +1214,36 @@ class ScopedLatencyMetric {
 // Inline implementations of template methods
 ////////////////////////////////////////////////////////////
 
-inline scoped_refptr<Counter> MetricEntity::FindOrCreateCounter(
-    const CounterPrototype* proto) {
-  CheckInstantiation(proto);
-  std::lock_guard<simple_spinlock> l(lock_);
-  scoped_refptr<Counter> m = down_cast<Counter*>(FindPtrOrNull(metric_map_, proto).get());
-  if (!m) {
-    m = new Counter(proto);
-    InsertOrDie(&metric_map_, proto, m);
-  }
-  return m;
-}
-
-inline scoped_refptr<Histogram> MetricEntity::FindOrCreateHistogram(
-    const HistogramPrototype* proto) {
-  CheckInstantiation(proto);
-  std::lock_guard<simple_spinlock> l(lock_);
-  scoped_refptr<Histogram> m = down_cast<Histogram*>(FindPtrOrNull(metric_map_, proto).get());
-  if (!m) {
-    m = new Histogram(proto);
-    InsertOrDie(&metric_map_, proto, m);
-  }
-  return m;
-}
-
-template<typename T>
-inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
-    const GaugePrototype<T>* proto,
-    const T& initial_value) {
-  CheckInstantiation(proto);
-  std::lock_guard<simple_spinlock> l(lock_);
-  scoped_refptr<AtomicGauge<T> > m = down_cast<AtomicGauge<T>*>(
-      FindPtrOrNull(metric_map_, proto).get());
-  if (!m) {
-    m = new AtomicGauge<T>(proto, initial_value);
-    InsertOrDie(&metric_map_, proto, m);
-  }
-  return m;
-}
-
-template<typename T>
-inline scoped_refptr<AtomicGauge<T> > MetricEntity::FindOrCreateGauge(
-    std::unique_ptr<GaugePrototype<T>> proto,
-    const T& initial_value) {
-  CheckInstantiation(proto.get());
-  std::lock_guard<simple_spinlock> l(lock_);
-  auto m = down_cast<AtomicGauge<T>*>(FindPtrOrNull(metric_map_, proto.get()).get());
-  if (!m) {
-    m = new AtomicGauge<T>(std::move(proto), initial_value);
-    InsertOrDie(&metric_map_, m->prototype(), m);
-  }
-  return m;
-}
-
-template<typename T>
-inline scoped_refptr<FunctionGauge<T> > MetricEntity::FindOrCreateFunctionGauge(
-    const GaugePrototype<T>* proto,
-    const Callback<T()>& function) {
-  CheckInstantiation(proto);
-  std::lock_guard<simple_spinlock> l(lock_);
-  scoped_refptr<FunctionGauge<T> > m = down_cast<FunctionGauge<T>*>(
-      FindPtrOrNull(metric_map_, proto).get());
-  if (!m) {
-    m = new FunctionGauge<T>(proto, function);
-    InsertOrDie(&metric_map_, proto, m);
-  }
-  return m;
-}
-
-struct OwningMetricCtorArgs {
+class OwningMetricCtorArgs {
+ public:
   OwningMetricCtorArgs(
-      std::string entity_type_,
-      std::string name_,
-      std::string label_,
-      MetricUnit::Type unit_,
-      std::string description_,
-      uint32_t flags_ = 0)
-    : entity_type(std::move(entity_type_)), name(std::move(name_)), label(std::move(label_)),
-      unit(unit_), description(std::move(description_)), flags(flags_) {}
+      std::string entity_type,
+      std::string name,
+      std::string label,
+      MetricUnit::Type unit,
+      std::string description,
+      MetricLevel level,
+      uint32_t flags = 0)
+    : entity_type_(std::move(entity_type)), name_(std::move(name)), label_(std::move(label)),
+      unit_(unit), description_(std::move(description)), level_(std::move(level)), flags_(flags) {}
+ protected:
+  std::string entity_type_;
+  std::string name_;
+  std::string label_;
+  MetricUnit::Type unit_;
+  std::string description_;
+  MetricLevel level_;
+  uint32_t flags_;
+};
 
-  std::string entity_type;
-  std::string name;
-  std::string label;
-  MetricUnit::Type unit;
-  std::string description;
-  uint32_t flags;
+class OwningCounterPrototype : public OwningMetricCtorArgs, public CounterPrototype {
+ public:
+  template <class... Args>
+  explicit OwningCounterPrototype(Args&&... args)
+      : OwningMetricCtorArgs(std::forward<Args>(args)...),
+        CounterPrototype(MetricPrototype::CtorArgs(
+            entity_type_.c_str(), name_.c_str(), label_.c_str(), unit_, description_.c_str(),
+            level_, flags_)) {}
 };
 
 template <class T>
@@ -1320,11 +1253,31 @@ class OwningGaugePrototype : public OwningMetricCtorArgs, public GaugePrototype<
   explicit OwningGaugePrototype(Args&&... args)
       : OwningMetricCtorArgs(std::forward<Args>(args)...),
         GaugePrototype<T>(MetricPrototype::CtorArgs(
-            OwningMetricCtorArgs::entity_type.c_str(), OwningMetricCtorArgs::name.c_str(),
-            OwningMetricCtorArgs::label.c_str(), unit, OwningMetricCtorArgs::description.c_str(),
-            flags)) {}
+            entity_type_.c_str(), name_.c_str(), label_.c_str(), unit_, description_.c_str(),
+            level_, flags_)) {}
 };
 
-} // namespace yb
+class OwningHistogramPrototype : public OwningMetricCtorArgs, public HistogramPrototype {
+ public:
+  template <class... Args>
+  explicit OwningHistogramPrototype(const std::string& entity_type,
+                                    const std::string& name,
+                                    const std::string& label,
+                                    MetricUnit::Type unit,
+                                    const std::string& description,
+                                    MetricLevel level,
+                                    uint32_t flags,
+                                    uint64_t max_trackable_value,
+                                    int num_sig_digits)
+      : OwningMetricCtorArgs(entity_type, name, label, unit, description, level, flags),
+        HistogramPrototype(MetricPrototype::CtorArgs(
+            OwningMetricCtorArgs::entity_type_.c_str(), OwningMetricCtorArgs::name_.c_str(),
+            OwningMetricCtorArgs::label_.c_str(), OwningMetricCtorArgs::unit_,
+            OwningMetricCtorArgs::description_.c_str(), OwningMetricCtorArgs::level_, flags_),
+                           max_trackable_value, num_sig_digits) {}
+};
 
-#endif // YB_UTIL_METRICS_H
+// Replace specific chars with underscore to pass PrometheusNameRegex().
+void EscapeMetricNameForPrometheus(std::string *id);
+
+} // namespace yb

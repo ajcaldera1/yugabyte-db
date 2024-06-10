@@ -148,6 +148,7 @@ AutoVacuumShmemStruct
 AutoVacuumWorkItem
 AutoVacuumWorkItemType
 AuxProcType
+BackfillIndexStmt
 BF_ctx
 BF_key
 BF_word
@@ -437,6 +438,7 @@ CreateStmt
 CreateStmtContext
 CreateSubscriptionStmt
 CreateTableAsStmt
+CreateTableGroupStmt
 CreateTableSpaceStmt
 CreateTransformStmt
 CreateTrigStmt
@@ -716,6 +718,7 @@ FormData_pg_statistic
 FormData_pg_statistic_ext
 FormData_pg_subscription
 FormData_pg_subscription_rel
+FormData_pg_tablegroup
 FormData_pg_tablespace
 FormData_pg_transform
 FormData_pg_trigger
@@ -726,6 +729,9 @@ FormData_pg_ts_parser
 FormData_pg_ts_template
 FormData_pg_type
 FormData_pg_user_mapping
+FormData_pg_yb_tablegroup
+FormData_pg_yb_profile
+FormData_pg_yb_role_profile
 Form_pg_aggregate
 Form_pg_am
 Form_pg_amop
@@ -773,6 +779,7 @@ Form_pg_statistic
 Form_pg_statistic_ext
 Form_pg_subscription
 Form_pg_subscription_rel
+Form_pg_tablegroup
 Form_pg_tablespace
 Form_pg_transform
 Form_pg_trigger
@@ -783,6 +790,9 @@ Form_pg_ts_parser
 Form_pg_ts_template
 Form_pg_type
 Form_pg_user_mapping
+Form_pg_yb_tablegroup
+Form_pg_yb_profile
+Form_pg_yb_role_profile
 FormatNode
 FreeBlockNumberArray
 FreeListData
@@ -865,6 +875,7 @@ GinBtreeEntryInsertData
 GinBtreeStack
 GinBuildState
 GinChkVal
+GinEntries
 GinEntryAccumulator
 GinIndexStat
 GinMetaPageData
@@ -913,6 +924,8 @@ GucEnumAssignHook
 GucEnumCheckHook
 GucIntAssignHook
 GucIntCheckHook
+GucOidAssignHook
+GucOidCheckHook
 GucRealAssignHook
 GucRealCheckHook
 GucShowHook
@@ -1094,14 +1107,34 @@ JoinType
 JsObject
 JsValue
 JsonAggState
+JsonBaseObjectInfo
 JsonHashEntry
 JsonIterateStringValuesAction
 JsonLexContext
+JsonLikeRegexContext
 JsonParseContext
+JsonPath
+JsonPathBool
+JsonPathExecContext
+JsonPathExecResult
+JsonPathGinAddPathItemFunc
+JsonPathGinContext
+JsonPathGinExtractNodesFunc
+JsonPathGinNode
+JsonPathGinNodeType
+JsonPathGinPath
+JsonPathGinPathItem
+JsonPathItem
+JsonPathItemType
+JsonPathParseItem
+JsonPathParseResult
+JsonPathPredicateCallback
 JsonSemAction
 JsonTokenType
 JsonTransformStringValuesAction
 JsonTypeCategory
+JsonValueList
+JsonValueListIterator
 Jsonb
 JsonbAggState
 JsonbContainer
@@ -1132,6 +1165,7 @@ LLVMJitHandle
 LLVMMemoryBufferRef
 LLVMModuleRef
 LLVMOrcJITStackRef
+LLVMOrcLookupStateRef
 LLVMOrcModuleHandle
 LLVMOrcTargetAddress
 LLVMPassManagerBuilderRef
@@ -2001,6 +2035,7 @@ RoleSpec
 RoleSpecType
 RoleStmtType
 RollupData
+RowBounds
 RowCompareExpr
 RowCompareType
 RowExpr
@@ -2609,6 +2644,7 @@ XmlTableBuilderData
 YYLTYPE
 YYSTYPE
 YY_BUFFER_STATE
+YbCreateProfileStmt
 ZipfCache
 ZipfCell
 _SPI_connection

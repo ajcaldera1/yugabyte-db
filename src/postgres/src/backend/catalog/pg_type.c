@@ -35,6 +35,8 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes. */
+#include "catalog/catalog.h"
 #include "pg_yb_utils.h"
 
 /* Potentially set by pg_upgrade_support functions */
@@ -129,7 +131,7 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 	tup = heap_form_tuple(tupDesc, values, nulls);
 
 	/* Use binary-upgrade override for pg_type.oid? */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade || yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_pg_type_oid))
 			ereport(ERROR,
@@ -156,7 +158,9 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
 								 0,
 								 false,
 								 false,
-								 false);
+								 false,
+								 false, /* ybRelationIsSystem */
+								 false /* ybRelationIsShared */);
 
 	/* Post creation hook for new shell type */
 	InvokeObjectPostCreateHook(TypeRelationId, typoid, 0);
@@ -180,6 +184,11 @@ TypeShellMake(const char *typeName, Oid typeNamespace, Oid ownerId)
  *		Returns the ObjectAddress assigned to the new type.
  *		If newTypeOid is zero (the normal case), a new OID is created;
  *		otherwise we use exactly that OID.
+ *
+ *		YB NOTE:
+ *		If ybRelationIsShared is specified, pg_type entry will be
+ *		created for ALL databases. newTypeOid should be free in
+ *		all of them.
  * ----------------------------------------------------------------
  */
 ObjectAddress
@@ -213,7 +222,8 @@ TypeCreate(Oid newTypeOid,
 		   int32 typeMod,
 		   int32 typNDims,		/* Array dimensions for baseType */
 		   bool typeNotNull,
-		   Oid typeCollation)
+		   Oid typeCollation,
+		   bool ybRelationIsShared	/* only for relation rowtypes */)
 {
 	Relation	pg_type_desc;
 	Oid			typeObjectId;
@@ -227,6 +237,9 @@ TypeCreate(Oid newTypeOid,
 	NameData	name;
 	int			i;
 	ObjectAddress address;
+
+	bool		isSystem = IsSystemNamespace(typeNamespace);
+	bool		ybSharedInsert = ybRelationIsShared && !IsBootstrapProcessingMode();
 
 	/*
 	 * We assume that the caller validated the arguments individually, but did
@@ -404,20 +417,9 @@ TypeCreate(Oid newTypeOid,
 	 */
 	pg_type_desc = heap_open(TypeRelationId, RowExclusiveLock);
 
-
-	/*
-	 * We do not support updates in YugaByte as of 12/14/2018 so we will error
-	 * out later if type already exists. No need to waste a master-lookup here.
-	 * TODO Will need to re-enable this when we support shell types.
-	 */
-	tup = NULL;
-	if (!IsYugaByteEnabled())
-	{
-		tup = SearchSysCacheCopy2(TYPENAMENSP,
-		                          CStringGetDatum(typeName),
-		                          ObjectIdGetDatum(typeNamespace));
-	}
-
+	tup = SearchSysCacheCopy2(TYPENAMENSP,
+							  CStringGetDatum(typeName),
+							  ObjectIdGetDatum(typeNamespace));
 	if (HeapTupleIsValid(tup))
 	{
 		/*
@@ -463,8 +465,16 @@ TypeCreate(Oid newTypeOid,
 		/* Force the OID if requested by caller */
 		if (OidIsValid(newTypeOid))
 			HeapTupleSetOid(tup, newTypeOid);
+
+		/*
+		 * This is already checked by transformCreateStmt for system relations,
+		 * but just in case.
+		 */
+		else if (ybRelationIsShared && IsYsqlUpgrade)
+			elog(ERROR, "shared relations must have an explicit type OID");
+
 		/* Use binary-upgrade override for pg_type.oid, if supplied. */
-		else if (IsBinaryUpgrade)
+		else if (IsBinaryUpgrade || yb_binary_restore)
 		{
 			if (!OidIsValid(binary_upgrade_next_pg_type_oid))
 				ereport(ERROR,
@@ -474,9 +484,30 @@ TypeCreate(Oid newTypeOid,
 			HeapTupleSetOid(tup, binary_upgrade_next_pg_type_oid);
 			binary_upgrade_next_pg_type_oid = InvalidOid;
 		}
+		else if (IsYsqlUpgrade && isSystem && relationKind != RELKIND_VIEW)
+		{
+			/*
+			 * Views in yb_system_views.sql don't define their oids, we
+			 * auto-assign them.
+			 *
+			 * Also, there's actually a bunch of system relations without
+			 * explicit type OIDs created by initdb - e.g.
+			 * pg_attrdef (non-shared, gets typoid=10000) or
+			 * pg_db_role_setting (shared, gets typoid=11555).
+			 * For now though we hope that any future system relations won't
+			 * be like that - YB relations certainly shouldn't be.
+			 */
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
+					 errmsg("system relations must have an explicit type OID!")));
+		}
 		/* else allow system to assign oid */
 
-		typeObjectId = CatalogTupleInsert(pg_type_desc, tup);
+		/*
+		 * pg_type has PK(oid), so if row type OID for the shared relation
+		 * is taken in any DB, this step will fail gracefully.
+		 */
+		typeObjectId = YBCatalogTupleInsert(pg_type_desc, tup, ybSharedInsert);
 	}
 
 	/*
@@ -492,7 +523,9 @@ TypeCreate(Oid newTypeOid,
 								 relationKind,
 								 isImplicitArray,
 								 isDependentType,
-								 rebuildDeps);
+								 rebuildDeps,
+								 isSystem,
+								 ybSharedInsert);
 
 	/* Post creation hook for new type */
 	InvokeObjectPostCreateHook(TypeRelationId, typeObjectId, 0);
@@ -524,10 +557,9 @@ TypeCreate(Oid newTypeOid,
  * If rebuild is true, we remove existing dependencies and rebuild them
  * from scratch.  This is needed for ALTER TYPE, and also when replacing
  * a shell type.  We don't remove an existing extension dependency, though.
- * (That means an extension can't absorb a shell type created in another
- * extension, nor ALTER a type created by another extension.  Also, if it
- * replaces a free-standing shell type or ALTERs a free-standing type,
- * that type will become a member of the extension.)
+ * That means an extension can't absorb a shell type that is free-standing
+ * or belongs to another extension, nor ALTER a type that is free-standing or
+ * belongs to another extension.
  */
 void
 GenerateTypeDependencies(Oid typeObjectId,
@@ -537,7 +569,9 @@ GenerateTypeDependencies(Oid typeObjectId,
 						 char relationKind, /* only for relation rowtypes */
 						 bool isImplicitArray,
 						 bool isDependentType,
-						 bool rebuild)
+						 bool rebuild,
+						 bool ybRelationIsSystem,
+						 bool ybRelationIsShared)
 {
 	ObjectAddress myself,
 				referenced;
@@ -552,6 +586,19 @@ GenerateTypeDependencies(Oid typeObjectId,
 	myself.classId = TypeRelationId;
 	myself.objectId = typeObjectId;
 	myself.objectSubId = 0;
+
+	/*
+	 * For non-view system relations during YSQL upgrade, we only need to
+	 * record a pin dependency, nothing else.
+	 */
+	if (IsYsqlUpgrade && ybRelationIsSystem && relationKind != RELKIND_VIEW)
+	{
+		if (rebuild)
+			elog(ERROR, "cannot rebuild dependencies for a system relation rowtype");
+
+		YbRecordPinDependency(&myself, ybRelationIsShared);
+		return;
+	}
 
 	/*
 	 * Make dependencies on namespace, owner, ACL, extension.

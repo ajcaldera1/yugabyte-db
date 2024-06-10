@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_DEBUG_LEAKCHECK_DISABLER_H_
-#define YB_UTIL_DEBUG_LEAKCHECK_DISABLER_H_
+#pragma once
 
 #include "yb/gutil/macros.h"
 #include "yb/util/debug/leak_annotations.h"
@@ -45,12 +44,7 @@ class ScopedLeakCheckDisabler {
   ScopedLeakCheckDisabler() {}
 
  private:
-
-#if defined(__has_feature)
-#  if __has_feature(address_sanitizer)
   ScopedLSANDisabler lsan_disabler;
-#  endif
-#endif
 
   DISALLOW_COPY_AND_ASSIGN(ScopedLeakCheckDisabler);
 };
@@ -64,7 +58,14 @@ class ScopedLeakCheckDisabler {
 #define DISABLE_ASAN
 #endif
 
+#if defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define DISABLE_UBSAN __attribute__((no_sanitize("undefined")))
+  #endif
+#endif
+#ifndef DISABLE_UBSAN
+#define DISABLE_UBSAN
+#endif
+
 } // namespace debug
 } // namespace yb
-
-#endif // YB_UTIL_DEBUG_LEAKCHECK_DISABLER_H_

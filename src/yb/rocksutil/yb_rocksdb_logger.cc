@@ -11,9 +11,11 @@
 // under the License.
 //
 
-#include <glog/logging.h>
-
 #include "yb/rocksutil/yb_rocksdb_logger.h"
+
+#include <stdarg.h>
+
+#include "yb/util/logging.h"
 
 using rocksdb::InfoLogLevel;
 

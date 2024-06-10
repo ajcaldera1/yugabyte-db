@@ -21,7 +21,7 @@ SUBDIRS = access bootstrap catalog parser commands executor foreign lib libpq \
 	main nodes optimizer partitioning port postmaster \
 	regex replication rewrite \
 	statistics storage tcop tsearch utils $(top_builddir)/src/timezone \
-	jit
+	jit ybgate
 
 include $(srcdir)/common.mk
 
@@ -54,14 +54,45 @@ endif
 ifndef YB_BUILD_ROOT
 $(error YB_BUILD_ROOT is not set)
 endif
-
-LIBS += -L$(YB_BUILD_ROOT)/lib -lyb_util -lyb_pggate
+# Do not append $(YB_PG_EXE_LD_FLAGS_AFTER_YB_LIBS) here. We will append it
+# later, after initializing SHLIB_LINK.
+LIBS += -L$(YB_BUILD_ROOT)/lib -lyb_util -lyb_pggate -lyb_pggate_util
 
 CCLD = $(CXX)
 
+# Shared library configuration (see Makefile_ybpostgres.shlib -- included below)
+PGFILEDESC = "Postgres shared library"
+NAME = yb_pgbackend
+YB_SO_MAJOR_VERSION= 1
+YB_SO_MINOR_VERSION= $(MAJORVERSION)
+
+# Use := for immediate variable expansion. Further changes to $(LIBS) must not affect
+# $(SHLIB_LINK).
+SHLIB_LINK := $(LIBS)
+
+# YB_PG_EXE_LD_FLAGS_AFTER_YB_LIBS should only be used for linking executables.
+LIBS += $(YB_PG_EXE_LD_FLAGS_AFTER_YB_LIBS)
+
+SHLIB_EXPORTS = exports.txt
+
+.NOTPARALLEL:
+
 ##########################################################################
 
-all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP)
+exports.txt: exports-common.txt exports-test.txt
+	cat exports-common.txt > $@
+ifneq ($(YB_DO_NOT_BUILD_TESTS), 1)
+	cat exports-test.txt >> $@
+endif
+
+all: submake-libpgport submake-catalog-headers submake-utils-headers postgres $(POSTGRES_IMP) all-lib
+
+# Shared-library target all-lib.
+# Depends on postgres build, and Makefile_ybpostgres.shlib will add the other
+# deps (e.g. all-shared-lib and/or all-static-lib).
+all-lib: postgres all-lib exports.txt
+include $(top_srcdir)/src/Makefile_ybpostgres.shlib
+
 
 ifneq ($(PORTNAME), cygwin)
 ifneq ($(PORTNAME), win32)
@@ -179,7 +210,6 @@ $(top_builddir)/src/include/storage/lwlocknames.h: storage/lmgr/lwlocknames.h
 	  cd '$(dir $@)' && rm -f $(notdir $@) && \
 	  $(LN_S) "$$prereqdir/$(notdir $<)" .
 
-
 utils/probes.o: utils/probes.d $(SUBDIROBJS)
 	$(DTRACE) $(DTRACEFLAGS) -C -G -s $(call expand_subsys,$^) -o $@
 
@@ -194,13 +224,14 @@ distprep:
 	$(MAKE) -C replication	repl_gram.c repl_scanner.c syncrep_gram.c syncrep_scanner.c
 	$(MAKE) -C storage/lmgr	lwlocknames.h lwlocknames.c
 	$(MAKE) -C utils	distprep
+	$(MAKE) -C utils/adt	jsonpath_gram.c jsonpath_scan.c
 	$(MAKE) -C utils/misc	guc-file.c
 	$(MAKE) -C utils/sort	qsort_tuple.c
 
 
 ##########################################################################
 
-install: all installdirs install-bin
+install: all installdirs install-bin install-lib
 ifeq ($(PORTNAME), cygwin)
 ifeq ($(MAKE_DLL), true)
 	$(INSTALL_DATA) libpostgres.a '$(DESTDIR)$(libdir)/libpostgres.a'
@@ -317,6 +348,8 @@ maintainer-clean: distclean
 	      replication/syncrep_scanner.c \
 	      storage/lmgr/lwlocknames.c \
 	      storage/lmgr/lwlocknames.h \
+	      utils/adt/jsonpath_gram.c \
+	      utils/adt/jsonpath_scan.c \
 	      utils/misc/guc-file.c \
 	      utils/sort/qsort_tuple.c
 

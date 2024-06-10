@@ -29,18 +29,13 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_RW_SEMAPHORE_H
-#define YB_UTIL_RW_SEMAPHORE_H
+#pragma once
 
 #include <boost/smart_ptr/detail/yield_k.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/atomicops.h"
-#include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
-#include "yb/util/debug-util.h"
-
-#include "yb/util/thread.h"
 
 namespace yb {
 
@@ -65,9 +60,11 @@ namespace yb {
 // ... and then in gdb, print the contents of the semaphore, and you should
 // see the collected stack trace.
 class rw_semaphore {
+#ifndef NDEBUG
+  static constexpr int64_t kInvalidThreadId = -1;
+#endif
  public:
-  rw_semaphore() : state_(0) {
-  }
+  rw_semaphore() : state_(0) {}
   ~rw_semaphore() {}
 
   void lock_shared() {
@@ -142,7 +139,7 @@ class rw_semaphore {
     WaitPendingReaders();
 
 #ifndef NDEBUG
-    writer_tid_ = Thread::CurrentThreadId();
+    AssignWriterTid();
 #endif // NDEBUG
     RecordLockHolderStack();
   }
@@ -152,7 +149,7 @@ class rw_semaphore {
     DCHECK_EQ(base::subtle::NoBarrier_Load(&state_), kWriteFlag);
 
 #ifndef NDEBUG
-    writer_tid_ = -1; // Invalid tid.
+    writer_tid_ = kInvalidThreadId; // Invalid tid.
 #endif // NDEBUG
 
     ResetLockHolderStack();
@@ -202,9 +199,10 @@ class rw_semaphore {
  private:
   volatile Atomic32 state_;
 #ifndef NDEBUG
-  int64_t writer_tid_;
+  void AssignWriterTid();
+
+  int64_t writer_tid_ = kInvalidThreadId;
 #endif // NDEBUG
 };
 
 } // namespace yb
-#endif /* YB_UTIL_RW_SEMAPHORE_H */

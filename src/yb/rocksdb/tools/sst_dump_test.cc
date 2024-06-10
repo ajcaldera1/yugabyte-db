@@ -21,18 +21,21 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_LITE
 
 #include <stdint.h>
-#include "yb/rocksdb/sst_dump_tool.h"
 
+#include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/filter_policy.h"
+#include "yb/rocksdb/sst_dump_tool.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/table/table_builder.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/test_util.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
@@ -67,7 +70,7 @@ void createSST(const std::string& base_file_name,
   auto ikc = std::make_shared<rocksdb::InternalKeyComparator>(opts.comparator);
   unique_ptr<TableBuilder> tb;
 
-  env->NewWritableFile(base_file_name, &base_file, env_options);
+  ASSERT_OK(env->NewWritableFile(base_file_name, &base_file, env_options));
   opts.table_factory = tf;
   std::vector<std::unique_ptr<IntTblPropCollectorFactory> >
       int_tbl_prop_collector_factories;
@@ -76,10 +79,11 @@ void createSST(const std::string& base_file_name,
   unique_ptr<WritableFileWriter> data_file_writer;
   if (opts.table_factory->IsSplitSstForWriteSupported()) {
     unique_ptr<WritableFile> data_file;
-    env->NewWritableFile(TableBaseToDataFileName(base_file_name), &data_file, env_options);
+    ASSERT_OK(env->NewWritableFile(
+        TableBaseToDataFileName(base_file_name), &data_file, env_options));
     data_file_writer.reset(new WritableFileWriter(std::move(data_file), EnvOptions()));
   }
-  tb.reset(opts.table_factory->NewTableBuilder(
+  tb = opts.table_factory->NewTableBuilder(
       TableBuilderOptions(imoptions,
                           ikc,
                           int_tbl_prop_collector_factories,
@@ -87,28 +91,29 @@ void createSST(const std::string& base_file_name,
                           CompressionOptions(),
                           /* skip_filters */ false),
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
-      base_file_writer.get(), data_file_writer.get()));
+      base_file_writer.get(), data_file_writer.get());
 
   // Populate slightly more than 1K keys
   uint32_t num_keys = 1024;
   for (uint32_t i = 0; i < num_keys; i++) {
     tb->Add(MakeKey(i), MakeValue(i));
   }
-  tb->Finish();
-  base_file_writer->Close();
+  ASSERT_OK(tb->Finish());
+  ASSERT_OK(base_file_writer->Close());
 }
 
 void cleanup(const std::string& file_name) {
   Env* env = Env::Default();
-  env->DeleteFile(file_name);
+  ASSERT_OK(env->DeleteFile(file_name));
   std::string outfile_name = file_name.substr(0, file_name.length() - 4);
   outfile_name.append("_dump.txt");
-  env->DeleteFile(outfile_name);
+  env->CleanupFile(outfile_name);
 }
+
 }  // namespace
 
 // Test for sst dump tool "raw" mode
-class SSTDumpToolTest : public testing::Test {
+class SSTDumpToolTest : public RocksDBTest {
  public:
   BlockBasedTableOptions table_options_;
 
@@ -129,7 +134,7 @@ TEST_F(SSTDumpToolTest, EmptyFilter) {
   snprintf(usage[1], optLength, "--command=raw");
   snprintf(usage[2], optLength, "--file=rocksdb_sst_test.sst");
 
-  rocksdb::SSTDumpTool tool;
+  rocksdb::SSTDumpTool tool(nullptr);
   ASSERT_TRUE(!tool.Run(3, usage));
 
   cleanup(file_name);
@@ -231,13 +236,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr, "SKIPPED as SSTDumpTool is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE  return RUN_ALL_TESTS();

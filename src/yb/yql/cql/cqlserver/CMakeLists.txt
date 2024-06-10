@@ -11,6 +11,8 @@
 # under the License.
 #
 
+set(YB_PCH_PREFIX cqlserver)
+
 #########################################
 # cqlserver_service_proto
 #########################################
@@ -26,7 +28,6 @@ set(CQLSERVER_YRPC_LIBS
   protobuf
   remote_bootstrap_proto
   rpc_header_proto
-  wire_protocol_proto
   ${OPENSSL_CRYPTO_LIBRARY})
 ADD_YB_LIBRARY(cql_service_proto
   SRCS ${CQLSERVER_YRPC_SRCS}
@@ -38,13 +39,14 @@ ADD_YB_LIBRARY(cql_service_proto
 #########################################
 
 set(CQLSERVER_SRCS
-  cql_message.cc
   cql_processor.cc
   cql_rpc.cc
   cql_server.cc
   cql_server_options.cc
   cql_service.cc
   cql_statement.cc
+  statements-path-handler.cc
+  system_query_cache.cc
 )
 
 add_library(yb-cql ${CQLSERVER_SRCS})
@@ -57,8 +59,8 @@ target_link_libraries(yb-cql
   cql_service_proto
   server_common
   server_process
-  lz4
-  snappy)
+  ldap
+  lber)
 
 # Tests
 set(YB_TEST_LINK_LIBS yb-cql integration-tests ${YB_MIN_TEST_LIBS})

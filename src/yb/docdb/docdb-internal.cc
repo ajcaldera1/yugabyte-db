@@ -11,8 +11,13 @@
 // under the License.
 //
 
-#include "yb/common/transaction.h"
 #include "yb/docdb/docdb-internal.h"
+
+#include "yb/common/transaction.h"
+
+#include "yb/docdb/docdb_fwd.h"
+#include "yb/docdb/shared_lock_manager_fwd.h"
+#include "yb/dockv/value_type.h"
 
 namespace yb {
 namespace docdb {
@@ -23,18 +28,24 @@ KeyType GetKeyType(const Slice& slice, StorageDbType db_type) {
   }
 
   if (db_type == StorageDbType::kRegular) {
-    return KeyType::kValueKey;
+    return KeyType::kPlainSubDocKey;
   }
 
-  if (slice.size() > 0 && slice[0] == ValueTypeAsChar::kTransactionId) {
-    if (slice.size() == TransactionId::static_size() + 1) {
+  if (slice[0] == dockv::KeyEntryTypeAsChar::kTransactionId) {
+    if (slice.size() == TransactionId::StaticSize() + 1) {
       return KeyType::kTransactionMetadata;
+    } else if (slice.size() == TransactionId::StaticSize() + 2) {
+      // Key for post-apply transaction metadata is [prefix] [transaction id] 00.
+      return KeyType::kPostApplyTransactionMetadata;
     } else {
       return KeyType::kReverseTxnKey;
     }
-  } else {
-    return KeyType::kIntentKey;
   }
+  if (slice[0] == dockv::KeyEntryTypeAsChar::kExternalTransactionId) {
+    return KeyType::kExternalIntents;
+  }
+
+  return KeyType::kIntentKey;
 }
 
 } // namespace docdb

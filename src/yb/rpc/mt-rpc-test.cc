@@ -32,22 +32,29 @@
 
 #include <string>
 
-#include <boost/bind.hpp>
 #include <gtest/gtest.h>
 
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc-test-base.h"
+#include "yb/rpc/rpc_controller.h"
+#include "yb/rpc/yb_rpc.h"
+
 #include "yb/util/countdown_latch.h"
 #include "yb/util/metrics.h"
+#include "yb/util/net/net_util.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 
 METRIC_DECLARE_counter(rpc_connections_accepted);
 METRIC_DECLARE_counter(rpcs_queue_overflow);
 
 using std::string;
 using std::shared_ptr;
-using strings::Substitute;
 using namespace std::literals;
 
 namespace yb {
@@ -59,21 +66,21 @@ class MultiThreadedRpcTest : public RpcTestBase {
   void SingleCall(const HostPort& server_addr, const RemoteMethod* method,
                   Status* result, CountDownLatch* latch) {
     LOG(INFO) << "Connecting to " << server_addr;
-    shared_ptr<Messenger> client_messenger(CreateMessenger("ClientSC"));
-    Proxy p(client_messenger, server_addr);
+    auto client_messenger = CreateAutoShutdownMessengerHolder("ClientSC");
+    Proxy p(client_messenger.get(), server_addr);
     *result = DoTestSyncCall(&p, method);
     latch->CountDown();
   }
 
   // Make RPC calls until we see a failure.
   void HammerServer(const HostPort& server_addr, const RemoteMethod* method, Status* last_result) {
-    shared_ptr<Messenger> client_messenger(CreateMessenger("ClientHS"));
-    HammerServerWithMessenger(server_addr, method, last_result, client_messenger);
+    auto client_messenger = CreateAutoShutdownMessengerHolder("ClientHS");
+    HammerServerWithMessenger(server_addr, method, last_result, client_messenger.get());
   }
 
   void HammerServerWithMessenger(
       const HostPort& server_addr, const RemoteMethod* method, Status* last_result,
-      const shared_ptr<Messenger>& messenger) {
+      Messenger* messenger) {
     LOG(INFO) << "Connecting to " << server_addr;
     Proxy p(messenger, server_addr);
 
@@ -95,7 +102,8 @@ static void AssertShutdown(yb::Thread* thread, const Status* status) {
   ASSERT_OK(ThreadJoiner(thread).warn_every(500ms).Join());
   string msg = status->ToString();
   ASSERT_TRUE(msg.find("Service unavailable") != string::npos ||
-              msg.find("Network error") != string::npos)
+              msg.find("Network error") != string::npos ||
+              msg.find("Resource unavailable") != string::npos)
               << "Status is actually: " << msg;
 }
 
@@ -132,13 +140,13 @@ TEST_F(MultiThreadedRpcTest, TestShutdownClientWhileCallsPending) {
   HostPort server_addr;
   StartTestServer(&server_addr);
 
-  shared_ptr<Messenger> client_messenger(CreateMessenger("Client"));
+  std::unique_ptr<Messenger> client_messenger(CreateMessenger("Client"));
 
   scoped_refptr<yb::Thread> thread;
   Status status;
   ASSERT_OK(yb::Thread::Create("test", "test",
       &MultiThreadedRpcTest::HammerServerWithMessenger, this, server_addr,
-      CalculatorServiceMethods::AddMethod(), &status, client_messenger, &thread));
+      CalculatorServiceMethods::AddMethod(), &status, client_messenger.get(), &thread));
 
   // Shut down the messenger after a very brief sleep. This often will race so that the
   // call gets submitted to the messenger before shutdown, but the negotiation won't have
@@ -146,7 +154,6 @@ TEST_F(MultiThreadedRpcTest, TestShutdownClientWhileCallsPending) {
   // See KUDU-104.
   SleepFor(MonoDelta::FromMicroseconds(10));
   client_messenger->Shutdown();
-  client_messenger.reset();
 
   ASSERT_OK(ThreadJoiner(thread.get()).warn_every(500ms).Join());
   ASSERT_TRUE(status.IsAborted() ||
@@ -180,7 +187,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
   MessengerBuilder bld("messenger1");
   bld.set_num_reactors(kMaxConcurrency);
   bld.set_metric_entity(metric_entity());
-  auto server_messenger = ASSERT_RESULT(bld.Build());
+  std::unique_ptr<Messenger> server_messenger = ASSERT_RESULT(bld.Build());
 
   Endpoint server_addr;
   ASSERT_OK(server_messenger->ListenAddress(
@@ -189,9 +196,13 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
 
   std::unique_ptr<ServiceIf> service(new GenericCalculatorService());
   auto service_name = service->service_name();
-  ThreadPool thread_pool("bogus_pool", kMaxConcurrency, 0UL);
+  ThreadPool thread_pool(ThreadPoolOptions {
+    .name = "bogus_pool",
+    .max_workers = 0
+  });
   scoped_refptr<ServicePool> service_pool(new ServicePool(kMaxConcurrency,
                                                           &thread_pool,
+                                                          &server_messenger->scheduler(),
                                                           std::move(service),
                                                           metric_entity()));
   ASSERT_OK(server_messenger->RegisterService(service_name, service_pool));
@@ -211,7 +222,7 @@ TEST_F(MultiThreadedRpcTest, TestBlowOutServiceQueue) {
   latch.Wait();
 
   // The rest would time out after 10 sec, but we help them along.
-  ASSERT_OK(server_messenger->UnregisterService(service_name));
+  server_messenger->UnregisterAllServices();
   service_pool->Shutdown();
   thread_pool.Shutdown();
   server_messenger->Shutdown();
@@ -296,11 +307,13 @@ TEST_F(MultiThreadedRpcTest, MemoryLimit) {
   LOG(INFO) << "Server " << server_addr;
 
   std::atomic<bool> stop(false);
-  MessengerOptions options;
+  MessengerOptions options = kDefaultClientMessengerOptions;
   options.n_reactors = 1;
   options.num_connections_to_server = 1;
-  Proxy proxy_for_big(CreateMessenger("Client for big", options), server_addr);
-  Proxy proxy_for_small(CreateMessenger("Client for small", options), server_addr);
+  auto messenger_for_big = CreateAutoShutdownMessengerHolder("Client for big", options);
+  auto messenger_for_small = CreateAutoShutdownMessengerHolder("Client for small", options);
+  Proxy proxy_for_big(messenger_for_big.get(), server_addr);
+  Proxy proxy_for_small(messenger_for_small.get(), server_addr);
 
   std::vector<std::thread> threads;
   while (threads.size() != 10) {
@@ -314,7 +327,8 @@ TEST_F(MultiThreadedRpcTest, MemoryLimit) {
         RpcController controller;
         controller.set_timeout(500ms);
         auto status = proxy->SyncRequest(
-            CalculatorServiceMethods::EchoMethod(), req, &resp, &controller);
+            CalculatorServiceMethods::EchoMethod(), /* method_metrics= */ nullptr, req, &resp,
+            &controller);
         if (big_call) {
           ASSERT_NOK(status);
         } else {
@@ -335,4 +349,3 @@ TEST_F(MultiThreadedRpcTest, MemoryLimit) {
 
 } // namespace rpc
 } // namespace yb
-

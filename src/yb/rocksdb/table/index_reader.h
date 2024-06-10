@@ -11,16 +11,15 @@
 // under the License.
 //
 
-#ifndef YB_ROCKSDB_TABLE_INDEX_READER_H
-#define YB_ROCKSDB_TABLE_INDEX_READER_H
+#pragma once
 
 #include <stddef.h>
 
 #include "yb/rocksdb/status.h"
-#include "yb/rocksdb/table/block_based_table_internal.h"
+#include "yb/rocksdb/table/block.h"
 #include "yb/rocksdb/table/two_level_iterator.h"
+
 #include "yb/util/logging.h"
-#include "yb/util/result.h"
 
 namespace rocksdb {
 
@@ -57,12 +56,17 @@ class IndexReader {
                                         TwoLevelIteratorState* index_iterator_state = nullptr,
                                         bool total_order_seek = true) = 0;
 
+  // Returns approximate middle key from the index. Key from the index might not match any key
+  // actually written to SST file, because keys could be shortened and substituted before them are
+  // written into the index (see ShortenedIndexBuilder).
+  virtual Result<std::string> GetMiddleKey() const = 0;
+
   // The size of the index.
   virtual size_t size() const = 0;
   // Memory usage of the index block
   virtual size_t usable_size() const = 0;
 
-  // Report an approximation of how much memory has been used other than memory
+  // Reports an approximation of how much memory has been used other than memory
   // that was allocated in block cache.
   virtual size_t ApproximateMemoryUsage() const = 0;
 
@@ -79,7 +83,7 @@ class BinarySearchIndexReader : public IndexReader {
   // `BinarySearchIndexReader`.
   // On success, index_reader will be populated; otherwise it will remain
   // unmodified.
-  static CHECKED_STATUS Create(
+  static Status Create(
       RandomAccessFileReader* file, const Footer& footer, const BlockHandle& index_handle, Env* env,
       const ComparatorPtr& comparator, std::unique_ptr<IndexReader>* index_reader,
       const std::shared_ptr<yb::MemTracker>& mem_tracker);
@@ -88,7 +92,7 @@ class BinarySearchIndexReader : public IndexReader {
       BlockIter* iter = nullptr,
       // Rest of parameters are ignored by BinarySearchIndexReader.
       TwoLevelIteratorState* state = nullptr, bool total_order_seek = true) override {
-    auto new_iter = index_block_->NewIterator(comparator_.get(), iter, true);
+    auto new_iter = index_block_->NewIndexIterator(comparator_.get(), iter, true);
     return iter ? nullptr : new_iter;
   }
 
@@ -107,6 +111,8 @@ class BinarySearchIndexReader : public IndexReader {
     return index_block_->ApproximateMemoryUsage();
   }
 
+  Result<std::string> GetMiddleKey() const override;
+
  private:
   BinarySearchIndexReader(const ComparatorPtr& comparator,
                           std::unique_ptr<Block>&& index_block)
@@ -116,14 +122,14 @@ class BinarySearchIndexReader : public IndexReader {
 
   ~BinarySearchIndexReader() {}
 
-  std::unique_ptr<Block> index_block_;
+  const std::unique_ptr<Block> index_block_;
 };
 
 // Index that leverages an internal hash table to quicken the lookup for a given
 // key.
 class HashIndexReader : public IndexReader {
  public:
-  static CHECKED_STATUS Create(
+  static Status Create(
       const SliceTransform* hash_key_extractor, const Footer& footer, RandomAccessFileReader* file,
       Env* env, const ComparatorPtr& comparator, const BlockHandle& index_handle,
       InternalIterator* meta_index_iter, std::unique_ptr<IndexReader>* index_reader,
@@ -132,7 +138,7 @@ class HashIndexReader : public IndexReader {
   InternalIterator* NewIterator(
       BlockIter* iter = nullptr, TwoLevelIteratorState* state = nullptr,
       bool total_order_seek = true) override {
-    auto new_iter = index_block_->NewIterator(comparator_.get(), iter, total_order_seek);
+    auto new_iter = index_block_->NewIndexIterator(comparator_.get(), iter, total_order_seek);
     return iter ? nullptr : new_iter;
   }
 
@@ -151,6 +157,8 @@ class HashIndexReader : public IndexReader {
     return index_block_->ApproximateMemoryUsage() + prefixes_contents_.data.size();
   }
 
+  Result<std::string> GetMiddleKey() const override;
+
  private:
   HashIndexReader(const ComparatorPtr& comparator, std::unique_ptr<Block>&& index_block)
       : IndexReader(comparator), index_block_(std::move(index_block)) {
@@ -163,7 +171,7 @@ class HashIndexReader : public IndexReader {
     prefixes_contents_ = std::move(prefixes_contents);
   }
 
-  std::unique_ptr<Block> index_block_;
+  const std::unique_ptr<Block> index_block_;
   BlockContents prefixes_contents_;
 };
 
@@ -172,12 +180,12 @@ class MultiLevelIndexReader : public IndexReader {
  public:
   // Read the top level index from the file and create an instance for `MultiLevelIndexReader`.
   static Result<std::unique_ptr<MultiLevelIndexReader>> Create(
-      RandomAccessFileReader* file, const Footer& footer, int num_levels,
+      RandomAccessFileReader* file, const Footer& footer, uint32_t num_levels,
       const BlockHandle& top_level_index_handle, Env* env, const ComparatorPtr& comparator,
       const std::shared_ptr<yb::MemTracker>& mem_tracker);
 
   MultiLevelIndexReader(
-      const ComparatorPtr& comparator, int num_levels,
+      const ComparatorPtr& comparator, uint32_t num_levels,
       std::unique_ptr<Block> top_level_index_block)
       : IndexReader(comparator),
         num_levels_(num_levels),
@@ -190,6 +198,16 @@ class MultiLevelIndexReader : public IndexReader {
   InternalIterator* NewIterator(
       BlockIter* iter, TwoLevelIteratorState* index_iterator_state, bool) override;
 
+  Result<std::string> GetMiddleKey() const override;
+
+  uint32_t TEST_GetNumLevels() const {
+    return num_levels_;
+  }
+
+  uint32_t TEST_GetTopLevelBlockNumRestarts() const {
+    return top_level_index_block_->NumRestarts();
+  }
+
  private:
   size_t size() const override { return top_level_index_block_->size(); }
 
@@ -201,10 +219,8 @@ class MultiLevelIndexReader : public IndexReader {
     return top_level_index_block_->ApproximateMemoryUsage();
   }
 
-  const int num_levels_;
+  const uint32_t num_levels_;
   const std::unique_ptr<Block> top_level_index_block_;
 };
 
 } // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_INDEX_READER_H

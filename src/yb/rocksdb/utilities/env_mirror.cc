@@ -21,9 +21,13 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
+#include "yb/util/logging.h"
 
 #include "yb/rocksdb/utilities/env_mirror.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
@@ -35,22 +39,21 @@ class SequentialFileMirror : public SequentialFile {
   std::string fname;
   explicit SequentialFileMirror(std::string f) : fname(std::move(f)) {}
 
-  Status Read(size_t n, Slice* result, char* scratch) {
+  Status Read(size_t n, Slice* result, uint8_t* scratch) override {
     Slice aslice;
     Status as = a_->Read(n, &aslice, scratch);
     if (as.ok()) {
-      char* bscratch = new char[n];
+      std::unique_ptr<uint8_t[]> bscratch(new uint8_t[n]);
       Slice bslice;
-      size_t off = 0;
+      size_t off [[maybe_unused]] = 0;  // NOLINT
       size_t left = aslice.size();
       while (left) {
-        Status bs = b_->Read(left, &bslice, bscratch);
-        assert(as.code() == bs.code());
-        assert(memcmp(bscratch, scratch + off, bslice.size()) == 0);
+        Status bs = b_->Read(left, &bslice, bscratch.get());
+        DCHECK(as.code() == bs.code());
+        DCHECK_EQ(memcmp(bscratch.get(), scratch + off, bslice.size()), 0);
         off += bslice.size();
         left -= bslice.size();
       }
-      delete[] bscratch;
       *result = aslice;
     } else {
       Status bs = b_->Read(n, result, scratch);
@@ -59,18 +62,21 @@ class SequentialFileMirror : public SequentialFile {
     return as;
   }
 
-  Status Skip(uint64_t n) {
+  Status Skip(uint64_t n) override {
     Status as = a_->Skip(n);
     Status bs = b_->Skip(n);
     assert(as.code() == bs.code());
     return as;
   }
-  Status InvalidateCache(size_t offset, size_t length) {
+
+  Status InvalidateCache(size_t offset, size_t length) override {
     Status as = a_->InvalidateCache(offset, length);
     Status bs = b_->InvalidateCache(offset, length);
     assert(as.code() == bs.code());
     return as;
   }
+
+  const std::string& filename() const override { return fname; }
 };
 
 class RandomAccessFileMirror : public RandomAccessFile {
@@ -79,10 +85,10 @@ class RandomAccessFileMirror : public RandomAccessFile {
   std::string fname;
   explicit RandomAccessFileMirror(std::string f) : fname(std::move(f)) {}
 
-  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const {
+  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
     Status as = a_->Read(offset, n, result, scratch);
     if (as.ok()) {
-      char* bscratch = new char[n];
+      uint8_t* bscratch = new uint8_t[n];
       Slice bslice;
       size_t off = 0;
       size_t left = result->size();
@@ -101,15 +107,35 @@ class RandomAccessFileMirror : public RandomAccessFile {
     return as;
   }
 
-  bool ShouldForwardRawRequest() const {
+  yb::Result<uint64_t> Size() const override {
+    const auto a_size = a_->Size();
+    const auto b_size = b_->Size();
+    CHECK_EQ(a_size.ok(), b_size.ok());
+    if (a_size.ok()) {
+      CHECK_EQ(*a_size, *b_size);
+    }
+    return a_size;
+  }
+
+  yb::Result<uint64_t> INode() const override {
+    return STATUS(NotSupported, "INode", "Not supported in RandomAccessFileMirror");
+  }
+
+  bool ShouldForwardRawRequest() const override {
     // NOTE: not verified
     return a_->ShouldForwardRawRequest();
   }
 
-  size_t GetUniqueId(char* id, size_t max_size) const {
+  size_t GetUniqueId(char* id) const override {
     // NOTE: not verified
-    return a_->GetUniqueId(id, max_size);
+    return a_->GetUniqueId(id);
   }
+
+  size_t memory_footprint() const override {
+    LOG(FATAL) << "memory_footprint is not supported in RandomAccessFileMirror";
+  }
+
+  const std::string& filename() const override { return fname; }
 };
 
 class WritableFileMirror : public WritableFile {
@@ -165,11 +191,11 @@ class WritableFileMirror : public WritableFile {
     assert(as == b_->IsSyncThreadSafe());
     return as;
   }
-  void SetIOPriority(Env::IOPriority pri) override {
+  void SetIOPriority(yb::IOPriority pri) override {
     a_->SetIOPriority(pri);
     b_->SetIOPriority(pri);
   }
-  Env::IOPriority GetIOPriority() override {
+  yb::IOPriority GetIOPriority() override {
     // NOTE: we don't verify this one
     return a_->GetIOPriority();
   }
@@ -183,9 +209,9 @@ class WritableFileMirror : public WritableFile {
     // NOTE: we don't verify this one
     return a_->GetPreallocationStatus(block_size, last_allocated_block);
   }
-  size_t GetUniqueId(char* id, size_t max_size) const override {
+  size_t GetUniqueId(char* id) const override {
     // NOTE: we don't verify this one
-    return a_->GetUniqueId(id, max_size);
+    return a_->GetUniqueId(id);
   }
   Status InvalidateCache(size_t offset, size_t length) override {
     Status as = a_->InvalidateCache(offset, length);
@@ -193,6 +219,8 @@ class WritableFileMirror : public WritableFile {
     assert(as.code() == bs.code());
     return as;
   }
+
+  const std::string& filename() const override { return fname; }
 
  protected:
   Status Allocate(uint64_t offset, uint64_t length) override {
@@ -275,5 +303,115 @@ Status EnvMirror::ReuseWritableFile(const std::string& fname,
   return as;
 }
 
+Status EnvMirror::NewDirectory(const std::string& name,
+                               unique_ptr<Directory>* result) {
+  unique_ptr<Directory> br;
+  Status as = a_->NewDirectory(name, result);
+  Status bs = b_->NewDirectory(name, &br);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::FileExists(const std::string& f) {
+  Status as = a_->FileExists(f);
+  Status bs = b_->FileExists(f);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::GetChildren(const std::string& dir,
+                              std::vector<std::string>* r) {
+  std::vector<std::string> ar, br;
+  Status as = a_->GetChildren(dir, &ar);
+  Status bs = b_->GetChildren(dir, &br);
+  assert(as.code() == bs.code());
+  std::sort(ar.begin(), ar.end());
+  std::sort(br.begin(), br.end());
+  if (!as.ok() || ar != br) {
+    assert(0 == "getchildren results don't match");
+  }
+  *r = ar;
+  return as;
+}
+
+Status EnvMirror::DeleteFile(const std::string& f) {
+  Status as = a_->DeleteFile(f);
+  Status bs = b_->DeleteFile(f);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::CreateDir(const std::string& d) {
+  Status as = a_->CreateDir(d);
+  Status bs = b_->CreateDir(d);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::CreateDirIfMissing(const std::string& d) {
+  Status as = a_->CreateDirIfMissing(d);
+  Status bs = b_->CreateDirIfMissing(d);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::DeleteDir(const std::string& d) {
+  Status as = a_->DeleteDir(d);
+  Status bs = b_->DeleteDir(d);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::GetFileSize(const std::string& f, uint64_t* s) {
+  uint64_t asize, bsize;
+  Status as = a_->GetFileSize(f, &asize);
+  Status bs = b_->GetFileSize(f, &bsize);
+  assert(as.code() == bs.code());
+  assert(!as.ok() || asize == bsize);
+  *s = asize;
+  return as;
+}
+
+Status EnvMirror::GetFileModificationTime(const std::string& fname,
+                                          uint64_t* file_mtime) {
+  uint64_t amtime, bmtime;
+  Status as = a_->GetFileModificationTime(fname, &amtime);
+  Status bs = b_->GetFileModificationTime(fname, &bmtime);
+  assert(as.code() == bs.code());
+  assert(!as.ok() || amtime - bmtime < 10000 || bmtime - amtime < 10000);
+  *file_mtime = amtime;
+  return as;
+}
+
+Status EnvMirror::RenameFile(const std::string& s, const std::string& t) {
+  Status as = a_->RenameFile(s, t);
+  Status bs = b_->RenameFile(s, t);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::LinkFile(const std::string& s, const std::string& t) {
+  Status as = a_->LinkFile(s, t);
+  Status bs = b_->LinkFile(s, t);
+  assert(as.code() == bs.code());
+  return as;
+}
+
+Status EnvMirror::LockFile(const std::string& f, FileLock** l) {
+  FileLock* al, *bl;
+  Status as = a_->LockFile(f, &al);
+  Status bs = b_->LockFile(f, &bl);
+  assert(as.code() == bs.code());
+  if (as.ok()) *l = new FileLockMirror(al, bl);
+  return as;
+}
+
+Status EnvMirror::UnlockFile(FileLock* l) {
+  FileLockMirror* ml = static_cast<FileLockMirror*>(l);
+  Status as = a_->UnlockFile(ml->a_);
+  Status bs = b_->UnlockFile(ml->b_);
+  assert(as.code() == bs.code());
+  return as;
+}
+
 }  // namespace rocksdb
-#endif

@@ -67,7 +67,9 @@
 #include "utils/lsyscache.h"
 
 /*  YB includes. */
+#include "access/yb_scan.h"
 #include "executor/ybc_fdw.h"
+#include "executor/ybcExpr.h"
 #include "pg_yb_utils.h"
 
 /* results of subquery_is_pushdown_safe */
@@ -201,11 +203,18 @@ make_one_rel(PlannerInfo *root, List *joinlist)
 			{
 				RangeTblEntry *rte = root->simple_rte_array[rti];
 				if (IsYBRelationById(rte->relid)) {
+					ListCell *lc;
 					/*
 					 * Set the YugaByte FDW routine because we will use the foreign
 					 * scan API below.
 					 */
+					relation->is_yb_relation = true;
 					relation->fdwroutine = (FdwRoutine *) ybc_fdw_handler();
+					foreach(lc, relation->baserestrictinfo)
+					{
+						RestrictInfo *ri = lfirst_node(RestrictInfo, lc);
+						ri->yb_pushable = YbCanPushdownExpr(ri->clause, NULL);
+					}
 				}
 			}
 		}
@@ -517,19 +526,7 @@ set_rel_pathlist(PlannerInfo *root, RelOptInfo *rel,
 				else
 				{
 					/* Plain relation */
-					if (IsYBRelationById(rte->relid))
-					{
-						/*
-						 * Using a foreign scan which will use the YB FDW by
-						 * default.
-						 */
-						set_foreign_pathlist(root, rel, rte);
-					}
-					else
-					{
-						/* Use regular scan for initdb tables. */
-						set_plain_rel_pathlist(root, rel, rte);
-					}
+					set_plain_rel_pathlist(root, rel, rte);
 				}
 				break;
 			case RTE_SUBQUERY:
@@ -681,12 +678,10 @@ set_rel_consider_parallel(PlannerInfo *root, RelOptInfo *rel,
 					return;
 			}
 
-			if (IsYugaByteEnabled())
+			if (rel->is_yb_relation)
 			{
-				/* If YB scan, disable parallelization for now. */
-				return;
+				/* TODO(#19470) check YB specific conditions */
 			}
-
 			/*
 			 * There are additional considerations for appendrels, which we'll
 			 * deal with in set_append_rel_size and set_append_rel_pathlist.
@@ -828,8 +823,17 @@ create_plain_partial_paths(PlannerInfo *root, RelOptInfo *rel)
 {
 	int			parallel_workers;
 
-	parallel_workers = compute_parallel_worker(rel, rel->pages, -1,
-											   max_parallel_workers_per_gather);
+	if (rel->is_yb_relation)
+	{
+		Assert(rel->relid > 0);
+		RangeTblEntry  *rte = root->simple_rte_array[rel->relid];
+		parallel_workers = yb_compute_parallel_worker(
+			rel, YbGetTableDistribution(rte->relid),
+			max_parallel_workers_per_gather);
+	}
+	else
+		parallel_workers = compute_parallel_worker(
+			rel, rel->pages, -1, max_parallel_workers_per_gather);
 
 	/* If any limit was set to zero, the user doesn't want a parallel scan. */
 	if (parallel_workers <= 0)
@@ -1007,7 +1011,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 		rte->relkind == RELKIND_PARTITIONED_TABLE &&
 		rel->baserestrictinfo != NIL)
 	{
-		live_children = prune_append_rel_partitions(rel);
+		live_children = prune_append_rel_partitions(root, rel);
 		did_pruning = true;
 	}
 
@@ -1115,6 +1119,7 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 			{
 				Node	   *onecq = (Node *) lfirst(lc2);
 				bool		pseudoconstant;
+				RestrictInfo *childri;
 
 				/* check for pseudoconstant (no Vars or volatile functions) */
 				pseudoconstant =
@@ -1126,13 +1131,23 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 					root->hasPseudoConstantQuals = true;
 				}
 				/* reconstitute RestrictInfo with appropriate properties */
-				childquals = lappend(childquals,
-									 make_restrictinfo((Expr *) onecq,
-													   rinfo->is_pushed_down,
-													   rinfo->outerjoin_delayed,
-													   pseudoconstant,
-													   rinfo->security_level,
-													   NULL, NULL, NULL));
+				childri = make_restrictinfo((Expr *) onecq,
+											rinfo->is_pushed_down,
+											rinfo->outerjoin_delayed,
+											pseudoconstant,
+											rinfo->security_level,
+											NULL, NULL, NULL);
+				if (childrel->is_yb_relation)
+				{
+					/*
+					 * Even if parent clause was not pushable, parts of it still
+					 * maybe after they have been split by make_ands_implicit.
+					 * Hence re-evaluate pushability.
+					 */
+					childri->yb_pushable = rinfo->yb_pushable ||
+						YbCanPushdownExpr(childri->clause, NULL);
+				}
+				childquals = lappend(childquals, childri);
 				/* track minimum security level among child quals */
 				cq_min_security = Min(cq_min_security, rinfo->security_level);
 			}
@@ -1286,6 +1301,9 @@ set_append_rel_size(PlannerInfo *root, RelOptInfo *rel,
 
 		/* We have at least one live child. */
 		has_live_children = true;
+
+		if (!childRTE->inh)
+			root->yb_num_referenced_relations++;
 
 		/*
 		 * If any live child is not parallel-safe, treat the whole appendrel
@@ -1472,7 +1490,10 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 	double		partial_rows = -1;
 
 	/* If appropriate, consider parallel append */
-	pa_subpaths_valid = enable_parallel_append && rel->consider_parallel;
+	if (IsYugaByteEnabled() && !yb_enable_parallel_append)
+		pa_subpaths_valid = false;
+	else
+		pa_subpaths_valid = enable_parallel_append && rel->consider_parallel;
 
 	/*
 	 * AppendPath generated for partitioned tables must record the RT indexes
@@ -1837,11 +1858,15 @@ add_paths_to_append_rel(PlannerInfo *root, RelOptInfo *rel,
 			accumulate_append_subpath(subpath, &subpaths, NULL);
 		}
 
+		subpaths_valid &= yb_has_same_batching_reqs(subpaths);
+
 		if (subpaths_valid)
 			add_path(rel, (Path *)
 					 create_append_path(root, rel, subpaths, NIL,
 										required_outer, 0, false,
 										partitioned_rels, -1));
+		else
+			break;
 	}
 }
 
@@ -3483,21 +3508,32 @@ void
 create_partial_bitmap_paths(PlannerInfo *root, RelOptInfo *rel,
 							Path *bitmapqual)
 {
-	int			parallel_workers;
+	int			parallel_workers = 0;
 	double		pages_fetched;
 
 	/* Compute heap pages for bitmap heap scan */
 	pages_fetched = compute_bitmap_pages(root, rel, bitmapqual, 1.0,
 										 NULL, NULL);
 
-	parallel_workers = compute_parallel_worker(rel, pages_fetched, -1,
-											   max_parallel_workers_per_gather);
+	/*
+	 * Even if we support bitmap scan of YB tables, no PQ until explicitly
+	 * validated.
+	 */
+	if (!rel->is_yb_relation)
+		parallel_workers = compute_parallel_worker(
+			rel, pages_fetched, -1, max_parallel_workers_per_gather);
 
 	if (parallel_workers <= 0)
 		return;
 
-	add_partial_path(rel, (Path *) create_bitmap_heap_path(root, rel,
-														   bitmapqual, rel->lateral_relids, 1.0, parallel_workers));
+	if (IsYugaByteEnabled() && rel->is_yb_relation)
+		/* TODO(#20575): support parallel bitmap scans */
+		return;
+	else
+		add_partial_path(rel, (Path *) create_bitmap_heap_path(root, rel,
+															   bitmapqual,
+															   rel->lateral_relids,
+															   1.0, parallel_workers));
 }
 
 /*
@@ -3527,7 +3563,16 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 	 */
 	if (rel->rel_parallel_workers != -1)
 		parallel_workers = rel->rel_parallel_workers;
-	else
+	/*
+	 * For YB relations yb_compute_parallel_worker should be used.
+	 * However, there may be cases (notable example - PG extensions) when
+	 * compute_parallel_worker is called on a YB relation.
+	 * There's no good way here to figure out relid to provide
+	 * YbTableDistribution and forwad the call to yb_compute_parallel_worker.
+	 * Hence leave parallel_workers at 0 and disable parallelism.
+	 * For non-YB relations use standard calculation, provided by postgres.
+	 */
+	else if (!rel->is_yb_relation)
 	{
 		/*
 		 * If the number of pages being scanned is insufficient to justify a
@@ -3586,6 +3631,45 @@ compute_parallel_worker(RelOptInfo *rel, double heap_pages, double index_pages,
 			else
 				parallel_workers = index_parallel_workers;
 		}
+	}
+
+	/* In no case use more than caller supplied maximum number of workers */
+	parallel_workers = Min(parallel_workers, max_workers);
+
+	return parallel_workers;
+}
+
+/*
+ * Compute the number of parallel workers to scan a YB relation.
+ *
+ * Function has the same purpose as the compute_parallel_worker, but calculation
+ * criteria is quite different. YB tables have no pages, calculations depend on
+ * estimated number of tuples, as well as distribution type
+ *
+ * Rules and limitations implemented in compute_parallel_worker are still apply:
+ * user specified number of workers takes precedence and result would
+ * not exceed "max_workers", typically coming from a GUC.
+ */
+int
+yb_compute_parallel_worker(RelOptInfo *rel,
+						   YbTableDistribution yb_dist, int max_workers)
+{
+	int parallel_workers = 0;
+	/*
+	 * If the user has set the parallel_workers reloption, use that; otherwise
+	 * select a default number of workers.
+	 */
+	if (rel->rel_parallel_workers != -1)
+		parallel_workers = rel->rel_parallel_workers;
+	else
+	{
+		/*
+		 * Due to a number of known issues with various distribution types
+		 * for the time being we focus on the colocated case only.
+		 * Later on we will enable other distribution types, with GUC controls.
+		 */
+		if (yb_dist == YB_COLOCATED)
+			parallel_workers = ybParallelWorkers(rel->tuples);
 	}
 
 	/* In no case use more than caller supplied maximum number of workers */
@@ -3752,6 +3836,9 @@ print_path(PlannerInfo *root, Path *path, int indent)
 			break;
 		case T_BitmapHeapPath:
 			ptype = "BitmapHeapScan";
+			break;
+		case T_YbBitmapTablePath:
+			ptype = "YbBitmapTableScan";
 			break;
 		case T_BitmapAndPath:
 			ptype = "BitmapAndPath";

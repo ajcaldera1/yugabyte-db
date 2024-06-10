@@ -30,18 +30,50 @@
 // under the License.
 //
 
+#include <memory>
+#include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <boost/optional/optional_fwd.hpp>
 #include <gtest/gtest.h>
 
-#include "yb/gutil/strings/substitute.h"
+#include "yb/client/client_fwd.h"
+#include "yb/client/client.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table_creator.h"
+#include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
-#include "yb/common/wire_protocol-test-util.h"
-#include "yb/integration-tests/cluster_verifier.h"
-#include "yb/integration-tests/ts_itest-base.h"
 
-DEFINE_int32(num_rows_per_tablet, 100, "The number of rows to be inserted into each tablet");
+#include "yb/common/common_fwd.h"
+#include "yb/common/entity_ids.h"
+#include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
+
+#include "yb/consensus/consensus.pb.h"
+#include "yb/consensus/consensus.proxy.h"
+
+#include "yb/gutil/ref_counted.h"
+#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/type_traits.h"
+
+#include "yb/integration-tests/cluster_verifier.h"
+#include "yb/integration-tests/external_mini_cluster.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
+#include "yb/server/server_base.pb.h"
+#include "yb/server/server_base.proxy.h"
+
+#include "yb/util/format.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_util.h"
+#include "yb/util/flags.h"
+
+DEFINE_NON_RUNTIME_int32(num_rows_per_tablet, 100,
+    "The number of rows to be inserted into each tablet");
 
 using std::vector;
 
@@ -49,6 +81,7 @@ namespace yb {
 namespace client {
 
 using std::shared_ptr;
+using std::string;
 
 static const int kNumTabletServers = 3;
 static const int kNumTablets = 3;
@@ -147,7 +180,7 @@ struct SliceKeysTestSetup {
     TypeDescriptor<KeyTypeWrapper>::AddHashValue(insert->mutable_request(), row_key_num);
   }
 
-  int64_t KeyIntVal(const QLRow& row) const {
+  int64_t KeyIntVal(const qlexpr::QLRow& row) const {
     return TypeDescriptor<KeyTypeWrapper>::GetIntVal(row.column(0));
   }
 
@@ -197,7 +230,7 @@ struct IntKeysTestSetup {
     TypeDescriptor<CppType>::AddHashValue(insert->mutable_request(), val);
   }
 
-  int64_t KeyIntVal(const QLRow& row) const {
+  int64_t KeyIntVal(const qlexpr::QLRow& row) const {
     return TypeDescriptor<CppType>::GetIntVal(row.column(0));
   }
 
@@ -228,7 +261,7 @@ class AllTypesItest : public YBTest {
  public:
   AllTypesItest() {
     if (AllowSlowTests()) {
-      FLAGS_num_rows_per_tablet = 10000;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_rows_per_tablet) = 10000;
     }
     setup_ = TestSetup();
   }
@@ -238,13 +271,13 @@ class AllTypesItest : public YBTest {
   void CreateAllTypesSchema() {
     YBSchemaBuilder builder;
     setup_.AddKeyColumnsToSchema(&builder);
-    builder.AddColumn("int8_val")->Type(INT8);
-    builder.AddColumn("int16_val")->Type(INT16);
-    builder.AddColumn("int32_val")->Type(INT32);
-    builder.AddColumn("int64_val")->Type(INT64);
-    builder.AddColumn("string_val")->Type(STRING);
-    builder.AddColumn("bool_val")->Type(BOOL);
-    builder.AddColumn("binary_val")->Type(BINARY);
+    builder.AddColumn("int8_val")->Type(DataType::INT8);
+    builder.AddColumn("int16_val")->Type(DataType::INT16);
+    builder.AddColumn("int32_val")->Type(DataType::INT32);
+    builder.AddColumn("int64_val")->Type(DataType::INT64);
+    builder.AddColumn("string_val")->Type(DataType::STRING);
+    builder.AddColumn("bool_val")->Type(DataType::BOOL);
+    builder.AddColumn("binary_val")->Type(DataType::BINARY);
     CHECK_OK(builder.Build(&schema_));
   }
 
@@ -260,16 +293,17 @@ class AllTypesItest : public YBTest {
 
     cluster_.reset(new ExternalMiniCluster(opts));
     RETURN_NOT_OK(cluster_->Start());
-    YBClientBuilder builder;
-    return cluster_->CreateClient(&builder, &client_);
+    client_ = VERIFY_RESULT(cluster_->CreateClient());
+    return Status::OK();
   }
 
   Status CreateTable() {
     CreateAllTypesSchema();
-    gscoped_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
+    std::unique_ptr<client::YBTableCreator> table_creator(client_->NewTableCreator());
 
-    const YBTableName table_name("my_keyspace", "all-types-table");
-    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name()));
+    const YBTableName table_name(YQL_DATABASE_CQL, "my_keyspace", "all-types-table");
+    RETURN_NOT_OK(client_->CreateNamespaceIfNotExists(table_name.namespace_name(),
+                                                      table_name.namespace_type()));
     RETURN_NOT_OK(table_creator->table_name(table_name)
                   .schema(&schema_)
                   .num_tablets(kNumTablets)
@@ -288,26 +322,27 @@ class AllTypesItest : public YBTest {
     table_.AddInt64ColumnValue(req, "int64_val", int_val);
     std::string content = StringPrintf("hello %010x", int_val);
     table_.AddStringColumnValue(req, "string_val", content);
-    table_.AddBinaryColumnValue(req, "binary_val", content);
     table_.AddBoolColumnValue(req, "bool_val", int_val % 2);
+    table_.AddBinaryColumnValue(req, "binary_val", content);
     VLOG(1) << "Inserting row[" << split_idx << "," << row_idx << "]" << insert->ToString();
-    return session->Apply(insert);
+    session->Apply(insert);
+    return Status::OK();
   }
 
   // This inserts kNumRowsPerTablet in each of the tablets. In the end we should have
   // perfectly partitioned table, if the encoding of the keys was correct and the rows
   // ended up in the right place.
   Status InsertRows() {
-    shared_ptr<YBSession> session = client_->NewSession();
+    shared_ptr<YBSession> session = client_->NewSession(MonoDelta::FromSeconds(60));
     int max_rows_per_tablet = setup_.GetRowsPerTablet();
     for (int i = 0; i < kNumTablets; ++i) {
       for (int j = 0; j < max_rows_per_tablet; ++j) {
         RETURN_NOT_OK(GenerateRow(session.get(), i, j));
         if (j % 1000 == 0) {
-          RETURN_NOT_OK(session->Flush());
+          RETURN_NOT_OK(session->TEST_Flush());
         }
       }
-      RETURN_NOT_OK(session->Flush());
+      RETURN_NOT_OK(session->TEST_Flush());
     }
     return Status::OK();
   }
@@ -323,7 +358,7 @@ class AllTypesItest : public YBTest {
     projection->push_back("bool_val");
   }
 
-  void VerifyRow(const QLRow& row) {
+  void VerifyRow(const qlexpr::QLRow& row) {
     int64_t key_int_val = setup_.KeyIntVal(row);
     int64_t row_idx = key_int_val % setup_.Increment();;
     int64_t split_idx = key_int_val / setup_.Increment();
@@ -366,6 +401,7 @@ class AllTypesItest : public YBTest {
   }
 
   void TearDown() override {
+    client_.reset();
     cluster_->AssertNoCrashes();
     cluster_->Shutdown();
   }
@@ -373,17 +409,17 @@ class AllTypesItest : public YBTest {
  protected:
   TestSetup setup_;
   YBSchema schema_;
-  shared_ptr<YBClient> client_;
-  gscoped_ptr<ExternalMiniCluster> cluster_;
+  std::unique_ptr<YBClient> client_;
+  std::unique_ptr<ExternalMiniCluster> cluster_;
   TableHandle table_;
 };
 
-typedef ::testing::Types<IntKeysTestSetup<KeyTypeWrapper<INT8>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT16>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT32>>,
-                         IntKeysTestSetup<KeyTypeWrapper<INT64>>,
-                         SliceKeysTestSetup<KeyTypeWrapper<STRING>>,
-                         SliceKeysTestSetup<KeyTypeWrapper<BINARY>>
+typedef ::testing::Types<IntKeysTestSetup<KeyTypeWrapper<DataType::INT8>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT16>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT32>>,
+                         IntKeysTestSetup<KeyTypeWrapper<DataType::INT64>>,
+                         SliceKeysTestSetup<KeyTypeWrapper<DataType::STRING>>,
+                         SliceKeysTestSetup<KeyTypeWrapper<DataType::BINARY>>
                          > KeyTypes;
 
 TYPED_TEST_CASE(AllTypesItest, KeyTypes);

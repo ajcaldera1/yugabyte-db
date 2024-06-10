@@ -29,39 +29,70 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/util/test_util.h"
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
-#include <gtest/gtest.h>
 #include <gtest/gtest-spi.h>
-#include <boost/scope_exit.hpp>
 
+#include "yb/gutil/casts.h"
+#include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/strcat.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
 #include "yb/gutil/walltime.h"
-#include "yb/util/env.h"
-#include "yb/util/path_util.h"
-#include "yb/util/random.h"
-#include "yb/util/spinlock_profiling.h"
-#include "yb/util/thread.h"
-#include "yb/util/logging.h"
 
-DEFINE_string(test_leave_files, "on_failure",
+#include "yb/util/curl_util.h"
+#include "yb/util/env.h"
+#include "yb/util/env_util.h"
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
+#include "yb/util/path_util.h"
+#include "yb/util/spinlock_profiling.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/thread.h"
+#include "yb/util/debug/trace_event.h"
+
+DEFINE_NON_RUNTIME_string(test_leave_files, "on_failure",
               "Whether to leave test files around after the test run. "
               " Valid values are 'always', 'on_failure', or 'never'");
 
-DEFINE_int32(test_random_seed, 0, "Random seed to use for randomized tests");
+DEFINE_NON_RUNTIME_int32(test_random_seed, 0, "Random seed to use for randomized tests");
 DECLARE_int64(memory_limit_hard_bytes);
 DECLARE_bool(enable_tracing);
-DECLARE_bool(running_test);
+DECLARE_bool(TEST_enable_sync_points);
+DECLARE_bool(TEST_running_test);
+DECLARE_bool(never_fsync);
+DECLARE_string(vmodule);
+DEFINE_test_flag(bool, use_yb_controller, false, "Use YBController in tests.");
 
 using std::string;
 using strings::Substitute;
 using gflags::FlagSaver;
 
 namespace yb {
+
+namespace {
+
+class YBTestEnvironment : public ::testing::Environment {
+ public:
+  void SetUp() override {
+  }
+
+  void TearDown() override {
+  }
+};
+
+class YBTestEnvironmentRegisterer {
+ public:
+  YBTestEnvironmentRegisterer() {
+    ::testing::AddGlobalTestEnvironment(new YBTestEnvironment());
+  }
+
+};
+
+YBTestEnvironmentRegisterer yb_test_environment_registerer;
+
+}  // namespace
 
 static const char* const kSlowTestsEnvVariable = "YB_ALLOW_SLOW_TESTS";
 
@@ -72,9 +103,10 @@ static const uint64 kTestBeganAtMicros = Env::Default()->NowMicros();
 ///////////////////////////////////////////////////
 
 YBTest::YBTest()
-  : env_(new EnvWrapper(Env::Default())),
-    test_dir_(GetTestDataDirectory()) {
+    : env_(new EnvWrapper(Env::Default())),
+      test_dir_(GetTestDataDirectory()) {
   InitThreading();
+  debug::EnableTraceEvents();
 }
 
 // env passed in from subclass, for tests that run in-memory
@@ -102,11 +134,15 @@ YBTest::~YBTest() {
 }
 
 void YBTest::SetUp() {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_running_test) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_sync_points) = true;
+
   InitSpinLockContentionProfiling();
   InitGoogleLoggingSafeBasic("yb_test");
-  FLAGS_enable_tracing = true;
-  FLAGS_memory_limit_hard_bytes = 8 * 1024 * 1024 * 1024L;
-  FLAGS_running_test = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tracing) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_memory_limit_hard_bytes) = 8 * 1024 * 1024 * 1024L;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_never_fsync) = true;
+
   for (const char* env_var_name : {
       "ASAN_OPTIONS",
       "LSAN_OPTIONS",
@@ -118,6 +154,8 @@ void YBTest::SetUp() {
       LOG(INFO) << "Environment variable " << env_var_name << ": " << value;
     }
   }
+
+  global_curl_ = std::make_unique<CurlGlobalInitializer>();
 }
 
 string YBTest::GetTestPath(const string& relative_path) {
@@ -229,7 +267,7 @@ void AssertEventually(const std::function<void(void)>& f,
       testing::TestPartResultArray results;
       testing::ScopedFakeTestPartResultReporter reporter(
           testing::ScopedFakeTestPartResultReporter::INTERCEPT_ONLY_CURRENT_THREAD,
-      &results);
+          &results);
       f();
 
       // Determine whether their function produced any new test failure results.
@@ -258,84 +296,119 @@ void AssertEventually(const std::function<void(void)>& f,
   }
 }
 
-Status Wait(std::function<Result<bool>()> condition,
-            MonoTime deadline,
-            const std::string& description,
-            MonoDelta initial_delay,
-            double delay_multiplier,
-            MonoDelta max_delay) {
-  auto start = MonoTime::Now();
-  MonoDelta delay = initial_delay;
-  for (;;) {
-    const auto current = condition();
-    if (!current.ok()) {
-      return current.status();
-    }
-    if (current.get()) {
-      break;
-    }
-    const auto now = MonoTime::Now();
-    const auto left = deadline - now;
-    if (left <= MonoDelta::kZero) {
-      return STATUS_FORMAT(TimedOut,
-                           "Operation '$0' didn't complete within $1ms",
-                           description,
-                           (now - start).ToMilliseconds());
-    }
-    delay = std::min(std::min(MonoDelta::FromSeconds(delay.ToSeconds() * delay_multiplier), left),
-                     max_delay);
-    SleepFor(delay);
-  }
-  return Status::OK();
-}
-
-// Waits for the given condition to be true or until the provided timeout has expired.
-Status WaitFor(std::function<Result<bool>()> condition,
-               MonoDelta timeout,
-               const string& description,
-               MonoDelta initial_delay,
-               double delay_multiplier,
-               MonoDelta max_delay) {
-  return Wait(condition, MonoTime::Now() + timeout, description, initial_delay, delay_multiplier,
-              max_delay);
-}
-
-void AssertLoggedWaitFor(
-    std::function<Result<bool>()> condition,
-    MonoDelta timeout,
-    const string& description,
-    MonoDelta initial_delay,
-    double delay_multiplier,
-    MonoDelta max_delay) {
-  LOG(INFO) << description;
-  ASSERT_OK(WaitFor(condition, timeout, description, initial_delay));
-  LOG(INFO) << description << " - DONE";
-}
-
-string GetToolPath(const string& tool_name) {
+string GetToolPath(const string& rel_path, const string& tool_name) {
   string exe;
   CHECK_OK(Env::Default()->GetExecutablePath(&exe));
-  string binroot = DirName(exe) + "/../bin/";
-  string tool_path = JoinPathSegments(binroot, tool_name);
+  const string binroot = JoinPathSegments(DirName(exe), rel_path);
+  const string tool_path = JoinPathSegments(binroot, tool_name);
   CHECK(Env::Default()->FileExists(tool_path)) << tool_name << " tool not found at " << tool_path;
   return tool_path;
 }
 
-int CalcNumTablets(int num_tablet_servers) {
+bool UseYbController() {
+  if (FLAGS_TEST_use_yb_controller) {
+    return true;
+  }
+  const char* env = getenv("YB_TEST_YB_CONTROLLER");
+  if (env) {
+    auto s = string(env);
+    if (s == "1" || s == "true") {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool DisableMiniClusterBackupTests() {
+  const char* env = getenv("YB_DISABLE_MINICLUSTER_BACKUP_TESTS");
+  if (env) {
+    auto s = string(env);
+    if (s == "1" || s == "true") {
+      return true;
+    }
+  }
+  return false;
+}
+
+void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>* args_dest) {
+  const char* extra_daemon_flags_env_var_value = getenv(env_var_name);
+  if (extra_daemon_flags_env_var_value) {
+    LOG(INFO) << "Setting extra daemon flags as specified by env var " << env_var_name << ": "
+              << extra_daemon_flags_env_var_value;
+    // TODO: this has an issue with handling quoted arguments with embedded spaces.
+    std::istringstream iss(extra_daemon_flags_env_var_value);
+    copy(std::istream_iterator<string>(iss),
+         std::istream_iterator<string>(),
+         std::back_inserter(*args_dest));
+  } else {
+    LOG(INFO) << "Env var " << env_var_name << " not specified, not setting extra flags from it";
+  }
+}
+
+string GetCertsDir() {
+  const auto sub_dir = "test_certs";
+  return JoinPathSegments(env_util::GetRootDir(sub_dir), sub_dir);
+}
+
+int CalcNumTablets(size_t num_tablet_servers) {
 #ifdef NDEBUG
   return 0;  // Will use the default.
 #elif defined(THREAD_SANITIZER) || defined(ADDRESS_SANITIZER)
-  return num_tablet_servers;
+  return narrow_cast<int>(num_tablet_servers);
 #else
-  return num_tablet_servers * 3;
+  return narrow_cast<int>(num_tablet_servers * 3);
 #endif
 }
 
-void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop) {
-  auto end = CoarseMonoClock::now() + duration;
-  while (!stop->load(std::memory_order_acquire) && CoarseMonoClock::now() < end) {
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+Status CorruptFile(
+    const std::string& file_path, int64_t offset, size_t bytes_to_corrupt,
+    CorruptionType corruption_type) {
+  if (bytes_to_corrupt == 0) {
+    LOG(INFO) << "Not corrupting file " << file_path << " since bytes_to_corrupt == 0";
+    return Status::OK();
   }
+  struct stat sbuf;
+  if (stat(file_path.c_str(), &sbuf) != 0) {
+    const char* msg = strerror(errno);
+    return STATUS_FORMAT(IOError, "$0: $1", msg, file_path);
+  }
+
+  if (offset < 0) {
+    offset = std::max<int64_t>(sbuf.st_size + offset, 0);
+  }
+  offset = std::min<int64_t>(offset, sbuf.st_size);
+  if (yb::std_util::cmp_greater(offset + bytes_to_corrupt, sbuf.st_size)) {
+    bytes_to_corrupt = sbuf.st_size - offset;
+  }
+
+  LOG(INFO) << "Corrupting file " << file_path << ", " << bytes_to_corrupt << " bytes at offset "
+            << offset << ", file size: " << sbuf.st_size;
+
+  RWFileOptions opts;
+  opts.mode = Env::CreateMode::OPEN_EXISTING;
+  opts.sync_on_close = true;
+  std::unique_ptr<RWFile> file;
+  RETURN_NOT_OK(Env::Default()->NewRWFile(opts, file_path, &file));
+  std::unique_ptr<uint8_t[]> scratch(new uint8_t[bytes_to_corrupt]);
+  Slice data_read;
+  RETURN_NOT_OK(file->Read(offset, bytes_to_corrupt, &data_read, scratch.get()));
+  SCHECK_EQ(data_read.size(), bytes_to_corrupt, IOError, "Unexpected number of bytes read");
+
+  for (uint8_t* p = data_read.mutable_data(); p < data_read.end(); ++p) {
+    switch (corruption_type) {
+      case CorruptionType::kZero:
+        *p = 0;
+        continue;
+      case CorruptionType::kXor55:
+        *p ^= 0x55;
+        continue;
+    }
+    FATAL_INVALID_ENUM_VALUE(CorruptionType, corruption_type);
+  }
+
+  RETURN_NOT_OK(file->Write(offset, data_read));
+  RETURN_NOT_OK(file->Sync());
+  return file->Close();
 }
 
 } // namespace yb

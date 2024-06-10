@@ -10,14 +10,16 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/util/net/rate_limiter.h"
+
 #include "yb/util/size_literals.h"
+#include "yb/util/status.h"
+#include "yb/util/flags.h"
 
 using namespace yb::size_literals;
 
-DEFINE_int32(rate_limiter_min_size, 32_KB, "Minimum size for each transmission request");
-DEFINE_int32(rate_limiter_min_rate, 1000, "Minimum transmission rate in bytes/sec");
+DEFINE_UNKNOWN_int32(rate_limiter_min_size, 32_KB, "Minimum size for each transmission request");
+DEFINE_UNKNOWN_uint64(rate_limiter_min_rate, 1000, "Minimum transmission rate in bytes/sec");
 
 namespace yb {
 
@@ -80,9 +82,7 @@ void RateLimiter::UpdateTimeSlotSizeAndMaybeSleep(uint64_t data_size, MonoDelta 
             << " received size=" << data_size
             << " and sleeping for=" << sleep_time;
     SleepFor(MonoDelta::FromMilliseconds(sleep_time));
-#if defined(OS_MACOSX)
     total_time_slept_ += MonoDelta::FromMilliseconds(sleep_time);
-#endif
     end_time_ = MonoTime::Now();
     // If we slept for more than 80% of time_slot_ms_, reduce the size of this time slot.
     if (sleep_time > time_slot_ms_ * 80 / 100) {
@@ -120,9 +120,10 @@ inline uint64_t RateLimiter::GetSizeForNextTimeSlot() {
           << " max_transmission_rate=" << target_rate_
           << " min_time_slot=" << min_time_slot_;
   VLOG(1) << "Max allowed bytes per time slot: "
-             << target_rate_  * min_time_slot_  / MonoTime::kMillisecondsPerSecond;
-  VLOG(1) << "time_slot_size: " << time_slot_ms_;
-  return target_rate_ * time_slot_ms_ / MonoTime::kMillisecondsPerSecond;
+          << target_rate_ * max_time_slot_ / MonoTime::kMillisecondsPerSecond;
+  auto time_slot_size = target_rate_ * time_slot_ms_ / MonoTime::kMillisecondsPerSecond;
+  VLOG(1) << "time_slot_size: " << time_slot_size << " in " << time_slot_ms_ << " ms.";
+  return time_slot_size;
 }
 
 void RateLimiter::Init() {

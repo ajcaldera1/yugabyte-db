@@ -30,26 +30,32 @@
 // under the License.
 //
 
-#ifndef YB_RPC_SERVICE_POOL_H
-#define YB_RPC_SERVICE_POOL_H
+#pragma once
+
+#include <stdint.h>
 
 #include <string>
+#include <type_traits>
 #include <vector>
 
+#include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/rpc_service.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/blocking_queue.h"
 #include "yb/util/mutex.h"
-#include "yb/util/thread.h"
-#include "yb/util/status.h"
 
 namespace yb {
 
+template<class T>
+class AtomicGauge;
+
 class Counter;
-class Histogram;
+class EventStats;
 class MetricEntity;
 class Socket;
 
@@ -61,24 +67,25 @@ class ServicePool : public RpcService {
  public:
   ServicePool(size_t max_tasks,
               ThreadPool* thread_pool,
+              Scheduler* scheduler,
               ServiceIfPtr service,
               const scoped_refptr<MetricEntity>& metric_entity);
   virtual ~ServicePool();
 
-  // Shut down the queue and the thread pool.
-  virtual void Shutdown();
+  void StartShutdown() override;
+  void CompleteShutdown() override;
 
-  virtual void QueueInboundCall(InboundCallPtr call) override;
-  virtual void Handle(InboundCallPtr call) override;
+  void FillEndpoints(RpcEndpointMap* map) override;
+  void QueueInboundCall(InboundCallPtr call) override;
+  void Handle(InboundCallPtr call) override;
   const Counter* RpcsTimedOutInQueueMetricForTests() const;
   const Counter* RpcsQueueOverflowMetric() const;
   std::string service_name() const;
 
+  ServiceIfPtr TEST_get_service() const;
  private:
   std::unique_ptr<ServicePoolImpl> impl_;
 };
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_SERVICE_POOL_H

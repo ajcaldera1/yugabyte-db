@@ -12,15 +12,30 @@
 //
 
 #include "yb/yql/cql/ql/ptree/pt_dml_using_clause_element.h"
+
+#include "yb/common/ql_type.h"
+
+#include "yb/util/status.h"
+
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/sem_state.h"
+#include "yb/yql/cql/ql/util/errcodes.h"
 
 namespace yb {
 namespace ql {
 
+namespace {
+
+constexpr const char* const kTtl = "ttl";
+constexpr const char* const kTimestamp = "timestamp";
+
+}
+
 PTDmlUsingClauseElement::PTDmlUsingClauseElement(MemoryContext *memctx,
-                                                 YBLocation::SharedPtr loc,
+                                                 YBLocationPtr loc,
                                                  const MCSharedPtr<MCString>& name,
-                                                 const PTExpr::SharedPtr& value)
+                                                 const PTExprPtr& value)
     : TreeNode(memctx, loc),
       name_(name),
       value_(value) {
@@ -30,6 +45,13 @@ PTDmlUsingClauseElement::~PTDmlUsingClauseElement() {
 }
 
 Status PTDmlUsingClauseElement::Analyze(SemContext *sem_context) {
+  if (name_ == nullptr) {
+    return sem_context->Error(
+        this,
+        "Undefined parameter name in DML using clause element",
+        ErrorCode::INVALID_ARGUMENTS);
+  }
+
   if (strcmp(name_->c_str(), kTtl) != 0 && strcmp(name_->c_str(), kTimestamp) != 0) {
     return sem_context->Error(
         this,
@@ -49,18 +71,26 @@ Status PTDmlUsingClauseElement::Analyze(SemContext *sem_context) {
 
   SemState sem_state(sem_context);
   if (strcmp(name_->c_str(), kTtl) == 0) {
-    sem_state.SetExprState(QLType::Create(INT32), InternalType::kInt32Value);
+    sem_state.SetExprState(QLType::Create(DataType::INT32), InternalType::kInt32Value);
     sem_state.set_bindvar_name(PTBindVar::ttl_bindvar_name());
   } else {
     // has to be timestamp.
     DCHECK_EQ(0, strcmp(name_->c_str(), kTimestamp));
-    sem_state.SetExprState(QLType::Create(INT64), InternalType::kInt64Value);
+    sem_state.SetExprState(QLType::Create(DataType::INT64), InternalType::kInt64Value);
     sem_state.set_bindvar_name(PTBindVar::timestamp_bindvar_name());
   }
 
   RETURN_NOT_OK(value_->Analyze(sem_context));
 
   return Status::OK();
+}
+
+bool PTDmlUsingClauseElement::IsTTL() const {
+  return strcmp(name_->c_str(), kTtl) == 0;
+}
+
+bool PTDmlUsingClauseElement::IsTimestamp() const {
+  return strcmp(name_->c_str(), kTimestamp) == 0;
 }
 
 } // namespace ql

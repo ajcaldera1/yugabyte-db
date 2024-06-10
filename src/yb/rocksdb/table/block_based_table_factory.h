@@ -21,24 +21,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_FACTORY_H
-#define YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_FACTORY_H
+#pragma once
 
 #include <stdint.h>
 
 #include <memory>
 #include <string>
 
-#include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/table.h"
-#include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/table/block_based_table_reader.h"
 
 namespace rocksdb {
 
 struct EnvOptions;
 
-using std::unique_ptr;
 class BlockBasedTableBuilder;
 
 class BlockBasedTableFactory : public TableFactory {
@@ -51,16 +47,16 @@ class BlockBasedTableFactory : public TableFactory {
   const char* Name() const override { return "BlockBasedTable"; }
 
   Status NewTableReader(const TableReaderOptions& table_reader_options,
-                        unique_ptr<RandomAccessFileReader>&& file,
+                        std::unique_ptr<RandomAccessFileReader>&& file,
                         uint64_t file_size,
-                        unique_ptr<TableReader>* table_reader) const override;
+                        std::unique_ptr<TableReader>* table_reader) const override;
 
   // This is a variant of virtual member function NewTableReader function with
   // added capability to control pre-fetching of blocks on BlockBasedTable::Open
   Status NewTableReader(const TableReaderOptions& table_reader_options,
-                        unique_ptr<RandomAccessFileReader>&& file,
+                        std::unique_ptr<RandomAccessFileReader>&& file,
                         uint64_t file_size,
-                        unique_ptr<TableReader>* table_reader,
+                        std::unique_ptr<TableReader>* table_reader,
                         DataIndexLoadMode prefetch_data_index,
                         PrefetchFilter prefetch_filter) const;
 
@@ -68,7 +64,7 @@ class BlockBasedTableFactory : public TableFactory {
 
   // base_file should be not nullptr, data_file should either point to different file writer
   // or be nullptr in order to produce single SST file containing both data and metadata.
-  TableBuilder* NewTableBuilder(
+  std::unique_ptr<TableBuilder> NewTableBuilder(
       const TableBuilderOptions& table_builder_options,
       uint32_t column_family_id, WritableFileWriter* base_file,
       WritableFileWriter* data_file = nullptr) const override;
@@ -82,9 +78,6 @@ class BlockBasedTableFactory : public TableFactory {
   const BlockBasedTableOptions& table_options() const;
 
   void* GetOptions() override { return &table_options_; }
-
-  std::shared_ptr<TableAwareReadFileFilter> NewTableAwareReadFileFilter(
-      const ReadOptions &read_options, const Slice &user_key) const override;
 
  private:
   BlockBasedTableOptions table_options_;
@@ -100,5 +93,3 @@ inline const char* ToBlockBasedTablePropertyValue(bool value) {
 }
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_FACTORY_H

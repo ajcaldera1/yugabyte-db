@@ -21,13 +21,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#include "yb/rocksdb/db/skiplist.h"
 #include <set>
+
+#include <gtest/gtest.h>
+
+#include "yb/rocksdb/db/skiplist.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/arena.h"
 #include "yb/rocksdb/util/hash.h"
 #include "yb/rocksdb/util/random.h"
 #include "yb/rocksdb/util/testharness.h"
+
+#include "yb/util/format.h"
+#include "yb/util/random_util.h"
+#include "yb/rocksdb/util/testutil.h"
 
 namespace rocksdb {
 
@@ -45,7 +52,9 @@ struct TestComparator {
   }
 };
 
-class SkipTest : public testing::Test {};
+typedef SkipList<Key, TestComparator> TestSkipList;
+
+class SkipTest : public RocksDBTest {};
 
 TEST_F(SkipTest, Empty) {
   Arena arena;
@@ -54,13 +63,13 @@ TEST_F(SkipTest, Empty) {
   ASSERT_TRUE(!list.Contains(10));
 
   SkipList<Key, TestComparator>::Iterator iter(&list);
-  ASSERT_TRUE(!iter.Valid());
+  ASSERT_TRUE(!iter.Entry());
   iter.SeekToFirst();
-  ASSERT_TRUE(!iter.Valid());
+  ASSERT_TRUE(!iter.Entry());
   iter.Seek(100);
-  ASSERT_TRUE(!iter.Valid());
+  ASSERT_TRUE(!iter.Entry());
   iter.SeekToLast();
-  ASSERT_TRUE(!iter.Valid());
+  ASSERT_TRUE(!iter.Entry());
 }
 
 TEST_F(SkipTest, InsertAndLookup) {
@@ -89,19 +98,19 @@ TEST_F(SkipTest, InsertAndLookup) {
   // Simple iterator tests
   {
     SkipList<Key, TestComparator>::Iterator iter(&list);
-    ASSERT_TRUE(!iter.Valid());
+    ASSERT_TRUE(!iter.Entry());
 
     iter.Seek(0);
-    ASSERT_TRUE(iter.Valid());
-    ASSERT_EQ(*(keys.begin()), iter.key());
+    ASSERT_TRUE(iter.Entry());
+    ASSERT_EQ(*(keys.begin()), iter.Entry());
 
     iter.SeekToFirst();
-    ASSERT_TRUE(iter.Valid());
-    ASSERT_EQ(*(keys.begin()), iter.key());
+    ASSERT_TRUE(iter.Entry());
+    ASSERT_EQ(*(keys.begin()), iter.Entry());
 
     iter.SeekToLast();
-    ASSERT_TRUE(iter.Valid());
-    ASSERT_EQ(*(keys.rbegin()), iter.key());
+    ASSERT_TRUE(iter.Entry());
+    ASSERT_EQ(*(keys.rbegin()), iter.Entry());
   }
 
   // Forward iteration test
@@ -113,11 +122,11 @@ TEST_F(SkipTest, InsertAndLookup) {
     std::set<Key>::iterator model_iter = keys.lower_bound(i);
     for (int j = 0; j < 3; j++) {
       if (model_iter == keys.end()) {
-        ASSERT_TRUE(!iter.Valid());
+        ASSERT_TRUE(!iter.Entry());
         break;
       } else {
-        ASSERT_TRUE(iter.Valid());
-        ASSERT_EQ(*model_iter, iter.key());
+        ASSERT_TRUE(iter.Entry());
+        ASSERT_EQ(*model_iter, iter.Entry());
         ++model_iter;
         iter.Next();
       }
@@ -133,11 +142,91 @@ TEST_F(SkipTest, InsertAndLookup) {
     for (std::set<Key>::reverse_iterator model_iter = keys.rbegin();
          model_iter != keys.rend();
          ++model_iter) {
-      ASSERT_TRUE(iter.Valid());
-      ASSERT_EQ(*model_iter, iter.key());
+      ASSERT_TRUE(iter.Entry());
+      ASSERT_EQ(*model_iter, iter.Entry());
       iter.Prev();
     }
-    ASSERT_TRUE(!iter.Valid());
+    ASSERT_TRUE(!iter.Entry());
+  }
+}
+
+TEST_F(SkipTest, Erase) {
+  constexpr int kNumIterations = 100;
+  constexpr int kNumKeys = 200;
+
+  for (int iteration = 0; iteration != kNumIterations; ++iteration) {
+    Arena arena;
+    TestComparator cmp;
+    TestSkipList list(cmp, &arena);
+
+    std::vector<Key> keys(kNumKeys);
+
+    for (size_t i = 0; i != keys.size(); ++i) {
+      keys[i] = yb::RandomUniformInt<Key>();
+      list.Insert(keys[i]);
+    }
+
+    std::set<Key> left_keys(keys.begin(), keys.end());
+    std::shuffle(keys.begin(), keys.end(), yb::ThreadLocalRandom());
+
+    for (auto key : keys) {
+      left_keys.erase(key);
+      list.Erase(key, cmp);
+      TestSkipList::Iterator iter(&list);
+      iter.SeekToFirst();
+      auto j = left_keys.begin();
+      while (iter.Entry()) {
+        ASSERT_NE(j, left_keys.end());
+
+        ASSERT_EQ(iter.Entry(), *j);
+
+        iter.Next();
+        ++j;
+      }
+      ASSERT_EQ(j, left_keys.end());
+    }
+  }
+}
+
+TEST_F(SkipTest, EraseInsert) {
+  constexpr int kNumIterations = 100;
+
+  for (int iteration = 0; iteration != kNumIterations; ++iteration) {
+    Arena arena;
+    TestComparator cmp;
+    TestSkipList list(cmp, &arena);
+
+    std::set<Key> present_keys;
+
+    for (size_t i = 0; i != 1000; ++i) {
+      if (present_keys.empty() || yb::RandomUniformBool()) {
+        Key key = yb::RandomUniformInt<Key>(1, 100);
+        if (present_keys.count(key)) {
+          continue;
+        }
+        LOG(INFO) << "Insert: " << key;
+        present_keys.insert(key);
+        list.Insert(key);
+      } else {
+        auto idx = yb::RandomUniformInt<size_t>(0, present_keys.size() - 1);
+        auto it = present_keys.begin();
+        std::advance(it, idx);
+        LOG(INFO) << "Erase: " << *it;
+        list.Erase(*it, cmp);
+        present_keys.erase(it);
+      }
+
+      SCOPED_TRACE(yb::Format("i: $0", i));
+
+      std::vector<Key> listed;
+      TestSkipList::Iterator iter(&list);
+      iter.SeekToFirst();
+      while (iter.Entry()) {
+        listed.push_back(iter.Entry());
+        iter.Next();
+      }
+      ASSERT_EQ(yb::ToString(listed), yb::ToString(present_keys));
+    }
   }
 }
 
@@ -251,10 +340,10 @@ class ConcurrentTest {
     iter.Seek(pos);
     while (true) {
       Key current;
-      if (!iter.Valid()) {
+      if (!iter.Entry()) {
         current = MakeKey(K, 0);
       } else {
-        current = iter.key();
+        current = iter.Entry();
         ASSERT_TRUE(IsValidKey(current)) << current;
       }
       ASSERT_LE(pos, current) << "should not go backwards";
@@ -280,7 +369,7 @@ class ConcurrentTest {
         }
       }
 
-      if (!iter.Valid()) {
+      if (!iter.Entry()) {
         break;
       }
 
@@ -349,11 +438,9 @@ class TestState {
 static void ConcurrentReader(void* arg) {
   TestState* state = reinterpret_cast<TestState*>(arg);
   Random rnd(state->seed_);
-  int64_t reads = 0;
   state->Change(TestState::RUNNING);
   while (!state->quit_flag_.load(std::memory_order_acquire)) {
     state->t_.ReadStep(&rnd);
-    ++reads;
   }
   state->Change(TestState::DONE);
 }
@@ -383,7 +470,6 @@ TEST_F(SkipTest, Concurrent2) { RunConcurrent(2); }
 TEST_F(SkipTest, Concurrent3) { RunConcurrent(3); }
 TEST_F(SkipTest, Concurrent4) { RunConcurrent(4); }
 TEST_F(SkipTest, Concurrent5) { RunConcurrent(5); }
-
 }  // namespace rocksdb
 
 int main(int argc, char** argv) {

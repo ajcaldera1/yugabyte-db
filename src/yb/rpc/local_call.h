@@ -13,10 +13,12 @@
 //
 //
 
-#ifndef YB_RPC_LOCAL_CALL_H
-#define YB_RPC_LOCAL_CALL_H
+#pragma once
+
+#include "yb/gutil/casts.h"
 
 #include "yb/rpc/outbound_call.h"
+#include "yb/rpc/rpc_context.h"
 #include "yb/rpc/yb_rpc.h"
 
 namespace yb {
@@ -27,31 +29,44 @@ class LocalYBInboundCall;
 // A short-circuited outbound call.
 class LocalOutboundCall : public OutboundCall {
  public:
-  LocalOutboundCall(const RemoteMethod* remote_method,
+  LocalOutboundCall(const RemoteMethod& remote_method,
                     const std::shared_ptr<OutboundCallMetrics>& outbound_call_metrics,
-                    google::protobuf::Message* response_storage,
-                    RpcController* controller, RpcMetrics* rpc_metrics, ResponseCallback callback);
+                    AnyMessagePtr response_storage,
+                    RpcController* controller,
+                    std::shared_ptr<RpcMetrics> rpc_metrics,
+                    ResponseCallback callback,
+                    ThreadPool* callback_thread_pool);
 
-  CHECKED_STATUS SetRequestParam(
-      const google::protobuf::Message& req, const MemTrackerPtr& mem_tracker) override;
+  Status SetRequestParam(
+      AnyMessageConstPtr req, std::unique_ptr<Sidecars> sidecars,
+      const MemTrackerPtr& mem_tracker) override;
 
   const std::shared_ptr<LocalYBInboundCall>& CreateLocalInboundCall();
 
- protected:
-  void Serialize(boost::container::small_vector_base<RefCntBuffer>* output) override;
+  size_t ObjectSize() const override { return sizeof(*this); }
 
-  CHECKED_STATUS GetSidecar(int idx, Slice* sidecar) const override;
+  const AnyMessageConstPtr& request() const {
+    return req_;
+  }
+
+  bool is_local() const override { return true; }
+
+ protected:
+  void Serialize(ByteBlocks* output) override;
+
+  Result<RefCntSlice> ExtractSidecar(size_t idx) const override;
+  size_t TransferSidecars(Sidecars* context) override;
 
  private:
   friend class LocalYBInboundCall;
 
-  const google::protobuf::Message* req_ = nullptr;
+  AnyMessageConstPtr req_;
 
   std::shared_ptr<LocalYBInboundCall> inbound_call_;
 };
 
 // A short-circuited YB inbound call.
-class LocalYBInboundCall : public YBInboundCall {
+class LocalYBInboundCall : public YBInboundCall, public RpcCallParams {
  public:
   LocalYBInboundCall(RpcMetrics* rpc_metrics, const RemoteMethod& remote_method,
                      std::weak_ptr<LocalOutboundCall> outbound_call,
@@ -63,20 +78,26 @@ class LocalYBInboundCall : public YBInboundCall {
   const Endpoint& local_address() const override;
   CoarseTimePoint GetClientDeadline() const override { return deadline_; }
 
-  CHECKED_STATUS ParseParam(google::protobuf::Message* message) override;
+  Status ParseParam(RpcCallParams* params) override;
 
-  const google::protobuf::Message* request() const { return outbound_call()->req_; }
-  google::protobuf::Message* response() const { return outbound_call()->response(); }
+  size_t ObjectSize() const override { return sizeof(*this); }
+
+  std::shared_ptr<LocalOutboundCall> outbound_call() const {
+    return outbound_call_.lock();
+  }
+
+  std::string ToString() const override {
+    return yb::Format("Local call. call-id : $0 ", call_id());
+  }
 
  protected:
-  void Respond(const google::protobuf::MessageLite& response, bool is_success) override;
+  void Respond(AnyMessageConstPtr req, bool is_success) override;
 
  private:
   friend class LocalOutboundCall;
 
-  std::shared_ptr<LocalOutboundCall> outbound_call() const { return outbound_call_.lock(); }
-
-  const std::vector<RefCntBuffer>& sidecars() const { return sidecars_; }
+  Result<size_t> ParseRequest(Slice param, const RefCntBuffer& buffer) override;
+  AnyMessageConstPtr SerializableResponse() override;
 
   // Weak pointer back to the outbound call owning this inbound call to avoid circular reference.
   std::weak_ptr<LocalOutboundCall> outbound_call_;
@@ -84,7 +105,39 @@ class LocalYBInboundCall : public YBInboundCall {
   const CoarseTimePoint deadline_;
 };
 
+template <class Params, class F>
+auto HandleCall(InboundCallPtr call, F f) {
+  auto yb_call = std::static_pointer_cast<YBInboundCall>(call);
+  if (yb_call->IsLocalCall()) {
+    auto local_call = std::static_pointer_cast<LocalYBInboundCall>(yb_call);
+    auto outbound_call = local_call->outbound_call();
+    auto* req = yb::down_cast<const typename Params::RequestType*>(
+        Params::CastMessage(outbound_call->request()));
+    auto* resp = yb::down_cast<typename Params::ResponseType*>(
+        Params::CastMessage(outbound_call->response()));
+    RpcContext rpc_context(std::move(local_call));
+    f(req, resp, std::move(rpc_context));
+  } else {
+    auto params = std::make_shared<Params>();
+    auto* req = &params->request();
+    auto* resp = &params->response();
+    RpcContext rpc_context(yb_call, std::move(params));
+    if (!rpc_context.responded()) {
+      f(req, resp, std::move(rpc_context));
+    }
+  }
+}
+
+class LocalYBInboundCallTracker : public InboundCall::CallProcessedListener {
+ public:
+  void Enqueue(const InboundCallPtr& call) EXCLUDES(lock_);
+  void CallProcessed(InboundCall* call) override EXCLUDES(lock_);
+  Status DumpRunningRpcs(const DumpRunningRpcsRequestPB& req, DumpRunningRpcsResponsePB* resp);
+
+ private:
+  std::mutex lock_;
+  std::unordered_map<int64_t, InboundCallWeakPtr> calls_being_handled_ GUARDED_BY(lock_);
+};
+
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_LOCAL_CALL_H

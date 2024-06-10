@@ -21,6 +21,7 @@
 #include "utils/hsearch.h"
 #include "utils/relcache.h"
 
+#include "yb_ash.h"
 
 /* ----------
  * Paths for the statistics files (relative to installation's $PGDATA).
@@ -29,9 +30,22 @@
 #define PGSTAT_STAT_PERMANENT_DIRECTORY		"pg_stat"
 #define PGSTAT_STAT_PERMANENT_FILENAME		"pg_stat/global.stat"
 #define PGSTAT_STAT_PERMANENT_TMPFILE		"pg_stat/global.tmp"
+#define PGSTAT_YBSTAT_PERMANENT_FILENAME    "pg_stat/yb_global.stat"
+#define PGSTAT_YBSTAT_PERMANENT_TMPFILE     "pg_stat/yb_global.tmp"
 
 /* Default directory to store temporary statistics data in */
 #define PG_STAT_TMP_DIR		"pg_stat_tmp"
+
+/* Caps the number of queries which can be stored in the array. */
+#define TERMINATED_QUERIES_SIZE 1000
+
+/*
+ * The number of attempts to read a BEEntry before proceeding with inconsistent
+ * results. This must be a multiple of YB_BEENTRY_LOGGING_INTERVAL
+ */
+#define YB_MAX_BEENTRIES_ATTEMPTS 1000
+/* How often to log BEEntry read failures */
+#define YB_BEENTRY_LOGGING_INTERVAL 100
 
 /* Values for track_functions GUC variable --- order is significant! */
 typedef enum TrackFunctionsLevel
@@ -62,6 +76,7 @@ typedef enum StatMsgType
 	PGSTAT_MTYPE_BGWRITER,
 	PGSTAT_MTYPE_FUNCSTAT,
 	PGSTAT_MTYPE_FUNCPURGE,
+	PGSTAT_MTYPE_QUERYTERMINATION,
 	PGSTAT_MTYPE_RECOVERYCONFLICT,
 	PGSTAT_MTYPE_TEMPFILE,
 	PGSTAT_MTYPE_DEADLOCK
@@ -203,8 +218,10 @@ typedef struct PgStat_MsgHdr
  * platforms, but we're being conservative here.)
  * ----------
  */
-#define PGSTAT_MAX_MSG_SIZE 1000
-#define PGSTAT_MSG_PAYLOAD	(PGSTAT_MAX_MSG_SIZE - sizeof(PgStat_MsgHdr))
+#define PGSTAT_MAX_MSG_SIZE 	1000
+#define PGSTAT_MSG_PAYLOAD		(PGSTAT_MAX_MSG_SIZE - sizeof(PgStat_MsgHdr))
+#define QUERY_TEXT_SIZE 		256
+#define QUERY_TERMINATION_SIZE	256
 
 
 /* ----------
@@ -446,6 +463,19 @@ typedef struct PgStat_MsgTempFile
 	size_t		m_filesize;
 } PgStat_MsgTempFile;
 
+typedef struct PgStat_MsgQueryTermination
+{
+	PgStat_MsgHdr m_hdr;
+
+	Oid m_st_userid;
+	Oid m_databaseoid;
+	int32 backend_pid;
+	TimestampTz activity_start_timestamp;
+	TimestampTz activity_end_timestamp;
+	char query_string[QUERY_TEXT_SIZE];
+	char termination_reason[QUERY_TERMINATION_SIZE];
+} PgStat_MsgQueryTermination;
+
 /* ----------
  * PgStat_FunctionCounts	The actual per-function counts kept by a backend
  *
@@ -555,6 +585,7 @@ typedef union PgStat_Msg
 	PgStat_MsgFuncpurge msg_funcpurge;
 	PgStat_MsgRecoveryConflict msg_recoveryconflict;
 	PgStat_MsgDeadlock msg_deadlock;
+	PgStat_MsgQueryTermination msg_querytermination;
 } PgStat_Msg;
 
 
@@ -567,6 +598,42 @@ typedef union PgStat_Msg
  */
 
 #define PGSTAT_FILE_FORMAT_ID	0x01A5BC9D
+
+typedef struct PgStat_YBStatQueryEntry
+{
+	/*
+	 * query_oid is not an actual oid. It is an index that
+	 * represents its location in the array that stores the
+	 * terminated queries modulo TERMINATED_QUERIES_SIZE.
+	 */
+	Oid query_oid;
+
+	/*
+	 * We need to store the owner ID of the database for
+	 * security validation when the queries are fetched by the user.
+	 */
+	Oid st_userid;
+	Oid database_oid;
+	int32 backend_pid;
+	TimestampTz activity_start_timestamp;
+	TimestampTz activity_end_timestamp;
+
+	/*
+	 * query_string_size: records the length of the string
+	 * so that when writing this string to file, we only write
+	 * that many characters.
+	 */
+	size_t query_string_size;
+	char query_string[QUERY_TEXT_SIZE];
+
+	/*
+	 * termination_reason_size: records the length of the string
+	 * so that when writing this string to file, we only write
+	 * that many characters.
+	 */
+	size_t termination_reason_size;
+	char termination_reason[QUERY_TERMINATION_SIZE];
+} PgStat_YBStatQueryEntry;
 
 /* ----------
  * PgStat_StatDBEntry			The collector's data per database
@@ -710,7 +777,8 @@ typedef enum BackendType
 	B_STARTUP,
 	B_WAL_RECEIVER,
 	B_WAL_SENDER,
-	B_WAL_WRITER
+	B_WAL_WRITER,
+	YB_YSQL_CONN_MGR
 } BackendType;
 
 
@@ -832,7 +900,8 @@ typedef enum
 	WAIT_EVENT_REPLICATION_ORIGIN_DROP,
 	WAIT_EVENT_REPLICATION_SLOT_DROP,
 	WAIT_EVENT_SAFE_SNAPSHOT,
-	WAIT_EVENT_SYNC_REP
+	WAIT_EVENT_SYNC_REP,
+	WAIT_EVENT_YB_PARALLEL_SCAN_EMPTY,
 } WaitEventIPC;
 
 /* ----------
@@ -845,7 +914,8 @@ typedef enum
 {
 	WAIT_EVENT_BASE_BACKUP_THROTTLE = PG_WAIT_TIMEOUT,
 	WAIT_EVENT_PG_SLEEP,
-	WAIT_EVENT_RECOVERY_APPLY_DELAY
+	WAIT_EVENT_RECOVERY_APPLY_DELAY,
+	WAIT_EVENT_YB_TXN_CONFLICT_BACKOFF
 } WaitEventTimeout;
 
 /* ----------
@@ -932,10 +1002,12 @@ typedef enum
 typedef enum ProgressCommandType
 {
 	PROGRESS_COMMAND_INVALID,
-	PROGRESS_COMMAND_VACUUM
+	PROGRESS_COMMAND_VACUUM,
+	PROGRESS_COMMAND_COPY,
+	PROGRESS_COMMAND_CREATE_INDEX
 } ProgressCommandType;
 
-#define PGSTAT_NUM_PROGRESS_PARAM	10
+#define PGSTAT_NUM_PROGRESS_PARAM	17
 
 /* ----------
  * Shared-memory data structures
@@ -958,6 +1030,24 @@ typedef struct PgBackendSSLStatus
 	char		ssl_cipher[NAMEDATALEN];	/* MUST be null-terminated */
 	char		ssl_clientdn[NAMEDATALEN];	/* MUST be null-terminated */
 } PgBackendSSLStatus;
+
+/*
+ * YbPgBackendCatalogVersionStatus
+ *
+ * Each live backend maintains a YbPgBackendCatalogVersionStatus struct in
+ * shared memory indicating what catalog version it is at.  A backend in the
+ * middle of a query or transaction uses a consistent snapshot of the system
+ * catalog (technically, only the cache does, not direct reads/writes to/from
+ * system catalog).  The catalog version indicates that snapshot.  has_version
+ * is false for backends that are idle (and not in txn) or non-client backends.
+ */
+typedef struct YbPgBackendCatalogVersionStatus
+{
+	bool		has_version;	/* whether the backend is using the following
+								   version */
+	uint64_t	version;		/* if has_version, catalog version that the
+								   backend is on */
+} YbPgBackendCatalogVersionStatus;
 
 
 /* ----------
@@ -983,11 +1073,12 @@ typedef struct PgBackendStatus
 	 * the copy is valid; otherwise start over.  This makes updates cheap
 	 * while reads are potentially expensive, but that's the tradeoff we want.
 	 *
-	 * The above protocol needs the memory barriers to ensure that the
-	 * apparent order of execution is as it desires. Otherwise, for example,
-	 * the CPU might rearrange the code so that st_changecount is incremented
-	 * twice before the modification on a machine with weak memory ordering.
-	 * This surprising result can lead to bugs.
+	 * The above protocol needs memory barriers to ensure that the apparent
+	 * order of execution is as it desires.  Otherwise, for example, the CPU
+	 * might rearrange the code so that st_changecount is incremented twice
+	 * before the modification on a machine with weak memory ordering.  Hence,
+	 * use the macros defined below for manipulating st_changecount, rather
+	 * than touching it directly.
 	 */
 	int			st_changecount;
 
@@ -1008,6 +1099,7 @@ typedef struct PgBackendStatus
 	Oid			st_userid;
 	SockAddr	st_clientaddr;
 	char	   *st_clienthostname;	/* MUST be null-terminated */
+	char 		*st_databasename; /* Used in YB Mode */
 
 	/* Information about SSL connection */
 	bool		st_ssl;
@@ -1040,44 +1132,92 @@ typedef struct PgBackendStatus
 	ProgressCommandType st_progress_command;
 	Oid			st_progress_command_target;
 	int64		st_progress_param[PGSTAT_NUM_PROGRESS_PARAM];
+
+	/*
+	 * Memory usage of backend from TCMalloc, including PostgreSQL memory usage
+	 * + pggate memory usage + cached memory - memory that was freed but not recycled
+	 */
+	int64_t yb_st_allocated_mem_bytes;
+
+	/* YB catalog version */
+	YbPgBackendCatalogVersionStatus yb_st_catalog_version;
+
+	/* YB (pg_client <--> tserver) Session ID */
+	uint64_t yb_session_id;
+
 } PgBackendStatus;
 
 /*
- * Macros to load and store st_changecount with the memory barriers.
+ * Macros to load and store st_changecount with appropriate memory barriers.
  *
- * pgstat_increment_changecount_before() and
- * pgstat_increment_changecount_after() need to be called before and after
- * PgBackendStatus entries are modified, respectively. This makes sure that
- * st_changecount is incremented around the modification.
+ * Use PGSTAT_BEGIN_WRITE_ACTIVITY() before, and PGSTAT_END_WRITE_ACTIVITY()
+ * after, modifying the current process's PgBackendStatus data.  Note that,
+ * since there is no mechanism for cleaning up st_changecount after an error,
+ * THESE MACROS FORM A CRITICAL SECTION.  Any error between them will be
+ * promoted to PANIC, causing a database restart to clean up shared memory!
+ * Hence, keep the critical section as short and straight-line as possible.
+ * Aside from being safer, that minimizes the window in which readers will
+ * have to loop.
  *
- * Also pgstat_save_changecount_before() and pgstat_save_changecount_after()
- * need to be called before and after PgBackendStatus entries are copied into
- * private memory, respectively.
+ * Reader logic should follow this sketch:
+ *
+ *		int attempt = 1;
+ *		while (yb_pgstat_log_read_activity(beentry, ++attempt))
+ *		{
+ *			int before_ct, after_ct;
+ *
+ *			pgstat_begin_read_activity(beentry, before_ct);
+ *			... copy beentry data to local memory ...
+ *			pgstat_end_read_activity(beentry, after_ct);
+ *			if (pgstat_read_activity_complete(before_ct, after_ct))
+ *				break;
+ *			CHECK_FOR_INTERRUPTS();
+ *		}
+ *
+ * For extra safety, we generally use volatile beentry pointers, although
+ * the memory barriers should theoretically be sufficient.
  */
-#define pgstat_increment_changecount_before(beentry)	\
-	do {	\
-		beentry->st_changecount++;	\
+#define PGSTAT_BEGIN_WRITE_ACTIVITY(beentry) \
+	do { \
+		START_CRIT_SECTION(); \
+		(beentry)->st_changecount++; \
 		pg_write_barrier(); \
 	} while (0)
 
+#define PGSTAT_END_WRITE_ACTIVITY(beentry) \
+	do { \
+		pg_write_barrier(); \
+		(beentry)->st_changecount++; \
+		Assert(((beentry)->st_changecount & 1) == 0); \
+		END_CRIT_SECTION(); \
+	} while (0)
+
+#define pgstat_begin_read_activity(beentry, before_changecount) \
+	do { \
+		(before_changecount) = (beentry)->st_changecount; \
+		pg_read_barrier(); \
+	} while (0)
+
+#define pgstat_end_read_activity(beentry, after_changecount) \
+	do { \
+		pg_read_barrier(); \
+		(after_changecount) = (beentry)->st_changecount; \
+	} while (0)
+
+#define pgstat_read_activity_complete(before_changecount, after_changecount) \
+	((before_changecount) == (after_changecount) && \
+	 ((before_changecount) & 1) == 0)
+
+/* deprecated names for above macros; these are gone in v12 */
+#define pgstat_increment_changecount_before(beentry) \
+	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry)
 #define pgstat_increment_changecount_after(beentry) \
-	do {	\
-		pg_write_barrier(); \
-		beentry->st_changecount++;	\
-		Assert((beentry->st_changecount & 1) == 0); \
-	} while (0)
+	PGSTAT_END_WRITE_ACTIVITY(beentry)
+#define pgstat_save_changecount_before(beentry, save_changecount) \
+	pgstat_begin_read_activity(beentry, save_changecount)
+#define pgstat_save_changecount_after(beentry, save_changecount) \
+	pgstat_end_read_activity(beentry, save_changecount)
 
-#define pgstat_save_changecount_before(beentry, save_changecount)	\
-	do {	\
-		save_changecount = beentry->st_changecount; \
-		pg_read_barrier();	\
-	} while (0)
-
-#define pgstat_save_changecount_after(beentry, save_changecount)	\
-	do {	\
-		pg_read_barrier();	\
-		save_changecount = beentry->st_changecount; \
-	} while (0)
 
 /* ----------
  * LocalPgBackendStatus
@@ -1105,6 +1245,9 @@ typedef struct LocalPgBackendStatus
 	 * not.
 	 */
 	TransactionId backend_xmin;
+
+	/* Backend's RSS memory usage */
+	int64_t yb_backend_rss_mem_bytes;
 } LocalPgBackendStatus;
 
 /*
@@ -1135,6 +1278,8 @@ extern PGDLLIMPORT int pgstat_track_activity_query_size;
 extern char *pgstat_stat_directory;
 extern char *pgstat_stat_tmpname;
 extern char *pgstat_stat_filename;
+extern char *pgstat_ybstat_filename;
+extern char *pgstat_ybstat_tmpname;
 
 /*
  * BgWriter statistics counters are updated directly by bgwriter and bufmgr
@@ -1191,9 +1336,12 @@ extern void pgstat_report_deadlock(void);
 
 extern void pgstat_initialize(void);
 extern void pgstat_bestart(void);
+extern void yb_pgstat_clear_entry_pid(int pid);
 
 extern void pgstat_report_activity(BackendState state, const char *cmd_str);
 extern void pgstat_report_tempfile(size_t filesize);
+extern void pgstat_report_query_termination(const char *termination_reason,
+						int32 backend_pid);
 extern void pgstat_report_appname(const char *appname);
 extern void pgstat_report_xact_timestamp(TimestampTz tstamp);
 extern const char *pgstat_get_wait_event(uint32 wait_event_info);
@@ -1216,6 +1364,8 @@ extern PgStat_BackendFunctionEntry *find_funcstat_entry(Oid func_id);
 extern void pgstat_initstats(Relation rel);
 
 extern char *pgstat_clip_activity(const char *raw_activity);
+
+extern bool yb_pgstat_log_read_activity(volatile PgBackendStatus *beentry, int attempt);
 
 /* ----------
  * pgstat_report_wait_start() -
@@ -1248,6 +1398,29 @@ pgstat_report_wait_start(uint32 wait_event_info)
 }
 
 /* ----------
+ * pgstat_report_wait_end_for_proc(PGPROC *proc) -
+ *
+ *	Called to report end of a wait for a specific process.
+ *
+ * NB: this *must* be able to survive being called before MyProc has been
+ * initialized.
+ * ----------
+ */
+static inline void
+pgstat_report_wait_end_for_proc(volatile PGPROC *proc)
+{
+	if (!pgstat_track_activities || !proc)
+		return;
+
+	/*
+	 * Since this is a four-byte field which is always read and written as
+	 * four-bytes, updates are atomic.
+	 */
+	proc->wait_event_info = 0;
+}
+
+
+/* ----------
  * pgstat_report_wait_end() -
  *
  *	Called to report end of a wait.
@@ -1259,16 +1432,39 @@ pgstat_report_wait_start(uint32 wait_event_info)
 static inline void
 pgstat_report_wait_end(void)
 {
+	return pgstat_report_wait_end_for_proc(MyProc);
+}
+
+/* ----------
+ * yb_pgstat_report_wait_start() -
+ *
+ *	Called to get the current wait event info and set a new wait
+ *  event info.
+ *
+ * NB: this *must* be able to survive being called before MyProc has been
+ * initialized.
+ * ----------
+ */
+static inline uint32
+yb_pgstat_report_wait_start(uint32 wait_event_info)
+{
+	/* If ASH is disabled, do nothing */
+	if (!yb_enable_ash)
+		return wait_event_info;
+
+	uint32 prev_wait_event_info = 0;
 	volatile PGPROC *proc = MyProc;
 
-	if (!pgstat_track_activities || !proc)
-		return;
-
-	/*
-	 * Since this is a four-byte field which is always read and written as
-	 * four-bytes, updates are atomic.
-	 */
-	proc->wait_event_info = 0;
+	if (pgstat_track_activities && proc)
+	{
+		/*
+		 * Since this is a four-byte field which is always read and written as
+		 * four-bytes, updates are atomic.
+		 */
+		prev_wait_event_info = proc->wait_event_info;
+		proc->wait_event_info = wait_event_info;
+	}
+	return prev_wait_event_info;
 }
 
 /* nontransactional event counts are simple enough to inline */
@@ -1345,11 +1541,28 @@ extern void pgstat_send_bgwriter(void);
  */
 extern PgStat_StatDBEntry *pgstat_fetch_stat_dbentry(Oid dbid);
 extern PgStat_StatTabEntry *pgstat_fetch_stat_tabentry(Oid relid);
+extern PgStat_YBStatQueryEntry *pgstat_fetch_ybstat_queries(Oid db_oid, size_t* num_queries);
 extern PgBackendStatus *pgstat_fetch_stat_beentry(int beid);
 extern LocalPgBackendStatus *pgstat_fetch_stat_local_beentry(int beid);
 extern PgStat_StatFuncEntry *pgstat_fetch_stat_funcentry(Oid funcid);
 extern int	pgstat_fetch_stat_numbackends(void);
 extern PgStat_ArchiverStats *pgstat_fetch_stat_archiver(void);
 extern PgStat_GlobalStats *pgstat_fetch_global(void);
+extern PgBackendStatus		*getBackendStatusArray(void);
+
+/*
+ * Metric to track number of sql connections established since
+ * postmaster started.
+ */
+extern uint64_t *yb_new_conn;
+
+/* ----------
+ * YB functions called from backends
+ * ----------
+ */
+extern void yb_pgstat_report_allocated_mem_bytes(void);
+extern void yb_pgstat_set_catalog_version(uint64_t catalog_version);
+extern void yb_pgstat_set_has_catalog_version(bool has_catalog_version);
+extern void yb_pgstat_add_session_info(uint64_t session_id);
 
 #endif							/* PGSTAT_H */

@@ -29,16 +29,20 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TABLET_LOCAL_TABLET_WRITER_H_
-#define YB_TABLET_LOCAL_TABLET_WRITER_H_
+#pragma once
 
+#include <future>
 #include <vector>
 
-#include "yb/consensus/log_anchor_registry.h"
-#include "yb/consensus/opid_util.h"
-#include "yb/tablet/operations/write_operation.h"
+#include <google/protobuf/repeated_field.h>
+
+#include "yb/common/common_fwd.h"
+
 #include "yb/gutil/macros.h"
-#include "yb/gutil/singleton.h"
+
+#include "yb/tablet/write_query_context.h"
+
+#include "yb/tserver/tserver_fwd.h"
 
 namespace yb {
 namespace tablet {
@@ -48,24 +52,24 @@ namespace tablet {
 //
 // This is useful for unit-testing the Tablet code paths with no consensus
 // implementation or thread pools.
-class LocalTabletWriter : public WriteOperationContext {
+class LocalTabletWriter : public WriteQueryContext {
  public:
   typedef google::protobuf::RepeatedPtrField<QLWriteRequestPB> Batch;
 
-  explicit LocalTabletWriter(Tablet* tablet);
+  explicit LocalTabletWriter(TabletPtr tablet);
+  ~LocalTabletWriter();
 
-  CHECKED_STATUS Write(QLWriteRequestPB* req);
-  CHECKED_STATUS WriteBatch(Batch* batch);
+  Status Write(QLWriteRequestPB* req);
+  Status WriteBatch(Batch* batch);
 
  private:
   void Submit(std::unique_ptr<Operation> operation, int64_t term) override;
-  void Aborted(Operation* operation) override {}
-  HybridTime ReportReadRestart() override;
+  Result<HybridTime> ReportReadRestart() override;
 
-  Tablet* const tablet_;
+  TabletPtr tablet_;
 
-  tserver::WriteRequestPB req_;
-  tserver::WriteResponsePB resp_;
+  std::unique_ptr<tserver::WriteRequestPB> req_;
+  std::unique_ptr<tserver::WriteResponsePB> resp_;
   std::promise<Status> write_promise_;
 
   DISALLOW_COPY_AND_ASSIGN(LocalTabletWriter);
@@ -74,4 +78,3 @@ class LocalTabletWriter : public WriteOperationContext {
 
 }  // namespace tablet
 }  // namespace yb
-#endif  // YB_TABLET_LOCAL_TABLET_WRITER_H_

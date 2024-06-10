@@ -102,6 +102,15 @@
 #define ALLOC_BLOCKHDRSZ	MAXALIGN(sizeof(AllocBlockData))
 #define ALLOC_CHUNKHDRSZ	sizeof(struct AllocChunkData)
 
+/* Calculate the total allocated size for a block */
+#define ASET_BLOCK_TOTAL_SIZE(BLK) (BLK->endptr - ((char *)BLK))
+/*
+ * Calculate the total initial allocated size for a set. Note that the keeper
+ * block is always allocated along with the set header at the same time. It
+ * is never removed from the header or replaced.
+ */
+#define ASET_INITIAL_TOTAL_SIZE(SET) (((AllocSetContext *) SET)->keeper->endptr - ((char *) SET))
+
 typedef struct AllocBlockData *AllocBlock;	/* forward reference */
 typedef struct AllocChunkData *AllocChunk;
 
@@ -273,8 +282,9 @@ static void AllocSetDelete(MemoryContext context);
 static Size AllocSetGetChunkSpace(MemoryContext context, void *pointer);
 static bool AllocSetIsEmpty(MemoryContext context);
 static void AllocSetStats(MemoryContext context,
-			  MemoryStatsPrintFunc printfunc, void *passthru,
-			  MemoryContextCounters *totals);
+						  MemoryStatsPrintFunc printfunc, void *passthru,
+						  MemoryContextCounters *totals,
+						  bool print_to_stderr);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 static void AllocSetCheck(MemoryContext context);
@@ -424,9 +434,13 @@ AllocSetContextCreateExtended(MemoryContext parent,
 	/*
 	 * Check whether the parameters match either available freelist.  We do
 	 * not need to demand a match of maxBlockSize.
+	 * Access to the freelist is not thread safe, so avoid it in multi-thread
+	 * mode.
 	 */
-	if (minContextSize == ALLOCSET_DEFAULT_MINSIZE &&
-		initBlockSize == ALLOCSET_DEFAULT_INITSIZE)
+	if (IsMultiThreadedMode())
+		freeListIndex = -1;
+	else if (minContextSize == ALLOCSET_DEFAULT_MINSIZE &&
+			 initBlockSize == ALLOCSET_DEFAULT_INITSIZE)
 		freeListIndex = 0;
 	else if (minContextSize == ALLOCSET_SMALL_MINSIZE &&
 			 initBlockSize == ALLOCSET_SMALL_INITSIZE)
@@ -485,6 +499,8 @@ AllocSetContextCreateExtended(MemoryContext parent,
 				 errdetail("Failed while creating memory context \"%s\".",
 						   name)));
 	}
+
+	YbPgMemAddConsumption(firstBlockSize);
 
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
@@ -604,10 +620,12 @@ AllocSetReset(MemoryContext context)
 		else
 		{
 			/* Normal case, release the block */
+			size_t freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
 #ifdef CLOBBER_FREED_MEMORY
 			wipe_mem(block, block->freeptr - ((char *) block));
 #endif
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
 		}
 		block = next;
 	}
@@ -664,8 +682,11 @@ AllocSetDelete(MemoryContext context)
 				freelist->first_free = (AllocSetContext *) oldset->header.nextchild;
 				freelist->num_free--;
 
+				size_t freed_sz = ASET_INITIAL_TOTAL_SIZE(oldset);
+
 				/* All that remains is to free the header/initial block */
 				free(oldset);
+				YbPgMemSubConsumption(freed_sz);
 			}
 			Assert(freelist->num_free == 0);
 		}
@@ -688,13 +709,19 @@ AllocSetDelete(MemoryContext context)
 #endif
 
 		if (block != set->keeper)
+		{
+			size_t freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
 			free(block);
+			YbPgMemSubConsumption(freed_sz);
+		}
 
 		block = next;
 	}
 
+	size_t freed_sz = ASET_INITIAL_TOTAL_SIZE(set);
 	/* Finally, free the context header, including the keeper block */
 	free(set);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -733,6 +760,9 @@ AllocSetAlloc(MemoryContext context, Size size)
 		block = (AllocBlock) malloc(blksize);
 		if (block == NULL)
 			return NULL;
+
+		YbPgMemAddConsumption(blksize);
+
 		block->aset = set;
 		block->freeptr = block->endptr = ((char *) block) + blksize;
 
@@ -928,6 +958,8 @@ AllocSetAlloc(MemoryContext context, Size size)
 		if (block == NULL)
 			return NULL;
 
+		YbPgMemAddConsumption(blksize);
+
 		block->aset = set;
 		block->freeptr = ((char *) block) + ALLOC_BLOCKHDRSZ;
 		block->endptr = ((char *) block) + blksize;
@@ -1028,10 +1060,14 @@ AllocSetFree(MemoryContext context, void *pointer)
 			set->blocks = block->next;
 		if (block->next)
 			block->next->prev = block->prev;
+
+		/* Must be place before the wipe_mem wipes the content */
+		size_t freed_sz = ASET_BLOCK_TOTAL_SIZE(block);
 #ifdef CLOBBER_FREED_MEMORY
 		wipe_mem(block, block->freeptr - ((char *) block));
 #endif
 		free(block);
+		YbPgMemSubConsumption(freed_sz);
 	}
 	else
 	{
@@ -1144,6 +1180,7 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 		AllocBlock	block = (AllocBlock) (((char *) chunk) - ALLOC_BLOCKHDRSZ);
 		Size		chksize;
 		Size		blksize;
+		Size		oldblksize;
 
 		/*
 		 * Try to verify that we have a sane block pointer: it should
@@ -1159,6 +1196,8 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 		/* Do the realloc */
 		chksize = MAXALIGN(size);
 		blksize = chksize + ALLOC_BLOCKHDRSZ + ALLOC_CHUNKHDRSZ;
+		oldblksize = block->endptr - ((char *) block);
+
 		block = (AllocBlock) realloc(block, blksize);
 		if (block == NULL)
 		{
@@ -1167,6 +1206,8 @@ AllocSetRealloc(MemoryContext context, void *pointer, Size size)
 			return NULL;
 		}
 		block->freeptr = block->endptr = ((char *) block) + blksize;
+		YbPgMemSubConsumption(oldblksize);
+		YbPgMemAddConsumption(blksize);
 
 		/* Update pointers since block has likely been moved */
 		chunk = (AllocChunk) (((char *) block) + ALLOC_BLOCKHDRSZ);
@@ -1310,11 +1351,12 @@ AllocSetIsEmpty(MemoryContext context)
  * printfunc: if not NULL, pass a human-readable stats string to this.
  * passthru: pass this pointer through to printfunc.
  * totals: if not NULL, add stats about this context into *totals.
+ * print_to_stderr: print stats to stderr if true, elog otherwise.
  */
 static void
 AllocSetStats(MemoryContext context,
 			  MemoryStatsPrintFunc printfunc, void *passthru,
-			  MemoryContextCounters *totals)
+			  MemoryContextCounters *totals, bool print_to_stderr)
 {
 	AllocSet	set = (AllocSet) context;
 	Size		nblocks = 0;
@@ -1353,7 +1395,7 @@ AllocSetStats(MemoryContext context,
 				 "%zu total in %zd blocks; %zu free (%zd chunks); %zu used",
 				 totalspace, nblocks, freespace, freechunks,
 				 totalspace - freespace);
-		printfunc(context, passthru, stats_string);
+		printfunc(context, passthru, stats_string, print_to_stderr);
 	}
 
 	if (totals)

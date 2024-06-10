@@ -45,6 +45,7 @@
 #include "commands/schemacmds.h"
 #include "miscadmin.h"
 #include "parser/parse_utilcmd.h"
+#include "parser/scansup.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
@@ -71,14 +72,16 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 {
 	const char *schemaName = stmt->schemaname;
 	Oid			namespaceId;
-	OverrideSearchPath *overridePath;
 	List	   *parsetree_list;
 	ListCell   *parsetree_item;
 	Oid			owner_uid;
 	Oid			saved_uid;
 	int			save_sec_context;
+	int			save_nestlevel;
+	char	   *nsp = namespace_search_path;
 	AclResult	aclresult;
 	ObjectAddress address;
+	StringInfoData pathbuf;
 
 	GetUserIdAndSecContext(&saved_uid, &save_sec_context);
 
@@ -111,7 +114,7 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	 * superuser will always have both of these privileges a fortiori.
 	 */
 	aclresult = pg_database_aclcheck(MyDatabaseId, saved_uid, ACL_CREATE);
-	if (aclresult != ACLCHECK_OK)
+	if (aclresult != ACLCHECK_OK && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
 
@@ -131,14 +134,25 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	 * the permissions checks, but since CREATE TABLE IF NOT EXISTS makes its
 	 * creation-permission check first, we do likewise.
 	 */
-	if (stmt->if_not_exists &&
-		SearchSysCacheExists1(NAMESPACENAME, PointerGetDatum(schemaName)))
+	if (stmt->if_not_exists)
 	{
-		ereport(NOTICE,
-				(errcode(ERRCODE_DUPLICATE_SCHEMA),
-				 errmsg("schema \"%s\" already exists, skipping",
-						schemaName)));
-		return InvalidOid;
+		namespaceId = get_namespace_oid(schemaName, true);
+		if (OidIsValid(namespaceId))
+		{
+			/*
+			 * If we are in an extension script, insist that the pre-existing
+			 * object be a member of the extension, to avoid security risks.
+			 */
+			ObjectAddressSet(address, NamespaceRelationId, namespaceId);
+			checkMembershipInCurrentExtension(&address);
+
+			/* OK to skip */
+			ereport(NOTICE,
+					(errcode(ERRCODE_DUPLICATE_SCHEMA),
+					 errmsg("schema \"%s\" already exists, skipping",
+							schemaName)));
+			return InvalidOid;
+		}
 	}
 
 	/*
@@ -160,14 +174,26 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 	CommandCounterIncrement();
 
 	/*
-	 * Temporarily make the new namespace be the front of the search path, as
-	 * well as the default creation target namespace.  This will be undone at
-	 * the end of this routine, or upon error.
+	 * Prepend the new schema to the current search path.
+	 *
+	 * We use the equivalent of a function SET option to allow the setting to
+	 * persist for exactly the duration of the schema creation.  guc.c also
+	 * takes care of undoing the setting on error.
 	 */
-	overridePath = GetOverrideSearchPath(CurrentMemoryContext);
-	overridePath->schemas = lcons_oid(namespaceId, overridePath->schemas);
-	/* XXX should we clear overridePath->useTemp? */
-	PushOverrideSearchPath(overridePath);
+	save_nestlevel = NewGUCNestLevel();
+
+	initStringInfo(&pathbuf);
+	appendStringInfoString(&pathbuf, quote_identifier(schemaName));
+
+	while (scanner_isspace(*nsp))
+		nsp++;
+
+	if (*nsp != '\0')
+		appendStringInfo(&pathbuf, ", %s", nsp);
+
+	(void) set_config_option("search_path", pathbuf.data,
+							 PGC_USERSET, PGC_S_SESSION,
+							 GUC_ACTION_SAVE, true, 0, false);
 
 	/*
 	 * Report the new schema to possibly interested event triggers.  Note we
@@ -225,8 +251,10 @@ CreateSchemaCommand(CreateSchemaStmt *stmt, const char *queryString,
 		CommandCounterIncrement();
 	}
 
-	/* Reset search path to normal state */
-	PopOverrideSearchPath();
+	/*
+	 * Restore the GUC variable search_path we set above.
+	 */
+	AtEOXact_GUC(true, save_nestlevel);
 
 	/* Reset current user and security context */
 	SetUserIdAndSecContext(saved_uid, save_sec_context);
@@ -287,12 +315,19 @@ RenameSchema(const char *oldname, const char *newname)
 				 errmsg("schema \"%s\" already exists", newname)));
 
 	/* must be owner */
-	if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()))
+	if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()) && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 					   oldname);
 
 	/* must have CREATE privilege on database */
 	aclresult = pg_database_aclcheck(MyDatabaseId, GetUserId(), ACL_CREATE);
+
+	/* yb_db_admin has superuser-like privileges */
+	if (IsYbDbAdminUser(GetUserId()))
+	{
+		aclresult = ACLCHECK_OK;
+	}
+
 	if (aclresult != ACLCHECK_OK)
 		aclcheck_error(aclresult, OBJECT_DATABASE,
 					   get_database_name(MyDatabaseId));
@@ -395,12 +430,16 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		AclResult	aclresult;
 
 		/* Otherwise, must be owner of the existing object */
-		if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()))
+		if (!pg_namespace_ownercheck(HeapTupleGetOid(tup), GetUserId()) && !IsYbDbAdminUser(GetUserId()))
 			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_SCHEMA,
 						   NameStr(nspForm->nspname));
 
 		/* Must be able to become new owner */
-		check_is_member_of_role(GetUserId(), newOwnerId);
+		if (!is_member_of_role(GetUserId(), newOwnerId) && !IsYbDbAdminUser(GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 	errmsg("must be member of role \"%s\"",
+							GetUserNameFromId(newOwnerId, false))));
 
 		/*
 		 * must have create-schema rights
@@ -411,8 +450,16 @@ AlterSchemaOwner_internal(HeapTuple tup, Relation rel, Oid newOwnerId)
 		 * schemas.  Because superusers will always have this right, we need
 		 * no special case for them.
 		 */
-		aclresult = pg_database_aclcheck(MyDatabaseId, GetUserId(),
-										 ACL_CREATE);
+		if (IsYbDbAdminUser(GetUserId()))
+		{
+			aclresult = ACLCHECK_OK;
+		}
+		else
+		{
+			aclresult = pg_database_aclcheck(MyDatabaseId, GetUserId(),
+													ACL_CREATE);
+		}
+
 		if (aclresult != ACLCHECK_OK)
 			aclcheck_error(aclresult, OBJECT_DATABASE,
 						   get_database_name(MyDatabaseId));

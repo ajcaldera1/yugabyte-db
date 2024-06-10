@@ -29,42 +29,53 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/server/rpcz-path-handler.h"
 
-#include <fstream>
 #include <functional>
 #include <memory>
 #include <string>
 
-#include "yb/gutil/map-util.h"
-#include "yb/gutil/strings/numbers.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_introspection.pb.h"
 #include "yb/server/webserver.h"
+#include "yb/util/jsonwriter.h"
+#include "yb/util/status_log.h"
 
 namespace yb {
 
 using yb::rpc::DumpRunningRpcsRequestPB;
 using yb::rpc::DumpRunningRpcsResponsePB;
 using yb::rpc::Messenger;
-using std::shared_ptr;
 using std::stringstream;
 
 using namespace std::placeholders;
 
 namespace {
 
-void RpczPathHandler(const shared_ptr<Messenger>& messenger,
-                     const Webserver::WebRequest& req, stringstream* output) {
+template <class Map>
+bool GetBool(const Map& map, const typename Map::key_type& key, bool default_value) {
+  auto it = map.find(key);
+  if (it == map.end()) {
+    return default_value;
+  }
+
+  return ParseLeadingBoolValue(it->second, default_value);
+}
+
+void RpczPathHandler(
+    Messenger* messenger, bool show_local_calls, const Webserver::WebRequest& req,
+    Webserver::WebResponse* resp) {
+  std::stringstream *output = &resp->output;
   DumpRunningRpcsRequestPB dump_req;
   DumpRunningRpcsResponsePB dump_resp;
 
-  string arg = FindWithDefault(req.parsed_args, "include_traces", "false");
-  dump_req.set_include_traces(ParseLeadingBoolValue(arg.c_str(), false));
+  dump_req.set_get_wait_state(GetBool(req.parsed_args, "get_wait_state", false));
+  dump_req.set_export_wait_state_code_as_string(true);
+  dump_req.set_include_traces(GetBool(req.parsed_args, "include_traces", false));
+  dump_req.set_dump_timed_out(GetBool(req.parsed_args, "timed_out", false));
+  dump_req.set_get_local_calls(show_local_calls);
 
-  WARN_NOT_OK(messenger->DumpRunningRpcs(dump_req, &dump_resp),
-             "DumpRunningRpcs failed");
+  WARN_NOT_OK(messenger->DumpRunningRpcs(dump_req, &dump_resp), "DumpRunningRpcs failed");
 
   JsonWriter writer(output, JsonWriter::PRETTY);
   writer.Protobuf(dump_resp);
@@ -72,9 +83,10 @@ void RpczPathHandler(const shared_ptr<Messenger>& messenger,
 
 } // anonymous namespace
 
-void AddRpczPathHandlers(const shared_ptr<Messenger>& messenger, Webserver* webserver) {
+void AddRpczPathHandlers(Messenger* messenger, bool show_local_calls, Webserver* webserver) {
   webserver->RegisterPathHandler(
-      "/rpcz", "RPCs", std::bind(RpczPathHandler, messenger, _1, _2), false, false);
+      "/rpcz", "RPCs", std::bind(RpczPathHandler, messenger, show_local_calls, _1, _2), false,
+      false);
 }
 
 } // namespace yb

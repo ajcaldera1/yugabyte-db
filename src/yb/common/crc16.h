@@ -54,8 +54,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_COMMON_CRC16_H_
-#define YB_COMMON_CRC16_H_
+#pragma once
 
 namespace yb {
 
@@ -94,14 +93,12 @@ static const uint16_t crc16tab[256] = {
     0x6e17, 0x7e36, 0x4e55, 0x5e74, 0x2e93, 0x3eb2, 0x0ed1, 0x1ef0
 };
 
-uint16_t crc16(const uint8_t* buf, int len) {
-  int counter;
+inline uint16_t crc16(const uint8_t* buf, size_t len) {
   uint16_t crc = 0;
-  for (counter = 0; counter < len; counter++)
+  for (size_t counter = 0; counter < len; counter++) {
     crc = (crc << 8) ^ crc16tab[((crc >> 8) ^ *buf++) & 0x00FF];
+  }
   return crc;
 }
 
 } // namespace yb
-
-#endif // YB_COMMON_CRC16_H_

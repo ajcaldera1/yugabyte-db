@@ -43,6 +43,7 @@
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_publication.h"
+#include "commands/extension.h"
 #include "commands/matview.h"
 #include "commands/trigger.h"
 #include "executor/execdebug.h"
@@ -66,6 +67,7 @@
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
 
+#include "pg_yb_utils.h"
 
 /* Hooks for plugins to get control in ExecutorStart/Run/Finish/End */
 ExecutorStart_hook_type ExecutorStart_hook = NULL;
@@ -94,24 +96,13 @@ static bool ExecCheckRTEPermsModified(Oid relOid, Oid userid,
 						  Bitmapset *modifiedCols,
 						  AclMode requiredPerms);
 static void ExecCheckXactReadOnly(PlannedStmt *plannedstmt);
-static char *ExecBuildSlotValueDescription(Oid reloid,
+static char *ExecBuildSlotValueDescription(Relation rel,
 							  TupleTableSlot *slot,
 							  TupleDesc tupdesc,
 							  Bitmapset *modifiedCols,
 							  int maxfieldlen);
 static void EvalPlanQualStart(EPQState *epqstate, EState *parentestate,
 				  Plan *planTree);
-
-/*
- * Note that GetUpdatedColumns() also exists in commands/trigger.c.  There does
- * not appear to be any good header to put it into, given the structures that
- * it uses, so we let them be duplicated.  Be sure to update both if one needs
- * to be changed, however.
- */
-#define GetInsertedColumns(relinfo, estate) \
-	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->insertedCols)
-#define GetUpdatedColumns(relinfo, estate) \
-	(rt_fetch((relinfo)->ri_RangeTableIndex, (estate)->es_range_table)->updatedCols)
 
 /* end of local decls */
 
@@ -129,7 +120,7 @@ static void EvalPlanQualStart(EPQState *epqstate, EState *parentestate,
  *
  * eflags contains flag bits as described in executor.h.
  *
- * NB: the CurrentMemoryContext when this is called will become the parent
+ * NB: the GetCurrentMemoryContext() when this is called will become the parent
  * of the per-query context used for this Executor invocation.
  *
  * We provide a function hook variable that lets loadable plugins
@@ -171,8 +162,10 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	 * We have lower-level defenses in CommandCounterIncrement and elsewhere
 	 * against performing unsafe operations in parallel mode, but this gives a
 	 * more user-friendly error message.
+	 *
+	 * YB: We also notify pggate whether the statement is read only.
 	 */
-	if ((XactReadOnly || IsInParallelMode()) &&
+	if ((IsYugaByteEnabled() || XactReadOnly || IsInParallelMode()) &&
 		!(eflags & EXEC_FLAG_EXPLAIN_ONLY))
 		ExecCheckXactReadOnly(queryDesc->plannedstmt);
 
@@ -212,7 +205,6 @@ standard_ExecutorStart(QueryDesc *queryDesc, int eflags)
 	switch (queryDesc->operation)
 	{
 		case CMD_SELECT:
-
 			/*
 			 * SELECT FOR [KEY] UPDATE/SHARE and modifying CTEs need to mark
 			 * tuples
@@ -324,6 +316,9 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 
 	Assert(estate != NULL);
 	Assert(!(estate->es_top_eflags & EXEC_FLAG_EXPLAIN_ONLY));
+
+	if (IsYugaByteEnabled())
+		YBBeginOperationsBuffering();
 
 	/*
 	 * Switch into per-query memory context
@@ -438,6 +433,10 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 	if (!(estate->es_top_eflags & EXEC_FLAG_SKIP_TRIGGERS))
 		AfterTriggerEndQuery(estate);
 
+	// Flush buffered operations straight before elapsed time calculation.
+	if (IsYugaByteEnabled())
+		YBEndOperationsBuffering();
+
 	if (queryDesc->totaltime)
 		InstrStopNode(queryDesc->totaltime, 0);
 
@@ -515,6 +514,7 @@ standard_ExecutorEnd(QueryDesc *queryDesc)
 	queryDesc->estate = NULL;
 	queryDesc->planstate = NULL;
 	queryDesc->totaltime = NULL;
+	queryDesc->yb_query_stats = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -675,8 +675,8 @@ ExecCheckRTEPerms(RangeTblEntry *rte)
 
 			while ((col = bms_next_member(rte->selectedCols, col)) >= 0)
 			{
-				/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-				AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+				/* Add appropriate offset to get attribute # from column # */
+				AttrNumber attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 				if (attno == InvalidAttrNumber)
 				{
@@ -738,8 +738,8 @@ ExecCheckRTEPermsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
 
 	while ((col = bms_next_member(modifiedCols, col)) >= 0)
 	{
-		/* bit #s are offset by FirstLowInvalidHeapAttributeNumber */
-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+		/* Add appropriate offset to get attribute # from column # */
+		AttrNumber attno = col + YBGetFirstLowInvalidAttributeNumberFromOid(relOid);
 
 		if (attno == InvalidAttrNumber)
 		{
@@ -764,11 +764,14 @@ ExecCheckRTEPermsModified(Oid relOid, Oid userid, Bitmapset *modifiedCols,
  * Note: in a Hot Standby this would need to reject writes to temp
  * tables just as we do in parallel mode; but an HS standby can't have created
  * any temp tables in the first place, so no need to check that.
+ *
+ * YB: We also notify pggate whether the statement is read only.
  */
 static void
 ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 {
 	ListCell   *l;
+	bool		yb_is_read_only = true;
 
 	/*
 	 * Fail if write permissions are requested in parallel mode for table
@@ -788,10 +791,21 @@ ExecCheckXactReadOnly(PlannedStmt *plannedstmt)
 			continue;
 
 		PreventCommandIfReadOnly(CreateCommandTag((Node *) plannedstmt));
+		yb_is_read_only = false;
 	}
 
 	if (plannedstmt->commandType != CMD_SELECT || plannedstmt->hasModifyingCTE)
+	{
 		PreventCommandIfParallelMode(CreateCommandTag((Node *) plannedstmt));
+		yb_is_read_only = false;
+	}
+
+	if (IsYugaByteEnabled())
+	{
+		if (plannedstmt->rowMarks)
+			yb_is_read_only = false;
+		HandleYBStatus(YBCPgSetReadOnlyStmt(yb_is_read_only));
+	}
 }
 
 
@@ -818,7 +832,10 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 	/*
 	 * Do permissions checks
 	 */
-	ExecCheckRTPerms(rangeTable, true);
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension))
+	{
+		ExecCheckRTPerms(rangeTable, true);
+	}
 
 	/*
 	 * initialize the node's execution state
@@ -1037,6 +1054,8 @@ InitPlan(QueryDesc *queryDesc, int eflags)
 
 		i++;
 	}
+
+	queryDesc->yb_query_stats = InstrAlloc(1, queryDesc->instrument_options);
 
 	/*
 	 * Initialize the private state information for all the nodes in the query
@@ -1302,7 +1321,7 @@ void
 InitResultRelInfo(ResultRelInfo *resultRelInfo,
 				  Relation resultRelationDesc,
 				  Index resultRelationIndex,
-				  Relation partition_root,
+				  ResultRelInfo *partition_root_rri,
 				  int instrument_options)
 {
 	List	   *partition_check = NIL;
@@ -1363,7 +1382,7 @@ InitResultRelInfo(ResultRelInfo *resultRelInfo,
 	partition_check = RelationGetPartitionQual(resultRelationDesc);
 
 	resultRelInfo->ri_PartitionCheck = partition_check;
-	resultRelInfo->ri_PartitionRoot = partition_root;
+	resultRelInfo->ri_RootResultRelInfo = partition_root_rri;
 	resultRelInfo->ri_PartitionReadyForRouting = false;
 }
 
@@ -1727,15 +1746,7 @@ ExecutePlan(EState *estate,
 		 * process so we just end the loop...
 		 */
 		if (TupIsNull(slot))
-		{
-			/*
-			 * If we know we won't need to back up, we can release resources
-			 * at this point.
-			 */
-			if (!(estate->es_top_eflags & EXEC_FLAG_BACKWARD))
-				(void) ExecShutdownNode(planstate);
 			break;
-		}
 
 		/*
 		 * If we have a junk filter, then project a new tuple with the junk
@@ -1778,16 +1789,15 @@ ExecutePlan(EState *estate,
 		 */
 		current_tuple_count++;
 		if (numberTuples && numberTuples == current_tuple_count)
-		{
-			/*
-			 * If we know we won't need to back up, we can release resources
-			 * at this point.
-			 */
-			if (!(estate->es_top_eflags & EXEC_FLAG_BACKWARD))
-				(void) ExecShutdownNode(planstate);
 			break;
-		}
 	}
+
+	/*
+	 * If we know we won't need to back up, we can release resources at this
+	 * point.
+	 */
+	if (!(estate->es_top_eflags & EXEC_FLAG_BACKWARD))
+		(void) ExecShutdownNode(planstate);
 
 	if (use_parallel_mode)
 		ExitParallelMode();
@@ -1915,41 +1925,50 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
 							TupleTableSlot *slot,
 							EState *estate)
 {
+	Relation 	root_rel;
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	Relation	orig_rel = rel;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	char	   *val_desc;
 	Bitmapset  *modifiedCols;
-	Bitmapset  *insertedCols;
-	Bitmapset  *updatedCols;
 
 	/*
 	 * Need to first convert the tuple to the root partitioned table's row
 	 * type. For details, check similar comments in ExecConstraints().
 	 */
-	if (resultRelInfo->ri_PartitionRoot)
+	if (resultRelInfo->ri_RootResultRelInfo)
 	{
-		HeapTuple	tuple = ExecFetchSlotTuple(slot);
-		TupleDesc	old_tupdesc = RelationGetDescr(rel);
-		TupleConversionMap *map;
+		ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
+		TupleDesc	old_tupdesc;
+		AttrNumber *map;
 
-		rel = resultRelInfo->ri_PartitionRoot;
-		tupdesc = RelationGetDescr(rel);
+		root_rel = rootrel->ri_RelationDesc;
+		tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
+
+		old_tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
 		/* a reverse map */
-		map = convert_tuples_by_name(old_tupdesc, tupdesc,
-									 gettext_noop("could not convert row type"));
+		map = convert_tuples_by_name_map_if_req(old_tupdesc, tupdesc,
+												gettext_noop("could not convert row type"));
+
+		/*
+		 * Partition-specific slot's tupdesc can't be changed, so allocate a
+		 * new one.
+		 */
 		if (map != NULL)
-		{
-			tuple = do_convert_tuple(tuple, map);
-			ExecSetSlotDescriptor(slot, tupdesc);
-			ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-		}
+			slot = execute_attr_map_slot(map, slot,
+										 MakeTupleTableSlot(tupdesc));
+		modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+								 ExecGetUpdatedCols(rootrel, estate));
+	}
+	else
+	{
+		root_rel = resultRelInfo->ri_RelationDesc;
+		tupdesc = RelationGetDescr(resultRelInfo->ri_RelationDesc);
+		modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+								 ExecGetUpdatedCols(resultRelInfo, estate));
 	}
 
-	insertedCols = GetInsertedColumns(resultRelInfo, estate);
-	updatedCols = GetUpdatedColumns(resultRelInfo, estate);
-	modifiedCols = bms_union(insertedCols, updatedCols);
-	val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
+	val_desc = ExecBuildSlotValueDescription(root_rel,
 											 slot,
 											 tupdesc,
 											 modifiedCols,
@@ -1974,14 +1993,14 @@ ExecPartitionCheckEmitError(ResultRelInfo *resultRelInfo,
  */
 void
 ExecConstraints(ResultRelInfo *resultRelInfo,
-				TupleTableSlot *slot, EState *estate)
+				TupleTableSlot *slot,
+				EState *estate,
+				ModifyTableState *mtstate)
 {
 	Relation	rel = resultRelInfo->ri_RelationDesc;
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	TupleConstr *constr = tupdesc->constr;
 	Bitmapset  *modifiedCols;
-	Bitmapset  *insertedCols;
-	Bitmapset  *updatedCols;
 
 	Assert(constr || resultRelInfo->ri_PartitionCheck);
 
@@ -1993,6 +2012,38 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 		for (attrChk = 1; attrChk <= natts; attrChk++)
 		{
 			Form_pg_attribute att = TupleDescAttr(tupdesc, attrChk - 1);
+
+			/*
+			 * Below we check if attribute belongs to the modified columns for
+			 * the NOT NULL constraint and if so, performs single-row updates.
+			 * Thus modified columns must be calculated beforehand.
+			 */
+			if (resultRelInfo->ri_RootResultRelInfo)
+			{
+				ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
+				modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+										 ExecGetUpdatedCols(rootrel, estate));
+			}
+			else
+			{
+				modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+										 ExecGetUpdatedCols(resultRelInfo, estate));
+			}
+
+			bool att_in_modified_cols = bms_is_member(
+				att->attnum - YBGetFirstLowInvalidAttributeNumber(rel),
+				modifiedCols);
+
+			if (mtstate && !mtstate->yb_fetch_target_tuple && !att_in_modified_cols)
+			{
+				/*
+				 * Without a target tuple, we only know the values of the
+				 * modified columns. But in this case it is safe to skip the
+				 * unmodified columns anyway.
+				 */
+				bms_free(modifiedCols);
+				continue;
+			}
 
 			if (att->attnotnull && slot_attisnull(slot, attrChk))
 			{
@@ -2007,28 +2058,28 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 				 * rowtype so that val_desc shown error message matches the
 				 * input tuple.
 				 */
-				if (resultRelInfo->ri_PartitionRoot)
+				if (resultRelInfo->ri_RootResultRelInfo)
 				{
-					HeapTuple	tuple = ExecFetchSlotTuple(slot);
-					TupleConversionMap *map;
+					ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
+					AttrNumber *map;
 
-					rel = resultRelInfo->ri_PartitionRoot;
-					tupdesc = RelationGetDescr(rel);
+					tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
 					/* a reverse map */
-					map = convert_tuples_by_name(orig_tupdesc, tupdesc,
-												 gettext_noop("could not convert row type"));
+					map = convert_tuples_by_name_map_if_req(orig_tupdesc,
+															tupdesc,
+															gettext_noop("could not convert row type"));
+
+					/*
+					 * Partition-specific slot's tupdesc can't be changed, so
+					 * allocate a new one.
+					 */
 					if (map != NULL)
-					{
-						tuple = do_convert_tuple(tuple, map);
-						ExecSetSlotDescriptor(slot, tupdesc);
-						ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-					}
+						slot = execute_attr_map_slot(map, slot,
+													 MakeTupleTableSlot(tupdesc));
+					rel = rootrel->ri_RelationDesc;
 				}
 
-				insertedCols = GetInsertedColumns(resultRelInfo, estate);
-				updatedCols = GetUpdatedColumns(resultRelInfo, estate);
-				modifiedCols = bms_union(insertedCols, updatedCols);
-				val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
+				val_desc = ExecBuildSlotValueDescription(rel,
 														 slot,
 														 tupdesc,
 														 modifiedCols,
@@ -2041,6 +2092,7 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 						 val_desc ? errdetail("Failing row contains %s.", val_desc) : 0,
 						 errtablecol(orig_rel, attrChk)));
 			}
+			bms_free(modifiedCols);
 		}
 	}
 
@@ -2054,29 +2106,34 @@ ExecConstraints(ResultRelInfo *resultRelInfo,
 			Relation	orig_rel = rel;
 
 			/* See the comment above. */
-			if (resultRelInfo->ri_PartitionRoot)
+			if (resultRelInfo->ri_RootResultRelInfo)
 			{
-				HeapTuple	tuple = ExecFetchSlotTuple(slot);
+				ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
 				TupleDesc	old_tupdesc = RelationGetDescr(rel);
-				TupleConversionMap *map;
+				AttrNumber *map;
 
-				rel = resultRelInfo->ri_PartitionRoot;
-				tupdesc = RelationGetDescr(rel);
+				tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
 				/* a reverse map */
-				map = convert_tuples_by_name(old_tupdesc, tupdesc,
-											 gettext_noop("could not convert row type"));
-				if (map != NULL)
-				{
-					tuple = do_convert_tuple(tuple, map);
-					ExecSetSlotDescriptor(slot, tupdesc);
-					ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-				}
-			}
+				map = convert_tuples_by_name_map_if_req(old_tupdesc,
+														tupdesc,
+														gettext_noop("could not convert row type"));
 
-			insertedCols = GetInsertedColumns(resultRelInfo, estate);
-			updatedCols = GetUpdatedColumns(resultRelInfo, estate);
-			modifiedCols = bms_union(insertedCols, updatedCols);
-			val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
+				/*
+				 * Partition-specific slot's tupdesc can't be changed, so
+				 * allocate a new one.
+				 */
+				if (map != NULL)
+					slot = execute_attr_map_slot(map, slot,
+												 MakeTupleTableSlot(tupdesc));
+				modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+										 ExecGetUpdatedCols(rootrel, estate));
+				rel = rootrel->ri_RelationDesc;
+			}
+			else
+				modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+										 ExecGetUpdatedCols(resultRelInfo, estate));
+
+			val_desc = ExecBuildSlotValueDescription(rel,
 													 slot,
 													 tupdesc,
 													 modifiedCols,
@@ -2144,8 +2201,6 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
 		{
 			char	   *val_desc;
 			Bitmapset  *modifiedCols;
-			Bitmapset  *insertedCols;
-			Bitmapset  *updatedCols;
 
 			switch (wco->kind)
 			{
@@ -2160,29 +2215,33 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
 					 */
 				case WCO_VIEW_CHECK:
 					/* See the comment in ExecConstraints(). */
-					if (resultRelInfo->ri_PartitionRoot)
+					if (resultRelInfo->ri_RootResultRelInfo)
 					{
-						HeapTuple	tuple = ExecFetchSlotTuple(slot);
+						ResultRelInfo *rootrel = resultRelInfo->ri_RootResultRelInfo;
 						TupleDesc	old_tupdesc = RelationGetDescr(rel);
-						TupleConversionMap *map;
+						AttrNumber *map;
 
-						rel = resultRelInfo->ri_PartitionRoot;
-						tupdesc = RelationGetDescr(rel);
+						tupdesc = RelationGetDescr(rootrel->ri_RelationDesc);
 						/* a reverse map */
-						map = convert_tuples_by_name(old_tupdesc, tupdesc,
-													 gettext_noop("could not convert row type"));
-						if (map != NULL)
-						{
-							tuple = do_convert_tuple(tuple, map);
-							ExecSetSlotDescriptor(slot, tupdesc);
-							ExecStoreTuple(tuple, slot, InvalidBuffer, false);
-						}
-					}
+						map = convert_tuples_by_name_map_if_req(old_tupdesc,
+																tupdesc,
+																gettext_noop("could not convert row type"));
 
-					insertedCols = GetInsertedColumns(resultRelInfo, estate);
-					updatedCols = GetUpdatedColumns(resultRelInfo, estate);
-					modifiedCols = bms_union(insertedCols, updatedCols);
-					val_desc = ExecBuildSlotValueDescription(RelationGetRelid(rel),
+						/*
+						 * Partition-specific slot's tupdesc can't be changed,
+						 * so allocate a new one.
+						 */
+						if (map != NULL)
+							slot = execute_attr_map_slot(map, slot,
+														 MakeTupleTableSlot(tupdesc));
+						modifiedCols = bms_union(ExecGetInsertedCols(rootrel, estate),
+												 ExecGetUpdatedCols(rootrel, estate));
+						rel = rootrel->ri_RelationDesc;
+					}
+					else
+						modifiedCols = bms_union(ExecGetInsertedCols(resultRelInfo, estate),
+												 ExecGetUpdatedCols(resultRelInfo, estate));
+					val_desc = ExecBuildSlotValueDescription(rel,
 															 slot,
 															 tupdesc,
 															 modifiedCols,
@@ -2248,7 +2307,7 @@ ExecWithCheckOptions(WCOKind kind, ResultRelInfo *resultRelInfo,
  * columns they are.
  */
 static char *
-ExecBuildSlotValueDescription(Oid reloid,
+ExecBuildSlotValueDescription(Relation rel,
 							  TupleTableSlot *slot,
 							  TupleDesc tupdesc,
 							  Bitmapset *modifiedCols,
@@ -2262,6 +2321,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 	AclResult	aclresult;
 	bool		table_perm = false;
 	bool		any_perm = false;
+	Oid     reloid = RelationGetRelid(rel);
 
 	/*
 	 * Check if RLS is enabled and should be active for the relation; if so,
@@ -2316,7 +2376,7 @@ ExecBuildSlotValueDescription(Oid reloid,
 			 */
 			aclresult = pg_attribute_aclcheck(reloid, att->attnum,
 											  GetUserId(), ACL_SELECT);
-			if (bms_is_member(att->attnum - FirstLowInvalidHeapAttributeNumber,
+			if (bms_is_member(att->attnum - YBGetFirstLowInvalidAttributeNumber(rel),
 							  modifiedCols) || aclresult == ACLCHECK_OK)
 			{
 				column_perm = any_perm = true;
@@ -2395,7 +2455,7 @@ ExecUpdateLockMode(EState *estate, ResultRelInfo *relinfo)
 	 * been modified, then we can use a weaker lock, allowing for better
 	 * concurrency.
 	 */
-	updatedCols = GetUpdatedColumns(relinfo, estate);
+	updatedCols = ExecGetUpdatedCols(relinfo, estate);
 	keyCols = RelationGetIndexAttrBitmap(relinfo->ri_RelationDesc,
 										 INDEX_ATTR_BITMAP_KEY);
 
@@ -2446,9 +2506,16 @@ ExecBuildAuxRowMark(ExecRowMark *erm, List *targetlist)
 	if (erm->markType != ROW_MARK_COPY)
 	{
 		/* need ctid for all methods other than COPY */
-		snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		if (IsYBBackedRelation(erm->relation))
+		{
+			snprintf(resname, sizeof(resname), "ybctid%u", erm->rowmarkId);
+		}
+		else
+		{
+			snprintf(resname, sizeof(resname), "ctid%u", erm->rowmarkId);
+		}
 		aerm->ctidAttNo = ExecFindJunkAttributeInTlist(targetlist,
-													   resname);
+													resname);
 		if (!AttributeNumberIsValid(aerm->ctidAttNo))
 			elog(ERROR, "could not find junk %s column", resname);
 	}

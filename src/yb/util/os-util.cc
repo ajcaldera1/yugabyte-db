@@ -35,23 +35,20 @@
 // - Replaced StringParser with strings/numbers.
 // - Fixes for cpplint.
 // - Fixed parsing when thread names have spaces.
-
 #include "yb/util/os-util.h"
 
 #include <fstream>
-#include <sstream>
 #include <string>
 #include <vector>
-#include <unistd.h>
 
-#include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/strings/split.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/errno.h"
 
 using std::ifstream;
 using std::istreambuf_iterator;
 using std::stringstream;
+using std::string;
+using std::vector;
 using strings::Split;
 using strings::Substitute;
 

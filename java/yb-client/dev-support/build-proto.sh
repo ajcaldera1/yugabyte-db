@@ -39,10 +39,26 @@
 
 . "${BASH_SOURCE%/*}/../../../build-support/common-build-env.sh"
 
-# In case we are on NFS, try to use the shared thirdparty, if possible.
-find_thirdparty_dir
+if [[ -z ${BUILD_ROOT:-} ]]; then
+  set_cmake_build_type_and_compiler_type
+  set_build_root
+fi
 
-PROTOC_BIN=$YB_THIRDPARTY_DIR/installed/uninstrumented/bin/protoc
+find_or_download_thirdparty
+
+THIRDPARTY_BUILD_TYPE=uninstrumented
+
+thirdparty_installed_dir_from_cmake_cache=$(
+  grep --max-count=1 "YB_THIRDPARTY_INSTALLED_DIR:STRING=" "${BUILD_ROOT}/CMakeCache.txt"
+)
+
+if [[ -n ${thirdparty_installed_dir_from_cmake_cache} ]]; then
+  thirdparty_installed_dir=${thirdparty_installed_dir_from_cmake_cache#*:STRING=}
+else
+  thirdparty_installed_dir="$YB_THIRDPARTY_DIR/installed/$THIRDPARTY_BUILD_TYPE"
+fi
+PROTOC_BIN=${thirdparty_installed_dir}/${THIRDPARTY_BUILD_TYPE}/bin/protoc
+
 if [[ ! -f $PROTOC_BIN ]]; then
   if which protoc > /dev/null; then
     PROTOC_BIN=$( which protoc )

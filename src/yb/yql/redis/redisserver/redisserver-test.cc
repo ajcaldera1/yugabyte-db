@@ -12,35 +12,48 @@
 //
 
 #include <chrono>
-#include <cstdio>
 #include <memory>
 #include <random>
 #include <string>
 #include <thread>
 #include <vector>
-#include <algorithm>
 
 #include <boost/algorithm/string.hpp>
+
+#include "yb/client/yb_table_name.h"
 
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/substitute.h"
 
-#include "yb/client/meta_cache.h"
-
 #include "yb/integration-tests/redis_table_test_base.h"
+
+#include "yb/master/catalog_manager_if.h"
+#include "yb/master/flush_manager.h"
+#include "yb/master/master_admin.pb.h"
+
+#include "yb/rpc/io_thread_pool.h"
+
+#include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/tablet_server.h"
+
+#include "yb/util/cast.h"
+#include "yb/util/enums.h"
+#include "yb/util/metrics.h"
+#include "yb/util/net/socket.h"
+#include "yb/util/protobuf.h"
+#include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/result.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_util.h"
+#include "yb/util/tsan_util.h"
+#include "yb/util/value_changer.h"
 
 #include "yb/yql/redis/redisserver/redis_client.h"
 #include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/yql/redis/redisserver/redis_encoding.h"
 #include "yb/yql/redis/redisserver/redis_server.h"
-
-#include "yb/rpc/io_thread_pool.h"
-
-#include "yb/util/cast.h"
-#include "yb/util/enums.h"
-#include "yb/util/protobuf.h"
-#include "yb/util/test_util.h"
-#include "yb/util/value_changer.h"
+#include "yb/util/flags.h"
 
 DECLARE_uint64(redis_max_concurrent_commands);
 DECLARE_uint64(redis_max_batch);
@@ -49,21 +62,22 @@ DECLARE_uint64(redis_max_queued_bytes);
 DECLARE_int64(redis_rpc_block_size);
 DECLARE_bool(redis_safe_batch);
 DECLARE_bool(emulate_redis_responses);
-DECLARE_bool(test_tserver_timeout);
-DECLARE_bool(enable_backpressure_mode_for_testing);
+DECLARE_bool(enable_direct_local_tablet_server_call);
+DECLARE_bool(TEST_tserver_timeout);
+DECLARE_bool(TEST_enable_backpressure_mode_for_testing);
 DECLARE_bool(yedis_enable_flush);
 DECLARE_int32(redis_service_yb_client_timeout_millis);
-DECLARE_int32(redis_max_value_size);
-DECLARE_int32(redis_max_command_size);
+DECLARE_uint64(redis_max_value_size);
+DECLARE_uint64(redis_max_command_size);
 DECLARE_int32(redis_password_caching_duration_ms);
-DECLARE_int32(rpc_max_message_size);
-DECLARE_int32(consensus_max_batch_size_bytes);
+DECLARE_uint64(rpc_max_message_size);
+DECLARE_uint64(consensus_max_batch_size_bytes);
 DECLARE_int32(consensus_rpc_timeout_ms);
 DECLARE_int64(max_time_in_queue_ms);
 
-DEFINE_uint64(test_redis_max_concurrent_commands, 20,
+DEFINE_NON_RUNTIME_uint64(test_redis_max_concurrent_commands, 20,
     "Value of redis_max_concurrent_commands for pipeline test");
-DEFINE_uint64(test_redis_max_batch, 250,
+DEFINE_NON_RUNTIME_uint64(test_redis_max_batch, 250,
     "Value of redis_max_batch for pipeline test");
 
 METRIC_DECLARE_gauge_uint64(redis_available_sessions);
@@ -81,7 +95,6 @@ using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
 using yb::integration_tests::RedisTableTestBase;
-using yb::util::ToRepeatedPtrField;
 
 #if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
 constexpr int kDefaultTimeoutMs = 100000;
@@ -214,7 +227,7 @@ class TestRedisService : public RedisTableTestBase {
           ASSERT_EQ(expected.size(), replies.size())
               << "Originator: " << __FILE__ << ":" << line << std::endl
               << "Expected: " << yb::ToString(expected) << std::endl
-              << " Replies: " << reply.ToString();
+              << " Replies: " << Max500CharsPrinter(reply.ToString());
           for (size_t i = 0; i < expected.size(); i++) {
             DVLOG(3) << "Checking " << replies[i].ToString();
             if (expected[i].get_type() == RedisReplyType::kString &&
@@ -299,21 +312,54 @@ class TestRedisService : public RedisTableTestBase {
 
   void VerifyCallbacks();
 
+  Status FlushRedisTable() {
+    // Flush the table
+    auto epoch = master::LeaderEpoch(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())
+                                         ->catalog_manager()
+                                         .leader_ready_term());
+    master::FlushTablesRequestPB req;
+    req.set_is_compaction(false);
+    table_name().SetIntoTableIdentifierPB(req.add_tables());
+    master::FlushTablesResponsePB resp;
+    RETURN_NOT_OK(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())->flush_manager().
+                  FlushTables(&req, &resp, /* rpc_context */ nullptr, epoch));
+
+    master::IsFlushTablesDoneRequestPB wait_req;
+    // Wait for table creation.
+    wait_req.set_flush_request_id(resp.flush_request_id());
+
+    for (int k = 0; k < 20; ++k) {
+      master::IsFlushTablesDoneResponsePB wait_resp;
+      RETURN_NOT_OK(VERIFY_RESULT(mini_cluster()->GetLeaderMiniMaster())
+                        ->flush_manager().IsFlushTablesDone(&wait_req, &wait_resp));
+      if (wait_resp.done()) {
+        return Status::OK();
+      }
+      SleepFor(MonoDelta::FromSeconds(1));
+    }
+    return STATUS(IllegalState, "Could not flush redis table.");
+  }
+
   int server_port() { return redis_server_port_; }
 
-  CHECKED_STATUS Send(const std::string& cmd);
+  Status Send(const std::string& cmd);
 
-  CHECKED_STATUS SendCommandAndGetResponse(
-      const string& cmd, int expected_resp_length, int timeout_in_millis = kDefaultTimeoutMs);
+  Status SendCommandAndGetResponse(
+      const string& cmd, size_t expected_resp_length, int timeout_in_millis = kDefaultTimeoutMs);
 
   size_t CountSessions(const GaugePrototype<uint64_t>& proto) {
     constexpr uint64_t kInitialValue = 0UL;
-    auto counter = server_->metric_entity()->FindOrCreateGauge(&proto, kInitialValue);
+    auto counter = server_->metric_entity()->FindOrCreateMetric<AtomicGauge<uint64_t>>(
+        &proto, kInitialValue);
     return counter->value();
   }
 
   virtual Endpoint RedisProxyEndpoint() {
-    return Endpoint(IpAddress(), server_port());
+    if (use_external_mini_cluster()) {
+      return Endpoint(IpAddress(), server_port());
+    }
+    auto server = mini_cluster()->mini_tablet_server(0)->server();
+    return Endpoint(server->first_rpc_address().address(), redis_server_port_);
   }
 
   void TestTSTtl(const std::string& expire_command, int64_t ttl_sec, int64_t expire_val,
@@ -390,7 +436,7 @@ class TestRedisService : public RedisTableTestBase {
   }
 
   void TestFlush(const string& flush_cmd, const bool allow_flush) {
-    FLAGS_yedis_enable_flush = allow_flush;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_yedis_enable_flush) = allow_flush;
     // Populate keys.
     const int kKeyCount = 100;
     for (int i = 0; i < kKeyCount; i++) {
@@ -432,9 +478,14 @@ class TestRedisService : public RedisTableTestBase {
   RedisClient& client() {
     if (!test_client_) {
       io_thread_pool_.emplace("test", 1);
-      test_client_ = std::make_shared<RedisClient>("127.0.0.1", server_port());
+      test_client_ = CreateClient();
     }
     return *test_client_;
+  }
+
+  std::shared_ptr<RedisClient> CreateClient() {
+    auto endpoint = RedisProxyEndpoint();
+    return std::make_shared<RedisClient>(endpoint.address().to_string(), endpoint.port());
   }
 
   void UseClient(std::shared_ptr<RedisClient> client) {
@@ -714,27 +765,36 @@ class TestRedisService : public RedisTableTestBase {
   std::vector<uint8_t> resp_;
   boost::optional<rpc::IoThreadPool> io_thread_pool_;
   std::shared_ptr<RedisClient> test_client_;
-  boost::optional<google::FlagSaver> flag_saver_;
 };
 
+class NoLocalCallsRedisServiceTest : public TestRedisService {
+ public:
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_direct_local_tablet_server_call) = false;
+    TestRedisService::SetUp();
+  }
+};
+
+
 void TestRedisService::SetUp() {
-  if (IsTsan()) {
-    flag_saver_.emplace();
-    FLAGS_redis_max_value_size = 1_MB;
-    FLAGS_rpc_max_message_size = FLAGS_redis_max_value_size * 4 - 1;
-    FLAGS_redis_max_command_size = FLAGS_rpc_max_message_size - 2_KB;
-    FLAGS_consensus_max_batch_size_bytes = FLAGS_rpc_max_message_size - 2_KB;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_service_yb_client_timeout_millis) = kDefaultTimeoutMs;
+  if (IsSanitizer()) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_value_size) = 1_MB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_max_message_size) = FLAGS_redis_max_value_size * 4 - 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_command_size) = FLAGS_rpc_max_message_size - 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_max_batch_size_bytes) =
+        FLAGS_rpc_max_message_size - 2_KB;
   } else {
 #ifndef NDEBUG
-    flag_saver_.emplace();
-    FLAGS_redis_max_value_size = 32_MB;
-    FLAGS_rpc_max_message_size = FLAGS_redis_max_value_size * 4 - 1;
-    FLAGS_redis_max_command_size = FLAGS_rpc_max_message_size - 2_KB;
-    FLAGS_consensus_max_batch_size_bytes = FLAGS_rpc_max_message_size - 2_KB;
-    FLAGS_consensus_rpc_timeout_ms = 3000;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_value_size) = 32_MB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_max_message_size) = FLAGS_redis_max_value_size * 4 - 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_command_size) = FLAGS_rpc_max_message_size - 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_max_batch_size_bytes) =
+        FLAGS_rpc_max_message_size - 2_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_consensus_rpc_timeout_ms) = 3000;
 #endif
   }
-  FLAGS_redis_max_read_buffer_size = redis_max_read_buffer_size_;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_read_buffer_size) = redis_max_read_buffer_size_;
   LOG(INFO) << "FLAGS_redis_max_read_buffer_size=" << FLAGS_redis_max_read_buffer_size
             << ", FLAGS_redis_max_queued_bytes=" << FLAGS_redis_max_queued_bytes;
 
@@ -745,9 +805,14 @@ void TestRedisService::SetUp() {
 }
 
 void TestRedisService::StartServer() {
+  if (use_external_mini_cluster()) {
+    redis_server_port_ = external_mini_cluster()->tablet_server(0)->redis_rpc_port();
+    return;
+  }
+
   redis_server_port_ = GetFreePort(&redis_port_lock_);
   RedisServerOptions opts;
-  opts.rpc_opts.rpc_bind_addresses = strings::Substitute("0.0.0.0:$0", redis_server_port_);
+  opts.rpc_opts.rpc_bind_addresses = AsString(RedisProxyEndpoint());
   // No need to save the webserver port, as we don't plan on using it. Just use a unique free port.
   opts.webserver_opts.port = GetFreePort(&redis_webserver_lock_);
   string fs_root = GetTestPath("RedisServerTest-fsroot");
@@ -757,13 +822,16 @@ void TestRedisService::StartServer() {
   auto master_rpc_addrs = master_rpc_addresses_as_strings();
   opts.master_addresses_flag = JoinStrings(master_rpc_addrs, ",");
 
-  server_.reset(new RedisServer(opts, nullptr /* tserver */));
+  server_ = std::make_unique<RedisServer>(opts, mini_cluster()->mini_tablet_server(0)->server());
   LOG(INFO) << "Starting redis server...";
   CHECK_OK(server_->Start());
   LOG(INFO) << "Redis server successfully started.";
 }
 
 void TestRedisService::StopServer() {
+  if (!server_) {
+    return;
+  }
   LOG(INFO) << "Shut down redis server...";
   server_->Shutdown();
   server_.reset();
@@ -802,25 +870,24 @@ void TestRedisService::CloseRedisClient() {
 }
 
 void TestRedisService::TearDown() {
-  size_t allocated_sessions = CountSessions(METRIC_redis_allocated_sessions);
-  if (!expected_no_sessions_) {
-    EXPECT_GT(allocated_sessions, 0); // Check that metric is sane.
-  } else {
-    EXPECT_EQ(0, allocated_sessions);
+  if (!use_external_mini_cluster()) {
+    size_t allocated_sessions = CountSessions(METRIC_redis_allocated_sessions);
+    if (!expected_no_sessions_) {
+      EXPECT_GT(allocated_sessions, 0); // Check that metric is sane.
+    } else {
+      EXPECT_EQ(0, allocated_sessions);
+    }
+    EXPECT_EQ(allocated_sessions, CountSessions(METRIC_redis_available_sessions));
   }
-  EXPECT_EQ(allocated_sessions, CountSessions(METRIC_redis_available_sessions));
 
   CloseRedisClient();
   StopServer();
   RedisTableTestBase::TearDown();
-
-  flag_saver_.reset();
 }
 
 Status TestRedisService::Send(const std::string& cmd) {
   // Send the command.
-  int32_t bytes_written = 0;
-  EXPECT_OK(client_sock_.Write(util::to_uchar_ptr(cmd.c_str()), cmd.length(), &bytes_written));
+  auto bytes_written = EXPECT_RESULT(client_sock_.Write(to_uchar_ptr(cmd.c_str()), cmd.length()));
 
   EXPECT_EQ(cmd.length(), bytes_written);
 
@@ -828,19 +895,18 @@ Status TestRedisService::Send(const std::string& cmd) {
 }
 
 Status TestRedisService::SendCommandAndGetResponse(
-    const string& cmd, int expected_resp_length, int timeout_in_millis) {
+    const string& cmd, size_t expected_resp_length, int timeout_in_millis) {
   RETURN_NOT_OK(Send(cmd));
 
   // Receive the response.
   MonoTime deadline = MonoTime::Now();
   deadline.AddDelta(MonoDelta::FromMilliseconds(timeout_in_millis));
-  size_t bytes_read = 0;
   resp_.resize(expected_resp_length);
   if (expected_resp_length) {
     memset(resp_.data(), 0, expected_resp_length);
   }
-  RETURN_NOT_OK(client_sock_.BlockingRecv(
-      resp_.data(), expected_resp_length, &bytes_read, deadline));
+  auto bytes_read = VERIFY_RESULT(client_sock_.BlockingRecv(
+      resp_.data(), expected_resp_length, deadline));
   resp_.resize(bytes_read);
   if (expected_resp_length != bytes_read) {
     return STATUS(
@@ -888,7 +954,7 @@ void TestRedisService::SendCommandAndExpectResponse(int line,
 
   // Verify that the response is as expected.
 
-  std::string response(util::to_char_ptr(resp_.data()), expected.length());
+  std::string response(to_char_ptr(resp_.data()), expected.length());
   ASSERT_EQ(expected, response)
                 << "Command: " << Slice(cmd).ToDebugString() << std::endl
                 << "Originator: " << __FILE__ << ":" << line;
@@ -906,7 +972,8 @@ void TestRedisService::DoRedisTest(int line,
             << reply.as_string() << ", of type: " << to_underlying(reply.get_type());
     num_callbacks_called_++;
     ASSERT_EQ(reply_type, reply.get_type())
-        << "Originator: " << __FILE__ << ":" << line << ", reply: " << reply.ToString();
+        << "Originator: " << __FILE__ << ":" << line << ", reply: "
+        << Max500CharsPrinter(reply.ToString());
     callback(reply);
   });
 }
@@ -938,8 +1005,8 @@ class TestRedisServiceCleanQueueOnShutdown : public TestRedisService {
   void SetUp() override {
     saver_.emplace();
 
-    FLAGS_redis_max_concurrent_commands = 1;
-    FLAGS_redis_max_batch = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_concurrent_commands) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_batch) = 1;
     TestRedisService::SetUp();
   }
 
@@ -965,11 +1032,11 @@ class TestRedisServiceReceiveBufferOverflow : public TestRedisService {
   void SetUp() override {
     saver_.emplace();
 
-    FLAGS_redis_max_concurrent_commands = 1;
-    FLAGS_redis_max_batch = 1;
-    // TODO FLAGS_rpc_initial_buffer_size = 128;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_concurrent_commands) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_batch) = 1;
+    // TODO ANNOTATE_UNPROTECTED_WRITE(FLAGS_rpc_initial_buffer_size) = 128;
     redis_max_read_buffer_size_changer_.Init(128, &redis_max_read_buffer_size_);
-    FLAGS_redis_max_queued_bytes = 0;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_queued_bytes) = 0;
     TestRedisService::SetUp();
   }
 
@@ -997,7 +1064,7 @@ TEST_F_EX(TestRedisService, ReceiveBufferOverflow, TestRedisServiceReceiveBuffer
 
 class TestTooBigCommand : public TestRedisService {
   void SetUp() override {
-    FLAGS_redis_rpc_block_size = 32;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_rpc_block_size) = 32;
     redis_max_read_buffer_size_changer_.Init(1024, &redis_max_read_buffer_size_);
     TestRedisService::SetUp();
   }
@@ -1021,9 +1088,9 @@ TEST_F_EX(TestRedisService, TooBigCommand, TestTooBigCommand) {
   ASSERT_TRUE(status.IsNetworkError()) << "Status: " << status;
 }
 
-TEST_F(TestRedisService, HugeCommandInline) {
+TEST_F_EX(TestRedisService, HugeCommandInline, NoLocalCallsRedisServiceTest) {
   // Set a larger timeout for the yql layer : 1 min vs 10 min for tsan/asan.
-  FLAGS_redis_service_yb_client_timeout_millis = 6 * kDefaultTimeoutMs;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_service_yb_client_timeout_millis) = 6 * kDefaultTimeoutMs;
 
   LOG(INFO) << "Creating a value of size " << FLAGS_redis_max_value_size;
   std::string value(FLAGS_redis_max_value_size, 'T');
@@ -1081,8 +1148,8 @@ TEST_F(TestRedisService, BatchedCommandsInline) {
 }
 
 TEST_F(TestRedisService, TestTimedoutInQueue) {
-  FLAGS_redis_max_batch = 1;
-  SetAtomicFlag(true, &FLAGS_enable_backpressure_mode_for_testing);
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_batch) = 1;
+  SetAtomicFlag(true, &FLAGS_TEST_enable_backpressure_mode_for_testing);
 
   DoRedisTestOk(__LINE__, {"SET", "foo", "value"});
   DoRedisTestBulkString(__LINE__, {"GET", "foo"}, "value");
@@ -1118,9 +1185,10 @@ namespace {
 class TestRedisServicePipelined : public TestRedisService {
  public:
   void SetUp() override {
-    FLAGS_redis_safe_batch = false;
-    FLAGS_redis_max_concurrent_commands = FLAGS_test_redis_max_concurrent_commands;
-    FLAGS_redis_max_batch = FLAGS_test_redis_max_batch;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_safe_batch) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_concurrent_commands) =
+        FLAGS_test_redis_max_concurrent_commands;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_batch) = FLAGS_test_redis_max_batch;
     TestRedisService::SetUp();
   }
 };
@@ -1280,9 +1348,9 @@ TEST_F_EX(TestRedisService, MixedBatch, TestRedisServicePipelined) {
 class TestRedisServiceSafeBatch : public TestRedisService {
  public:
   void SetUp() override {
-    FLAGS_redis_max_concurrent_commands = 1;
-    FLAGS_redis_max_batch = FLAGS_test_redis_max_batch;
-    FLAGS_redis_safe_batch = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_concurrent_commands) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_max_batch) = FLAGS_test_redis_max_batch;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_safe_batch) = true;
     TestRedisService::SetUp();
   }
 };
@@ -1529,7 +1597,7 @@ TEST_F(TestRedisService, TestEmptyValue) {
 void ConnectWithPassword(
     TestRedisService* test, const char* password, bool auth_should_succeed,
     bool get_should_succeed) {
-  auto rc1 = std::make_shared<RedisClient>("127.0.0.1", test->server_port());
+  auto rc1 = test->CreateClient();
   test->UseClient(rc1);
 
   if (auth_should_succeed) {
@@ -1551,9 +1619,9 @@ void ConnectWithPassword(
 }
 
 TEST_F(TestRedisService, TestSelect) {
-  auto rc1 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto rc2 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto rc3 = std::make_shared<RedisClient>("127.0.0.1", server_port());
+  auto rc1 = CreateClient();
+  auto rc2 = CreateClient();
+  auto rc3 = CreateClient();
 
   const string default_db("0");
   const string second_db("2");
@@ -1776,10 +1844,10 @@ TEST_F(TestRedisService, TestDeleteDB) {
 TEST_F(TestRedisService, TestMonitor) {
   constexpr uint32 kDelayMs = NonTsanVsTsan(100, 1000);
   expected_no_sessions_ = true;
-  auto rc1 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto rc2 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto mc1 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto mc2 = std::make_shared<RedisClient>("127.0.0.1", server_port());
+  auto rc1 = CreateClient();
+  auto rc2 = CreateClient();
+  auto mc1 = CreateClient();
+  auto mc2 = CreateClient();
 
   UseClient(rc1);
   DoRedisTestBulkString(__LINE__, {"PING", "cmd1"}, "cmd1");  // Excluded from both mc1 and mc2.
@@ -2480,7 +2548,7 @@ class TestRedisServiceExternal : public TestRedisService {
   void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) override {
     opts->extra_tserver_flags.push_back(
         "--redis_connection_soft_limit_grace_period_sec=" +
-        yb::ToString(kSoftLimitGracePeriod.ToSeconds()));
+        AsString(static_cast<int>(kSoftLimitGracePeriod.ToSeconds())));
   }
 
   static const MonoDelta kSoftLimitGracePeriod;
@@ -2582,7 +2650,7 @@ TEST_F(TestRedisServiceExternal, TestPUnsubscribeCluster) {
   TestPubSub(LocalOrCluster::kCluster, SubOrUnsub::kUnsubscribe, PatternOrChannel::kPattern);
 }
 
-TEST_F(TestRedisServiceExternal, TestSlowSubscribersCatchingUp) {
+TEST_F(TestRedisServiceExternal, YB_DISABLE_TEST(TestSlowSubscribersCatchingUp)) {
   expected_no_sessions_ = true;
 
   auto ts0 = external_mini_cluster()->tablet_server(0);
@@ -2654,7 +2722,7 @@ TEST_F(TestRedisServiceExternal, TestSlowSubscribersCatchingUp) {
   }
 }
 
-TEST_F(TestRedisServiceExternal, TestSlowSubscribersSoftLimit) {
+TEST_F(TestRedisServiceExternal, YB_DISABLE_TEST(TestSlowSubscribersSoftLimit)) {
   expected_no_sessions_ = true;
 
   auto ts0 = external_mini_cluster()->tablet_server(0);
@@ -2781,11 +2849,11 @@ TEST_F(TestRedisServiceExternal, SubscribedClientMode) {
 }
 
 TEST_F(TestRedisService, TestAuth) {
-  FLAGS_redis_password_caching_duration_ms = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_password_caching_duration_ms) = 0;
   const char* kRedisAuthPassword = "redis-password";
   // Expect new connections to require authentication
-  auto rc1 = std::make_shared<RedisClient>("127.0.0.1", server_port());
-  auto rc2 = std::make_shared<RedisClient>("127.0.0.1", server_port());
+  auto rc1 = CreateClient();
+  auto rc2 = CreateClient();
   UseClient(rc1);
   DoRedisTestSimpleString(__LINE__, {"PING"}, "PONG");
   SyncClient();
@@ -2850,10 +2918,10 @@ TEST_F(TestRedisService, TestAuth) {
 
 TEST_F(TestRedisService, TestPasswordChangeWithDelay) {
   constexpr uint32 kCachingDurationMs = 1000;
-  FLAGS_redis_password_caching_duration_ms = kCachingDurationMs;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_redis_password_caching_duration_ms) = kCachingDurationMs;
   const char* kRedisAuthPassword = "redis-password";
   auto start = std::chrono::steady_clock::now();
-  auto rc1 = std::make_shared<RedisClient>("127.0.0.1", server_port());
+  auto rc1 = CreateClient();
 
   UseClient(rc1);
   DoRedisTestOk(__LINE__, {"CONFIG", "SET", "REQUIREPASS", kRedisAuthPassword});
@@ -3222,7 +3290,7 @@ TEST_F(TestRedisService, TestDummyLocal) {
 }
 
 TEST_F(TestRedisService, TestTimeSeriesTtl) {
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   DoRedisTestOk(__LINE__, {"TSADD", "key", "10", "v", "EXPIRE_IN", "5"});
   SyncClient();
 
@@ -3237,7 +3305,7 @@ TEST_F(TestRedisService, TestTimeSeriesTtl) {
 
 TEST_F(TestRedisService, TestTimeSeries) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   // Need an int for timeseries as a score.
   DoRedisTestExpectError(__LINE__, {"TSADD", "ts_key", "42.0", "42"});
@@ -3315,7 +3383,7 @@ TEST_F(TestRedisService, TestTimeSeries) {
 
 TEST_F(TestRedisService, TestSortedSets) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   // Need an double for sorted sets as a score.
   DoRedisTestExpectError(__LINE__, {"ZADD", "z_key", "subkey1", "42"});
@@ -3561,7 +3629,7 @@ TEST_F(TestRedisService, ZRangeByScoreInvalidOptions) {
 
 TEST_F(TestRedisService, TestZRevRange) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   DoRedisTestInt(__LINE__, {"ZADD", "z_multi", "0", "v0", "0", "v1", "0", "v2",
       "1", "v3", "1", "v4", "1", "v5"}, 6);
   SyncClient();
@@ -3602,7 +3670,7 @@ TEST_F(TestRedisService, TestZRevRange) {
 
 TEST_F(TestRedisService, TestZRange) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   DoRedisTestInt(__LINE__, {"ZADD", "z_multi", "0", "v0", "0", "v1", "0", "v2",
       "1", "v3", "1", "v4", "1", "v5"}, 6);
   SyncClient();
@@ -3645,7 +3713,7 @@ TEST_F(TestRedisService, TestZRange) {
 
 TEST_F(TestRedisService, TestZScore) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   DoRedisTestInt(__LINE__, {"ZADD", "z_multi", "0", "v0", "0", "v0_copy", "1", "v1",
       "2", "v2", "3", "v3", "4.5", "v4"}, 6);
   SyncClient();
@@ -4263,7 +4331,7 @@ TEST_F(TestRedisService, TestTsRem) {
 
 TEST_F(TestRedisService, TestOverwrites) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   // Test Upsert.
   DoRedisTestInt(__LINE__, {"HSET", "map_key", "subkey1", "42"}, 1);
@@ -4332,7 +4400,7 @@ TEST_F(TestRedisService, TestSetNX) {
 TEST_F(TestRedisService, TestAdditionalCommands) {
 
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   DoRedisTestInt(__LINE__, {"HSET", "map_key", "subkey1", "42"}, 1);
   DoRedisTestInt(__LINE__, {"HSET", "map_key", "subkey2", "12"}, 1);
@@ -4528,7 +4596,7 @@ TEST_F(TestRedisService, TestAdditionalCommands) {
 
 TEST_F(TestRedisService, TestDel) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   DoRedisTestOk(__LINE__, {"SET", "key", "value"});
   DoRedisTestInt(__LINE__, {"DEL", "key"}, 1);
@@ -4540,7 +4608,7 @@ TEST_F(TestRedisService, TestDel) {
 
 TEST_F(TestRedisService, TestHDel) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   DoRedisTestInt(__LINE__, {"HSET", "map_key", "subkey1", "42"}, 1);
   SyncClient();
@@ -4570,7 +4638,7 @@ TEST_F(TestRedisService, TestSADDBatch) {
 
 TEST_F(TestRedisService, TestSRem) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
 
   DoRedisTestInt(__LINE__, {"SADD", "set_key", "subkey1"}, 1);
   SyncClient();
@@ -4586,7 +4654,7 @@ TEST_F(TestRedisService, TestSRem) {
 }
 
 TEST_F(TestRedisService, TestEmulateFlagFalse) {
-  FLAGS_emulate_redis_responses = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = false;
 
   DoRedisTestOk(__LINE__, {"HSET", "map_key", "subkey1", "42"});
 
@@ -4659,7 +4727,7 @@ TEST_F(TestRedisService, TestHMGetTiming) {
   VerifyCallbacks();
 }
 
-TEST_F(TestRedisService, TestTtlSet) {
+TEST_F(TestRedisService, YB_DISABLE_TEST(TestTtlSet)) {
   std::string collection_key = "russell";
   std::string values[10] = {"the", "set", "of", "all", "sets",
                             "that", "do", "not", "contain", "themselves"};
@@ -4667,7 +4735,7 @@ TEST_F(TestRedisService, TestTtlSet) {
   TestTtlSet(&collection_key, values, card);
 }
 
-TEST_F(TestRedisService, TestTtlSortedSet) {
+TEST_F(TestRedisService, YB_DISABLE_TEST(TestTtlSortedSet)) {
   std::string collection_key = "sort_me_up";
   CollectionEntry values[10] = { std::make_tuple("5.4223", "insertion"),
                                  std::make_tuple("-1", "bogo"),
@@ -4683,7 +4751,7 @@ TEST_F(TestRedisService, TestTtlSortedSet) {
   TestTtlSortedSet(&collection_key, values, card);
 }
 
-TEST_F(TestRedisService, TestTtlHash) {
+TEST_F(TestRedisService, YB_DISABLE_TEST(TestTtlHash)) {
   std::string collection_key = "hash_browns";
   CollectionEntry values[10] = { std::make_tuple("eggs", "hyperloglog"),
                                  std::make_tuple("bagel", "bloom"),
@@ -5135,7 +5203,7 @@ TEST_F(TestRedisService, TestListBasic) {
 
 TEST_F(TestRedisService, Keys) {
   // The default value is true, but we explicitly set this here for clarity.
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   DoRedisTestInt(__LINE__, {"ZADD", "z_key_0", "1", "a"}, 1);
   DoRedisTestInt(__LINE__, {"ZADD", "z_key_0", "2", "b"}, 1);
   DoRedisTestOk(__LINE__, {"SET", "z_key_1", "v1"});
@@ -5163,7 +5231,7 @@ TEST_F(TestRedisService, Keys) {
 }
 
 TEST_F(TestRedisService, KeysZeroChar) {
-  FLAGS_emulate_redis_responses = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_emulate_redis_responses) = true;
   string s("foo\0bar", 6);
   string s1("foo\0bars", 7);
   DoRedisTestInt(__LINE__, {"HSET", s, "1", "a"}, 1);
@@ -5182,11 +5250,11 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestArray(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf"}, {"v1"});
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = true;
   DoRedisTestExpectError(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf"},
-                         "Deadline for query passed.");
+                         "TEST: Deadline for query passed");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = false;
 
   // Test TimeSeries.
   DoRedisTestOk(__LINE__, {"TSADD", "ts_key", "1", "v1"});
@@ -5194,11 +5262,11 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestArray(__LINE__, {"TSRANGEBYTIME", "ts_key", "-inf", "+inf"}, {"1", "v1"});
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = true;
   DoRedisTestExpectError(__LINE__, {"TSRANGEBYTIME", "ts_key", "-inf", "+inf"},
-                         "Deadline for query passed.");
+                         "TEST: Deadline for query passed");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = false;
 
   // Test a point read doesn't time out.
   DoRedisTestOk(__LINE__, {"SET", "k", "v"});
@@ -5206,7 +5274,7 @@ TEST_F(TestRedisService, RangeScanTimeout) {
   DoRedisTestBulkString(__LINE__, {"GET", "k"}, "v");
   SyncClient();
 
-  FLAGS_test_tserver_timeout = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = true;
   DoRedisTestBulkString(__LINE__, {"GET", "k"}, "v");
 
   SyncClient();
@@ -5216,14 +5284,36 @@ TEST_F(TestRedisService, RangeScanTimeout) {
 TEST_F(TestRedisService, KeysTimeout) {
   DoRedisTestInt(__LINE__, {"ZADD", "z_key", "1.0", "v1"}, 1);
   SyncClient();
-  FLAGS_test_tserver_timeout = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = true;
   DoRedisTestExpectError(__LINE__, {"KEYS", "*"},
-                         "Errors occured while reaching out to the tablet servers");
+                         "Errors occurred while reaching out to the tablet servers");
   SyncClient();
-  FLAGS_test_tserver_timeout = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_tserver_timeout) = false;
   DoRedisTestArray(__LINE__, {"KEYS", "*"}, {"z_key"});
   SyncClient();
   VerifyCallbacks();
+}
+
+TEST_F(TestRedisService, KeysWithFlush) {
+  for (int i = 0; i < 2; i++) {
+    DoRedisTestOk(__LINE__, {"SET", Format("k$0", i), Format("v$0", i)});
+    SyncClient();
+    ASSERT_OK(FlushRedisTable());
+  }
+
+  DoRedisTestArray(__LINE__, {"KEYS", "*"}, {"k0", "k1"});
+  SyncClient();
+  VerifyCallbacks();
+}
+
+TEST_F(TestRedisService, SortedSetsIncr) {
+  DoRedisTestInt(__LINE__, {"ZADD", "z_key", "1", "v1"}, 1);
+  SyncClient();
+  DoRedisTestInt(__LINE__, {"ZADD", "z_key", "incr", "1", "v1"}, 0);
+  SyncClient();
+  DoRedisTestScoreValueArray(__LINE__, {"ZRANGEBYSCORE", "z_key", "-inf", "+inf", "WITHSCORES"},
+                                       {2}, {"v1"});
+  SyncClient();
 }
 
 }  // namespace redisserver

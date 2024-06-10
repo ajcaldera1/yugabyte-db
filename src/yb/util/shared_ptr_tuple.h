@@ -13,11 +13,8 @@
 //
 //
 
-#ifndef YB_UTIL_SHARED_PTR_TUPLE_H
-#define YB_UTIL_SHARED_PTR_TUPLE_H
+#pragma once
 
-#include <type_traits>
-#include <tuple>
 #include <memory>
 
 namespace yb {
@@ -108,5 +105,3 @@ struct SharedPtrTuple : public TypeIndexer<Types ...> {
 
 } // namespace util
 } // namespace yb
-
-#endif // YB_UTIL_SHARED_PTR_TUPLE_H

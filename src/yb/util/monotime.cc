@@ -32,13 +32,14 @@
 
 #include "yb/util/monotime.h"
 
-#include <limits>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
-#include "yb/gutil/mathlimits.h"
+#include "yb/gutil/casts.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/sysinfo.h"
 #include "yb/gutil/walltime.h"
+
+#include "yb/util/result.h"
 #include "yb/util/thread_restrictions.h"
 
 using namespace std::literals;
@@ -60,6 +61,20 @@ bool SafeToAdd64(int64_t a, int64_t b) {
   return negativeSum == negativeA;
 }
 
+using SystemClock = std::chrono::system_clock;
+
+std::chrono::system_clock::time_point ToSystemClockTimeBase() {
+  auto now_system = SystemClock::now();
+  auto coarse_since_epoch = CoarseMonoClock::now().time_since_epoch();
+  return now_system - std::chrono::duration_cast<SystemClock::duration>(coarse_since_epoch);
+}
+
+time_t ToTimeT(const MonoTime& monotime) {
+  static SystemClock::time_point base = ToSystemClockTimeBase();
+  return std::chrono::system_clock::to_time_t(
+      base + std::chrono::duration_cast<SystemClock::duration>(
+                 monotime.ToSteadyTimePoint().time_since_epoch()));
+}
 } // namespace
 
 ///
@@ -72,20 +87,35 @@ const MonoDelta MonoDelta::kMin = MonoDelta(std::numeric_limits<NanoDeltaType>::
 const MonoDelta MonoDelta::kMax = MonoDelta(std::numeric_limits<NanoDeltaType>::max());
 const MonoDelta MonoDelta::kZero = MonoDelta(0);
 
+template <class V>
+MonoDelta MonoDeltaByMultiplication(V value, int64_t mul) {
+  CHECK_LE(value, std::numeric_limits<int64_t>::max() / mul);
+  int64_t delta = value * mul;
+  return MonoDelta::FromNanoseconds(delta);
+}
+
+MonoDelta MonoDelta::FromDays(double days) {
+  return MonoDeltaByMultiplication(days, MonoTime::kNanosecondsPerDay);
+}
+
+MonoDelta MonoDelta::FromHours(double hours) {
+  return MonoDeltaByMultiplication(hours, MonoTime::kNanosecondsPerHour);
+}
+
+MonoDelta MonoDelta::FromMinutes(double minutes) {
+  return MonoDeltaByMultiplication(minutes, MonoTime::kNanosecondsPerMinute);
+}
+
 MonoDelta MonoDelta::FromSeconds(double seconds) {
-  CHECK_LE(seconds, std::numeric_limits<int64_t>::max() / MonoTime::kNanosecondsPerSecond);
-  int64_t delta = seconds * MonoTime::kNanosecondsPerSecond;
-  return MonoDelta(delta);
+  return MonoDeltaByMultiplication(seconds, MonoTime::kNanosecondsPerSecond);
 }
 
 MonoDelta MonoDelta::FromMilliseconds(int64_t ms) {
-  CHECK_LE(ms, std::numeric_limits<int64_t>::max() / MonoTime::kNanosecondsPerMillisecond);
-  return MonoDelta(ms * MonoTime::kNanosecondsPerMillisecond);
+  return MonoDeltaByMultiplication(ms, MonoTime::kNanosecondsPerMillisecond);
 }
 
 MonoDelta MonoDelta::FromMicroseconds(int64_t us) {
-  CHECK_LE(us, std::numeric_limits<int64_t>::max() / MonoTime::kNanosecondsPerMicrosecond);
-  return MonoDelta(us * MonoTime::kNanosecondsPerMicrosecond);
+  return MonoDeltaByMultiplication(us, MonoTime::kNanosecondsPerMicrosecond);
 }
 
 MonoDelta MonoDelta::FromNanoseconds(int64_t ns) {
@@ -137,6 +167,21 @@ double MonoDelta::ToSeconds() const {
   return d;
 }
 
+double MonoDelta::ToMinutes() const {
+  auto seconds = ToSeconds();
+  return seconds / MonoTime::kSecondsPerMinute;
+}
+
+double MonoDelta::ToHours() const {
+  auto minutes = ToMinutes();
+  return minutes / MonoTime::kMinutesPerHour;
+}
+
+double MonoDelta::ToDays() const {
+  auto hours = ToHours();
+  return hours / MonoTime::kHoursPerDay;
+}
+
 int64_t MonoDelta::ToNanoseconds() const {
   DCHECK(Initialized());
   return nano_delta_;
@@ -176,23 +221,32 @@ MonoDelta& MonoDelta::operator-=(const MonoDelta& rhs) {
 
 MonoDelta& MonoDelta::operator*=(int64_t mul) {
   DCHECK(Initialized());
-  DCHECK_EQ(nano_delta_ * mul / mul, nano_delta_); // Check for overflow
+  DCHECK(mul == 0 || (nano_delta_ * mul / mul == nano_delta_)) // Check for overflow
+      << "Mul: " << mul << ", nano_delta_: " << nano_delta_;
   DCHECK(nano_delta_ * mul != kUninitialized);
   nano_delta_ *= mul;
+  return *this;
+}
+
+MonoDelta& MonoDelta::operator/=(int64_t divisor) {
+  DCHECK(Initialized());
+  DCHECK_NE(divisor, 0);
+  nano_delta_ /= divisor;
   return *this;
 }
 
 void MonoDelta::ToTimeVal(struct timeval *tv) const {
   DCHECK(Initialized());
   tv->tv_sec = nano_delta_ / MonoTime::kNanosecondsPerSecond;
-  tv->tv_usec = (nano_delta_ - (tv->tv_sec * MonoTime::kNanosecondsPerSecond))
-      / MonoTime::kNanosecondsPerMicrosecond;
+  tv->tv_usec = narrow_cast<int32_t>(
+      (nano_delta_ - tv->tv_sec * MonoTime::kNanosecondsPerSecond)
+      / MonoTime::kNanosecondsPerMicrosecond);
 
   // tv_usec must be between 0 and 999999.
   // There is little use for negative timevals so wrap it in PREDICT_FALSE.
   if (PREDICT_FALSE(tv->tv_usec < 0)) {
     --(tv->tv_sec);
-    tv->tv_usec += 1000000;
+    tv->tv_usec += MonoTime::kMicrosecondsPerSecond;
   }
 
   // Catch positive corner case where we "round down" and could potentially set a timeout of 0.
@@ -301,6 +355,17 @@ std::string MonoTime::ToString() const {
   return StringPrintf("%.3fs", ToSeconds());
 }
 
+std::string MonoTime::ToFormattedString(const std::string& format) const {
+  if (!Initialized()) return "<Uninitialized>";
+  if (IsMax()) return "<Max>";
+  if (IsMin()) return "<Min>";
+
+  std::string ret;
+  StringAppendStrftime(&ret, format.c_str(), ToTimeT(*this), true);
+
+  return ret;
+}
+
 bool MonoTime::Equals(const MonoTime& other) const {
   return value_ == other.value_;
 }
@@ -326,9 +391,20 @@ void SleepFor(const MonoDelta& delta) {
   base::SleepForNanoseconds(delta.ToNanoseconds());
 }
 
+void SleepUntil(const MonoTime& deadline) {
+  while (true) {
+    const auto sleep_for = deadline - MonoTime::Now();
+    if (sleep_for.IsNegative()) {
+      break;
+    }
+    SleepFor(sleep_for);
+  }
+}
+
 CoarseMonoClock::time_point CoarseMonoClock::now() {
 #if defined(__APPLE__)
-  int64_t nanos = walltime_internal::GetMonoTimeNanos();
+  int64_t nanos = std::chrono::duration_cast<std::chrono::nanoseconds>(
+      std::chrono::steady_clock::now().time_since_epoch()).count();
 # else
   struct timespec ts;
   PCHECK(clock_gettime(CLOCK_MONOTONIC_COARSE, &ts) == 0);
@@ -338,12 +414,68 @@ CoarseMonoClock::time_point CoarseMonoClock::now() {
   return time_point(duration(nanos));
 }
 
+template <>
+CoarseMonoClock::Duration ClockResolution<CoarseMonoClock>() {
+#if defined(__APPLE__)
+  return std::chrono::duration_cast<CoarseMonoClock::Duration>(
+      std::chrono::steady_clock::duration(1));
+#else
+  struct timespec res;
+  if (clock_getres(CLOCK_MONOTONIC_COARSE, &res) == 0) {
+    auto resolution = std::chrono::seconds(res.tv_sec) + std::chrono::nanoseconds(res.tv_nsec);
+    return std::chrono::duration_cast<CoarseMonoClock::Duration>(resolution);
+  }
+  return CoarseMonoClock::Duration(1);
+#endif // defined(__APPLE__)
+}
+
 std::string ToString(CoarseMonoClock::TimePoint time_point) {
+  if (time_point == CoarseTimePoint::min()) {
+    return "-inf";
+  }
+  if (time_point == CoarseTimePoint::max()) {
+    return "+inf";
+  }
   return MonoDelta(time_point.time_since_epoch()).ToString();
 }
 
 CoarseTimePoint ToCoarse(MonoTime monotime) {
   return CoarseTimePoint(monotime.ToSteadyTimePoint().time_since_epoch());
+}
+
+std::chrono::steady_clock::time_point ToSteady(CoarseTimePoint time_point) {
+  return std::chrono::steady_clock::time_point(time_point.time_since_epoch());
+}
+
+bool IsInitialized(CoarseTimePoint time_point) {
+  return MonoDelta(time_point.time_since_epoch()).Initialized();
+}
+
+bool IsExtremeValue(CoarseTimePoint time_point) {
+  return time_point == CoarseTimePoint::min() || time_point == CoarseTimePoint::max();
+}
+
+std::string ToStringRelativeToNow(CoarseTimePoint t, CoarseTimePoint now) {
+  if (IsExtremeValue(t) || IsExtremeValue(now)) {
+    return ToString(t);
+  }
+  return Format("$0 ($1)", t, ToStringRelativeToNowOnly(t, now));
+}
+
+std::string ToStringRelativeToNow(CoarseTimePoint t, std::optional<CoarseTimePoint> now) {
+  if (now)
+    return ToStringRelativeToNow(t, *now);
+  return ToString(t);
+}
+
+std::string ToStringRelativeToNowOnly(CoarseTimePoint t, CoarseTimePoint now) {
+  if (t < now) {
+    return Format("$0 ago", now - t);
+  }
+  if (t > now) {
+    return Format("$0 from now", t - now);
+  }
+  return "now";
 }
 
 } // namespace yb

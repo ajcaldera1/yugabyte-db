@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_VIEWS_VTABLE_H
-#define YB_MASTER_YQL_VIEWS_VTABLE_H
+#pragma once
 
 #include "yb/master/yql_empty_vtable.h"
 
@@ -22,11 +21,12 @@ namespace master {
 // VTable implementation of system_schema.views.
 class YQLViewsVTable : public YQLEmptyVTable {
  public:
-  explicit YQLViewsVTable(const Master* const master);
+  explicit YQLViewsVTable(const TableName& table_name,
+                          const NamespaceName& namespace_name,
+                          Master* const master);
  protected:
   Schema CreateSchema() const;
 };
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_VIEWS_VTABLE_H

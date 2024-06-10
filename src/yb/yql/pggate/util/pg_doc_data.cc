@@ -15,83 +15,92 @@
 
 #include "yb/yql/pggate/util/pg_doc_data.h"
 
-#include "yb/client/client.h"
+#include "yb/common/ql_value.h"
 
-#include "yb/util/decimal.h"
+#include "yb/gutil/casts.h"
+#include "yb/gutil/endian.h"
+
+#include "yb/util/format.h"
+#include "yb/util/status_format.h"
 
 namespace yb {
 namespace pggate {
 
-//--------------------------------------------------------------------------------------------------
-// Write Tuple Routine in DocDB Format (wire_protocol).
-//--------------------------------------------------------------------------------------------------
-Status PgDocData::WriteTuples(const PgsqlResultSet& tuples, faststring *buffer) {
-  // Write the number rows.
-  WriteInt64(tuples.rsrow_count(), buffer);
+namespace {
 
-  // Write the row contents.
-  for (const PgsqlRSRow& tuple : tuples.rsrows()) {
-    RETURN_NOT_OK(WriteTuple(tuple, buffer));
-  }
-  return Status::OK();
+template <class Value, class Buffer> requires (std::is_integral<Value>::value)
+void PgWriteInt(Value value, Buffer* buffer) {
+  char buf[PgWireDataHeader::kSerializedSize + sizeof(value)];
+  PgWireDataHeader().SerializeTo(buf);
+  Store<Value, NetworkByteOrder>(buf + PgWireDataHeader::kSerializedSize, value);
+  buffer->Append(buf, sizeof(buf));
 }
 
-Status PgDocData::WriteTuple(const PgsqlRSRow& tuple, faststring *buffer) {
-  // Write the column contents.
-  for (const QLValue& col_value : tuple.rscols()) {
-    RETURN_NOT_OK(WriteColumn(col_value, buffer));
-  }
-  return Status::OK();
+template <class Int, class Value, class Buffer>
+    requires (std::is_integral<Int>::value && std::is_floating_point<Value>::value)
+void PgWriteFloat(Value value, Buffer* buffer) {
+  PgWriteInt(bit_cast<Int>(value), buffer);
 }
 
-Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
+template <bool NullTerminated, class Buffer>
+void PgWriteBytes(const Slice& value, Buffer* buffer) {
+  auto length = value.size() + NullTerminated;
+  PgWriteInt<uint64_t>(length, buffer);
+  buffer->Append(value.cdata(), length);
+}
+
+template <class Buffer>
+Status DoWriteColumn(const QLValuePB& col_value, Buffer* buffer) {
   // Write data header.
-  bool has_data = true;
-  PgWireDataHeader col_header;
-  if (col_value.IsNull()) {
-    col_header.set_null();
-    has_data = false;
-  }
-  WriteUint8(col_header.ToUint8(), buffer);
-
-  if (!has_data) {
+  if (QLValue::IsNull(col_value)) {
+    PgWireDataHeader header;
+    header.set_null();
+    char buf[PgWireDataHeader::kSerializedSize];
+    header.SerializeTo(buf);
+    buffer->Append(buf, sizeof(buf));
     return Status::OK();
   }
 
-  switch (col_value.type()) {
-    case InternalType::VALUE_NOT_SET:
-      break;
+  switch (col_value.value_case()) {
     case InternalType::kBoolValue:
-      WriteBool(col_value.bool_value(), buffer);
+      PgWriteInt<uint8_t>(col_value.bool_value(), buffer);
       break;
     case InternalType::kInt8Value:
-      WriteInt8(col_value.int8_value(), buffer);
+      PgWriteInt<int8_t>(col_value.int8_value(), buffer);
       break;
     case InternalType::kInt16Value:
-      WriteInt16(col_value.int16_value(), buffer);
+      PgWriteInt<int16_t>(col_value.int16_value(), buffer);
       break;
     case InternalType::kInt32Value:
-      WriteInt32(col_value.int32_value(), buffer);
+      PgWriteInt<int32_t>(col_value.int32_value(), buffer);
       break;
     case InternalType::kInt64Value:
-      WriteInt64(col_value.int64_value(), buffer);
+      PgWriteInt<int64_t>(col_value.int64_value(), buffer);
+      break;
+    case InternalType::kUint32Value:
+      PgWriteInt<uint32_t>(col_value.uint32_value(), buffer);
+      break;
+    case InternalType::kUint64Value:
+      PgWriteInt<uint64_t>(col_value.uint64_value(), buffer);
       break;
     case InternalType::kFloatValue:
-      WriteFloat(col_value.float_value(), buffer);
+      PgWriteFloat<uint32_t>(col_value.float_value(), buffer);
       break;
     case InternalType::kDoubleValue:
-      WriteDouble(col_value.double_value(), buffer);
+      PgWriteFloat<uint64_t>(col_value.double_value(), buffer);
       break;
     case InternalType::kStringValue:
-      WriteText(col_value.string_value(), buffer);
+      PgWriteBytes</* null_terminating= */ true>(col_value.string_value(), buffer);
       break;
     case InternalType::kBinaryValue:
-      WriteBinary(col_value.binary_value(), buffer);
+      PgWriteBytes</* null_terminating= */ false>(col_value.binary_value(), buffer);
       break;
     case InternalType::kDecimalValue:
       // Passing a serialized form of YB Decimal, decoding will be done in pg_expr.cc
-      WriteText(col_value.decimal_value(), buffer);
+      PgWriteBytes</* null_terminating= */ true>(col_value.decimal_value(), buffer);
       break;
+    case InternalType::kVirtualValue:
+      // Expecting database to return an actual value and not a virtual one.
     case InternalType::kTimestampValue:
     case InternalType::kDateValue: // Not used for PG storage
     case InternalType::kTimeValue: // Not used for PG storage
@@ -102,45 +111,47 @@ Status PgDocData::WriteColumn(const QLValue& col_value, faststring *buffer) {
     case InternalType::kTimeuuidValue:
       // PgGate has not supported these datatypes yet.
       return STATUS_FORMAT(NotSupported,
-          "Unexpected data was read from database: col_value.type()=$0", col_value.type());
+          "Unexpected data was read from database: col_value.type()=$0", col_value.value_case());
 
-    case InternalType::kListValue:
-    case InternalType::kMapValue:
-    case InternalType::kSetValue:
-    case InternalType::kFrozenValue:
+    case InternalType::VALUE_NOT_SET: FALLTHROUGH_INTENDED;
+    case InternalType::kListValue: FALLTHROUGH_INTENDED;
+    case InternalType::kMapValue: FALLTHROUGH_INTENDED;
+    case InternalType::kSetValue: FALLTHROUGH_INTENDED;
+    case InternalType::kFrozenValue: FALLTHROUGH_INTENDED;
+    case InternalType::kTupleValue:
       // Postgres does not have these datatypes.
       return STATUS_FORMAT(Corruption,
-          "Unexpected data was read from database: col_value.type()=$0", col_value.type());
+          "Unexpected data was read from database: col_value.type()=$0", col_value.value_case());
+    case InternalType::kGinNullValue:
+      PgWriteInt<uint8_t>(col_value.gin_null_value(), buffer);
   }
 
   return Status::OK();
+}
+
+} // namespace
+
+Status WriteColumn(const QLValuePB& col_value, WriteBuffer* buffer) {
+  return DoWriteColumn(col_value, buffer);
+}
+
+Status WriteColumn(const QLValuePB& col_value, ValueBuffer* buffer) {
+  return DoWriteColumn(col_value, buffer);
+}
+
+void WriteBinaryColumn(const Slice& col_value, WriteBuffer* buffer) {
+  PgWriteBytes</* null_terminating= */ false>(col_value, buffer);
 }
 
 //--------------------------------------------------------------------------------------------------
 // Read Tuple Routine in DocDB Format (wire_protocol).
 //--------------------------------------------------------------------------------------------------
 
-Status PgDocData::LoadCache(const string& cache, int64_t *total_row_count, Slice *cursor) {
-  // Setup the buffer to read the next set of tuples.
-  CHECK(cursor->empty()) << "Existing cache is not yet fully read";
+void PgDocData::LoadCache(const Slice& cache, int64_t *total_row_count, Slice *cursor) {
   *cursor = cache;
 
   // Read the number row_count in this set.
-  int64_t this_count;
-  size_t read_size = ReadNumber(cursor, &this_count);
-  *total_row_count = this_count;
-  cursor->remove_prefix(read_size);
-
-  return Status::OK();
-}
-
-PgWireDataHeader PgDocData::ReadDataHeader(Slice *cursor) {
-  // Read for NULL value.
-  uint8_t header_data;
-  size_t read_size = ReadNumber(cursor, &header_data);
-  cursor->remove_prefix(read_size);
-
-  return PgWireDataHeader(header_data);
+  *total_row_count = ReadNumber<int64_t>(cursor);
 }
 
 }  // namespace pggate

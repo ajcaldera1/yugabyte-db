@@ -22,22 +22,19 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
 // Thread-safe (provides internal synchronization)
-#ifndef YB_ROCKSDB_DB_TABLE_CACHE_H
-#define YB_ROCKSDB_DB_TABLE_CACHE_H
 
 #pragma once
+
 #include <stdint.h>
 
 #include <string>
 #include <vector>
 
-#include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/table.h"
+#include "yb/rocksdb/immutable_options.h"
+#include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/table/table_reader.h"
 
 namespace rocksdb {
 
@@ -60,7 +57,12 @@ class TableCache {
     Cache* cache = nullptr;
     bool created_new = false;
 
+    TableReaderWithHandle() = default;
+    TableReaderWithHandle(TableReaderWithHandle&& rhs);
+    TableReaderWithHandle& operator=(TableReaderWithHandle&& rhs);
     ~TableReaderWithHandle();
+
+    void Reset();
     void Release();
   };
 
@@ -71,11 +73,13 @@ class TableCache {
   // the returned iterator.  The returned "*tableptr" object is owned by
   // the cache and should not be deleted, and is valid for as long as the
   // returned iterator is live.
+  // If ioptions_.iterator_replacer is specified - it will receive `filter` as an argument.
   // @param skip_filters Disables loading/accessing the filter block
   InternalIterator* NewIterator(
       const ReadOptions& options, const EnvOptions& toptions,
       const InternalKeyComparatorPtr& internal_comparator,
-      const FileDescriptor& file_fd, TableReader** table_reader_ptr = nullptr,
+      const FileDescriptor& file_fd, Slice filter,
+      TableReader** table_reader_ptr = nullptr,
       HistogramImpl* file_read_hist = nullptr, bool for_compaction = false,
       Arena* arena = nullptr, bool skip_filters = false);
 
@@ -89,10 +93,12 @@ class TableCache {
       bool skip_filters = false);
 
   // Version of NewIterator which uses provided table reader instead of getting it by
-  // itself.
+  // itself. Releases TableReaderWithHandle before return.
   InternalIterator* NewIterator(
-      const ReadOptions& options, TableReaderWithHandle* trwh,
+      const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter,
       bool for_compaction = false, Arena* arena = nullptr, bool skip_filters = false);
+  InternalIterator* NewIndexIterator(
+      const ReadOptions& options, TableReaderWithHandle* trwh);
 
   // If a seek to internal key "k" in specified file finds an entry,
   // call (*handle_result)(arg, found_key, found_value) repeatedly until
@@ -107,6 +113,19 @@ class TableCache {
   // Evict any entry for the specified file number
   static void Evict(Cache* cache, uint64_t file_number);
 
+  // Returns table reader, tries to get it in following order:
+  // - From fd.table_reader
+  // - From table cache
+  // - Load from disk if no_io is false.
+  // Will return STATUS(Incomplete) if table is not yet loaded and no_io is true.
+  // See NewIterator for other parameters description.
+  // NOTE: read stats will be recorded by table reader into ioptions_.statistics the same was as
+  // for usual (not compaction-intended) TableIterator.
+  yb::Result<TableReaderWithHandle> GetTableReader(
+      const EnvOptions& toptions, const InternalKeyComparatorPtr& internal_comparator,
+      const FileDescriptor& fd, QueryId query_id, bool no_io, HistogramImpl* file_read_hist,
+      bool skip_filters, Statistics* statistics = nullptr);
+
   // Find table reader
   // @param skip_filters Disables loading/accessing the filter block
   Status FindTable(const EnvOptions& toptions,
@@ -115,7 +134,8 @@ class TableCache {
                    const QueryId query_id,
                    const bool no_io = false, bool record_read_stats = true,
                    HistogramImpl* file_read_hist = nullptr,
-                   bool skip_filters = false);
+                   bool skip_filters = false,
+                   Statistics* statistics = nullptr);
 
   // Get TableReader from a cache handle.
   TableReader* GetTableReaderFromHandle(Cache::Handle* handle);
@@ -123,6 +143,11 @@ class TableCache {
   // Get the table properties of a given table.
   // @no_io: indicates if we should load table to the cache if it is not present
   //         in table cache yet.
+  // WARNING: no_io == false should be used carefully, because if GetTableProperties is called
+  // with no_io == false it will create TableReader with file_read_hist == nullptr which
+  // could be reused by GetTableReaderForIterator from a concurrent thread and since
+  // file_read_hist was empty the TableIterator using this TableReader won't update file_read_hist
+  // passed to GetTableReaderForIterator.
   // @returns: `properties` will be reset on success. Please note that we will
   //            return STATUS(Incomplete, ) if table is not present in cache and
   //            we set `no_io` to be true.
@@ -130,7 +155,7 @@ class TableCache {
                             const InternalKeyComparatorPtr& internal_comparator,
                             const FileDescriptor& file_meta,
                             std::shared_ptr<const TableProperties>* properties,
-                            bool no_io = false);
+                            bool no_io);
 
   // Return total memory usage of the table reader of the file.
   // 0 if table reader of the file is not loaded.
@@ -144,12 +169,11 @@ class TableCache {
 
  private:
   // Build a table reader
-  Status GetTableReader(const EnvOptions& env_options,
-                        const InternalKeyComparatorPtr& internal_comparator,
-                        const FileDescriptor& fd, bool sequential_mode,
-                        bool record_read_stats, HistogramImpl* file_read_hist,
-                        unique_ptr<TableReader>* table_reader,
-                        bool skip_filters = false);
+  Status DoGetTableReader(
+      const EnvOptions& env_options, const InternalKeyComparatorPtr& internal_comparator,
+      const FileDescriptor& fd, bool sequential_mode, bool record_read_stats,
+      HistogramImpl* file_read_hist, std::unique_ptr<TableReader>* table_reader,
+      bool skip_filters = false);
 
   // Versions of corresponding public functions, but without performance metrics.
   Status DoGetTableReaderForIterator(
@@ -160,7 +184,7 @@ class TableCache {
       bool skip_filters = false);
 
   InternalIterator* DoNewIterator(
-      const ReadOptions& options, TableReaderWithHandle* trwh,
+      const ReadOptions& options, TableReaderWithHandle* trwh, Slice filter,
       bool for_compaction = false, Arena* arena = nullptr, bool skip_filters = false);
 
   const ImmutableCFOptions& ioptions_;
@@ -170,5 +194,3 @@ class TableCache {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_TABLE_CACHE_H

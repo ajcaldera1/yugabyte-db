@@ -13,10 +13,13 @@
 //
 //
 
-#include "yb/client/tablet_rpc.h"
 #include "yb/client/meta_cache.h"
+#include "yb/client/tablet_rpc.h"
+
+#include "yb/master/master_client.pb.h"
 
 #include "yb/util/test_util.h"
+#include "yb/util/trace.h"
 
 namespace yb {
 namespace client {
@@ -62,18 +65,18 @@ TEST_F(TabletRpcTest, TabletInvokerSelectTabletServerRace) {
   TabletServerMap ts_map;
 
   for (auto* replica : {&replica1, &replica2}) {
-    replica->set_role(consensus::RaftPeerPB_Role::RaftPeerPB_Role_FOLLOWER);
-    replica->set_member_type(consensus::RaftPeerPB_MemberType::RaftPeerPB_MemberType_VOTER);
+    replica->set_role(PeerRole::FOLLOWER);
+    replica->set_member_type(consensus::PeerMemberType::VOTER);
 
     const auto& uuid = replica->ts_info().permanent_uuid();
     ts_map.emplace(uuid, std::make_unique<RemoteTabletServer>(uuid, nullptr, nullptr));
   }
 
-  Partition partition;
-  Partition::FromPB(tablet_locations.partition(), &partition);
+  dockv::Partition partition;
+  dockv::Partition::FromPB(tablet_locations.partition(), &partition);
   internal::RemoteTabletPtr remote_tablet = new internal::RemoteTablet(
-      tablet_locations.tablet_id(), partition);
-
+      tablet_locations.tablet_id(), partition, /* partition_list_version = */ 0,
+      /* split_depth = */ 0, /* split_parent_id = */ "", RemoteTablet::kUnknownOpIdIndex);
 
   std::atomic<bool> stop_requested{false};
   std::thread replicas_refresher(
@@ -99,6 +102,7 @@ TEST_F(TabletRpcTest, TabletInvokerSelectTabletServerRace) {
                                     nullptr /* command */,
                                     nullptr /* rpc */,
                                     remote_tablet.get(),
+                                    /* table =*/ nullptr,
                                     nullptr /* retrier */,
                                     trace.get());
     invoker.SelectTabletServer();

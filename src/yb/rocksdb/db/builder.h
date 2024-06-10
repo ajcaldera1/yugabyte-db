@@ -21,20 +21,19 @@
 // under the License.
 //
 
-#ifndef YB_ROCKSDB_DB_BUILDER_H
-#define YB_ROCKSDB_DB_BUILDER_H
+#pragma once
 
 #include <string>
 #include <utility>
 #include <vector>
+
 #include "yb/rocksdb/db/table_properties_collector.h"
-#include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/status.h"
-#include "yb/rocksdb/types.h"
-#include "yb/rocksdb/options.h"
 #include "yb/rocksdb/immutable_options.h"
+#include "yb/rocksdb/options.h"
+#include "yb/rocksdb/status.h"
 #include "yb/rocksdb/table_properties.h"
+#include "yb/rocksdb/types.h"
 
 namespace rocksdb {
 
@@ -51,24 +50,26 @@ class WritableFileWriter;
 class InternalStats;
 class InternalIterator;
 
-TableBuilder* NewTableBuilder(const ImmutableCFOptions& options,
-                              const InternalKeyComparatorPtr& internal_comparator,
-                              const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
-                              uint32_t column_family_id,
-                              WritableFileWriter* file,
-                              const CompressionType compression_type,
-                              const CompressionOptions& compression_opts,
-                              const bool skip_filters = false);
+std::unique_ptr<TableBuilder> NewTableBuilder(
+    const ImmutableCFOptions& options,
+    const InternalKeyComparatorPtr& internal_comparator,
+    const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
+    uint32_t column_family_id,
+    WritableFileWriter* file,
+    const CompressionType compression_type,
+    const CompressionOptions& compression_opts,
+    const bool skip_filters = false);
 
-TableBuilder* NewTableBuilder(const ImmutableCFOptions& options,
-                              const InternalKeyComparatorPtr& internal_comparator,
-                              const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
-                              uint32_t column_family_id,
-                              WritableFileWriter* metadata_file,
-                              WritableFileWriter* data_file,
-                              const CompressionType compression_type,
-                              const CompressionOptions& compression_opts,
-                              const bool skip_filters = false);
+std::unique_ptr<TableBuilder> NewTableBuilder(
+    const ImmutableCFOptions& options,
+    const InternalKeyComparatorPtr& internal_comparator,
+    const IntTblPropCollectorFactories& int_tbl_prop_collector_factories,
+    uint32_t column_family_id,
+    WritableFileWriter* metadata_file,
+    WritableFileWriter* data_file,
+    const CompressionType compression_type,
+    const CompressionOptions& compression_opts,
+    const bool skip_filters = false);
 
 // Build a Table file from the contents of *iter.  The generated file
 // will be named according to number specified in meta. On success, the rest of
@@ -77,7 +78,7 @@ TableBuilder* NewTableBuilder(const ImmutableCFOptions& options,
 // zero, and no Table file will be produced.
 extern Status BuildTable(
     const std::string& dbname,
-    Env* env,
+    const DBOptions& db_options,
     const ImmutableCFOptions& options,
     const EnvOptions& env_options,
     TableCache* table_cache,
@@ -92,10 +93,13 @@ extern Status BuildTable(
     const CompressionOptions& compression_opts,
     bool paranoid_file_checks,
     InternalStats* internal_stats,
-    BoundaryValuesExtractor* boundary_values_extractor,
-    const Env::IOPriority io_priority = Env::IO_HIGH,
+    const yb::IOPriority io_priority = yb::IOPriority::kHigh,
     TableProperties* table_properties = nullptr);
 
-}  // namespace rocksdb
+// Check SST file to end with FLAGS_rocksdb_check_sst_file_tail_for_zeros zeros and log+return error
+// if this is the case.
+Status CheckSstTailForZeros(
+    const DBOptions& db_options, const EnvOptions& env_options, const std::string& file_path,
+    size_t check_size);
 
-#endif  // YB_ROCKSDB_DB_BUILDER_H
+}  // namespace rocksdb

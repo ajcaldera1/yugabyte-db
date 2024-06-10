@@ -22,7 +22,7 @@
 #include <mutex>
 
 #include <boost/function.hpp>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/util/monotime.h"
@@ -42,20 +42,19 @@ PeriodicTimer::Options::Options()
 }
 
 shared_ptr<PeriodicTimer> PeriodicTimer::Create(
-    shared_ptr<Messenger> messenger,
+    Messenger* messenger,
     RunTaskFunctor functor,
     MonoDelta period,
     Options options) {
-  return std::make_shared<PeriodicTimer>(
-      std::move(messenger), std::move(functor), period, options);
+  return std::make_shared<PeriodicTimer>(messenger, std::move(functor), period, options);
 }
 
 PeriodicTimer::PeriodicTimer(
-    shared_ptr<Messenger> messenger,
+    Messenger* messenger,
     RunTaskFunctor functor,
     MonoDelta period,
     Options options)
-    : messenger_(std::move(messenger)),
+    : messenger_(messenger),
       functor_(std::move(functor)),
       period_(period),
       options_(std::move(options)),
@@ -76,7 +75,7 @@ void PeriodicTimer::Start(MonoDelta next_task_delta) {
   if (!started_) {
     started_ = true;
     SnoozeUnlocked(next_task_delta);
-    int new_callback_generation = ++current_callback_generation_;
+    auto new_callback_generation = ++current_callback_generation_;
 
     // Invoke Callback() with the lock released.
     l.unlock();
@@ -85,7 +84,7 @@ void PeriodicTimer::Start(MonoDelta next_task_delta) {
 }
 
 void PeriodicTimer::Stop() {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   StopUnlocked();
 }
 
@@ -95,7 +94,7 @@ void PeriodicTimer::StopUnlocked() {
 }
 
 void PeriodicTimer::Snooze(MonoDelta next_task_delta) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   SnoozeUnlocked(next_task_delta);
 }
 
@@ -125,7 +124,7 @@ MonoDelta PeriodicTimer::GetMinimumPeriod() {
 }
 
 int64_t PeriodicTimer::NumCallbacksForTests() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   return num_callbacks_for_tests_;
 }
 
@@ -148,7 +147,7 @@ void PeriodicTimer::Callback(int64_t my_callback_generation) {
   MonoDelta delay = GetMinimumPeriod();
   bool run_task = false;
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     num_callbacks_for_tests_++;
 
     // If the timer was stopped, exit.

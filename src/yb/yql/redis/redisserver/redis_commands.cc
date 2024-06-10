@@ -17,30 +17,38 @@
 #include <boost/preprocessor/seq/for_each.hpp>
 #include <boost/preprocessor/stringize.hpp>
 
-#include <gflags/gflags.h>
-
 #include "yb/client/client.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/master/master.pb.h"
+#include "yb/dockv/partition.h"
+#include "yb/common/redis_constants_common.h"
+
+#include "yb/gutil/strings/join.h"
+
+#include "yb/master/master_client.pb.h"
 #include "yb/master/master_util.h"
 
-#include "yb/rpc/connection.h"
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/crypt.h"
+#include "yb/util/flags.h"
+#include "yb/util/format.h"
 #include "yb/util/metrics.h"
 #include "yb/util/redis_util.h"
+#include "yb/util/status_format.h"
 #include "yb/util/stol_utils.h"
 #include "yb/util/string_util.h"
 
 #include "yb/yql/redis/redisserver/redis_constants.h"
 #include "yb/yql/redis/redisserver/redis_encoding.h"
 #include "yb/yql/redis/redisserver/redis_rpc.h"
+
+using std::string;
+using std::vector;
 
 using namespace std::literals;
 using namespace std::placeholders;
@@ -56,14 +64,15 @@ static bool ValidateRedisPasswordSeparator(const char* flagname, const string& v
 }
 }
 
-DEFINE_bool(yedis_enable_flush, true, "Enables FLUSHDB and FLUSHALL commands in yedis.");
-DEFINE_bool(use_hashed_redis_password, true, "Store the hash of the redis passwords instead.");
-DEFINE_string(redis_passwords_separator, ",", "The character used to separate multiple passwords.");
+DEFINE_UNKNOWN_bool(yedis_enable_flush, true, "Enables FLUSHDB and FLUSHALL commands in yedis.");
+DEFINE_UNKNOWN_bool(use_hashed_redis_password, true,
+    "Store the hash of the redis passwords instead.");
+DEFINE_UNKNOWN_string(redis_passwords_separator, ",",
+    "The character used to separate multiple passwords.");
 
-DEFINE_int32(redis_keys_threshold, 10000,
+DEFINE_UNKNOWN_int32(redis_keys_threshold, 10000,
              "Maximum number of keys allowed to be in the db before the KEYS operation errors out");
 
-__attribute__((unused))
 DEFINE_validator(redis_passwords_separator, &ValidateRedisPasswordSeparator);
 
 namespace yb {
@@ -168,7 +177,7 @@ BOOST_PP_SEQ_FOR_EACH(DEFINE_HISTOGRAM, ~, REDIS_COMMANDS)
 #define CLUSTER_OP RedisResponsePB
 
 #define DO_PARSER_FORWARD(name, cname, arity, type) \
-    CHECKED_STATUS BOOST_PP_CAT(Parse, cname)( \
+    Status BOOST_PP_CAT(Parse, cname)( \
         BOOST_PP_CAT(type, _OP) *op, \
         const RedisClientCommand& args);
 #define PARSER_FORWARD(r, data, elem) DO_PARSER_FORWARD elem
@@ -176,11 +185,10 @@ BOOST_PP_SEQ_FOR_EACH(DEFINE_HISTOGRAM, ~, REDIS_COMMANDS)
 BOOST_PP_SEQ_FOR_EACH(PARSER_FORWARD, ~, REDIS_COMMANDS)
 
 YBTableName RedisServiceData::GetYBTableNameForRedisDatabase(const string& db_name) {
-  if (db_name == "0") {
-    return YBTableName(common::kRedisKeyspaceName, common::kRedisTableName);
-  } else {
-    return YBTableName(common::kRedisKeyspaceName, StrCat(common::kRedisTableName, "_", db_name));
-  }
+  return YBTableName(YQL_DATABASE_REDIS,
+                     common::kRedisKeyspaceName,
+                     db_name == "0" ? string(common::kRedisTableName)
+                                    : StrCat(common::kRedisTableName, "_", db_name));
 }
 
 namespace {
@@ -227,7 +235,11 @@ void Command(
                       BatchContext* context) { \
       BOOST_PP_CAT(type, _COMMAND)(cname); \
     }; \
-    yb::rpc::RpcMethodMetrics metrics(YB_REDIS_METRIC(name).Instantiate(metric_entity)); \
+    yb::rpc::RpcMethodMetrics metrics {               \
+        nullptr, \
+        nullptr, \
+        YB_REDIS_METRIC(name).Instantiate(metric_entity), \
+    };\
     setup_method({BOOST_PP_STRINGIZE(name), functor, arity, std::move(metrics)}); \
   } \
   /**/
@@ -257,7 +269,7 @@ class LocalCommandData {
     return context_->call();
   }
 
-  const std::shared_ptr<client::YBClient>& client() const {
+  client::YBClient* client() const {
     return context_->client();
   }
 
@@ -315,9 +327,9 @@ void GetTabletLocations(LocalCommandData data, RedisArrayPB* array_response) {
   vector<string> tablets, partitions;
   vector<master::TabletLocationsPB> locations;
   const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(
-                              data.call()->connection_context().redis_db_to_use());
-  auto s = data.client()->GetTablets(table_name, 0, &tablets, &partitions, &locations,
-                                     true /* update tablets cache */);
+      data.call()->connection_context().redis_db_to_use());
+  auto s = data.client()->GetTabletsAndUpdateCache(
+      table_name, 0, &tablets, &partitions, &locations);
   if (!s.ok()) {
     LOG(ERROR) << "Error getting tablets: " << s.message();
     return;
@@ -332,14 +344,16 @@ void GetTabletLocations(LocalCommandData data, RedisArrayPB* array_response) {
     uint16_t start_key = 0;
     uint16_t end_key_exclusive = kRedisClusterSlots;
     if (location.partition().has_partition_key_start()) {
-      if (location.partition().partition_key_start().size() == PartitionSchema::kPartitionKeySize) {
-        start_key = PartitionSchema::DecodeMultiColumnHashValue(
+      if (location.partition().partition_key_start().size() ==
+              dockv::PartitionSchema::kPartitionKeySize) {
+        start_key = dockv::PartitionSchema::DecodeMultiColumnHashValue(
             location.partition().partition_key_start());
       }
     }
     if (location.partition().has_partition_key_end()) {
-      if (location.partition().partition_key_end().size() == PartitionSchema::kPartitionKeySize) {
-        end_key_exclusive = PartitionSchema::DecodeMultiColumnHashValue(
+      if (location.partition().partition_key_end().size() ==
+              dockv::PartitionSchema::kPartitionKeySize) {
+        end_key_exclusive = dockv::PartitionSchema::DecodeMultiColumnHashValue(
             location.partition().partition_key_end());
       }
     }
@@ -347,7 +361,7 @@ void GetTabletLocations(LocalCommandData data, RedisArrayPB* array_response) {
     response.push_back(redisserver::EncodeAsInteger(end_key_exclusive - 1).ToBuffer());
 
     for (const auto &replica : location.replicas()) {
-      if (replica.role() == consensus::RaftPeerPB::LEADER) {
+      if (replica.role() == PeerRole::LEADER) {
         auto host = DesiredHostPort(replica.ts_info(), CloudInfoPB()).host();
         ts_info.push_back(redisserver::EncodeAsBulkString(host).ToBuffer());
 
@@ -407,11 +421,11 @@ void HandlePubSub(LocalCommandData data) {
   RedisResponsePB response;
   if (boost::iequals(data.arg(1).ToBuffer(), "CHANNELS") && data.arg_size() <= 3) {
     auto all = data.context()->service_data()->GetAllSubscriptions(AsPattern::kFalse);
-    unordered_set<string> matched;
+    std::unordered_set<std::string> matched;
     if (data.arg_size() > 2) {
       const string& pattern = data.arg(2).ToBuffer();
       for (auto& channel : all) {
-        if (RedisUtil::RedisPatternMatch(pattern, channel, /* ignore case */ false)) {
+        if (RedisPatternMatch(pattern, channel, /* ignore case */ false)) {
           matched.insert(channel);
         }
       }
@@ -431,9 +445,9 @@ void HandlePubSub(LocalCommandData data) {
     response.set_int_response(names.size());
   } else if (boost::iequals(data.arg(1).ToBuffer(), "NUMSUB")) {
     auto array_response = response.mutable_array_response();
-    for (int idx = 2; idx < data.arg_size(); idx++) {
+    for (size_t idx = 2; idx < data.arg_size(); idx++) {
       const string& channel = data.arg(idx).ToBuffer();
-      int subs = data.context()->service_data()->NumSubscribers(AsPattern::kFalse, channel);
+      auto subs = data.context()->service_data()->NumSubscribers(AsPattern::kFalse, channel);
       AddElements(redisserver::EncodeAsBulkString(channel), array_response);
       AddElements(redisserver::EncodeAsInteger(subs), array_response);
     }
@@ -449,7 +463,10 @@ void HandlePublish(LocalCommandData data) {
   const string& channel = data.arg(1).ToBuffer();
   const string& published_message = data.arg(2).ToBuffer();
 
-  data.context()->service_data()->ForwardToInterestedProxies(
+  // asrivastava: Is there use-after-move here? We get a clang-tidy warning for
+  // bugprone-use-after-move.
+  auto* service_data = data.context()->service_data();
+  service_data->ForwardToInterestedProxies(
       channel, published_message, [data = std::move(data)](int val) {
         RedisResponsePB response;
         response.set_code(RedisResponsePB::OK);
@@ -464,21 +481,21 @@ void HandleSubscribeLikeCommand(LocalCommandData data, AsPattern as_pattern) {
 
   // Add to the appenders after the call has been handled (i.e. reponded with "OK").
   vector<string> channels;
-  vector<int> subs;
-  for (int idx = 1; idx < data.arg_size(); idx++) {
+  for (size_t idx = 1; idx < data.arg_size(); idx++) {
     channels.emplace_back(data.arg(idx).ToBuffer());
   }
   auto conn = data.call()->connection().get();
+  vector<size_t> subs;
   data.context()->service_data()->AppendToSubscribers(as_pattern, channels, conn, &subs);
   string encoded_response;
-  for (int idx = 0; idx < channels.size(); idx++) {
+  for (size_t idx = 0; idx < channels.size(); idx++) {
     encoded_response += redisserver::EncodeAsArrayOfEncodedElements(vector<string>{
         redisserver::EncodeAsBulkString(as_pattern ? "psubscribe" : "subscribe").ToBuffer(),
         redisserver::EncodeAsBulkString(channels[idx]).ToBuffer(),
         redisserver::EncodeAsInteger(subs[idx]).ToBuffer()});
   }
 
-  VLOG(3) << "In response to [p]Subscribe queueing " << data.arg_size() - 1
+  VLOG(3) << "In response to [p]Subscribe queuing " << data.arg_size() - 1
           << " messages : " << encoded_response;
   response.set_encoded_response(encoded_response);
   data.Respond(&response);
@@ -500,7 +517,7 @@ void HandleUnsubscribeLikeCommand(LocalCommandData data, AsPattern as_pattern) {
   auto conn = data.call()->connection().get();
   vector<string> channels;
   if (data.arg_size() > 1) {
-    for (int idx = 1; idx < data.arg_size(); idx++) {
+    for (size_t idx = 1; idx < data.arg_size(); idx++) {
       channels.push_back(data.arg(idx).ToBuffer());
     }
   } else {
@@ -509,17 +526,17 @@ void HandleUnsubscribeLikeCommand(LocalCommandData data, AsPattern as_pattern) {
     }
   }
 
-  vector<int> subs;
+  vector<size_t> subs;
   data.context()->service_data()->RemoveFromSubscribers(as_pattern, channels, conn, &subs);
   string encoded_response;
-  for (int idx = 0; idx < channels.size(); idx++) {
+  for (size_t idx = 0; idx < channels.size(); idx++) {
     encoded_response += redisserver::EncodeAsArrayOfEncodedElements(vector<string>{
         redisserver::EncodeAsBulkString(as_pattern ? "punsubscribe" : "unsubscribe").ToBuffer(),
         redisserver::EncodeAsBulkString(channels[idx]).ToBuffer(),
         redisserver::EncodeAsInteger(subs[idx]).ToBuffer()});
   }
 
-  VLOG(3) << "In response to [p]Unsubscribe queueing " << channels.size()
+  VLOG(3) << "In response to [p]Unsubscribe queuing " << channels.size()
           << " messages : " << encoded_response;
   response.set_encoded_response(encoded_response);
   data.Respond(&response);
@@ -631,8 +648,8 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
     }
 
     auto table = data_.context()->table();
-    const std::string src_partition_start = table->FindPartitionStart(src_partition_key);
-    const std::string dest_partition_start = table->FindPartitionStart(dest_partition_key);
+    const std::string src_partition_start = *table->FindPartitionStart(src_partition_key);
+    const std::string dest_partition_start = *table->FindPartitionStart(dest_partition_key);
     if (src_partition_start == dest_partition_start) {
       num_tablets_.store(1, std::memory_order_release);
     } else {
@@ -652,7 +669,7 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
   std::shared_ptr<client::YBRedisWriteOp> write_dest_op_;
   std::shared_ptr<client::YBRedisWriteOp> write_dest_ttl_op_;
   std::shared_ptr<client::YBRedisWriteOp> delete_src_op_;
-  std::atomic_int num_tablets_{0};
+  std::atomic<size_t> num_tablets_{0};
 
   client::YBSession* session_;
   StatusFunctor src_functor_, dest_functor_;
@@ -704,13 +721,10 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
       return;
     }
 
-    auto status1 = session_->Apply(read_src_op_);
-    auto status2 = session_->Apply(read_ttl_op_);
-    if (!status1.ok() || !status2.ok()) {
-      RespondWithError("Could not apply read_src_op_.");
-      return;
-    }
-    session_->FlushAsync([retained_self = shared_from_this()](const Status& s) {
+    session_->Apply(read_src_op_);
+    session_->Apply(read_ttl_op_);
+    session_->FlushAsync([retained_self = shared_from_this()](client::FlushStatus* flush_status) {
+      const auto& s = flush_status->status;
       if (!s.ok()) {
         LOG(ERROR) << "Reading from src during a Rename failed. " << s;
         retained_self->RespondWithError(s.message().ToBuffer());
@@ -750,7 +764,7 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
           const string& second = *elements[i + 1];
           auto req_kv = write_dest_op_->mutable_request()->mutable_key_value();
           if (type == REDIS_TYPE_SORTEDSET) {
-            auto score = util::CheckedStold(second);
+            auto score = CheckedStold(second);
             if (!score.ok()) {
               LOG(DFATAL) << "Could not parse sorted set score " << second;
               RespondWithError("Could not parse sorted set score");
@@ -759,7 +773,7 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
             req_kv->add_subkey()->set_double_subkey(*score);
             req_kv->add_value(first);
           } else if (type == REDIS_TYPE_TIMESERIES) {
-            auto ts = util::CheckedStoll(first);
+            auto ts = CheckedStoll(first);
             if (!ts.ok()) {
               LOG(DFATAL) << "Could not parse sorted set ts " << first;
               RespondWithError("Could not parse timeseries ts");
@@ -803,8 +817,8 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
       return;
     }
 
-    RedisResponsePB ttlResponse = read_ttl_op_->response();
-    int ttl_ms = ttlResponse.int_response();
+    RedisResponsePB ttl_response = read_ttl_op_->response();
+    auto ttl_ms = ttl_response.int_response();
     if (ttl_ms > 0) {
       auto table = data_.context()->table();
       write_dest_ttl_op_ = std::make_shared<client::YBRedisWriteOp>(table);
@@ -814,13 +828,10 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
       write_dest_ttl_op_->mutable_request()->mutable_set_ttl_request()->set_ttl(ttl_ms);
     }
 
-    auto status1 = session_->Apply(delete_dest_op_);
-    auto status2 = session_->Apply(write_dest_op_);
-    if (!status1.ok() || !status2.ok()) {
-      RespondWithError("Could not apply deleteOps/write_dest_op_.");
-      return;
-    }
-    session_->FlushAsync([retained_self = shared_from_this()](const Status& s) {
+    session_->Apply(delete_dest_op_);
+    session_->Apply(write_dest_op_);
+    session_->FlushAsync([retained_self = shared_from_this()](client::FlushStatus* flush_status) {
+      const auto& s = flush_status->status;
       if (!s.ok()) {
         LOG(ERROR) << "Writing to dest during a Rename failed. " << s;
         retained_self->RespondWithError(s.message().ToBuffer());
@@ -837,13 +848,10 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
       return;
     }
 
-    auto status = session_->Apply(write_dest_ttl_op_);
-    if (!status.ok()) {
-      RespondWithError("Could not apply write_dest_ttl_op_.");
-      return;
-    }
+    session_->Apply(write_dest_ttl_op_);
 
-    session_->FlushAsync([retained_self = shared_from_this()](const Status& s) {
+    session_->FlushAsync([retained_self = shared_from_this()](client::FlushStatus* flush_status) {
+      const auto& s = flush_status->status;
       if (!s.ok()) {
         LOG(ERROR) << "Updating ttl for dest during a Rename failed. " << s;
         retained_self->RespondWithError(s.message().ToBuffer());
@@ -855,12 +863,9 @@ class RenameData : public std::enable_shared_from_this<RenameData> {
 
   void BeginDeleteSrc() {
     VLOG(1) << "4. BeginDeleteSrc";
-    auto status = session_->Apply(delete_src_op_);
-    if (!status.ok()) {
-      RespondWithError("Could not apply delete_src_op_.");
-      return;
-    }
-    session_->FlushAsync([retained_self = shared_from_this()](const Status& s) {
+    session_->Apply(delete_src_op_);
+    session_->FlushAsync([retained_self = shared_from_this()](client::FlushStatus* flush_status) {
+      const auto& s = flush_status->status;
       if (!s.ok()) {
         LOG(ERROR) << "Deleting src during a Rename failed. " << s;
         retained_self->RespondWithError(s.message().ToBuffer());
@@ -882,7 +887,7 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
  public:
   explicit KeysProcessor(const LocalCommandData& data)
       : data_(data),
-        partitions_(data.table()->GetPartitions()), sessions_(partitions_.size()),
+        partitions_(data.table()->GetPartitionsCopy()), sessions_(partitions_.size()),
         callbacks_(partitions_.size()) {
     resp_.set_code(RedisResponsePB::OK);
   }
@@ -911,22 +916,20 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
     auto operation = std::make_shared<client::YBRedisReadOp>(data_.table()->shared_from_this());
     auto request = operation->mutable_request();
     uint16_t hash_code = partition_key.size() == 0 ?
-        0 : PartitionSchema::DecodeMultiColumnHashValue(partition_key);
+        0 : dockv::PartitionSchema::DecodeMultiColumnHashValue(partition_key);
     request->mutable_key_value()->set_hash_code(hash_code);
     request->mutable_keys_request()->set_pattern(data_.arg(1).ToBuffer());
     request->mutable_keys_request()->set_threshold(keys_threshold_);
     sessions_[idx]->set_allow_local_calls_in_curr_thread(false);
-    auto status = sessions_[idx]->Apply(operation);
-    if (!status.ok()) {
-      ProcessedAll(status);
-      return;
-    }
+    sessions_[idx]->Apply(operation);
     sessions_[idx]->FlushAsync(std::bind(
         &KeysProcessor::ProcessedOne, shared_from_this(), idx, operation, _1));
   }
 
   void ProcessedOne(
-      size_t idx, const std::shared_ptr<client::YBRedisReadOp>& operation, const Status& status) {
+      size_t idx, const std::shared_ptr<client::YBRedisReadOp>& operation,
+      client::FlushStatus* flush_status) {
+    const auto& status = flush_status->status;
     if (!status.ok()) {
       ProcessedAll(status);
       return;
@@ -940,12 +943,12 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
       return;
     }
 
-    size_t count = response.array_response().elements_size();
+    auto count = response.array_response().elements_size();
     auto** elements = response.mutable_array_response()->mutable_elements()->mutable_data();
     keys_threshold_ -= count;
 
     auto& array_response = *resp_.mutable_array_response();
-    for (size_t i = 0; i != count; ++i) {
+    for (int i = 0; i != count; ++i) {
       array_response.mutable_elements()->AddAllocated(elements[i]);
     }
 
@@ -974,7 +977,7 @@ class KeysProcessor : public std::enable_shared_from_this<KeysProcessor> {
   std::vector<StatusFunctor> callbacks_;
   std::atomic<size_t> stored_{0};
   RedisResponsePB resp_;
-  size_t keys_threshold_ = FLAGS_redis_keys_threshold;
+  int32_t keys_threshold_ = FLAGS_redis_keys_threshold;
 };
 
 void HandleKeys(LocalCommandData data) {
@@ -1096,22 +1099,22 @@ void HandleFlushDB(LocalCommandData data) {
 }
 
 void HandleFlushAll(LocalCommandData data) {
-  vector<yb::client::YBTableName> table_names;
   const string prefix = common::kRedisTableName;
-  Status s = data.client()->ListTables(&table_names, prefix);
-  if (!s.ok()) {
+  auto result = data.client()->ListTables(prefix);
+  if (!result.ok()) {
     RedisResponsePB resp;
-    const Slice message = s.message();
+    const Slice message = result.status().message();
     resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);
     resp.set_error_message(message.data(), message.size());
     data.Respond(&resp);
     return;
   }
+  const auto& table_names = *result;
   // Gather table ids.
   vector<string> table_ids;
   for (const auto& name : table_names) {
     std::shared_ptr<client::YBTable> table;
-    s = data.client()->OpenTable(name, &table);
+    const auto s = data.client()->OpenTable(name, &table);
     if (!s.ok()) {
       RedisResponsePB resp;
       const Slice message = s.message();
@@ -1142,7 +1145,7 @@ void HandleCreateDB(LocalCommandData data) {
   // Figure out the redis table name that we should be using.
   const string db_name = data.arg(1).ToBuffer();
   const auto table_name = RedisServiceData::GetYBTableNameForRedisDatabase(db_name);
-  gscoped_ptr<yb::client::YBTableCreator> table_creator(data.client()->NewTableCreator());
+  std::unique_ptr<yb::client::YBTableCreator> table_creator(data.client()->NewTableCreator());
   s = table_creator->table_name(table_name)
           .table_type(yb::client::YBTableType::REDIS_TABLE_TYPE)
           .Create();
@@ -1162,18 +1165,17 @@ void HandleCreateDB(LocalCommandData data) {
 void HandleListDB(LocalCommandData data) {
   RedisResponsePB resp;
   // Figure out the redis table name that we should be using.
-  vector<yb::client::YBTableName> table_names;
   const string prefix = common::kRedisTableName;
   const size_t prefix_len = strlen(common::kRedisTableName);
-  Status s = data.client()->ListTables(&table_names, prefix);
-  if (!s.ok()) {
-    const Slice message = s.message();
+  const auto result = data.client()->ListTables(prefix);
+  if (!result.ok()) {
+    const Slice message = result.status().message();
     resp.set_code(RedisResponsePB_RedisStatusCode_SERVER_ERROR);
     resp.set_error_message(message.data(), message.size());
     data.Respond(&resp);
     return;
   }
-
+  const auto& table_names = *result;
   auto array_response = resp.mutable_array_response();
   vector<string> dbs;
   for (const auto& ybname : table_names) {
@@ -1260,7 +1262,7 @@ void HandleDebugSleep(LocalCommandData data) {
     }
   };
 
-  auto time_ms = util::CheckedStoll(data.arg(1));
+  auto time_ms = CheckedStoll(data.arg(1));
   if (!time_ms.ok()) {
     RedisResponsePB resp;
     resp.set_code(RedisResponsePB::PARSING_ERROR);

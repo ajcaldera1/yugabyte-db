@@ -11,37 +11,31 @@
 // under the License.
 //
 
-#ifndef YB_INTEGRATION_TESTS_YB_TABLE_TEST_BASE_H_
-#define YB_INTEGRATION_TESTS_YB_TABLE_TEST_BASE_H_
+#pragma once
 
 #include <atomic>
 #include <cmath>
 #include <cstdlib>
 #include <future>
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
 
-#include "yb/client/callbacks.h"
-#include "yb/client/client-test-util.h"
+#include "yb/client/schema.h"
 #include "yb/client/table_handle.h"
+
 #include "yb/gutil/ref_counted.h"
-#include "yb/gutil/strings/split.h"
-#include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/integration-tests/load_generator.h"
-#include "yb/integration-tests/mini_cluster.h"
+
 #include "yb/integration-tests/external_mini_cluster.h"
+#include "yb/integration-tests/mini_cluster.h"
+
 #include "yb/master/mini_master.h"
-#include "yb/tablet/maintenance_manager.h"
-#include "yb/tablet/tablet_metrics.h"
-#include "yb/tablet/tablet_peer.h"
-#include "yb/tserver/mini_tablet_server.h"
-#include "yb/tserver/tablet_server.h"
-#include "yb/tserver/ts_tablet_manager.h"
+
+#include "yb/tools/tools_fwd.h"
+
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
-#include "yb/util/stopwatch.h"
 #include "yb/util/subprocess.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
@@ -49,37 +43,61 @@
 namespace yb {
 namespace integration_tests {
 
-// This is a common base class from which SQLTableTest and RedisTableTest will inherit from.
+// This is a common base class that SQLTableTest and RedisTableTest inherit from.
 // In future some of the functionality may be migrated to sub-base classes when it becomes bigger.
 // i.e. scan related functions may be moved down because it is only supported for SQL tables.
 class YBTableTestBase : public YBTest {
  protected:
   YBTableTestBase();
-  virtual void SetUp() override;
-  virtual void TearDown() override;
+  ~YBTableTestBase();
+
+  void SetUp() override;
+  void TearDown() override;
+
+  virtual void BeforeCreateTable();
+  virtual void BeforeStartCluster();
 
   virtual bool use_external_mini_cluster();
+  virtual bool use_yb_admin_client();
   virtual int session_timeout_ms();
-  virtual int num_masters();
-  virtual int num_tablet_servers();
+  virtual size_t num_masters();
+  virtual size_t num_tablet_servers();
+  virtual int num_drives();
   virtual int num_tablets();
   virtual int client_rpc_timeout_ms();
   virtual client::YBTableName table_name();
   virtual bool need_redis_table();
+  virtual bool enable_ysql();
 
-  void CreateRedisTable(
-      std::shared_ptr<yb::client::YBClient> client, client::YBTableName table_name);
+  void CreateRedisTable(const client::YBTableName& table_name);
   virtual void CreateTable();
   void OpenTable();
-  void DeleteTable();
-  virtual void PutKeyValue(yb::client::YBSession* session, string key, string value);
-  virtual void PutKeyValue(string key, string value);
+  virtual void DeleteTable();
+  virtual Status PutKeyValue(yb::client::YBSession* session,
+                             const std::string& key,
+                             const std::string& value);
+  virtual void PutKeyValue(const std::string& key, const std::string& value);
+  virtual void PutKeyValueIgnoreError(const std::string& key, const std::string& value);
   void RestartCluster();
   std::vector<std::pair<std::string, std::string>> GetScanResults(const client::TableRange& range);
   void FetchTSMetricsPage();
+  void WaitForLoadBalanceCompletion(
+      yb::MonoDelta timeout = MonoDelta::FromMilliseconds(kDefaultLoadBalanceTimeoutMs));
+
+  // These utility functions only work with external_mini_cluster_.
+  template <class T>
+  T GetMasterLeaderProxy() {
+    DCHECK(use_external_mini_cluster());
+    return external_mini_cluster_->GetLeaderMasterProxy<T>();
+  }
+
+  // Calls GetLoadOnTserver to get loads for the provided tservers.
+  Result<std::vector<uint32_t>> GetTserverLoads(const std::vector<int>& ts_idxs);
+  Result<uint32_t> GetLoadOnTserver(ExternalTabletServer* server);
 
   client::TableHandle table_;
-  std::shared_ptr<yb::client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
+  std::unique_ptr<tools::ClusterAdminClient> yb_admin_client_;
   bool table_exists_ = false;
 
   yb::MiniCluster* mini_cluster() {
@@ -94,11 +112,11 @@ class YBTableTestBase : public YBTest {
 
   virtual void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) {}
 
-  vector<string> master_rpc_addresses_as_strings() {
-    vector<string> host_ports;
-    int num_masters = use_external_mini_cluster() ? external_mini_cluster()->num_masters()
-                                                  : mini_cluster()->num_masters();
-    for (int i = 0; i < num_masters; i++) {
+  std::vector<std::string> master_rpc_addresses_as_strings() {
+    std::vector<std::string> host_ports;
+    size_t num_masters = use_external_mini_cluster() ? external_mini_cluster()->num_masters()
+                                                     : mini_cluster()->num_masters();
+    for (size_t i = 0; i < num_masters; i++) {
       auto sock_addr = use_external_mini_cluster()
                            ? external_mini_cluster()->master(i)->bound_rpc_addr()
                            : mini_cluster()->mini_master(i)->bound_rpc_addr();
@@ -112,16 +130,25 @@ class YBTableTestBase : public YBTest {
 
   static constexpr int kDefaultNumMasters = 1;
   static constexpr int kDefaultNumTabletServers = 3;
+  static constexpr int kDefaultNumDrives = 1;
   static constexpr int kDefaultSessionTimeoutMs = 60000;
   static constexpr int kDefaultClientRpcTimeoutMs = 30000;
+  static constexpr int kDefaultLoadBalanceTimeoutMs = 60000;
   static constexpr bool kDefaultUsingExternalMiniCluster = false;
+  static constexpr bool kDefaultEnableYSQL = true;
   static const client::YBTableName kDefaultTableName;
 
-  vector<uint16_t> master_rpc_ports();
-  // Calls CreateYBClient and assigns it to local class field
+  // Set custom Env and rocksdb::Env to be used by MiniTabletServer, otherwise MiniTabletServer
+  // will use own Env and rocksdb::Env.
+  std::unique_ptr<Env> ts_env_;
+  std::unique_ptr<rocksdb::Env> ts_rocksdb_env_;
+
+  std::vector<uint16_t> master_rpc_ports();
+  // Calls CreateYBClient and assigns it to local class field.
   void CreateClient();
   // Creates a ClientYB client without assigning it to the class field.
-  std::shared_ptr<yb::client::YBClient> CreateYBClient();
+  std::unique_ptr<yb::client::YBClient> CreateYBClient();
+  void CreateAdminClient();
 
   std::shared_ptr<yb::client::YBSession> NewSession();
 
@@ -134,9 +161,12 @@ class YBTableTestBase : public YBTest {
 
   // All the default tables that are pre-created. Used to skip the initial create table step, when
   // the given table has been already pre-created.
-  vector<string> default_tables_created_;
+  std::vector<std::string> default_tables_created_;
+
+  // For tests that use multiple tables, store the tables here.
+  // For tests with a single table, this is equivalent to table_name().
+  std::vector<client::YBTableName> table_names_;
 };
 
 }  // namespace integration_tests
 }  // namespace yb
-#endif  // YB_INTEGRATION_TESTS_YB_TABLE_TEST_BASE_H_

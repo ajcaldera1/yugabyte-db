@@ -19,18 +19,22 @@
 //
 
 #include "yb/rocksdb/table/get_context.h"
+
+#include "yb/rocksdb/db/merge_context.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/merge_operator.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/util/perf_context_imp.h"
 #include "yb/rocksdb/util/statistics.h"
+#include "yb/rocksdb/util/stop_watch.h"
+
+#include "yb/util/stats/perf_step_timer.h"
 
 namespace rocksdb {
 
 namespace {
 
 void appendToReplayLog(std::string* replay_log, ValueType type, Slice value) {
-#ifndef ROCKSDB_LITE
   if (replay_log) {
     if (replay_log->empty()) {
       // Optimization: in the common case of only one operation in the
@@ -40,7 +44,6 @@ void appendToReplayLog(std::string* replay_log, ValueType type, Slice value) {
     replay_log->push_back(type);
     PutLengthPrefixedSlice(replay_log, value);
   }
-#endif  // ROCKSDB_LITE
 }
 
 }  // namespace
@@ -181,7 +184,6 @@ bool GetContext::SaveValue(const ParsedInternalKey& parsed_key,
 
 void replayGetContextLog(const Slice& replay_log, const Slice& user_key,
                          GetContext* get_context) {
-#ifndef ROCKSDB_LITE
   Slice s = replay_log;
   while (s.size()) {
     auto type = static_cast<ValueType>(*s.data());
@@ -196,9 +198,6 @@ void replayGetContextLog(const Slice& replay_log, const Slice& user_key,
     get_context->SaveValue(
         ParsedInternalKey(user_key, kMaxSequenceNumber, type), value);
   }
-#else   // ROCKSDB_LITE
-  assert(false);
-#endif  // ROCKSDB_LITE
 }
 
 }  // namespace rocksdb

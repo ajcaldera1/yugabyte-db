@@ -35,30 +35,30 @@
 #include <mutex>
 
 #include "yb/consensus/consensus_peers.h"
-#include "yb/consensus/log.h"
+
 #include "yb/gutil/map-util.h"
-#include "yb/gutil/stl_util.h"
-#include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/logging.h"
 #include "yb/util/threadpool.h"
+
+DECLARE_bool(enable_multi_raft_heartbeat_batcher);
 
 namespace yb {
 namespace consensus {
 
-using log::Log;
-using strings::Substitute;
-
-PeerManager::PeerManager(const std::string tablet_id,
-                         const std::string local_uuid,
-                         PeerProxyFactory* peer_proxy_factory,
-                         PeerMessageQueue* queue,
-                         ThreadPoolToken* raft_pool_token,
-                         const scoped_refptr<log::Log>& log)
+PeerManager::PeerManager(
+    const std::string tablet_id,
+    const std::string local_uuid,
+    PeerProxyFactory* peer_proxy_factory,
+    PeerMessageQueue* queue,
+    ThreadPoolToken* raft_pool_token,
+    consensus::MultiRaftManager* multi_raft_manager)
     : tablet_id_(tablet_id),
       local_uuid_(local_uuid),
       peer_proxy_factory_(peer_proxy_factory),
       queue_(queue),
       raft_pool_token_(raft_pool_token),
-      log_(log) {
+      multi_raft_manager_(multi_raft_manager) {
 }
 
 PeerManager::~PeerManager() {
@@ -66,9 +66,9 @@ PeerManager::~PeerManager() {
 }
 
 void PeerManager::UpdateRaftConfig(const RaftConfigPB& config) {
-  VLOG(1) << "Updating peers from new config: " << config.ShortDebugString();
+  VLOG_WITH_PREFIX(1) << "Updating peers from new config: " << config.ShortDebugString();
 
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   // Create new peers.
   for (const RaftPeerPB& peer_pb : config.peers()) {
     if (peers_.find(peer_pb.permanent_uuid()) != peers_.end()) {
@@ -78,40 +78,47 @@ void PeerManager::UpdateRaftConfig(const RaftConfigPB& config) {
       continue;
     }
 
-    VLOG(1) << GetLogPrefix() << "Adding remote peer. Peer: " << peer_pb.ShortDebugString();
+    VLOG_WITH_PREFIX(1) << "Adding remote peer. Peer: " << peer_pb.ShortDebugString();
+    MultiRaftHeartbeatBatcherPtr multi_raft_batcher = nullptr;
+    if (multi_raft_manager_) {
+      multi_raft_batcher = multi_raft_manager_->AddOrGetBatcher(peer_pb);
+    }
     auto remote_peer = Peer::NewRemotePeer(
-        peer_pb, tablet_id_, local_uuid_, queue_, raft_pool_token_,
-        peer_proxy_factory_->NewProxy(peer_pb), consensus_, peer_proxy_factory_->messenger());
+        peer_pb, tablet_id_, local_uuid_, peer_proxy_factory_->NewProxy(peer_pb), queue_,
+        multi_raft_batcher, raft_pool_token_, consensus_, peer_proxy_factory_->messenger());
     if (!remote_peer.ok()) {
-      LOG(WARNING) << "Failed to create remote peer for " << peer_pb.ShortDebugString() << ": "
-                   << remote_peer.status();
+      LOG_WITH_PREFIX(WARNING)
+          << "Failed to create remote peer for " << peer_pb.ShortDebugString() << ": "
+          << remote_peer.status();
       return;
     }
 
-    auto status = (**remote_peer).SignalRequest(RequestTriggerMode::kNonEmptyOnly);
-    LOG_IF(WARNING, !status.ok()) << "Failed to send first request to peer "
-                                  << (**remote_peer).peer_pb().ShortDebugString() << ": " << status;
     peers_[peer_pb.permanent_uuid()] = std::move(*remote_peer);
   }
 }
 
 void PeerManager::SignalRequest(RequestTriggerMode trigger_mode) {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   for (auto iter = peers_.begin(); iter != peers_.end();) {
     Status s = iter->second->SignalRequest(trigger_mode);
-    if (PREDICT_FALSE(!s.ok())) {
-      LOG(WARNING) << GetLogPrefix()
-                   << "Peer was closed, removing from peers. Peer: "
-                   << (*iter).second->peer_pb().ShortDebugString();
+    if (PREDICT_FALSE(s.IsIllegalState())) {
+      LOG_WITH_PREFIX(WARNING)
+          << "Peer was closed: " << s << ", removing from peers. Peer: "
+          << (*iter).second->peer_pb().ShortDebugString();
       iter = peers_.erase(iter);
     } else {
+      if (PREDICT_FALSE(!s.ok())) {
+        LOG_WITH_PREFIX(WARNING)
+            << "Peer " << (*iter).second->peer_pb().ShortDebugString()
+            << " failed to send request: " << s;
+      }
       iter++;
     }
   }
 }
 
 void PeerManager::Close() {
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   for (const auto& entry : peers_) {
     entry.second->Close();
   }
@@ -119,12 +126,12 @@ void PeerManager::Close() {
 }
 
 void PeerManager::ClosePeersNotInConfig(const RaftConfigPB& config) {
-  unordered_map<string, RaftPeerPB> peers_in_config;
+  std::unordered_map<std::string, RaftPeerPB> peers_in_config;
   for (const RaftPeerPB &peer_pb : config.peers()) {
     InsertOrDie(&peers_in_config, peer_pb.permanent_uuid(), peer_pb);
   }
 
-  std::lock_guard<simple_spinlock> lock(lock_);
+  std::lock_guard lock(lock_);
   for (auto iter = peers_.begin(); iter != peers_.end();) {
     auto peer = iter->second.get();
 
@@ -143,8 +150,20 @@ void PeerManager::ClosePeersNotInConfig(const RaftConfigPB& config) {
   }
 }
 
-std::string PeerManager::GetLogPrefix() const {
-  return Substitute("T $0 P $1: ", tablet_id_, local_uuid_);
+void PeerManager::DumpToHtml(std::ostream& out) const {
+  out << "<h2>Peer Manager</h2>" << std::endl;
+  out << "<ul>" << std::endl;
+  std::lock_guard lock(lock_);
+  for (const auto& entry : peers_) {
+    out << "<li>" << std::endl;
+    entry.second->DumpToHtml(out);
+    out << "</li>" << std::endl;
+  }
+  out << "</ul>" << std::endl;
+}
+
+std::string PeerManager::LogPrefix() const {
+  return MakeTabletLogPrefix(tablet_id_, local_uuid_);
 }
 
 } // namespace consensus

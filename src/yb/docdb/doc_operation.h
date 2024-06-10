@@ -11,15 +11,15 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_DOC_OPERATION_H_
-#define YB_DOCDB_DOC_OPERATION_H_
+#pragma once
 
 #include <boost/container/small_vector.hpp>
 
-#include "yb/common/common.pb.h"
 #include "yb/common/read_hybrid_time.h"
+#include "yb/common/transaction.pb.h"
 
 #include "yb/docdb/docdb_fwd.h"
+#include "yb/docdb/read_operation_data.h"
 
 #include "yb/util/monotime.h"
 #include "yb/util/ref_cnt_buffer.h"
@@ -29,20 +29,32 @@ namespace docdb {
 
 struct DocOperationApplyData {
   DocWriteBatch* doc_write_batch;
-  CoarseTimePoint deadline;
-  ReadHybridTime read_time;
+  ReadOperationData read_operation_data;
   HybridTime* restart_read_ht;
+  SchemaPackingProvider* schema_packing_provider;  // null okay
+
+  CoarseTimePoint deadline() const {
+    return read_operation_data.deadline;
+  }
+
+  const ReadHybridTime& read_time() const {
+    return read_operation_data.read_time;
+  }
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(read_operation_data, restart_read_ht);
+  }
 };
 
 // When specifiying the parent key, the constant -1 is used for the subkey index.
 const int kNilSubkeyIndex = -1;
 
-typedef boost::container::small_vector_base<RefCntPrefix> DocPathsToLock;
+using DocPathsToLock = boost::container::small_vector_base<RefCntPrefix>;
 
-YB_DEFINE_ENUM(GetDocPathsMode, (kLock)(kIntents));
+YB_DEFINE_ENUM(GetDocPathsMode, (kLock)(kIntents)(kStrongReadIntents));
 YB_DEFINE_ENUM(DocOperationType,
-               (PGSQL_WRITE_OPERATION)(PGSQL_READ_OPERATION)(QL_WRITE_OPERATION)
-                   (REDIS_WRITE_OPERATION));
+               (PGSQL_WRITE_OPERATION)(QL_WRITE_OPERATION)(REDIS_WRITE_OPERATION));
+YB_STRONGLY_TYPED_BOOL(SingleOperation);
 
 class DocOperation {
  public:
@@ -62,11 +74,11 @@ class DocOperation {
   // Returned doc paths are controlled by mode argument:
   //   kLock - paths should be locked for this operation.
   //   kIntents - paths that should be used when writing intents, i.e. for conflict resolution.
-  virtual CHECKED_STATUS GetDocPaths(
+  virtual Status GetDocPaths(
       GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const = 0;
 
-  virtual CHECKED_STATUS Apply(const DocOperationApplyData& data) = 0;
-  virtual Type OpType() = 0;
+  virtual Status Apply(const DocOperationApplyData& data) = 0;
+  [[nodiscard]] virtual Type OpType() const = 0;
   virtual void ClearResponse() = 0;
 
   virtual std::string ToString() const = 0;
@@ -75,7 +87,9 @@ class DocOperation {
 template <DocOperationType OperationType, class RequestPB>
 class DocOperationBase : public DocOperation {
  public:
-  Type OpType() override {
+  explicit DocOperationBase(std::reference_wrapper<const RequestPB> request) : request_(request) {}
+
+  [[nodiscard]] Type OpType() const override {
     return OperationType;
   }
 
@@ -84,12 +98,10 @@ class DocOperationBase : public DocOperation {
   }
 
  protected:
-  RequestPB request_;
+  const RequestPB& request_;
 };
 
 typedef std::vector<std::unique_ptr<DocOperation>> DocOperations;
 
 }  // namespace docdb
 }  // namespace yb
-
-#endif // YB_DOCDB_DOC_OPERATION_H_

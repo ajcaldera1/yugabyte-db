@@ -31,14 +31,18 @@
 #include <algorithm>
 #include <utility>
 #include <vector>
-#include "yb/rocksdb/db/column_family.h"
 
+#include "yb/rocksdb/db/column_family.h"
+#include "yb/rocksdb/db/compaction_picker.h"
 #include "yb/rocksdb/db/db_impl.h"
+#include "yb/rocksdb/db/version_set.h"
+#include "yb/rocksdb/util/histogram.h"
+#include "yb/rocksdb/util/logging.h"
+
 #include "yb/util/string_util.h"
 
 namespace rocksdb {
 
-#ifndef ROCKSDB_LITE
 namespace {
 const double kMB = 1048576.0;
 const double kGB = kMB * 1024;
@@ -295,6 +299,24 @@ const DBPropertyInfo* GetPropertyInfo(const Slice& property) {
     return nullptr;
   }
   return &ppt_info_iter->second;
+}
+
+InternalStats::InternalStats(int num_levels, Env* env, ColumnFamilyData* cfd)
+    : db_stats_{},
+      cf_stats_value_{},
+      cf_stats_count_{},
+      comp_stats_(num_levels),
+      file_read_latency_(num_levels),
+      bg_error_count_(0),
+      number_levels_(num_levels),
+      env_(env),
+      cfd_(cfd),
+      started_at_(env->NowMicros()) {}
+
+InternalStats::~InternalStats() = default;
+
+HistogramImpl* InternalStats::GetFileReadHist(int level) {
+  return &file_read_latency_[level];
 }
 
 bool InternalStats::GetStringProperty(const DBPropertyInfo& property_info,
@@ -595,14 +617,14 @@ void InternalStats::DumpDBStats(std::string* value) {
            seconds_up, interval_seconds_up);
   value->append(buf);
   // Cumulative
-  uint64_t user_bytes_written = GetDBStats(InternalStats::BYTES_WRITTEN);
-  uint64_t num_keys_written = GetDBStats(InternalStats::NUMBER_KEYS_WRITTEN);
-  uint64_t write_other = GetDBStats(InternalStats::WRITE_DONE_BY_OTHER);
-  uint64_t write_self = GetDBStats(InternalStats::WRITE_DONE_BY_SELF);
-  uint64_t wal_bytes = GetDBStats(InternalStats::WAL_FILE_BYTES);
-  uint64_t wal_synced = GetDBStats(InternalStats::WAL_FILE_SYNCED);
-  uint64_t write_with_wal = GetDBStats(InternalStats::WRITE_WITH_WAL);
-  uint64_t write_stall_micros = GetDBStats(InternalStats::WRITE_STALL_MICROS);
+  uint64_t user_bytes_written = GetDBStats(InternalDBStatsType::BYTES_WRITTEN);
+  uint64_t num_keys_written = GetDBStats(InternalDBStatsType::NUMBER_KEYS_WRITTEN);
+  uint64_t write_other = GetDBStats(InternalDBStatsType::WRITE_DONE_BY_OTHER);
+  uint64_t write_self = GetDBStats(InternalDBStatsType::WRITE_DONE_BY_SELF);
+  uint64_t wal_bytes = GetDBStats(InternalDBStatsType::WAL_FILE_BYTES);
+  uint64_t wal_synced = GetDBStats(InternalDBStatsType::WAL_FILE_SYNCED);
+  uint64_t write_with_wal = GetDBStats(InternalDBStatsType::WRITE_WITH_WAL);
+  uint64_t write_stall_micros = 0;
   uint64_t compact_bytes_read = 0;
   uint64_t compact_bytes_write = 0;
   uint64_t compact_micros = 0;
@@ -865,10 +887,5 @@ void InternalStats::DumpCFStats(std::string* value) {
 }
 
 
-#else
-
-const DBPropertyInfo* GetPropertyInfo(const Slice& property) { return nullptr; }
-
-#endif  // !ROCKSDB_LITE
 
 }  // namespace rocksdb

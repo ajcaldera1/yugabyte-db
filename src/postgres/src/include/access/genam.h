@@ -17,6 +17,7 @@
 #include "access/sdir.h"
 #include "access/skey.h"
 #include "nodes/tidbitmap.h"
+#include "nodes/ybtidbitmap.h"
 #include "storage/lockdefs.h"
 #include "utils/relcache.h"
 #include "utils/snapshot.h"
@@ -136,7 +137,8 @@ extern bool index_insert(Relation indexRelation,
 			 HeapTuple heapTuple,
 			 Relation heapRelation,
 			 IndexUniqueCheck checkUnique,
-			 struct IndexInfo *indexInfo);
+			 struct IndexInfo *indexInfo,
+			 bool yb_shared_insert);
 extern void index_delete(Relation indexRelation,
 			 Datum *values, bool *isnull,
 			 Datum ybctid,
@@ -168,6 +170,8 @@ extern ItemPointer index_getnext_tid(IndexScanDesc scan,
 extern HeapTuple index_fetch_heap(IndexScanDesc scan);
 extern HeapTuple index_getnext(IndexScanDesc scan, ScanDirection direction);
 extern int64 index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap);
+extern int64 yb_index_getbitmap(IndexScanDesc scan, YbTIDBitmap *bitmap,
+								bool recheck);
 
 extern IndexBulkDeleteResult *index_bulk_delete(IndexVacuumInfo *info,
 				  IndexBulkDeleteResult *stats,
@@ -180,6 +184,10 @@ extern RegProcedure index_getprocid(Relation irel, AttrNumber attnum,
 				uint16 procnum);
 extern FmgrInfo *index_getprocinfo(Relation irel, AttrNumber attnum,
 				  uint16 procnum);
+
+extern bool yb_index_might_recheck(Relation heapRelation,
+								   Relation indexRelation, bool xs_want_itup,
+								   ScanKey keys, int nkeys);
 
 /*
  * index access method support routines (in genam.c)

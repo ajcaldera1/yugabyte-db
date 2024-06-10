@@ -13,15 +13,24 @@
 
 #include "yb/tablet/tablet-test-util.h"
 
-#include <gflags/gflags.h>
+#include "yb/qlexpr/ql_expr.h"
+#include "yb/common/ql_value.h"
 
-#include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
+
+#include "yb/dockv/reader_projection.h"
 
 #include "yb/gutil/strings/join.h"
 
 #include "yb/tablet/operations/change_metadata_operation.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 
 #include "yb/tserver/tserver_admin.pb.h"
+
+#include "yb/util/status_log.h"
+
+using std::string;
 
 DECLARE_bool(enable_data_block_fsync);
 
@@ -29,12 +38,13 @@ namespace yb {
 namespace tablet {
 
 YBTabletTest::YBTabletTest(const Schema& schema, TableType table_type)
-  : schema_(schema.CopyWithColumnIds()),
+  : schema_(schema),
     client_schema_(schema),
     table_type_(table_type) {
+  const_cast<Schema&>(schema_).InitColumnIdsByDefault();
   // Keep unit tests fast, but only if no one has set the flag explicitly.
   if (google::GetCommandLineFlagInfoOrDie("enable_data_block_fsync").is_default) {
-    FLAGS_enable_data_block_fsync = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_data_block_fsync) = false;
   }
 }
 
@@ -60,24 +70,25 @@ void YBTabletTest::SetUpTestTablet(const std::string& root_dir) {
 }
 
 void YBTabletTest::AlterSchema(const Schema& schema) {
-  tserver::ChangeMetadataRequestPB req;
+  ThreadSafeArena arena;
+  LWChangeMetadataRequestPB req(&arena);
   req.set_schema_version(tablet()->metadata()->schema_version() + 1);
 
-  ChangeMetadataOperationState operation_state(nullptr, nullptr, &req);
-  ASSERT_OK(tablet()->CreatePreparedChangeMetadata(&operation_state, &schema));
-  ASSERT_OK(tablet()->AlterSchema(&operation_state));
-  operation_state.Finish();
+  ChangeMetadataOperation operation(nullptr, nullptr, &req);
+  ASSERT_OK(tablet()->CreatePreparedChangeMetadata(
+      &operation, &schema, IsLeaderSide::kTrue));
+  ASSERT_OK(tablet()->AlterSchema(&operation));
+  operation.Release();
 }
 
 Status IterateToStringList(
-    common::YQLRowwiseIteratorIf* iter, std::vector<std::string> *out, int limit) {
+    docdb::YQLRowwiseIteratorIf* iter, const Schema& schema, std::vector<std::string> *out,
+    int limit) {
   out->clear();
-  Schema schema = iter->schema();
   int fetched = 0;
   std::vector<std::pair<QLValue, std::string>> temp;
-  QLTableRow row;
-  while (VERIFY_RESULT(iter->HasNext()) && fetched < limit) {
-    RETURN_NOT_OK(iter->NextRow(&row));
+  qlexpr::QLTableRow row;
+  while (VERIFY_RESULT(iter->FetchNext(&row)) && fetched < limit) {
     QLValue key;
     RETURN_NOT_OK(row.GetValue(schema.column_id(0), &key));
     temp.emplace_back(key, row.ToString(schema));
@@ -93,11 +104,13 @@ Status IterateToStringList(
 }
 
 // Dump all of the rows of the tablet into the given vector.
-Status DumpTablet(const Tablet& tablet, const Schema& projection, std::vector<std::string>* out) {
-  auto iter = tablet.NewRowIterator(projection, boost::none);
+Status DumpTablet(const Tablet& tablet, std::vector<std::string>* out) {
+  const auto& schema = *tablet.schema();
+  dockv::ReaderProjection reader_projection(schema);
+  auto iter = tablet.NewRowIterator(reader_projection);
   RETURN_NOT_OK(iter);
   std::vector<string> rows;
-  RETURN_NOT_OK(IterateToStringList(iter->get(), &rows));
+  RETURN_NOT_OK(IterateToStringList(iter->get(), schema, &rows));
   std::sort(rows.begin(), rows.end());
   out->swap(rows);
   return Status::OK();

@@ -61,7 +61,6 @@
 // tools/write_stress_runner.py should only take one parameter -- runtime_sec
 // and it should figure out everything else on its own.
 
-#include <cstdio>
 
 #ifndef GFLAGS
 int main() {
@@ -70,7 +69,7 @@ int main() {
 }
 #else
 
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
@@ -91,37 +90,35 @@ int main() {
 #include "yb/rocksdb/db/filename.h"
 
 using GFLAGS::ParseCommandLineFlags;
-using GFLAGS::RegisterFlagValidator;
 using GFLAGS::SetUsageMessage;
 
-DEFINE_int32(key_size, 10, "Key size");
-DEFINE_int32(value_size, 100, "Value size");
-DEFINE_string(db, "", "Use the db with the following name.");
-DEFINE_bool(destroy_db, true,
-            "Destory the existing DB before running the test");
+DEFINE_NON_RUNTIME_int32(key_size, 10, "Key size");
+DEFINE_NON_RUNTIME_int32(value_size, 100, "Value size");
+DEFINE_NON_RUNTIME_string(db, "", "Use the db with the following name.");
+DEFINE_NON_RUNTIME_bool(destroy_db, true, "Destory the existing DB before running the test");
 
-DEFINE_int32(runtime_sec, 10 * 60, "How long are we running for, in seconds");
-DEFINE_int32(seed, 139, "Random seed");
+DEFINE_NON_RUNTIME_int32(runtime_sec, 10 * 60, "How long are we running for, in seconds");
+DEFINE_NON_RUNTIME_int32(seed, 139, "Random seed");
 
-DEFINE_double(prefix_mutate_period_sec, 1.0,
-              "How often are we going to mutate the prefix");
-DEFINE_double(first_char_mutate_probability, 0.1,
-              "How likely are we to mutate the first char every period");
-DEFINE_double(second_char_mutate_probability, 0.2,
-              "How likely are we to mutate the second char every period");
-DEFINE_double(third_char_mutate_probability, 0.5,
-              "How likely are we to mutate the third char every period");
+DEFINE_NON_RUNTIME_double(prefix_mutate_period_sec, 1.0,
+    "How often are we going to mutate the prefix");
+DEFINE_NON_RUNTIME_double(first_char_mutate_probability, 0.1,
+    "How likely are we to mutate the first char every period");
+DEFINE_NON_RUNTIME_double(second_char_mutate_probability, 0.2,
+    "How likely are we to mutate the second char every period");
+DEFINE_NON_RUNTIME_double(
+    third_char_mutate_probability, 0.5, "How likely are we to mutate the third char every period");
 
-DEFINE_int32(iterator_hold_sec, 5,
-             "How long will the iterator hold files before it gets destroyed");
+DEFINE_NON_RUNTIME_int32(iterator_hold_sec, 5,
+    "How long will the iterator hold files before it gets destroyed");
 
-DEFINE_double(sync_probability, 0.01, "How often are we syncing writes");
-DEFINE_bool(delete_obsolete_files_with_fullscan, false,
-            "If true, we delete obsolete files after each compaction/flush "
-            "using GetChildren() API");
-DEFINE_bool(low_open_files_mode, false,
-            "If true, we set max_open_files to 20, so that every file access "
-            "needs to reopen it");
+DEFINE_NON_RUNTIME_double(sync_probability, 0.01, "How often are we syncing writes");
+DEFINE_NON_RUNTIME_bool(delete_obsolete_files_with_fullscan, false,
+    "If true, we delete obsolete files after each compaction/flush "
+    "using GetChildren() API");
+DEFINE_NON_RUNTIME_bool(low_open_files_mode, false,
+    "If true, we set max_open_files to 20, so that every file access "
+    "needs to reopen it");
 
 namespace rocksdb {
 
@@ -138,14 +135,14 @@ class WriteStress {
     // Choose a location for the test database if none given with --db=<path>
     if (FLAGS_db.empty()) {
       std::string default_db_path;
-      Env::Default()->GetTestDirectory(&default_db_path);
+      CHECK_OK(Env::Default()->GetTestDirectory(&default_db_path));
       default_db_path += "/write_stress";
       FLAGS_db = default_db_path;
     }
 
     Options options;
     if (FLAGS_destroy_db) {
-      DestroyDB(FLAGS_db, options);  // ignore
+      CHECK_OK(DestroyDB(FLAGS_db, options));
     }
 
     // make the LSM tree deep, so that we have many concurrent flushes and
@@ -258,27 +255,17 @@ class WriteStress {
     }
     threads_.clear();
 
-// Skip checking for leaked files in ROCKSDB_LITE since we don't have access to
-// function GetLiveFilesMetaData
-#ifndef ROCKSDB_LITE
     // let's see if we leaked some files
-    db_->PauseBackgroundWork();
+    CHECK_OK(db_->PauseBackgroundWork());
     std::vector<LiveFileMetaData> metadata;
     db_->GetLiveFilesMetaData(&metadata);
     std::set<uint64_t> sst_file_numbers;
     for (const auto& file : metadata) {
-      uint64_t number;
-      FileType type;
-      if (!ParseFileName(file.name, &number, "LOG", &type)) {
-        continue;
-      }
-      if (type == kTableFile) {
-        sst_file_numbers.insert(number);
-      }
+      sst_file_numbers.insert(file.name_id);
     }
 
     std::vector<std::string> children;
-    Env::Default()->GetChildren(FLAGS_db, &children);
+    CHECK_OK(Env::Default()->GetChildren(FLAGS_db, &children));
     for (const auto& child : children) {
       uint64_t number;
       FileType type;
@@ -295,8 +282,7 @@ class WriteStress {
         }
       }
     }
-    db_->ContinueBackgroundWork();
-#endif  // !ROCKSDB_LITE
+    CHECK_OK(db_->ContinueBackgroundWork());
 
     return 0;
   }

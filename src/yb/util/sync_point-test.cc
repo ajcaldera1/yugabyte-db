@@ -30,31 +30,37 @@
 // under the License.
 //
 
-#include "yb/util/sync_point.h"
+#include <atomic>
+#include <string>
 
 #include <gtest/gtest.h>
 
 #include "yb/gutil/ref_counted.h"
-#include "yb/util/test_util.h"
+
+#include "yb/util/monotime.h"
+#include "yb/util/result.h"
+#include "yb/util/sync_point.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/thread.h"
+
+DECLARE_bool(TEST_enable_sync_points);
 
 using std::string;
 using std::vector;
 
 namespace yb {
 
-#ifndef NDEBUG
 static void RunThread(bool *var) {
   *var = true;
   TEST_SYNC_POINT("first");
 }
-#endif
 
 TEST(SyncPointTest, TestSyncPoint) {
-#ifndef NDEBUG
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_sync_points) = true;
+
   // Set up a sync point "second" that depends on "first".
   vector<SyncPoint::Dependency> dependencies;
-  dependencies.push_back(SyncPoint::Dependency("first", "second"));
+  dependencies.push_back({"first", "second"});
   SyncPoint::GetInstance()->LoadDependency(dependencies);
   SyncPoint::GetInstance()->EnableProcessing();
 
@@ -62,17 +68,13 @@ TEST(SyncPointTest, TestSyncPoint) {
   // setting 'var' to true, which unblocks the main thread.
   scoped_refptr<Thread> thread;
   bool var = false;
-  ASSERT_OK(yb::Thread::Create("test", "test",
-                                        &RunThread, &var, &thread));
+  ASSERT_OK(yb::Thread::Create("test", "test", &RunThread, &var, &thread));
 
   // Blocked on RunThread to process "first".
   TEST_SYNC_POINT("second");
   ASSERT_TRUE(var);
 
   thread->Join();
-#else
-  LOG(INFO) << "Test skipped in release mode.";
-#endif // NDEBUG
 }
 
 } // namespace yb

@@ -15,53 +15,42 @@
 #include <cmath>
 #include <cstdlib>
 #include <future>
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
 
 #include "yb/client/callbacks.h"
-#include "yb/client/client-test-util.h"
+#include "yb/client/client.h"
 #include "yb/client/table.h"
 #include "yb/client/tablet_server.h"
 
 #include "yb/gutil/strings/split.h"
-#include "yb/gutil/strings/strcat.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/master/mini_master.h"
-#include "yb/tablet/maintenance_manager.h"
-#include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet_peer.h"
-#include "yb/tserver/tablet_server.h"
-#include "yb/util/test_macros.h"
-#include "yb/util/test_util.h"
 
 #include "yb/integration-tests/cluster_verifier.h"
 #include "yb/integration-tests/load_generator.h"
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
+#include "yb/master/mini_master.h"
+
+#include "yb/tserver/mini_tablet_server.h"
+
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/test_thread_holder.h"
+
 using namespace std::literals;
 
 using std::string;
 using std::vector;
-using std::unique_ptr;
 
-using yb::client::YBValue;
-
-using std::shared_ptr;
+DECLARE_int32(log_cache_size_limit_mb);
+DECLARE_int32(global_log_cache_size_limit_mb);
 
 namespace yb {
 namespace integration_tests {
-
-using client::YBClient;
-using client::YBClientBuilder;
-using client::YBColumnSchema;
-using client::YBSchema;
-using client::YBSchemaBuilder;
-using client::YBSession;
-using client::YBStatusMemberCallback;
-using client::YBTable;
-using client::YBTableCreator;
-using strings::Split;
 
 class KVTableTest : public YBTableTestBase {
  protected:
@@ -131,11 +120,10 @@ TEST_F(KVTableTest, LoadTest) {
   int value_size_bytes = 16;
   int max_write_errors = 0;
   int max_read_errors = 0;
-  bool stop_on_empty_read = true;
 
   // Create two separate clients for read and writes.
-  shared_ptr<YBClient> write_client = CreateYBClient();
-  shared_ptr<YBClient> read_client = CreateYBClient();
+  auto write_client = CreateYBClient();
+  auto read_client = CreateYBClient();
   yb::load_generator::YBSessionFactory write_session_factory(write_client.get(), &table_);
   yb::load_generator::YBSessionFactory read_session_factory(read_client.get(), &table_);
 
@@ -145,8 +133,7 @@ TEST_F(KVTableTest, LoadTest) {
   yb::load_generator::MultiThreadedReader reader(rows, reader_threads, &read_session_factory,
                                                  writer.InsertionPoint(), writer.InsertedKeys(),
                                                  writer.FailedKeys(), &stop_requested_flag,
-                                                 value_size_bytes, max_read_errors,
-                                                 stop_on_empty_read);
+                                                 value_size_bytes, max_read_errors);
 
   writer.Start();
   // Having separate write requires adding in write client id to the reader.
@@ -189,10 +176,9 @@ TEST_F(KVTableTest, Restart) {
   ASSERT_NO_FATALS(CheckSampleKeysValues());
 
   // Wait until all tablet servers come up.
-  std::vector<std::unique_ptr<client::YBTabletServer>> tablet_servers;
+  std::vector<client::YBTabletServer> tablet_servers;
   do {
-    tablet_servers.clear();
-    ASSERT_OK(client_->ListTabletServers(&tablet_servers));
+    tablet_servers = ASSERT_RESULT(client_->ListTabletServers());
     if (tablet_servers.size() == num_tablet_servers()) {
       break;
     }
@@ -201,6 +187,69 @@ TEST_F(KVTableTest, Restart) {
 
   ASSERT_NO_FATALS(cluster_verifier.CheckCluster());
   ASSERT_NO_FATALS(cluster_verifier.CheckRowCount(table_->name(), ClusterVerifier::EXACTLY, 3));
+}
+
+class KVTableSingleTabletTest : public KVTableTest {
+ public:
+  int num_tablets() override {
+    return 1;
+  }
+
+  void SetUp() override {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_global_log_cache_size_limit_mb) = 1;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_cache_size_limit_mb) = 1;
+    KVTableTest::SetUp();
+  }
+};
+
+// Write big values with small log cache.
+// And restart one tserver.
+//
+// So we expect that some operations would be unloaded to disk and loaded back
+// after this tservers joined raft group again.
+//
+// Also check that we track such operations.
+TEST_F_EX(KVTableTest, YB_DISABLE_TEST_ON_MACOS(BigValues), KVTableSingleTabletTest) {
+  std::atomic_bool stop_requested_flag(false);
+  SetFlagOnExit set_flag_on_exit(&stop_requested_flag);
+  int rows = 100;
+  int start_key = 0;
+  int writer_threads = 4;
+  int value_size_bytes = 32_KB;
+  int max_write_errors = 0;
+
+  // Create two separate clients for read and writes.
+  auto write_client = CreateYBClient();
+  yb::load_generator::YBSessionFactory write_session_factory(write_client.get(), &table_);
+
+  yb::load_generator::MultiThreadedWriter writer(rows, start_key, writer_threads,
+                                                 &write_session_factory, &stop_requested_flag,
+                                                 value_size_bytes, max_write_errors);
+
+  writer.Start();
+  mini_cluster_->mini_tablet_server(1)->Shutdown();
+  auto start_writes = writer.num_writes();
+  while (writer.num_writes() - start_writes < 50) {
+    std::this_thread::sleep_for(100ms);
+  }
+  ASSERT_OK(mini_cluster_->mini_tablet_server(1)->Start(tserver::WaitTabletsBootstrapped::kFalse));
+
+  ASSERT_OK(WaitFor([] {
+    std::vector<MemTrackerData> trackers;
+    trackers.clear();
+    CollectMemTrackerData(MemTracker::GetRootTracker(), 0, &trackers);
+    bool found = false;
+    for (const auto& data : trackers) {
+      if (data.tracker->id() == "OperationsFromDisk" && data.tracker->peak_consumption()) {
+        LOG(INFO) << "Tracker: " << data.tracker->ToString() << ", peak consumption: "
+                  << data.tracker->peak_consumption();
+        found = true;
+      }
+    }
+    return found;
+  }, 15s, "Load operations from disk"));
+
+  writer.WaitForCompletion();
 }
 
 }  // namespace integration_tests

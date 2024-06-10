@@ -79,6 +79,10 @@ extern void interpret_function_parameter_list(ParseState *pstate,
 								  List **parameterDefaults,
 								  Oid *variadicArgType,
 								  Oid *requiredResultType);
+extern ObjectAddress AlterFunctionOwner(AlterOwnerStmt *stmt, Oid newOwnerId);
+extern void AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId);
+extern ObjectAddress RenameFunction(RenameStmt *stmt, const char *newname);
+extern void RenameFunction_internal(Relation rel, HeapTuple tup, const char* newname);
 
 /* commands/operatorcmds.c */
 extern ObjectAddress DefineOperator(List *names, List *parameters);
@@ -91,6 +95,9 @@ extern void RemoveStatisticsById(Oid statsOid);
 extern void UpdateStatisticsForTypeChange(Oid statsOid,
 							  Oid relationOid, int attnum,
 							  Oid oldColumnType, Oid newColumnType);
+extern char *YbChooseExtendedStatisticName(const char *name1,
+							  const char *name2,
+							  const char *label, Oid namespaceid);
 
 /* commands/aggregatecmds.c */
 extern ObjectAddress DefineAggregate(ParseState *pstate, List *name, List *args, bool oldstyle,

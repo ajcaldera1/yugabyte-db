@@ -27,7 +27,10 @@
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/sst_file_manager_impl.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/sync_point.h"
+#include "yb/util/thread.h"
 
 namespace rocksdb {
 
@@ -42,12 +45,9 @@ DeleteScheduler::DeleteScheduler(Env* env, const std::string& trash_dir,
       cv_(&mu_),
       info_log_(info_log),
       sst_file_manager_(sst_file_manager) {
-  if (rate_bytes_per_sec_ <= 0) {
-    // Rate limiting is disabled
-    bg_thread_.reset();
-  } else {
-    bg_thread_.reset(
-        new std::thread(&DeleteScheduler::BackgroundEmptyTrash, this));
+  if (rate_bytes_per_sec_ > 0) {
+    CHECK_OK(yb::Thread::Create(
+        "rocksdb", "empty_trash", &DeleteScheduler::BackgroundEmptyTrash, this, &bg_thread_));
   }
 }
 
@@ -55,10 +55,10 @@ DeleteScheduler::~DeleteScheduler() {
   {
     MutexLock l(&mu_);
     closing_ = true;
-    cv_.SignalAll();
+    YB_PROFILE(cv_.SignalAll());
   }
   if (bg_thread_) {
-    bg_thread_->join();
+    bg_thread_->Join();
   }
 }
 
@@ -68,7 +68,7 @@ Status DeleteScheduler::DeleteFile(const std::string& file_path) {
     // Rate limiting is disabled
     s = env_->DeleteFile(file_path);
     if (s.ok() && sst_file_manager_) {
-      sst_file_manager_->OnDeleteFile(file_path);
+      RETURN_NOT_OK(sst_file_manager_->OnDeleteFile(file_path));
     }
     return s;
   }
@@ -82,7 +82,7 @@ Status DeleteScheduler::DeleteFile(const std::string& file_path) {
         trash_dir_.c_str());
     s = env_->DeleteFile(file_path);
     if (s.ok() && sst_file_manager_) {
-      sst_file_manager_->OnDeleteFile(file_path);
+      RETURN_NOT_OK(sst_file_manager_->OnDeleteFile(file_path));
     }
     return s;
   }
@@ -93,7 +93,7 @@ Status DeleteScheduler::DeleteFile(const std::string& file_path) {
     queue_.push(path_in_trash);
     pending_files_++;
     if (pending_files_ == 1) {
-      cv_.SignalAll();
+      YB_PROFILE(cv_.SignalAll());
     }
   }
   return s;
@@ -139,13 +139,13 @@ Status DeleteScheduler::MoveToTrash(const std::string& file_path,
     }
   }
   if (s.ok() && sst_file_manager_) {
-    sst_file_manager_->OnMoveFile(file_path, *path_in_trash);
+    RETURN_NOT_OK(sst_file_manager_->OnMoveFile(file_path, *path_in_trash));
   }
   return s;
 }
 
 void DeleteScheduler::BackgroundEmptyTrash() {
-  TEST_SYNC_POINT("DeleteScheduler::BackgroundEmptyTrash");
+  DEBUG_ONLY_TEST_SYNC_POINT("DeleteScheduler::BackgroundEmptyTrash");
 
   while (true) {
     MutexLock l(&mu_);
@@ -180,14 +180,14 @@ void DeleteScheduler::BackgroundEmptyTrash() {
       uint64_t total_penlty =
           ((total_deleted_bytes * kMicrosInSecond) / rate_bytes_per_sec_);
       while (!closing_ && !cv_.TimedWait(start_time + total_penlty)) {}
-      TEST_SYNC_POINT_CALLBACK("DeleteScheduler::BackgroundEmptyTrash:Wait",
-                               &total_penlty);
+      DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK(
+          "DeleteScheduler::BackgroundEmptyTrash:Wait", &total_penlty);
 
       pending_files_--;
       if (pending_files_ == 0) {
         // Unblock WaitForEmptyTrash since there are no more files waiting
         // to be deleted
-        cv_.SignalAll();
+        YB_PROFILE(cv_.SignalAll());
       }
     }
   }
@@ -198,7 +198,7 @@ Status DeleteScheduler::DeleteTrashFile(const std::string& path_in_trash,
   uint64_t file_size;
   Status s = env_->GetFileSize(path_in_trash, &file_size);
   if (s.ok()) {
-    TEST_SYNC_POINT("DeleteScheduler::DeleteTrashFile:DeleteFile");
+    DEBUG_ONLY_TEST_SYNC_POINT("DeleteScheduler::DeleteTrashFile:DeleteFile");
     s = env_->DeleteFile(path_in_trash);
   }
 
@@ -211,7 +211,7 @@ Status DeleteScheduler::DeleteTrashFile(const std::string& path_in_trash,
   } else {
     *deleted_bytes = file_size;
     if (sst_file_manager_) {
-      sst_file_manager_->OnDeleteFile(path_in_trash);
+      RETURN_NOT_OK(sst_file_manager_->OnDeleteFile(path_in_trash));
     }
   }
 

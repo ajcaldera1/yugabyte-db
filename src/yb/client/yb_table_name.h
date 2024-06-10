@@ -11,19 +11,17 @@
 // under the License.
 //
 
-#ifndef YB_CLIENT_YB_TABLE_NAME_H_
-#define YB_CLIENT_YB_TABLE_NAME_H_
+#pragma once
 
 #include <string>
+#include <boost/optional.hpp>
 
-#ifdef YB_HEADERS_NO_STUBS
-#include "yb/util/logging.h"
-#else
-#include "yb/client/stubs.h"
-#endif
+#include "yb/util/flags.h"
+#include "yb/util/memory/memory_usage.h"
 
-#include "yb/common/redis_constants_common.h"
+#include "yb/common/common_types.pb.h"
 
+#include "yb/master/master_types.pb.h"
 
 namespace yb {
 
@@ -41,26 +39,46 @@ DECLARE_bool(yb_system_namespace_readonly);
 class YBTableName {
  public:
   // Empty (undefined) name.
-  YBTableName() {}
+  YBTableName() : namespace_type_(YQL_DATABASE_UNKNOWN) {}
 
   // Complex table name: 'namespace_name.table_name'.
   // The namespace must not be empty.
   // For the case of undefined namespace the next constructor must be used.
-  YBTableName(const std::string& namespace_name, const std::string& table_name) {
+  YBTableName(YQLDatabase db_type,
+              const std::string& namespace_name,
+              const std::string& table_name) : namespace_type_(db_type) {
     set_namespace_name(namespace_name);
     set_table_name(table_name);
   }
 
-  YBTableName(const std::string& namespace_id, const std::string& namespace_name,
-              const std::string& table_name) {
+  YBTableName(YQLDatabase db_type,
+              const std::string& namespace_id,
+              const std::string& namespace_name,
+              const std::string& table_name) : namespace_type_(db_type) {
     set_namespace_id(namespace_id);
     set_namespace_name(namespace_name);
     set_table_name(table_name);
   }
 
+  YBTableName(YQLDatabase db_type,
+              const std::string& namespace_id,
+              const std::string& namespace_name,
+              const std::string& table_id,
+              const std::string& table_name,
+              const std::string& pgschema_name = "",
+              boost::optional<master::RelationType> relation_type = boost::none)
+            : namespace_type_(db_type) {
+    set_namespace_id(namespace_id);
+    set_namespace_name(namespace_name);
+    set_table_id(table_id);
+    set_table_name(table_name);
+    set_pgschema_name(pgschema_name);
+    set_relation_type(relation_type);
+  }
+
   // Simple table name (no namespace provided at the moment of construction).
   // In this case the namespace has not been set yet and it MUST be set later.
-  explicit YBTableName(const std::string& table_name) {
+  YBTableName(YQLDatabase db_type, const std::string& table_name) : namespace_type_(db_type) {
     set_table_name(table_name);
   }
 
@@ -76,12 +94,15 @@ class YBTableName {
     return namespace_name_; // Can be empty.
   }
 
-  const std::string& resolved_namespace_name() const {
-    DCHECK(has_namespace()); // At the moment the namespace name must NEVER be empty.
-                             // It must be set by set_namespace_name() before this call.
-                             // If the check fails - you forgot to call set_namespace_name().
-    return namespace_name_;
+  const std::string& namespace_id() const {
+    return namespace_id_; // Can be empty.
   }
+
+  YQLDatabase namespace_type() const {
+    return namespace_type_;
+  }
+
+  const std::string& resolved_namespace_name() const;
 
   bool has_table() const {
     return !table_name_.empty();
@@ -91,37 +112,54 @@ class YBTableName {
     return table_name_;
   }
 
-  bool is_system() const {
-    return IsSystemNamespace(resolved_namespace_name());
+  bool has_table_id() const {
+    return !table_id_.empty();
+  }
+
+  const std::string& table_id() const {
+    return table_id_; // Can be empty
+  }
+
+  bool has_pgschema_name() const {
+    return !pgschema_name_.empty();
+  }
+
+  const std::string& pgschema_name() const {
+    return pgschema_name_; // Can be empty
+  }
+
+  boost::optional<master::RelationType> relation_type() const {
+    return relation_type_;
+  }
+
+  bool is_system() const;
+
+  bool is_cql_namespace() const {
+    return namespace_type_ == YQL_DATABASE_CQL;
+  }
+
+  bool is_pgsql_namespace() const {
+    return namespace_type_ == YQL_DATABASE_PGSQL;
   }
 
   bool is_redis_namespace() const {
-    return ((has_namespace() && resolved_namespace_name() == common::kRedisKeyspaceName));
+    return namespace_type_ == YQL_DATABASE_REDIS;
   }
 
-  bool is_redis_table() const {
-    return (
-        (has_namespace() && resolved_namespace_name() == common::kRedisKeyspaceName) &&
-        table_name_.find(common::kRedisTableName) == 0);
-  }
+  bool is_redis_table() const;
 
   std::string ToString() const {
-    return (has_namespace() ? namespace_name_ + '.' + table_name_ : table_name_);
+    return has_namespace() ? (namespace_name_ + '.' + table_name_) : table_name_;
   }
 
-  void set_namespace_id(const std::string& namespace_id) {
-    DCHECK(!namespace_id.empty());
-    namespace_id_ = namespace_id;
-  }
+  void set_namespace_id(const std::string& namespace_id);
+  void set_namespace_name(const std::string& namespace_name);
+  void set_table_name(const std::string& table_name);
+  void set_table_id(const std::string& table_id);
+  void set_pgschema_name(const std::string& pgschema_name);
 
-  void set_namespace_name(const std::string& namespace_name) {
-    DCHECK(!namespace_name.empty());
-    namespace_name_ = namespace_name;
-  }
-
-  void set_table_name(const std::string& table_name) {
-    DCHECK(!table_name.empty());
-    table_name_ = table_name;
+  void set_relation_type(boost::optional<master::RelationType> relation_type) {
+    relation_type_ = relation_type;
   }
 
   // ProtoBuf helpers.
@@ -131,16 +169,27 @@ class YBTableName {
   void SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const;
   void GetFromNamespaceIdentifierPB(const master::NamespaceIdentifierPB& id);
 
-  static bool IsSystemNamespace(const std::string& namespace_name);
+  size_t DynamicMemoryUsage() const {
+    return sizeof(*this) +
+           DynamicMemoryUsageOf(
+               namespace_id_, namespace_name_, table_id_, table_name_ + pgschema_name_);
+  }
 
  private:
-  std::string namespace_id_; // Optional. Can be set when the client knows the namespace id also.
+  void check_db_type();
+
+  std::string namespace_id_; // Optional. Can be set when the client knows the namespace id.
   std::string namespace_name_; // Can be empty, that means the namespace has not been set yet.
+  YQLDatabase namespace_type_; // Can be empty, that means the namespace id will be used.
+  std::string table_id_; // Optional. Can be set when client knows the table id also.
   std::string table_name_;
+  std::string pgschema_name_; // Can be empty
+  // Optional. Can be set when the client knows the table type.
+  boost::optional<master::RelationType> relation_type_;
 };
 
 inline bool operator ==(const YBTableName& lhs, const YBTableName& rhs) {
-  // Not comparing namespace_id because it is optional.
+  // Not comparing namespace_id and table_id because they are optional.
   return (lhs.namespace_name() == rhs.namespace_name() && lhs.table_name() == rhs.table_name());
 }
 
@@ -153,5 +202,3 @@ size_t hash_value(const YBTableName& table_name);
 
 }  // namespace client
 }  // namespace yb
-
-#endif  // YB_CLIENT_YB_TABLE_NAME_H_

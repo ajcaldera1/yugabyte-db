@@ -27,15 +27,18 @@
 #if defined(__i386__) || defined(__x86_64__)
 #include <cpuid.h>
 #endif
-#include <errno.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/time.h>
-#include <sys/resource.h>
-#include <unistd.h>
-#include <cstdlib>
+
+#include "yb/util/logging.h"
+
 #include "yb/rocksdb/util/logging.h"
+#include "yb/util/status_log.h"
+
+#if defined(RLIMIT_NOFILE)
+#include "yb/util/std_util.h"
+#endif
 
 namespace rocksdb {
 namespace port {
@@ -49,7 +52,7 @@ static int PthreadCall(const char* label, int result) {
 }
 
 Mutex::Mutex(bool adaptive) {
-#ifdef OS_LINUX
+#ifdef __linux__
   if (!adaptive) {
     PthreadCall("init mutex", pthread_mutex_init(&mu_, nullptr));
   } else {
@@ -64,7 +67,7 @@ Mutex::Mutex(bool adaptive) {
   }
 #else // ignore adaptive for non-linux platform
   PthreadCall("init mutex", pthread_mutex_init(&mu_, nullptr));
-#endif // OS_LINUX
+#endif // __linux__
 }
 
 Mutex::~Mutex() { PthreadCall("destroy mutex", pthread_mutex_destroy(&mu_)); }
@@ -85,7 +88,7 @@ void Mutex::Unlock() {
 
 void Mutex::AssertHeld() {
 #ifndef NDEBUG
-  assert(locked_);
+  DCHECK(locked_);
 #endif
 }
 
@@ -179,7 +182,7 @@ int GetMaxOpenFiles() {
     return -1;
   }
   // protect against overflow
-  if (no_files_limit.rlim_cur >= std::numeric_limits<int>::max()) {
+  if (yb::std_util::cmp_greater_equal(no_files_limit.rlim_cur, std::numeric_limits<int>::max())) {
     return std::numeric_limits<int>::max();
   }
   return static_cast<int>(no_files_limit.rlim_cur);

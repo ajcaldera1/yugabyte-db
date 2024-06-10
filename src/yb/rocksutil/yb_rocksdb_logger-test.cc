@@ -12,16 +12,16 @@
 //
 
 #include <string>
-#include <gtest/gtest.h>
-#include <glog/logging.h>
+
+#include "yb/util/logging.h"
+
 #include "yb/rocksutil/yb_rocksdb_logger.h"
+
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
+#include "yb/util/string_trim.h"
 #include "yb/util/test_util.h"
 #include "yb/util/tostring.h"
-
-using yb::YBRocksDBLogger;
-using rocksdb::InfoLogLevel;
 
 namespace yb {
 

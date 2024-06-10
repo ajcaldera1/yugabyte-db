@@ -29,10 +29,12 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_STATUS_CALLBACK_H
-#define YB_UTIL_STATUS_CALLBACK_H
+#pragma once
+
+#include <functional>
 
 #include "yb/gutil/callback_forward.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -56,8 +58,6 @@ extern void DoNothingStatusCB(const Status& status);
 typedef Callback<Status(void)> StatusClosure;
 
 // To be used when setting a StatusClosure is optional.
-extern CHECKED_STATUS DoNothingStatusClosure();
+extern Status DoNothingStatusClosure();
 
 } // namespace yb
-
-#endif // YB_UTIL_STATUS_CALLBACK_H

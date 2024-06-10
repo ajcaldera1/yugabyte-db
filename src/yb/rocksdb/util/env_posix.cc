@@ -21,29 +21,25 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 #include <dirent.h>
-#include <errno.h>
 #include <fcntl.h>
-#if defined(OS_LINUX)
+#if defined(__linux__)
 #include <linux/fs.h>
 #endif
 #include <pthread.h>
-#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
-#ifdef OS_LINUX
+#ifdef __linux__
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #endif
-#include <sys/time.h>
 #include <sys/types.h>
 #include <time.h>
 #include <algorithm>
 // Get nano time includes
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(__linux__) || defined(OS_FREEBSD)
 #elif defined(__MACH__)
 #include <mach/clock.h>
 #include <mach/mach.h>
@@ -52,19 +48,22 @@
 #endif
 #include <deque>
 #include <set>
+
+#include "yb/gutil/casts.h"
+
 #include "yb/rocksdb/port/port.h"
-#include "yb/util/slice.h"
-#include "yb/rocksdb/util/coding.h"
+#include "yb/rocksdb/options.h"
 #include "yb/rocksdb/util/io_posix.h"
 #include "yb/rocksdb/util/thread_posix.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
-#include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/posix_logger.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/util/string_util.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/thread_local.h"
-#include "yb/rocksdb/util/thread_status_updater.h"
+
+#include "yb/util/logging.h"
+#include "yb/util/slice.h"
+#include "yb/util/stats/iostats_context_imp.h"
+#include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
 
 #if !defined(TMPFS_MAGIC)
 #define TMPFS_MAGIC 0x01021994
@@ -76,15 +75,11 @@
 #define EXT4_SUPER_MAGIC 0xEF53
 #endif
 
-#define STATUS_IO_ERROR(context, err_number) STATUS(IOError, (context), strerror(err_number))
+#include "yb/util/file_system_posix.h"
 
 namespace rocksdb {
 
 namespace {
-
-ThreadStatusUpdater* CreateThreadStatusUpdater() {
-  return new ThreadStatusUpdater();
-}
 
 // list of pathnames that are locked
 static std::set<std::string> lockedFiles;
@@ -152,32 +147,29 @@ class PosixEnv : public Env {
     for (int pool_id = 0; pool_id < Env::Priority::TOTAL; ++pool_id) {
       thread_pools_[pool_id].JoinAllThreads();
     }
-    // All threads must be joined before the deletion of
-    // thread_status_updater_.
-    delete thread_status_updater_;
   }
 
   virtual Status NewSequentialFile(const std::string& fname,
-                                   unique_ptr<SequentialFile>* result,
+                                   std::unique_ptr<SequentialFile>* result,
                                    const EnvOptions& options) override {
     return file_factory_->NewSequentialFile(fname, result, options);
   }
 
   virtual Status NewRandomAccessFile(const std::string& fname,
-                                     unique_ptr<RandomAccessFile>* result,
+                                     std::unique_ptr<RandomAccessFile>* result,
                                      const EnvOptions& options) override {
     return file_factory_->NewRandomAccessFile(fname, result, options);
   }
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 unique_ptr<WritableFile>* result,
+                                 std::unique_ptr<WritableFile>* result,
                                  const EnvOptions& options) override {
     return file_factory_->NewWritableFile(fname, result, options);
   }
 
   virtual Status ReuseWritableFile(const std::string& fname,
                                    const std::string& old_fname,
-                                   unique_ptr<WritableFile>* result,
+                                   std::unique_ptr<WritableFile>* result,
                                    const EnvOptions& options) override {
     return file_factory_->ReuseWritableFile(fname, old_fname, result, options);
   }
@@ -187,7 +179,7 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewDirectory(const std::string& name,
-                              unique_ptr<Directory>* result) override {
+                              std::unique_ptr<Directory>* result) override {
     result->reset();
     int fd;
     {
@@ -258,8 +250,8 @@ class PosixEnv : public Env {
     Status result;
     if (mkdir(name.c_str(), 0755) != 0) {
       if (errno != EEXIST) {
-        LOG(DFATAL) << "Not exists: " << name;
         result = STATUS_IO_ERROR(name, errno);
+        LOG(DFATAL) << "Mkdir failed: " << result;
       } else if (!DirExists(name)) { // Check that name is actually a
                                      // directory.
         // Message is taken from mkdir
@@ -367,14 +359,10 @@ class PosixEnv : public Env {
       *result = buf;
     }
     // Directory may already exist
-    CreateDir(*result);
+    if (!DirExists(*result)) {
+      RETURN_NOT_OK(CreateDir(*result));
+    }
     return Status::OK();
-  }
-
-  virtual Status GetThreadList(
-      std::vector<ThreadStatus>* thread_list) override {
-    assert(thread_status_updater_);
-    return thread_status_updater_->GetThreadList(thread_list);
   }
 
   static uint64_t gettid(pthread_t tid) {
@@ -393,7 +381,7 @@ class PosixEnv : public Env {
   }
 
   virtual Status NewLogger(const std::string& fname,
-                           shared_ptr<Logger>* result) override {
+                           std::shared_ptr<Logger>* result) override {
     FILE* f;
     {
       IOSTATS_TIMER_GUARD(open_nanos);
@@ -405,10 +393,12 @@ class PosixEnv : public Env {
     } else {
       int fd = fileno(f);
 #ifdef ROCKSDB_FALLOCATE_PRESENT
-      fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4 * 1024);
+      if (fallocate(fd, FALLOC_FL_KEEP_SIZE, 0, 4 * 1024) != 0) {
+        LOG(ERROR) << STATUS_IO_ERROR(fname, errno);
+      }
 #endif
       SetFD_CLOEXEC(fd, nullptr);
-      result->reset(new PosixLogger(f, &PosixEnv::gettid, this));
+      result->reset(new PosixLogger(fname, f, &PosixEnv::gettid, this));
       return Status::OK();
     }
   }
@@ -420,7 +410,7 @@ class PosixEnv : public Env {
   }
 
   uint64_t NowNanos() override {
-#if defined(OS_LINUX) || defined(OS_FREEBSD)
+#if defined(__linux__) || defined(OS_FREEBSD)
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return static_cast<uint64_t>(ts.tv_sec) * 1000000000 + ts.tv_nsec;
@@ -490,7 +480,7 @@ class PosixEnv : public Env {
 
   void LowerThreadPoolIOPriority(Priority pool = LOW) override {
     assert(pool >= Priority::LOW && pool <= Priority::HIGH);
-#ifdef OS_LINUX
+#ifdef __linux__
     thread_pools_[pool].LowerIOPriority();
 #endif
   }
@@ -583,7 +573,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
   ~PosixRocksDBFileFactory() {}
 
   Status NewSequentialFile(const std::string& fname,
-                           unique_ptr<SequentialFile>* result,
+                           std::unique_ptr<SequentialFile>* result,
                            const EnvOptions& options) override {
     result->reset();
     FILE* f = nullptr;
@@ -597,13 +587,13 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
     } else {
       int fd = fileno(f);
       SetFD_CLOEXEC(fd, &options);
-      *result = std::make_unique<PosixSequentialFile>(fname, f, options);
+      *result = std::make_unique<yb::PosixSequentialFile>(fname, f, options);
       return Status::OK();
     }
   }
 
   Status NewRandomAccessFile(const std::string& fname,
-                             unique_ptr<RandomAccessFile>* result,
+                             std::unique_ptr<RandomAccessFile>* result,
                              const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -631,13 +621,13 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
       }
       close(fd);
     } else {
-      *result = std::make_unique<PosixRandomAccessFile>(fname, fd, options);
+      *result = std::make_unique<yb::PosixRandomAccessFile>(fname, fd, options);
     }
     return s;
   }
 
   Status NewWritableFile(const std::string& fname,
-                         unique_ptr<WritableFile>* result,
+                         std::unique_ptr<WritableFile>* result,
                          const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -674,7 +664,7 @@ class PosixRocksDBFileFactory : public RocksDBFileFactory {
 
   Status ReuseWritableFile(const std::string& fname,
                            const std::string& old_fname,
-                           unique_ptr<WritableFile>* result,
+                           std::unique_ptr<WritableFile>* result,
                            const EnvOptions& options) override {
     result->reset();
     Status s;
@@ -769,7 +759,6 @@ PosixEnv::PosixEnv()
     // This allows later initializing the thread-local-env of each thread.
     thread_pools_[pool_id].SetHostEnv(this);
   }
-  thread_status_updater_ = CreateThreadStatusUpdater();
 }
 
 PosixEnv::PosixEnv(std::unique_ptr<RocksDBFileFactory> file_factory) :
@@ -781,7 +770,6 @@ PosixEnv::PosixEnv(std::unique_ptr<RocksDBFileFactory> file_factory) :
     // This allows later initializing the thread-local-env of each thread.
     thread_pools_[pool_id].SetHostEnv(this);
   }
-  thread_status_updater_ = CreateThreadStatusUpdater();
 }
 
 void PosixEnv::Schedule(void (*function)(void* arg1), void* arg, Priority pri,
@@ -871,7 +859,7 @@ Env* Env::Default() {
   ThreadLocalPtr::InitSingletons();
   // Make sure that SyncPoint inited before PosixEnv, to be deleted after it.
 #ifndef NDEBUG
-  SyncPoint::GetInstance();
+  yb::SyncPoint::GetInstance();
 #endif
   static PosixEnv default_env;
   return &default_env;

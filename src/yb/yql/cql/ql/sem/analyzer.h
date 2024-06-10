@@ -15,10 +15,12 @@
 // Entry point for the semantic analytical process.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_SEM_ANALYZER_H_
-#define YB_YQL_CQL_QL_SEM_ANALYZER_H_
+#pragma once
 
-#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/ptree_fwd.h"
+#include "yb/yql/cql/ql/util/util_fwd.h"
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 namespace ql {
@@ -39,24 +41,20 @@ class Analyzer {
 
   // Run semantics analysis on the given parse tree and decorate it with semantics information such
   // as datatype or object-type of a database object.
-  CHECKED_STATUS Analyze(ParseTree::UniPtr ptree);
+  Status Analyze(ParseTreePtr ptree);
 
   // Returns decorated parse tree from the semantic analysis and destroys the context.
-  ParseTree::UniPtr Done();
+  ParseTreePtr Done();
 
   // Return if metadata cache is used during semantic analysis.
-  bool cache_used() const {
-    return sem_context_->cache_used();
-  }
+  bool cache_used() const;
 
  private:
   // Environment (YBClient) for analyzing statements.
   QLEnv *ql_env_;
 
-  SemContext::UniPtr sem_context_;
+  std::unique_ptr<SemContext> sem_context_;
 };
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_SEM_ANALYZER_H_

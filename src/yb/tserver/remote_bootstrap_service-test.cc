@@ -32,26 +32,33 @@
 
 #include <limits>
 
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
-#include "yb/tserver/remote_bootstrap-test-base.h"
-#include "yb/consensus/log.h"
+#include "yb/common/wire_protocol.h"
+
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/log_util.h"
 #include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/opid_util.h"
+
+#include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rpc_header.pb.h"
+
 #include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/remote_bootstrap-test-base.h"
 #include "yb/tserver/remote_bootstrap.pb.h"
 #include "yb/tserver/remote_bootstrap.proxy.h"
-#include "yb/tserver/tserver_service.pb.h"
-#include "yb/tserver/tserver_service.proxy.h"
+
 #include "yb/util/crc.h"
 #include "yb/util/env_util.h"
 #include "yb/util/monotime.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_util.h"
+
+using std::string;
+using std::vector;
 
 #define ASSERT_REMOTE_ERROR(status, err, code, str) \
     ASSERT_NO_FATALS(AssertRemoteError(status, err, code, str))
@@ -62,9 +69,6 @@ DECLARE_uint64(remote_bootstrap_timeout_poll_period_ms);
 namespace yb {
 namespace tserver {
 
-using consensus::MaximumOpId;
-using consensus::MinimumOpId;
-using consensus::OpIdEquals;
 using env_util::ReadFully;
 using log::ReadableLogSegment;
 using rpc::ErrorStatusPB;
@@ -74,7 +78,7 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
  public:
   RemoteBootstrapServiceTest() {
     // Poll for session expiration every 10 ms for the session timeout test.
-    FLAGS_remote_bootstrap_timeout_poll_period_ms = 10;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_remote_bootstrap_timeout_poll_period_ms) = 10;
   }
 
  protected:
@@ -97,10 +101,11 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
         remote_bootstrap_proxy_->BeginRemoteBootstrapSession(req, resp, controller), controller);
   }
 
-  Status DoBeginValidRemoteBootstrapSession(string* session_id,
-                                            tablet::TabletSuperBlockPB* superblock = nullptr,
-                                            uint64_t* idle_timeout_millis = nullptr,
-                                            vector<uint64_t>* sequence_numbers = nullptr) {
+  Status DoBeginValidRemoteBootstrapSession(
+      string* session_id,
+      tablet::RaftGroupReplicaSuperBlockPB* superblock = nullptr,
+      uint64_t* idle_timeout_millis = nullptr,
+      uint64_t* first_sequence_number = nullptr) {
     BeginRemoteBootstrapSessionResponsePB resp;
     RpcController controller;
     RETURN_NOT_OK(DoBeginRemoteBootstrapSession(GetTabletId(), GetLocalUUID(), &resp, &controller));
@@ -111,8 +116,8 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
     if (idle_timeout_millis) {
       *idle_timeout_millis = resp.session_idle_timeout_millis();
     }
-    if (sequence_numbers) {
-      sequence_numbers->assign(resp.wal_segment_seqnos().begin(), resp.wal_segment_seqnos().end());
+    if (first_sequence_number) {
+      *first_sequence_number = resp.first_wal_segment_seqno();
     }
     return Status::OK();
   }
@@ -124,7 +129,8 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
     CheckRemoteBootstrapSessionActiveRequestPB req;
     req.set_session_id(session_id);
     return UnwindRemoteError(
-        remote_bootstrap_proxy_->CheckSessionActive(req, resp, controller), controller);
+        remote_bootstrap_proxy_->CheckRemoteBootstrapSessionActive(req, resp, controller),
+        controller);
   }
 
   Status DoFetchData(const string& session_id, const DataIdPB& data_id,
@@ -199,25 +205,24 @@ class RemoteBootstrapServiceTest : public RemoteBootstrapTest {
     return data_id;
   }
 
-  gscoped_ptr<RemoteBootstrapServiceProxy> remote_bootstrap_proxy_;
+  std::unique_ptr<RemoteBootstrapServiceProxy> remote_bootstrap_proxy_;
 };
 
 // Test beginning and ending a remote bootstrap session.
 TEST_F(RemoteBootstrapServiceTest, TestSimpleBeginEndSession) {
   string session_id;
-  tablet::TabletSuperBlockPB superblock;
+  tablet::RaftGroupReplicaSuperBlockPB superblock;
   uint64_t idle_timeout_millis;
-  vector<uint64_t> segment_seqnos;
+  uint64_t first_segment_seqno;
   ASSERT_OK(DoBeginValidRemoteBootstrapSession(&session_id,
                                                &superblock,
                                                &idle_timeout_millis,
-                                               &segment_seqnos));
+                                               &first_segment_seqno));
   // Basic validation of returned params.
   ASSERT_FALSE(session_id.empty());
   ASSERT_EQ(FLAGS_remote_bootstrap_idle_timeout_ms, idle_timeout_millis);
   ASSERT_TRUE(superblock.IsInitialized());
-  // We should have number of segments = number of rolls + 1 (due to the active segment).
-  ASSERT_EQ(kNumLogRolls + 1, segment_seqnos.size());
+  ASSERT_EQ(1, first_segment_seqno);
 
   EndRemoteBootstrapSessionResponsePB resp;
   RpcController controller;
@@ -333,23 +338,22 @@ TEST_F(RemoteBootstrapServiceTest, TestInvalidBlockOrOpId) {
 // Test that we are able to fetch log segments.
 TEST_F(RemoteBootstrapServiceTest, TestFetchLog) {
   string session_id;
-  tablet::TabletSuperBlockPB superblock;
+  tablet::RaftGroupReplicaSuperBlockPB superblock;
   uint64_t idle_timeout_millis;
-  vector<uint64_t> segment_seqnos;
+  uint64_t segment_seqno;
   ASSERT_OK(DoBeginValidRemoteBootstrapSession(&session_id,
                                                &superblock,
                                                &idle_timeout_millis,
-                                               &segment_seqnos));
+                                               &segment_seqno));
 
-  ASSERT_EQ(kNumLogRolls + 1, segment_seqnos.size());
-  uint64_t seg_seqno = *segment_seqnos.begin();
+  ASSERT_EQ(1, segment_seqno);
 
   // Fetch the remote data.
   FetchDataResponsePB resp;
   RpcController controller;
   DataIdPB data_id;
   data_id.set_type(DataIdPB::LOG_SEGMENT);
-  data_id.set_wal_segment_seqno(seg_seqno);
+  data_id.set_wal_segment_seqno(segment_seqno);
   ASSERT_OK(DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller));
 
   // Fetch the local data.
@@ -359,10 +363,10 @@ TEST_F(RemoteBootstrapServiceTest, TestFetchLog) {
   uint64_t first_seg_seqno = (*local_segments.begin())->header().sequence_number();
 
 
-  ASSERT_EQ(seg_seqno, first_seg_seqno)
-      << "Expected equal sequence numbers: " << seg_seqno
+  ASSERT_EQ(segment_seqno, first_seg_seqno)
+      << "Expected equal sequence numbers: " << segment_seqno
       << " and " << first_seg_seqno;
-  const scoped_refptr<ReadableLogSegment>& segment = local_segments[0];
+  const scoped_refptr<ReadableLogSegment>& segment = ASSERT_RESULT(local_segments.front());
   faststring scratch;
   int64_t size = ASSERT_RESULT(segment->readable_file_checkpoint()->Size());
   scratch.resize(size);
@@ -376,7 +380,8 @@ TEST_F(RemoteBootstrapServiceTest, TestFetchLog) {
 TEST_F(RemoteBootstrapServiceTest, TestSessionTimeout) {
   // This flag should be seen by the service due to TSO.
   // We have also reduced the timeout polling frequency in SetUp().
-  FLAGS_remote_bootstrap_idle_timeout_ms = 1; // Expire the session almost immediately.
+  // Expire the session almost immediately.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_remote_bootstrap_idle_timeout_ms) = 1;
 
   // Start session.
   string session_id;

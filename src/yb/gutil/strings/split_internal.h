@@ -28,20 +28,15 @@
 //
 // IWYU pragma: private, include "strings/split.h"
 
-#ifndef STRINGS_SPLIT_INTERNAL_H_
-#define STRINGS_SPLIT_INTERNAL_H_
+#pragma once
 
 #include <iterator>
-using std::back_insert_iterator;
-using std::iterator_traits;
 #include <map>
-using std::map;
-using std::multimap;
 #include <vector>
-using std::vector;
 
 #include "yb/gutil/port.h"  // for LANG_CXX11
 #include "yb/gutil/strings/stringpiece.h"
+#include "yb/gutil/type_traits.h"
 
 #ifdef LANG_CXX11
 // This must be included after "base/port.h", which defines LANG_CXX11.
@@ -179,16 +174,16 @@ struct GStringPieceTo {
 
 // Specialization for converting to string.
 template <>
-struct GStringPieceTo<string> {
-  string operator()(GStringPiece from) const {
+struct GStringPieceTo<std::string> {
+  std::string operator()(GStringPiece from) const {
     return from.ToString();
   }
 };
 
 // Specialization for converting to *const* string.
 template <>
-struct GStringPieceTo<const string> {
-  string operator()(GStringPiece from) const {
+struct GStringPieceTo<const std::string> {
+  std::string operator()(GStringPiece from) const {
     return from.ToString();
   }
 };
@@ -334,7 +329,7 @@ class Splitter {
   // use of this intermediate vector "v" can be removed.
   template <typename Container>
   Container ToContainer() {
-    vector<GStringPiece> v;
+    std::vector<GStringPiece> v;
     for (Iterator it = begin(); it != end_; ++it) {
       v.push_back(*it);
     }
@@ -411,7 +406,7 @@ class Splitter {
 
   // Reserves the given amount of capacity in a vector<string>
   template <typename A>
-  void ReserveCapacity(vector<string, A>* v, size_t size) {
+  void ReserveCapacity(std::vector<std::string, A>* v, size_t size) {
     v->reserve(size);
   }
   void ReserveCapacity(...) {}
@@ -423,5 +418,3 @@ class Splitter {
 }  // namespace internal
 
 }  // namespace strings
-
-#endif  // STRINGS_SPLIT_INTERNAL_H_

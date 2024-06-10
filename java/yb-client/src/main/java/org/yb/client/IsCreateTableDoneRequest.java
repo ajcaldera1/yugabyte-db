@@ -34,15 +34,16 @@ package org.yb.client;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
+import org.yb.master.MasterDdlOuterClass;
+import org.yb.master.MasterTypes;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
+import io.netty.buffer.ByteBuf;
 
 /**
  * Package-private RPC that can only go to a master.
  */
 @InterfaceAudience.Private
-class IsCreateTableDoneRequest extends YRpc<Master.IsCreateTableDoneResponsePB> {
+class IsCreateTableDoneRequest extends YRpc<MasterDdlOuterClass.IsCreateTableDoneResponsePB> {
 
   private final String tableId;
 
@@ -60,21 +61,21 @@ class IsCreateTableDoneRequest extends YRpc<Master.IsCreateTableDoneResponsePB> 
   }
 
   @Override
-  Pair<Master.IsCreateTableDoneResponsePB, Object> deserialize(
+  Pair<MasterDdlOuterClass.IsCreateTableDoneResponsePB, Object> deserialize(
       final CallResponse callResponse, String tsUUID) throws Exception {
-    Master.IsCreateTableDoneResponsePB.Builder builder = Master.IsCreateTableDoneResponsePB
-        .newBuilder();
+    MasterDdlOuterClass.IsCreateTableDoneResponsePB.Builder builder =
+        MasterDdlOuterClass.IsCreateTableDoneResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), builder);
-    Master.IsCreateTableDoneResponsePB resp = builder.build();
-    return new Pair<Master.IsCreateTableDoneResponsePB, Object>(
+    MasterDdlOuterClass.IsCreateTableDoneResponsePB resp = builder.build();
+    return new Pair<MasterDdlOuterClass.IsCreateTableDoneResponsePB, Object>(
         resp, builder.hasError() ? builder.getError() : null);
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
-    final Master.IsCreateTableDoneRequestPB.Builder builder = Master
+  ByteBuf serialize(Message header) {
+    final MasterDdlOuterClass.IsCreateTableDoneRequestPB.Builder builder = MasterDdlOuterClass
         .IsCreateTableDoneRequestPB.newBuilder();
-    builder.setTable(Master.TableIdentifierPB.newBuilder().setTableId(
+    builder.setTable(MasterTypes.TableIdentifierPB.newBuilder().setTableId(
         ByteString.copyFromUtf8(tableId)));
     return toChannelBuffer(header, builder.build());
   }

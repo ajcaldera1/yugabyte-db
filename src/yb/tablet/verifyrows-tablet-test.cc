@@ -32,26 +32,33 @@
 
 #include <memory>
 
-#include <boost/ptr_container/ptr_vector.hpp>
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
+#include "yb/qlexpr/ql_expr.h"
 #include "yb/common/ql_protocol_util.h"
 
-#include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
+
+#include "yb/dockv/reader_projection.h"
 
 #include "yb/gutil/macros.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/tablet-test-base.h"
+#include "yb/tablet/tablet.h"
+
 #include "yb/util/countdown_latch.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_graph.h"
 #include "yb/util/thread.h"
+#include "yb/util/flags.h"
 
-DEFINE_int32(num_counter_threads, 8, "Number of counting threads to launch");
-DEFINE_int32(num_summer_threads, 1, "Number of summing threads to launch");
-DEFINE_int32(num_slowreader_threads, 1, "Number of 'slow' reader threads to launch");
-DEFINE_int64(inserts_per_thread, 1000, "Number of rows inserted by the inserter thread");
+DEFINE_NON_RUNTIME_int32(num_counter_threads, 8, "Number of counting threads to launch");
+DEFINE_NON_RUNTIME_int32(num_summer_threads, 1, "Number of summing threads to launch");
+DEFINE_NON_RUNTIME_int32(num_slowreader_threads, 1, "Number of 'slow' reader threads to launch");
+DEFINE_NON_RUNTIME_int32(inserts_per_thread, 1000,
+                         "Number of rows inserted by the inserter thread");
 
 using std::shared_ptr;
 
@@ -77,11 +84,15 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
     superclass::SetUp();
 
     // Warm up code cache with all the projections we'll be using.
-    ASSERT_OK(tablet()->NewRowIterator(client_schema_, boost::none));
-    const Schema* schema = tablet()->schema();
-    ColumnSchema valcol = schema->column(schema->find_column("val"));
-    valcol_projection_ = Schema({ valcol }, 0);
-    ASSERT_OK(tablet()->NewRowIterator(valcol_projection_, boost::none));
+    dockv::ReaderProjection projection(client_schema_);
+    auto iter = ASSERT_RESULT(tablet()->NewRowIterator(projection));
+    ASSERT_OK(iter->FetchNext(nullptr));
+    const SchemaPtr schema = tablet()->schema();
+    auto valcol = ASSERT_RESULT(schema->ColumnIdByName("val"));
+    valcol_projection_.Init(*schema, {valcol});
+
+    iter = ASSERT_RESULT(tablet()->NewRowIterator(valcol_projection_));
+    ASSERT_OK(iter->FetchNext(nullptr));
 
     ts_collector_.StartDumperThread();
   }
@@ -95,7 +106,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
     CountDownOnScopeExit dec_count(&running_insert_count_);
     shared_ptr<TimeSeries> inserts = ts_collector_.GetTimeSeries("inserted");
 
-    uint64_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
+    int32_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
         / kNumInsertThreads;
 
     if (max_rows < FLAGS_inserts_per_thread) {
@@ -110,7 +121,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
 
     shared_ptr<TimeSeries> updates = ts_collector_.GetTimeSeries("updated");
 
-    LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
+    LocalTabletWriter writer(this->tablet(), &this->client_schema_);
 
     faststring update_buf;
 
@@ -118,17 +129,15 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
     int col_idx = schema.num_key_columns() == 1 ? 2 : 3;
     LOG(INFO) << "Update thread using schema: " << schema.ToString();
 
-    YBPartialRow row(&client_schema_);
+    dockv::YBPartialRow row(&client_schema_);
 
-    QLTableRow value_map;
+    qlexpr::QLTableRow value_map;
 
     while (running_insert_count_.count() > 0) {
-      auto iter = tablet()->NewRowIterator(client_schema_, boost::none);
+      auto iter = tablet()->NewRowIterator(client_schema_);
       CHECK_OK(iter);
 
-      while (ASSERT_RESULT((**iter).HasNext()) && running_insert_count_.count() > 0) {
-        CHECK_OK((**iter).NextRow(&value_map));
-
+      while (ASSERT_RESULT((**iter).FetchNext(&value_map)) && running_insert_count_.count() > 0) {
         unsigned int seed = 1234;
         if (rand_r(&seed) % 10 == 7) {
           // Increment the "val"
@@ -156,20 +165,18 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
   // This is meant to test that outstanding iterators don't end up
   // trying to reference already-freed memory.
   void SlowReaderThread(int tid) {
-    QLTableRow row;
+    qlexpr::QLTableRow row;
 
-    uint64_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
+    auto max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
             / kNumInsertThreads;
 
     int max_iters = kNumInsertThreads * max_rows / 10;
 
     while (running_insert_count_.count() > 0) {
-      auto iter = tablet()->NewRowIterator(client_schema_, boost::none);
-      ASSERT_OK(iter);
+      dockv::ReaderProjection projection(client_schema_);
+      auto iter = ASSERT_RESULT(tablet()->NewRowIterator(projection));
 
-      for (int i = 0; i < max_iters && ASSERT_RESULT((**iter).HasNext()); i++) {
-        ASSERT_OK((**iter).NextRow(&row));
-
+      for (int i = 0; i < max_iters && ASSERT_RESULT(iter->FetchNext(&row)); i++) {
         if (running_insert_count_.WaitFor(MonoDelta::FromMilliseconds(1))) {
           return;
         }
@@ -190,13 +197,11 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
 
     uint64_t sum = 0;
 
-    auto iter = tablet()->NewRowIterator(valcol_projection_, boost::none);
+    auto iter = tablet()->NewRowIterator(valcol_projection_);
     CHECK_OK(iter);
 
-    QLTableRow row;
-    while (CHECK_RESULT((**iter).HasNext())) {
-      CHECK_OK((**iter).NextRow(&row));
-
+    qlexpr::QLTableRow row;
+    while (CHECK_RESULT((**iter).FetchNext(&row))) {
       QLValue value;
       CHECK_OK(row.GetValue(schema_.column_id(2), &value));
       if (!value.IsNull()) {
@@ -225,7 +230,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
   // with a different value.
   void DeleteAndReinsertCycleThread(int tid) {
     int32_t iteration = 0;
-    LocalTabletWriter writer(this->tablet().get());
+    LocalTabletWriter writer(this->tablet());
 
     while (running_insert_count_.count() > 0) {
       for (int i = 0; i < 100; i++) {
@@ -241,7 +246,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
   // succeed in UPDATING a ghost row.
   void StubbornlyUpdateSameRowThread(int tid) {
     int32_t iteration = 0;
-    LocalTabletWriter writer(this->tablet().get());
+    LocalTabletWriter writer(this->tablet());
     while (running_insert_count_.count() > 0) {
       for (int i = 0; i < 100; i++) {
         Status s = this->UpdateTestRow(&writer, tid, iteration++);
@@ -274,7 +279,7 @@ class VerifyRowsTabletTest : public TabletTestBase<SETUP> {
 
   // Projection with only an int column.
   // This is provided by both harnesses.
-  Schema valcol_projection_;
+  dockv::ReaderProjection valcol_projection_;
 
   TimeSeriesCollector ts_collector_;
 };
@@ -284,7 +289,7 @@ TYPED_TEST_CASE(VerifyRowsTabletTest, TabletTestHelperTypes);
 TYPED_TEST(VerifyRowsTabletTest, DoTestAllAtOnce) {
   if (1000 == FLAGS_inserts_per_thread) {
     if (AllowSlowTests()) {
-      FLAGS_inserts_per_thread = 50000;
+      ANNOTATE_UNPROTECTED_WRITE(FLAGS_inserts_per_thread) = 50000;
     }
   }
 
@@ -298,7 +303,7 @@ TYPED_TEST(VerifyRowsTabletTest, DoTestAllAtOnce) {
     LOG(INFO) << "Sum = " << sum;
   }
 
-  uint64_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
+  auto max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * kNumInsertThreads)
           / kNumInsertThreads;
 
   this->VerifyTestRows(0, max_rows * kNumInsertThreads);

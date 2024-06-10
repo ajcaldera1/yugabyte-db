@@ -17,17 +17,18 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
-#include <map>
 #include <memory>
+#include <string>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/slice_transform.h"
 #include "yb/rocksdb/table/block_hash_index.h"
 #include "yb/rocksdb/table/internal_iterator.h"
-#include "yb/rocksdb/util/testharness.h"
+
 #include "yb/rocksdb/util/testutil.h"
 
 namespace rocksdb {
@@ -38,35 +39,52 @@ class MapIterator : public InternalIterator {
  public:
   explicit MapIterator(const Data& data) : data_(data), pos_(data_.end()) {}
 
-  bool Valid() const override { return pos_ != data_.end(); }
+  const KeyValueEntry& SeekToFirst() override {
+    pos_ = data_.begin();
+    return Entry();
+  }
 
-  void SeekToFirst() override { pos_ = data_.begin(); }
-
-  void SeekToLast() override {
+  const KeyValueEntry& SeekToLast() override {
     pos_ = data_.end();
     --pos_;
+    return Entry();
   }
 
-  void Seek(const Slice& target) override {
+  const KeyValueEntry& Seek(Slice target) override {
     pos_ = data_.find(target.ToString());
+    return Entry();
   }
 
-  void Next() override { ++pos_; }
+  const KeyValueEntry& Next() override {
+    ++pos_;
+    return Entry();
+  }
 
-  void Prev() override { --pos_; }
+  const KeyValueEntry& Prev() override {
+    --pos_;
+    return Entry();
+  }
 
-  Slice key() const override { return pos_->first; }
-
-  Slice value() const override { return pos_->second; }
+  const KeyValueEntry& Entry() const override {
+    if (pos_ == data_.end()) {
+      return KeyValueEntry::Invalid();
+    }
+    entry_ = KeyValueEntry {
+      .key = pos_->first,
+      .value = pos_->second,
+    };
+    return entry_;
+  }
 
   Status status() const override { return Status::OK(); }
 
  private:
   const Data& data_;
   Data::const_iterator pos_;
+  mutable KeyValueEntry entry_;
 };
 
-class BlockTest : public testing::Test {};
+class BlockTest : public RocksDBTest {};
 
 TEST_F(BlockTest, BasicTest) {
   const size_t keys_per_block = 4;
@@ -83,7 +101,7 @@ TEST_F(BlockTest, BasicTest) {
                                    "0806", "0807", "0808", "0809", };
 
   Data data_entries;
-  for (const auto key : keys) {
+  for (const auto& key : keys) {
     data_entries.insert({key, key});
   }
 

@@ -12,8 +12,7 @@
 // under the License.
 //
 //
-#ifndef YB_RPC_GROWABLE_BUFFER_H
-#define YB_RPC_GROWABLE_BUFFER_H
+#pragma once
 
 #include <iosfwd>
 #include <memory>
@@ -23,7 +22,7 @@
 #include "yb/rpc/stream.h"
 
 #include "yb/util/mem_tracker.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 #include "yb/util/net/socket.h"
 
@@ -67,7 +66,7 @@ class GrowableBufferDeleter {
 
  private:
   GrowableBufferAllocator* allocator_;
-  bool was_forced_;
+  bool was_forced_ = false;
 };
 
 // Convenience buffer for receiving bytes. Consists of chunks of allocated data.
@@ -84,6 +83,10 @@ class GrowableBuffer : public StreamReadBuffer {
   inline size_t size() const { return size_; }
   inline size_t capacity_left() const { return buffers_.size() * block_size_ - size_ - pos_; }
   inline size_t limit() const { return limit_; }
+
+  size_t DataAvailable() override {
+    return size_;
+  }
 
   bool Full() override { return pos_ + size_ >= limit_; }
 
@@ -144,5 +147,3 @@ std::ostream& operator<<(std::ostream& out, const GrowableBuffer& receiver);
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_GROWABLE_BUFFER_H

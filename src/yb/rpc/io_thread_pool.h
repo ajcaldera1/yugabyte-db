@@ -13,13 +13,13 @@
 //
 //
 
-#ifndef YB_RPC_IO_THREAD_POOL_H
-#define YB_RPC_IO_THREAD_POOL_H
+#pragma once
 
 #include <memory>
 #include <functional>
 
 #include "yb/rpc/rpc_fwd.h"
+#include "yb/util/net/net_fwd.h"
 
 namespace yb {
 namespace rpc {
@@ -42,5 +42,3 @@ class IoThreadPool {
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_IO_THREAD_POOL_H

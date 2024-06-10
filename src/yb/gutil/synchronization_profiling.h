@@ -47,10 +47,9 @@
  * Author: Chris Ruemmler
  */
 
-#ifndef BASE_AUXILIARY_SYNCHRONIZATION_PROFILING_H_
-#define BASE_AUXILIARY_SYNCHRONIZATION_PROFILING_H_
+#pragma once
 
-#include "yb/gutil/basictypes.h"
+#include "yb/gutil/integral_types.h"
 
 namespace gutil {
 
@@ -62,5 +61,4 @@ namespace gutil {
 ATTRIBUTE_WEAK extern void SubmitSpinLockProfileData(const void *, int64);
 extern void SubmitSpinLockProfileData(const void *contendedlock,
                                       int64 wait_cycles) {}
-}
-#endif  // BASE_AUXILIARY_SYNCHRONIZATION_PROFILING_H_
+} // namespace gutil

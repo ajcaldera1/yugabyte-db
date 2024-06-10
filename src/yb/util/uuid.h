@@ -11,21 +11,22 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_UUID_H
-#define YB_UTIL_UUID_H
+#pragma once
 
 #include <uuid/uuid.h>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/uuid_io.hpp>
-#include <boost/lexical_cast.hpp>
-#include <boost/system/error_code.hpp>
 
-#include "yb/gutil/strings/substitute.h"
-#include "yb/util/status.h"
-#include "yb/util/hexdump.h"
-#include "yb/util/slice.h"
+#include <array>
+#include <random>
+
+#include <boost/functional/hash.hpp>
+#include <boost/uuid/uuid.hpp>
+
+#include "yb/util/cast.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
+
+class Slice;
 
 constexpr size_t kUuidSize = 16;
 constexpr int kShaDigestSize = 5;
@@ -48,72 +49,82 @@ class Uuid {
 
   Uuid();
 
-  explicit Uuid(boost::uuids::uuid boost_uuid) : boost_uuid_(boost_uuid) {}
+  explicit Uuid(const boost::uuids::uuid& boost_uuid) : boost_uuid_(boost_uuid) {}
 
   explicit Uuid(const uuid_t copy);
 
   Uuid(const Uuid& other);
 
   // Generate a new boost uuid
-  static boost::uuids::uuid Generate();
+  static Uuid Generate();
+  static Uuid Generate(std::mt19937_64* rng);
+  static Uuid Nil();
 
-  // Builds an Uuid object given a string representation of the UUID.
-  CHECKED_STATUS FromString(const std::string& strval);
+  static Result<Uuid> FromString(const std::string& strval);
+  // name is used in error message in case of failure.
+  static Result<Uuid> FullyDecode(const Slice& slice, const char* name = nullptr);
+  static Uuid TryFullyDecode(const Slice& slice);
+  static Result<Uuid> Decode(Slice* slice, const char* name = nullptr);
 
   // Fills in strval with the string representation of the UUID.
-  CHECKED_STATUS ToString(std::string* strval) const;
+  Status ToString(std::string* strval) const;
 
   // Returns string representation the UUID. This method doesn't return a
   // Status for usecases in the code where we don't support returning a status.
   std::string ToString() const;
 
   // Fills in the given string with the raw bytes for the appropriate address in network byte order.
-  CHECKED_STATUS ToBytes(std::string* bytes) const;
+  void ToBytes(std::string* bytes) const;
+  void ToBytes(std::array<uint8_t, kUuidSize>* out) const;
+  void ToBytes(void* buffer) const;
+  Slice AsSlice() const;
 
   // Encodes the UUID into the time comparable uuid to be stored in RocksDB.
-  CHECKED_STATUS EncodeToComparable(std::string* bytes) const;
+  void EncodeToComparable(uint8_t* output) const;
+  void EncodeToComparable(std::string* bytes) const;
 
-  // Given a string holding the raw bytes in network byte order, it builds the appropriate
-  // UUID object.
-  CHECKED_STATUS FromBytes(const std::string& bytes);
+  template <class Buffer>
+  void AppendEncodedComparable(Buffer* bytes) const {
+    uint8_t output[kUuidSize];
+    EncodeToComparable(output);
+    bytes->append(reinterpret_cast<char *>(output), kUuidSize);
+  }
 
   // Given a string representation of uuid in hex where the bytes are in host byte order, build
   // an appropriate UUID object.
-  CHECKED_STATUS FromHexString(const std::string& hex_string);
+  static Result<Uuid> FromHexString(const std::string& hex_string);
+  // FromHexString above expects the string to have bytes in the host byte order (little endian)
+  // this variant is useful to generate a uuid where the bytes are in network order (big endian)
+  // Functionally, accepts strings similar to FromString, however the dashes are not required.
+  static Result<Uuid> FromHexStringBigEndian(const std::string& hex_string);
 
-  // Decodes the Comparable UUID bytes into a lexical UUID.
-  CHECKED_STATUS DecodeFromComparable(const std::string& bytes);
+  std::string ToHexString() const;
 
   // Give a slice holding raw bytes in network byte order, build the appropriate UUID
   // object. If size_hint is specified, it indicates the number of bytes to decode from the slice.
-  CHECKED_STATUS FromSlice(const Slice& slice, size_t size_hint = 0);
+  static Result<Uuid> FromSlice(const Slice& slice);
 
-  CHECKED_STATUS DecodeFromComparableSlice(const Slice& slice, size_t size_hint = 0);
+  // Decodes the Comparable UUID bytes.
+  static Result<Uuid> FromComparable(const Slice& slice);
 
   // For time UUIDs only.
   // This function takes a time UUID and generates a SHA hash for the MAC address bits.
   // This is done because it is not secure to generate UUIDs directly from the MAC address.
-  CHECKED_STATUS HashMACAddress();
+  Status HashMACAddress();
 
   // Builds the smallest TimeUUID that willl compare as larger than any TimeUUID with the given
   // timestamp.
-  CHECKED_STATUS maxFromUnixTimestamp(int64_t timestamp_ms);
+  Status MaxFromUnixTimestamp(int64_t timestamp_ms);
 
   // Builds the largest TimeUUID that willl compare as smaller than any TimeUUID with the given
   // timestamp.
-  CHECKED_STATUS minFromUnixTimestamp(int64_t timestamp_ms);
+  Status MinFromUnixTimestamp(int64_t timestamp_ms);
 
   // This function takes a 64 bit integer that represents the timestamp, that is basically the
   // number of milliseconds since epoch.
-  CHECKED_STATUS toUnixTimestamp(int64_t *timestamp_ms) const;
+  Status ToUnixTimestamp(int64_t *timestamp_ms) const;
 
-  CHECKED_STATUS IsTimeUuid() const {
-    if (boost_uuid_.version() == boost::uuids::uuid::version_time_based) {
-      return Status::OK();
-    }
-    return STATUS_SUBSTITUTE(InvalidArgument,
-                             "Not a type 1 UUID. Current type: $0", boost_uuid_.version());
-  }
+  Status IsTimeUuid() const;
 
   bool IsNil() const {
     return boost_uuid_.is_nil();
@@ -129,59 +140,7 @@ class Uuid {
 
   // A custom comparator that compares UUID v1 according to their timestamp.
   // If not, it will compare the version first and then lexicographically.
-  bool operator<(const Uuid& other) const {
-    // First compare the version, variant and then the timestamp bytes.
-    if (boost_uuid_.version() < other.boost_uuid_.version()) {
-      return true;
-    } else if (boost_uuid_.version() > other.boost_uuid_.version()) {
-      return false;
-    }
-    if (boost_uuid_.version() == boost::uuids::uuid::version_time_based) {
-      // Compare the hi timestamp bits.
-      for (int i = 6; i < kUuidMsbSize; i++) {
-        if (boost_uuid_.data[i] < other.boost_uuid_.data[i]) {
-          return true;
-        } else if (boost_uuid_.data[i] > other.boost_uuid_.data[i]) {
-          return false;
-        }
-      }
-      // Compare the mid timestamp bits.
-      for (int i = 4; i < 6; i++) {
-        if (boost_uuid_.data[i] < other.boost_uuid_.data[i]) {
-          return true;
-        } else if (boost_uuid_.data[i] > other.boost_uuid_.data[i]) {
-          return false;
-        }
-      }
-      // Compare the low timestamp bits.
-      for (int i = 0; i < 4; i++) {
-        if (boost_uuid_.data[i] < other.boost_uuid_.data[i]) {
-          return true;
-        } else if (boost_uuid_.data[i] > other.boost_uuid_.data[i]) {
-          return false;
-        }
-      }
-    } else {
-      // Compare all the other bits
-      for (int i = 0; i < kUuidMsbSize; i++) {
-        if (boost_uuid_.data[i] < other.boost_uuid_.data[i]) {
-          return true;
-        } else if (boost_uuid_.data[i] > other.boost_uuid_.data[i]) {
-          return false;
-        }
-      }
-    }
-
-    // Then compare the remaining bytes.
-    for (int i = kUuidMsbSize; i < kUuidSize; i++) {
-      if (boost_uuid_.data[i] < other.boost_uuid_.data[i]) {
-        return true;
-      } else if (boost_uuid_.data[i] > other.boost_uuid_.data[i]) {
-        return false;
-      }
-    }
-    return false;
-  }
+  bool operator<(const Uuid& other) const;
 
   bool operator>(const Uuid& other) const {
     return (other < *this);
@@ -200,6 +159,30 @@ class Uuid {
     return *this;
   }
 
+  const boost::uuids::uuid& impl() const {
+    return boost_uuid_;
+  }
+
+  uint8_t* data() {
+    return boost_uuid_.data;
+  }
+
+  const uint8_t* data() const {
+    return boost_uuid_.data;
+  }
+
+  const char* cdata() const {
+    return pointer_cast<const char*>(data());
+  }
+
+  size_t size() const {
+    return boost_uuid_.size();
+  }
+
+  auto version() const {
+    return boost_uuid_.version();
+  }
+
  private:
   boost::uuids::uuid boost_uuid_;
 
@@ -208,7 +191,7 @@ class Uuid {
   // into
   // [Version (4 bits)][Timestamp High (12 bits)][Timestamp Mid (16 bits)][Timestamp Low (32 bits)]
   // So that their lexical comparison of the bytes will result in time based comparison.
-  void toTimestampBytes(uint8_t* output) const {
+  void ToTimestampBytes(uint8_t* output) const {
     output[0] = boost_uuid_.data[6];
     output[1] = boost_uuid_.data[7];
     output[2] = boost_uuid_.data[4];
@@ -221,7 +204,7 @@ class Uuid {
 
   // Reverse the timestamp based byte stream into regular UUID style MSB.
   // See comments for toTimestampBytes function for more detail.
-  void fromTimestampBytes(const uint8_t* input) {
+  void FromTimestampBytes(const uint8_t* input) {
     uint8_t tmp[kUuidMsbSize];
     tmp[0] = input[4];
     tmp[1] = input[5];
@@ -237,7 +220,7 @@ class Uuid {
   // Utility method used by minTimeuuid and maxTimeuuid.
   // Set the timestamp bytes of a (time)uuid to the specified value (in hundred nanos).
   // Also ensure that the uuid is a version 1 uuid (i.e. timeuuid) by setting the version.
-  void fromTimestamp(int64_t ts_hnanos);
+  void FromTimestamp(int64_t ts_hnanos);
 
   // Encodes the MSB of the uuid into a version based byte stream as follows.
   // Used for non-time-based UUIDs, i.e. not version 1.
@@ -245,7 +228,7 @@ class Uuid {
   // into
   // [Version (4 bits)][Timestamp Low (32 bits)][Timestamp Mid (16 bits)][Timestamp High (12 bits)]
   // So that their lexical comparison of the bytes will result in version based comparison.
-  void toVersionFirstBytes(uint8_t* output) const {
+  void ToVersionFirstBytes(uint8_t* output) const {
     output[0] = (uint8_t) ( ((boost_uuid_.data[6] & 0xF0))
                           | ((boost_uuid_.data[0] & 0xF0) >> 4));
     output[1] = (uint8_t) ( ((boost_uuid_.data[0] & 0x0F) << 4)
@@ -265,7 +248,7 @@ class Uuid {
 
   // Reverse the version based byte stream into regular UUID style MSB.
   // See comments for toVersionFirstBytes function for more detail.
-  void fromVersionFirstBytes(const uint8_t* input) {
+  void FromVersionFirstBytes(const uint8_t* input) {
     uint8_t tmp[kUuidMsbSize];
     tmp[0] = (uint8_t)  ( ((input[0] & 0x0F) << 4)
                         | ((input[1] & 0xF0) >> 4));
@@ -287,6 +270,10 @@ class Uuid {
 
 };
 
-} // namespace yb
+inline size_t hash_value(const Uuid& uuid) {
+  return hash_value(uuid.impl());
+}
 
-#endif // YB_UTIL_UUID_H
+using UuidHash = boost::hash<Uuid>;
+
+} // namespace yb

@@ -10,14 +10,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
-#ifndef YB_UTIL_SPLIT_H_
-#define YB_UTIL_SPLIT_H_
+#pragma once
 
 #include <string>
+#include <vector>
 
 #include <boost/container/small_vector.hpp>
 
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/slice.h"
 
 namespace yb {
@@ -49,5 +49,3 @@ Status SplitArgs(const Slice& line, boost::container::small_vector_base<Slice>* 
 
 }  // namespace util
 }  // namespace yb
-
-#endif  // YB_UTIL_SPLIT_H_

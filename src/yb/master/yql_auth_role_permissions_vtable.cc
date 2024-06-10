@@ -11,30 +11,42 @@
 // under the License.
 //
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_auth_role_permissions_vtable.h"
+
+#include <boost/asio/ip/address.hpp>
+
 #include "yb/common/common.pb.h"
+#include "yb/common/ql_type.h"
 #include "yb/common/roles_permissions.h"
+#include "yb/common/schema.h"
+
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/master/permissions_manager.h"
+
+#include "yb/util/status_log.h"
+
+using std::string;
 
 namespace yb {
 namespace master {
 
-YQLAuthRolePermissionsVTable::YQLAuthRolePermissionsVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemAuthRolePermissionsTableName, master, CreateSchema()) {
+YQLAuthRolePermissionsVTable::YQLAuthRolePermissionsVTable(const TableName& table_name,
+                                                           const NamespaceName& namespace_name,
+                                                           Master* const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLAuthRolePermissionsVTable::RetrieveData(const QLReadRequestPB& request,
-                                                  std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<VTableDataPtr> YQLAuthRolePermissionsVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<RoleInfo>> roles;
-  master_->catalog_manager()->GetAllRoles(&roles);
+  catalog_manager().permissions_manager()->GetAllRoles(&roles);
   for (const auto& rp : roles) {
     auto l = rp->LockForRead();
-    const auto& pb = l->data().pb;
+    const auto& pb = l->pb;
     for (const auto& resource : pb.resources()) {
-      QLRow& row = (*vtable)->Extend();
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
       RETURN_NOT_OK(SetColumnValue(kResource, resource.canonical_resource(), &row));
 
@@ -53,11 +65,10 @@ Status YQLAuthRolePermissionsVTable::RetrieveData(const QLReadRequestPB& request
         }
       }
       RETURN_NOT_OK(SetColumnValue(kPermissions, permissions, &row));
-
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 

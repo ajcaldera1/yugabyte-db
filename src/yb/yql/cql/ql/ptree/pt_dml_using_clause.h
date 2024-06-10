@@ -11,10 +11,10 @@
 // under the License.
 //
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_H
-#define YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_H
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/pt_dml_using_clause_element.h"
+#include "yb/yql/cql/ql/ptree/list_node.h"
 
 namespace yb {
 namespace ql {
@@ -28,7 +28,7 @@ class PTDmlUsingClause: public TreeListNode<PTDmlUsingClauseElement> {
   typedef MCSharedPtr<const PTDmlUsingClause> SharedPtrConst;
 
   explicit PTDmlUsingClause(MemoryContext *memory_context,
-                            YBLocation::SharedPtr loc,
+                            YBLocationPtr loc,
                             const MCSharedPtr<PTDmlUsingClauseElement>& tnode = nullptr)
       : TreeListNode<PTDmlUsingClauseElement>(memory_context, loc, tnode),
         ttl_seconds_(nullptr),
@@ -44,11 +44,11 @@ class PTDmlUsingClause: public TreeListNode<PTDmlUsingClauseElement> {
     return MCMakeShared<PTDmlUsingClause>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
-  const PTExpr::SharedPtr& ttl_seconds() const;
+  const PTExprPtr& ttl_seconds() const;
 
-  const PTExpr::SharedPtr& user_timestamp_usec() const;
+  const PTExprPtr& user_timestamp_usec() const;
 
   bool has_user_timestamp_usec() const {
     return user_timestamp_usec_ != nullptr;
@@ -59,11 +59,9 @@ class PTDmlUsingClause: public TreeListNode<PTDmlUsingClauseElement> {
   }
 
  private:
-  PTExpr::SharedPtr ttl_seconds_;
-  PTExpr::SharedPtr user_timestamp_usec_;
+  PTExprPtr ttl_seconds_;
+  PTExprPtr user_timestamp_usec_;
 };
 
 } // namespace ql
 } // namespace yb
-
-#endif // YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_H

@@ -25,11 +25,16 @@ import static org.yb.AssertionWrappers.*;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
-import org.yb.util.RandomNumberUtil;
-import org.yb.util.SanitizerUtil;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import org.yb.util.RandomUtil;
+import org.yb.util.BuildTypeUtil;
 
 @RunWith(value=YBTestRunner.class)
 public class TestKeyspace extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestKeyspace.class);
+
   public void setupTable(String test_table) throws Exception {
     LOG.info("Create & setup table: " + test_table);
     super.setupTable(test_table, 2 /* num_rows */);
@@ -94,7 +99,7 @@ public class TestKeyspace extends BaseCQLTest {
   // We use a random keyspace name in each test to be sure that the keyspace does not exist in the
   // beginning of the test.
   private static String getRandomKeyspaceName() {
-    return "test_keyspace_" + RandomNumberUtil.randomNonNegNumber();
+    return "test_keyspace_" + RandomUtil.randomNonNegNumber();
   }
 
   @Test
@@ -108,9 +113,9 @@ public class TestKeyspace extends BaseCQLTest {
       useKeyspace(keyspaceName);
 
       for (int i = 0; i < 4; ++i) {
-        final int numRows = SanitizerUtil.isTSAN() ? 1000 : 7500;
+        final int numRows = BuildTypeUtil.isTSAN() ? 1000 : 7500;
         LOG.info("Create a big table '" + tableName + "' with " + numRows +
-            " rows (isTSAN=" + SanitizerUtil.isTSAN() + ", build type=" + TestUtils.getBuildType() +
+            " rows (isTSAN=" + BuildTypeUtil.isTSAN() + ", build type=" + TestUtils.getBuildType() +
             "). Iteration: " + i);
 
         try {
@@ -427,7 +432,7 @@ public class TestKeyspace extends BaseCQLTest {
 
     // Table1 name: "a" . "b.c"
     // Table2 name: "a.b" . "c"
-    final long randomId = RandomNumberUtil.randomNonNegNumber();
+    final long randomId = RandomUtil.randomNonNegNumber();
     final String keyspaceName1 = "a" + randomId;
     final String keyspaceName2 = "a" + randomId + ".b";
     final String longTableName1 = "\"" + keyspaceName1 + "\"." + "\"b.c\""; // Table1.

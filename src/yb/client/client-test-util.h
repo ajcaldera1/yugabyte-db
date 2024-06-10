@@ -29,15 +29,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CLIENT_CLIENT_TEST_UTIL_H_
-#define YB_CLIENT_CLIENT_TEST_UTIL_H_
+#pragma once
 
 #include <string>
 #include <vector>
 
 #include "yb/client/client_fwd.h"
-#include "yb/gutil/macros.h"
-#include "yb/util/status.h"
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 class Schema;
@@ -48,9 +47,9 @@ class TableRange;
 class YBSchema;
 
 
-// Log any pending errors in the given session, and then crash the current
+// Log any pending errors in the given session flush status, and then crash the current
 // process.
-void LogSessionErrorsAndDie(const YBSessionPtr& session, const Status& s);
+void LogSessionErrorsAndDie(const FlushStatus& flush_status);
 
 // Flush the given session. If any errors occur, log them and crash
 // the process.
@@ -61,6 +60,7 @@ void ScanTableToStrings(const TableHandle& table, std::vector<std::string>* row_
 
 // Scans in LEADER_ONLY mode, returning stringified rows.
 std::vector<std::string> ScanTableToStrings(const TableHandle& table);
+std::vector<std::string> ScanTableToStrings(const YBTableName& table_name, YBClient* client);
 
 // Count the number of rows in the table in LEADER_ONLY mode.
 int64_t CountTableRows(const TableHandle& table);
@@ -70,7 +70,27 @@ std::vector<std::string> ScanToStrings(const TableRange& range);
 // Convert a yb::Schema to a yb::client::YBSchema.
 YBSchema YBSchemaFromSchema(const Schema& schema);
 
+// Creates an operation to read value from `value_column` for hashed key `key` for the `table`.
+std::shared_ptr<YBqlReadOp> CreateReadOp(
+    int32_t key, const TableHandle& table, const std::string& value_column);
+
+Result<std::string> GetNamespaceIdByNamespaceName(
+    YBClient* client, const std::string& namespace_name);
+
+Result<std::string> GetTableIdByTableName(
+    YBClient* client, const std::string& namespace_name, const std::string& table_name);
+
+void VerifyNamespaceExists(YBClient *client, const NamespaceName& db_name, int timeout_secs = 20);
+
+void VerifyNamespaceNotExists(
+    YBClient *client, const NamespaceName& db_name, int timeout_secs = 20);
+
+void VerifyTableExists(
+    YBClient* client, const std::string& db_name, const std::string& table_name, int timeout_secs);
+
+void VerifyTableNotExists(
+    YBClient* client, const std::string& db_name, const std::string& table_name, int timeout_secs);
+
+
 }  // namespace client
 }  // namespace yb
-
-#endif // YB_CLIENT_CLIENT_TEST_UTIL_H_

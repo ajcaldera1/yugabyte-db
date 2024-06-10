@@ -36,6 +36,9 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
+/* YB includes */
+#include "pg_yb_utils.h"
+#include "yb_ysql_conn_mgr_helper.h"
 
 /*
  * The hash table in which prepared queries are stored. This is
@@ -180,6 +183,18 @@ PrepareQuery(PrepareStmt *stmt, const char *queryString,
 	StorePreparedStatement(stmt->name,
 						   plansource,
 						   true);
+
+	if (YbIsClientYsqlConnMgr())
+	{
+		/*
+		 * PREPARE statements (do not consider protocol-level prepared statements)
+		 * are not tracked by ysql connection manager.
+		 * EXECUTE statement should be forwarded on the same connection on
+		 * which PREPARE statement is executed, therefore the connection should be
+		 * made sticky.
+		 */
+		increment_sticky_object_count();
+	}
 }
 
 /*
@@ -218,6 +233,14 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
 	if (!entry->plansource->fixed_result)
 		elog(ERROR, "EXECUTE does not support variable-result cached plans");
 
+	/*
+	 * If the planner found a pg relation in this plan, set the appropriate
+	 * flag for the execution txn.
+	 */
+	if (entry->plansource->usesPostgresRel) {
+		SetTxnWithPGRel();
+	}
+
 	/* Evaluate parameters, if any */
 	if (entry->plansource->num_params > 0)
 	{
@@ -245,6 +268,17 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
 	/* Replan if needed, and increment plan refcount for portal */
 	cplan = GetCachedPlan(entry->plansource, paramLI, false, NULL);
 	plan_list = cplan->stmt_list;
+
+	/*
+	 * DO NOT add any logic that could possibly throw an error between
+	 * GetCachedPlan and PortalDefineQuery, or you'll leak the plan refcount.
+	 */
+	PortalDefineQuery(portal,
+					  NULL,
+					  query_string,
+					  entry->plansource->commandTag,
+					  plan_list,
+					  cplan);
 
 	/*
 	 * For CREATE TABLE ... AS EXECUTE, we must verify that the prepared
@@ -288,13 +322,6 @@ ExecuteQuery(ExecuteStmt *stmt, IntoClause *intoClause,
 		eflags = 0;
 		count = FETCH_ALL;
 	}
-
-	PortalDefineQuery(portal,
-					  NULL,
-					  query_string,
-					  entry->plansource->commandTag,
-					  plan_list,
-					  cplan);
 
 	/*
 	 * Run the portal as appropriate.

@@ -29,11 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_INIT_H
-#define YB_UTIL_INIT_H
+#pragma once
 
-#include "yb/gutil/macros.h"
-#include "yb/util/status.h"
+#include <string>
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -41,15 +41,19 @@ extern const char* kTopLevelDataDirName;
 
 // Return a NotSupported Status if the current CPU does not support the CPU flags
 // required for YB.
-CHECKED_STATUS CheckCPUFlags();
+Status CheckCPUFlags();
 
 // Returns an IllegalState Status if we cannot create the dir structure for logging.
-CHECKED_STATUS SetupLogDir(const std::string& server_type);
+Status SetupLogDir(const std::string& server_type);
+
+void SetGLogHeader(const std::string& server_info = "");
+
+// Installs signal handler. Safe to call before glog is initialized. This is not thread safe.
+Status InstallSignalHandler(int signum, void (*handler)(int));
 
 // Initialize YB, checking that the platform we are running on is supported, etc.
 // Issues a FATAL log message if we fail to init.
 // argv0 is passed to InitGoogleLoggingSafe.
-CHECKED_STATUS InitYB(const std::string &server_type, const char* argv0);
+Status InitYB(const std::string &server_type, const char* argv0);
 
 } // namespace yb
-#endif /* YB_UTIL_INIT_H */

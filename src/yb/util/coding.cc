@@ -18,12 +18,15 @@
 //
 
 #include "yb/util/coding.h"
+
+#include "yb/gutil/casts.h"
+
 #include "yb/util/coding-inl.h"
 
 namespace yb {
 
 void PutVarint32(faststring* dst, uint32_t v) {
-  uint8_t buf[5];
+  uint8_t buf[16];
   uint8_t* ptr = InlineEncodeVarint32(buf, v);
   dst->append(buf, ptr - buf);
 }
@@ -47,18 +50,23 @@ void PutFixed64(faststring *dst, uint64_t value) {
 }
 
 void PutVarint64(faststring *dst, uint64_t v) {
-  uint8_t buf[10];
+  uint8_t buf[16];
   uint8_t* ptr = EncodeVarint64(buf, v);
   dst->append(buf, ptr - buf);
 }
 
+void PutVarint64(boost::container::small_vector_base<uint8_t>* dst, uint64_t value) {
+  uint8_t buf[16];
+  dst->insert(dst->end(), buf, EncodeVarint64(buf, value));
+}
+
 void PutLengthPrefixedSlice(faststring* dst, const Slice& value) {
-  PutVarint32(dst, value.size());
+  PutVarint32(dst, narrow_cast<uint32_t>(value.size()));
   dst->append(value.data(), value.size());
 }
 
 void PutFixed32LengthPrefixedSlice(faststring* dst, const Slice& value) {
-  PutFixed32(dst, value.size());
+  PutFixed32(dst, narrow_cast<uint32_t>(value.size()));
   dst->append(value.data(), value.size());
 }
 

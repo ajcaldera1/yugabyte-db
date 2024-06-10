@@ -95,6 +95,12 @@
 #define inline
 #endif
 
+#if defined(__has_attribute) && __has_attribute(fallthrough)
+#define switch_fallthrough() __attribute__((fallthrough))
+#else
+#define switch_fallthrough()
+#endif
+
 /*
  * Attribute macros
  *
@@ -110,6 +116,18 @@
 #define pg_attribute_unused() __attribute__((unused))
 #else
 #define pg_attribute_unused()
+#endif
+
+/*
+ * Place this macro before functions that should be allowed to make misaligned
+ * accesses.  Think twice before using it on non-x86-specific code!
+ * Testing can be done with "-fsanitize=alignment -fsanitize-trap=alignment"
+ * on clang, or "-fsanitize=alignment -fno-sanitize-recover=alignment" on gcc.
+ */
+#if defined(__has_attribute) && __has_attribute(no_sanitize)
+#define pg_attribute_no_sanitize_alignment() __attribute__((no_sanitize("alignment")))
+#else
+#define pg_attribute_no_sanitize_alignment()
 #endif
 
 /*
@@ -1088,6 +1106,36 @@ typedef union PGAlignedXLogBlock
 #define PG_TEXTDOMAIN(domain) (domain "-" PG_MAJORVERSION)
 #endif
 
+/*
+ * Macro that allows to cast constness and volatile away from an expression, but doesn't
+ * allow changing the underlying type.  Enforcement of the latter
+ * currently only works for gcc like compilers.
+ *
+ * Please note IT IS NOT SAFE to cast constness away if the result will ever
+ * be modified (it would be undefined behaviour). Doing so anyway can cause
+ * compiler misoptimizations or runtime crashes (modifying readonly memory).
+ * It is only safe to use when the the result will not be modified, but API
+ * design or language restrictions prevent you from declaring that
+ * (e.g. because a function returns both const and non-const variables).
+ *
+ * Note that this only works in function scope, not for global variables (it'd
+ * be nice, but not trivial, to improve that).
+ */
+#if defined(HAVE__BUILTIN_TYPES_COMPATIBLE_P)
+#define unconstify(underlying_type, expr) \
+	(StaticAssertExpr(__builtin_types_compatible_p(__typeof(expr), const underlying_type), \
+					  "wrong cast"), \
+	 (underlying_type) (expr))
+#define unvolatize(underlying_type, expr) \
+	(StaticAssertExpr(__builtin_types_compatible_p(__typeof(expr), volatile underlying_type), \
+					  "wrong cast"), \
+	 (underlying_type) (expr))
+#else
+#define unconstify(underlying_type, expr) \
+	((underlying_type) (expr))
+#define unvolatize(underlying_type, expr) \
+	((underlying_type) (expr))
+#endif
 
 /* ----------------------------------------------------------------
  *				Section 9: system-specific hacks

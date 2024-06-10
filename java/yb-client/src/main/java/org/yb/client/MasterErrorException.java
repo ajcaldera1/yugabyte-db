@@ -33,7 +33,7 @@ package org.yb.client;
 
 import org.yb.annotations.InterfaceAudience;
 import org.yb.annotations.InterfaceStability;
-import org.yb.master.Master;
+import org.yb.master.MasterTypes;
 import org.yb.rpc.RpcHeader;
 
 /**
@@ -44,11 +44,15 @@ import org.yb.rpc.RpcHeader;
 @SuppressWarnings("serial")
 public class MasterErrorException extends YBServerException {
 
+  public final MasterTypes.MasterErrorPB error;
+
   MasterErrorException(String serverUuid, RpcHeader.ErrorStatusPB errorStatus) {
     super(serverUuid, errorStatus);
+    this.error = null;
   }
 
-  MasterErrorException(String serverUuid, Master.MasterErrorPB error) {
+  MasterErrorException(String serverUuid, MasterTypes.MasterErrorPB error) {
     super(serverUuid, error.getStatus());
+    this.error = error;
   }
 }

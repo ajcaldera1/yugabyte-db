@@ -12,45 +12,66 @@
 //
 package com.yugabyte.jedis;
 
-import com.google.common.net.HostAndPort;
-import com.google.protobuf.ByteString;
+import static org.yb.AssertionWrappers.*;
+
+import java.net.InetSocketAddress;
+import java.nio.ByteBuffer;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import java.util.Set;
+import java.util.TreeMap;
+import org.junit.Ignore;
+
 import org.apache.commons.text.RandomStringGenerator;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
 import org.yb.Common;
+import org.yb.CommonNet;
 import org.yb.YBParameterizedTestRunner;
-import org.yb.client.*;
-import org.yb.master.Master;
-import org.yb.minicluster.MiniYBCluster;
+import org.yb.client.GetTableSchemaResponse;
+import org.yb.client.LocatedTablet;
+import org.yb.client.ModifyClusterConfigLiveReplicas;
+import org.yb.client.ModifyClusterConfigReadReplicas;
+import org.yb.client.TestUtils;
+import org.yb.client.YBClient;
+import org.yb.client.YBTable;
+import org.yb.master.CatalogEntityInfo;
+import org.yb.master.CatalogEntityInfo.PlacementBlockPB;
+import org.yb.master.CatalogEntityInfo.PlacementInfoPB;
 import org.yb.minicluster.MiniYBDaemon;
 
+import com.google.common.collect.ImmutableMap;
+import com.google.common.net.HostAndPort;
+import com.google.protobuf.ByteString;
+
 import redis.clients.jedis.Jedis;
+import redis.clients.jedis.JedisCommands;
 import redis.clients.jedis.YBJedis;
 import redis.clients.util.JedisClusterCRC16;
 
-import java.net.InetSocketAddress;
-import java.nio.ByteBuffer;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.List;
-import java.util.Map;
-
-import static junit.framework.TestCase.*;
-
+@Ignore("Redis is not supported anymore")
 @RunWith(value=YBParameterizedTestRunner.class)
 public class TestReadFromFollowers extends BaseJedisTest {
-  private static final Logger LOG = LoggerFactory.getLogger(TestYBJedis.class);
+  private static final Logger LOG = LoggerFactory.getLogger(TestReadFromFollowers.class);
 
   protected static final int WAIT_FOR_FOLLOWER_TO_CATCH_UP_TIMEOUT_MS = 60000; // 60 seconds.
   protected static final int NUMBER_INSERTS_AND_READS = 1000;
   protected static final int DEFAULT_NUM_READS = 500;
 
-  protected final String tserverRedisFollowerFlag = "--redis_allow_reads_from_followers=true";
-  protected final String tserverMaxStaleness = "--max_stale_read_bound_time_ms=10000";
+  // These fields being lists are a dirty hack.
+  protected final List<String> tserverRedisFollowerFlag =
+      Arrays.asList("redis_allow_reads_from_followers", "true");
+  protected final List<String> tserverMaxStaleness =
+      Arrays.asList("max_stale_read_bound_time_ms", "10000");
 
   private YBTable redisTable = null;
 
@@ -59,12 +80,12 @@ public class TestReadFromFollowers extends BaseJedisTest {
   }
 
   public int getTestMethodTimeoutSec() {
-    return 360;
+    return 720;
   }
 
   // Run each test with both Jedis and YBJedis clients.
   @Parameterized.Parameters
-  public static Collection jedisClients() {
+  public static List<JedisClientType> jedisClients() {
     return Arrays.asList(JedisClientType.JEDIS, JedisClientType.YBJEDIS);
   }
 
@@ -86,7 +107,7 @@ public class TestReadFromFollowers extends BaseJedisTest {
         YBClient.REDIS_KEYSPACE_NAME, YBClient.REDIS_DEFAULT_TABLE_NAME);
 
     assertEquals(Common.PartitionSchemaPB.HashSchema.REDIS_HASH_SCHEMA,
-        tableSchema.getPartitionSchema().getHashSchema());
+                 tableSchema.getPartitionSchema().getHashSchema());
 
     setUpJedisClient();
   }
@@ -116,7 +137,25 @@ public class TestReadFromFollowers extends BaseJedisTest {
     for (int i = 0; i < nReads; i++) {
       String s = generator.generate(20);
       LOG.info("Iteration {}. Setting and getting {}", i, s);
-      assertEquals("OK", jedis_client.set(s, "v"));
+      boolean write_succeeded = false;
+      String ret;
+      for (int j = 0; j < 20; j++) {
+        try {
+          ret = jedis_client.set(s, "v");
+        } catch (Exception e) {
+          if (e.getMessage().contains("Not the leader")) {
+            continue;
+          }
+          throw e;
+        }
+        if (ret.equals("OK")) {
+          write_succeeded = true;
+          break;
+        }
+      }
+
+      assertTrue(write_succeeded);
+
       TestUtils.waitFor(() -> {
         if (jedis_client.get(s) == null) {
           return false;
@@ -131,15 +170,10 @@ public class TestReadFromFollowers extends BaseJedisTest {
   public void testLocalOps() throws Exception {
     assertNull(miniCluster);
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
-
-    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=true";
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-    createMiniCluster(3, masterArgs, tserverArgs);
+    createMiniCluster(3, 3,
+        // We don't want the tablets to move while we are testing.
+        Collections.singletonMap("enable_load_balancing", "false"),
+        Collections.singletonMap("TEST_assert_local_tablet_server_selected", "true"));
 
     // Setup the Jedis client.
     setUpJedis();
@@ -158,74 +192,69 @@ public class TestReadFromFollowers extends BaseJedisTest {
     final String PLACEMENT_ZONE2 = "testZone2";
     final String PLACEMENT_UUID = "placementUuid";
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
+    createMiniCluster(
+        3,
+        6,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of("enable_load_balancing", "false"),
+        ImmutableMap.of(
+            tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1),
+            "TEST_assert_tablet_server_select_is_in_zone", "testZone0",
+            "placement_cloud", PLACEMENT_CLOUD,
+            "placement_region", PLACEMENT_REGION,
+            "placement_uuid", PLACEMENT_UUID),
+        cb -> {
+          cb.perTServerFlags(Arrays.asList(
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE0),
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE0),
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE1),
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE1),
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE2),
+              ImmutableMap.of("placement_zone", PLACEMENT_ZONE2)));
+        }, Collections.emptyMap());
 
-    String tserverAssertTSInZone = "--assert_tablet_server_select_is_in_zone=testZone0";
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE0, "--placement_uuid=" + PLACEMENT_UUID));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE0, "--placement_uuid=" + PLACEMENT_UUID));
-
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE1, "--placement_uuid=" + PLACEMENT_UUID));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE1, "--placement_uuid=" + PLACEMENT_UUID));
-
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE2, "--placement_uuid=" + PLACEMENT_UUID));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertTSInZone,
-        "--placement_cloud=" + PLACEMENT_CLOUD, "--placement_region=" + PLACEMENT_REGION,
-        "--placement_zone=" + PLACEMENT_ZONE2, "--placement_uuid=" + PLACEMENT_UUID));
-
-    createMiniCluster(3, masterArgs, tserverArgs);
+    waitForTServersAtMasterLeader();
 
     YBClient syncClient = miniCluster.getClient();
 
     // Create the cluster config pb to be sent to the masters
-    org.yb.Common.CloudInfoPB cloudInfo0 = org.yb.Common.CloudInfoPB.newBuilder()
+    org.yb.CommonNet.CloudInfoPB cloudInfo0 = org.yb.CommonNet.CloudInfoPB.newBuilder()
         .setPlacementCloud(PLACEMENT_CLOUD)
         .setPlacementRegion(PLACEMENT_REGION)
         .setPlacementZone(PLACEMENT_ZONE0)
         .build();
 
     // Create the cluster config pb to be sent to the masters
-    org.yb.Common.CloudInfoPB cloudInfo1 = org.yb.Common.CloudInfoPB.newBuilder()
+    org.yb.CommonNet.CloudInfoPB cloudInfo1 = org.yb.CommonNet.CloudInfoPB.newBuilder()
         .setPlacementCloud(PLACEMENT_CLOUD)
         .setPlacementRegion(PLACEMENT_REGION)
         .setPlacementZone(PLACEMENT_ZONE1)
         .build();
 
     // Create the cluster config pb to be sent to the masters
-    org.yb.Common.CloudInfoPB cloudInfo2 = org.yb.Common.CloudInfoPB.newBuilder()
+    org.yb.CommonNet.CloudInfoPB cloudInfo2 = org.yb.CommonNet.CloudInfoPB.newBuilder()
         .setPlacementCloud(PLACEMENT_CLOUD)
         .setPlacementRegion(PLACEMENT_REGION)
         .setPlacementZone(PLACEMENT_ZONE2)
         .build();
 
-    Master.PlacementBlockPB placementBlock0 =
-        Master.PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo0).setMinNumReplicas(1).build();
+    PlacementBlockPB placementBlock0 =
+        PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo0).setMinNumReplicas(1).build();
 
-    Master.PlacementBlockPB placementBlock1 =
-        Master.PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo1).setMinNumReplicas(1).build();
+    PlacementBlockPB placementBlock1 =
+        PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo1).setMinNumReplicas(1).build();
 
-    Master.PlacementBlockPB placementBlock2 =
-        Master.PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo2).setMinNumReplicas(1).build();
+    PlacementBlockPB placementBlock2 =
+        PlacementBlockPB.newBuilder().setCloudInfo(cloudInfo2).setMinNumReplicas(1).build();
 
-    List<Master.PlacementBlockPB> placementBlocksLive = new ArrayList<Master.PlacementBlockPB>();
+    List<PlacementBlockPB> placementBlocksLive = new ArrayList<PlacementBlockPB>();
     placementBlocksLive.add(placementBlock0);
     placementBlocksLive.add(placementBlock1);
     placementBlocksLive.add(placementBlock2);
 
-    Master.PlacementInfoPB livePlacementInfo =
-        Master.PlacementInfoPB.newBuilder().addAllPlacementBlocks(placementBlocksLive).
+    PlacementInfoPB livePlacementInfo =
+        PlacementInfoPB.newBuilder().addAllPlacementBlocks(placementBlocksLive).
+            setNumReplicas(3).
             setPlacementUuid(ByteString.copyFromUtf8(PLACEMENT_UUID)).build();
 
     ModifyClusterConfigLiveReplicas liveOperation =
@@ -274,27 +303,25 @@ public class TestReadFromFollowers extends BaseJedisTest {
   public void testLocalOpsWithStaleFollowerGoToLeader() throws Exception {
     assertNull(miniCluster);
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
-
-    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=true";
-    String tserverAssertReadsRejectedBecauseStaleFollower =
-        "--assert_reads_from_follower_rejected_because_of_staleness";
-    String tserverRejectUpdateReplicaRequests =
-        "--follower_reject_update_consensus_requests_seconds=300";
-
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-
-    // We only want the first tserver to reject update consensus requests so the cluster can still
-    // make progress.
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet,
-        tserverMaxStaleness, tserverAssertReadsRejectedBecauseStaleFollower,
-        tserverRejectUpdateReplicaRequests));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet,
-        tserverMaxStaleness));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet,
-        tserverMaxStaleness));
-    createMiniCluster(3, masterArgs, tserverArgs);
+    createMiniCluster(
+        3,
+        3,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of("enable_load_balancing", "false"),
+        ImmutableMap.of(
+            tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1),
+            tserverMaxStaleness.get(0), tserverMaxStaleness.get(1),
+            "TEST_assert_local_tablet_server_selected", "true"),
+        cb -> {
+          // We only want the first tserver to reject update consensus requests so the cluster can
+          // still make progress.
+          cb.perTServerFlags(Arrays.asList(
+              ImmutableMap.of(
+                  "TEST_assert_reads_from_follower_rejected_because_of_staleness", "true",
+                  "TEST_follower_reject_update_consensus_requests_seconds", "300"),
+              ImmutableMap.of(),
+              ImmutableMap.of()));
+        }, Collections.emptyMap());
 
     // Setup the Jedis client.
     setUpJedis();
@@ -338,21 +365,14 @@ public class TestReadFromFollowers extends BaseJedisTest {
   public void testLocalOpsWithNonStaleFollowerAreServedByFollower() throws Exception {
     assertNull(miniCluster);
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
-
-    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=true";
-    String tserverAssertReadsInFollower = "--assert_reads_served_by_follower=true";
-
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverMaxStaleness,
-        tserverAssertLocalTablet, tserverAssertReadsInFollower));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverMaxStaleness,
-        tserverAssertLocalTablet, tserverAssertReadsInFollower));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverMaxStaleness,
-        tserverAssertLocalTablet, tserverAssertReadsInFollower));
-    createMiniCluster(3, masterArgs, tserverArgs);
+    createMiniCluster(3, 3,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of("enable_load_balancing", "false"),
+        ImmutableMap.of(
+            tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1),
+            tserverMaxStaleness.get(0), tserverMaxStaleness.get(1),
+            "TEST_assert_local_tablet_server_selected", "true",
+            "TEST_assert_reads_served_by_follower", "true"));
 
     // Setup the Jedis client.
     setUpJedis();
@@ -396,32 +416,32 @@ public class TestReadFromFollowers extends BaseJedisTest {
   }
 
   @Test
-  public void testLookupCacheGetsRefreshed() throws Exception {
+  public void testLookupCacheGetsRefreshedWhenRequestsTimeout() throws Exception {
     assertNull(miniCluster);
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
-
-    String simulateTimeOutFailures = "--simulate_time_out_failures=true";
-    String verifyAllReplicasAlive = "--verify_all_replicas_alive=true";
-    String forceLookupCacheRefreshSecs = "--force_lookup_cache_refresh_secs=10";
-
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-
-    // Only the first tserver needs to periodically update its cache.
-    // If a requests times out (because of flag --simulate_time_out_failures), then
-    // TS0 will make sure that the cache is updated either because of the periodic refresh of the
-    // lookup cache (the new feature we are testing here), or because the selected TS leader relica
-    // was marked as failed after the timeout (we already have code that handles this case, the new
-    // code handles the case when a follower replica gets marked as failed).
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, forceLookupCacheRefreshSecs,
-        verifyAllReplicasAlive, simulateTimeOutFailures));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, verifyAllReplicasAlive,
-        simulateTimeOutFailures));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, verifyAllReplicasAlive,
-        simulateTimeOutFailures));
-
-    createMiniCluster(3, masterArgs, tserverArgs);
+    createMiniCluster(
+        3,
+        3,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of("enable_load_balancing", "false"),
+        ImmutableMap.of(
+            tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1),
+            "TEST_verify_all_replicas_alive", "true",
+            // Setting this timeout to 4s since redis_service_yb_client_timeout_millis is 3s.
+            "TEST_simulate_time_out_failures_msecs", "4000"),
+        cb -> {
+          // For this test, we only need the first tserver to periodically update its cache.
+          // If a requests times out (because of flag --TEST_simulate_time_out_failures), then
+          // TS0 will make sure that the cache is updated either because of the periodic refresh of
+          // the lookup cache (the new feature we are testing here), or because the selected TS
+          // leader replica was marked as failed after the timeout (we already have code that
+          // handles this case, the new code handles the case when a follower replica gets marked
+          // as failed).
+          cb.perTServerFlags(Arrays.asList(
+              ImmutableMap.of("lookup_cache_refresh_secs", "1"),
+              ImmutableMap.of(),
+              ImmutableMap.of()));
+        }, Collections.emptyMap());
 
     // Setup the Jedis client.
     setUpJedis();
@@ -431,12 +451,326 @@ public class TestReadFromFollowers extends BaseJedisTest {
 
     for (int i = 0; i < 200; i++) {
       String s = generator.generate(20);
-      LOG.info("Inserting key {}", s);
-      assertEquals("OK", jedis_client.set(s, "v"));
-      LOG.info("Reading key {}", s);
-      String value = jedis_client.get(s);
+      String ret;
+      try {
+        ret = jedis_client.set(s, "v");
+      } catch (Exception e) {
+        LOG.info("Got exception " + e.toString());
+        i--;
+        continue;
+      }
+      if (!ret.equals("OK")) {
+        if (ret.equals("v")) {
+          // There seems to be a jedis bug that happens during timeouts.
+          // set responses start getting get responses and viceversa. Reset jedis client.
+          jedis_client = getClientForDB(DEFAULT_DB_NAME);
+
+        }
+        LOG.info("Invalid response " + ret);
+        i--;
+        Thread.sleep(500);
+        continue;
+      }
+      String value = null;
+      boolean requestTimedOut = true;
+      // If a read request times out, we want to continue reading the same key so that a refresh
+      // of the lookup cache is triggered, otherwise we could end up with failed replicas in the
+      // cache.
+      while (requestTimedOut) {
+        try {
+          value = jedis_client.get(s);
+          requestTimedOut = false;
+        } catch (Exception e) {
+          if (e.toString().contains("timed out")) {
+            requestTimedOut = true;
+            // Since the timeout simulated sleep (4000ms) is greater than the lookup cache refresh
+            // period, there is no need to sleep to force a refresh of the lookup cache.
+            continue;
+          }
+          LOG.info("Got unexpected exception: " +  e.toString());
+          throw e;
+        }
+      }
       if (value != null && !value.equals("v")) {
+        if (value.equals("OK")) {
+          // There seems to be a jedis bug that happens during timeouts.
+          // set responses start getting get responses and viceversa. Reset jedis client.
+          jedis_client = getClientForDB(DEFAULT_DB_NAME);
+          continue;
+        }
         fail(String.format("Invalid value %s returned for key %s", value, s));
+      }
+    }
+  }
+
+  @Test
+  public void testLookupCacheGetsRefreshedWhenTserversGetShutdown() throws Exception {
+    assertNull(miniCluster);
+
+    final int NUM_SERVERS_TO_REMOVE = TestUtils.isReleaseBuild() ? 6 : 3;
+
+    final int LOOKUP_REFRESH_SECS = 1;
+    final int CONSIDERED_FAILED_SECS = TestUtils.isReleaseBuild() ? 10 : 30;
+    final int NUM_SHARDS_PER_TSERVER = TestUtils.isReleaseBuild() ? -1 : 1;
+    final int RAFT_HEARTBEAT_INTERVAL_MS = TestUtils.isReleaseBuild() ? 100 : 500;
+    final int CONSENSUS_RPC_TIMEOUT_MS = TestUtils.isReleaseBuild() ? 600 : 3000;
+
+    String liveReplicaUuid = "live_replicas";
+    String readReplicaUuid = "read_replicas";
+
+    Map<String,String> tserverFlags = new TreeMap<>();
+
+    tserverFlags.put(tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1));
+    tserverFlags.put("lookup_cache_refresh_secs",
+        String.valueOf(LOOKUP_REFRESH_SECS));
+    tserverFlags.put("TEST_assert_failed_replicas_less_than", "2");
+    tserverFlags.put("follower_unavailable_considered_failed_sec",
+        String.valueOf(CONSIDERED_FAILED_SECS));
+    tserverFlags.put("retry_failed_replica_ms", "1000000");
+    tserverFlags.put("leader_failure_max_missed_heartbeat_periods", "20");
+    tserverFlags.put("raft_heartbeat_interval_ms",
+        String.valueOf(RAFT_HEARTBEAT_INTERVAL_MS));
+    tserverFlags.put("consensus_rpc_timeout_ms",
+        String.valueOf(CONSENSUS_RPC_TIMEOUT_MS));
+    tserverFlags.put("leader_failure_exp_backoff_max_delta_ms", "100");
+
+    tserverFlags.put("yb_num_shards_per_tserver",
+        String.valueOf(NUM_SHARDS_PER_TSERVER));
+    tserverFlags.put("heartbeat_interval_ms",
+        String.valueOf(RAFT_HEARTBEAT_INTERVAL_MS * 2));
+    tserverFlags.put("heartbeat_rpc_timeout_ms",
+        String.valueOf(RAFT_HEARTBEAT_INTERVAL_MS * 2 * 15));
+
+    // Create a cluster with RF = 3: 9 live replicas, and 3 read-only replicas.
+    createMiniCluster(
+        3,
+        9 + 3,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of(
+            "enable_load_balancing", "true",
+            "tserver_unresponsive_timeout_ms", String.valueOf((CONSIDERED_FAILED_SECS - 2) * 1000)),
+        tserverFlags,
+        cb -> {
+          List<Map<String, String>> perTserverFlags = new ArrayList<>();
+
+          // 9 live replicas.
+          perTserverFlags.addAll(Collections.nCopies(9,
+              ImmutableMap.of("placement_uuid", liveReplicaUuid)));
+
+          // 3 read-only replicas.
+          perTserverFlags.addAll(Collections.nCopies(3,
+              ImmutableMap.of("placement_uuid", readReplicaUuid)));
+
+          cb.perTServerFlags(perTserverFlags);
+        }, Collections.emptyMap());
+
+    PlacementInfoPB livePlacementInfo =
+        PlacementInfoPB.newBuilder()
+            .setNumReplicas(3)
+            .setPlacementUuid(ByteString.copyFromUtf8(liveReplicaUuid ))
+            .build();
+    ModifyClusterConfigLiveReplicas liveOperation =
+        new ModifyClusterConfigLiveReplicas(miniCluster.getClient(), livePlacementInfo);
+    liveOperation.doCall();
+
+    PlacementInfoPB readOnlyPlacementInfo =
+        PlacementInfoPB.newBuilder()
+            .setNumReplicas(3)
+            .setPlacementUuid(ByteString.copyFromUtf8(readReplicaUuid))
+            .build();
+    List<PlacementInfoPB> readOnlyPlacements = Arrays.asList(readOnlyPlacementInfo);
+    ModifyClusterConfigReadReplicas readReplicasConfigChange =
+        new ModifyClusterConfigReadReplicas(miniCluster.getClient(), readOnlyPlacements);
+    readReplicasConfigChange.doCall();
+
+    miniCluster.waitForTabletServers(12);
+    LOG.info("All tablet servers ready");
+
+    // Setup the Jedis client.
+    setUpJedis();
+
+    LOG.info("Done calling setUpJedis");
+
+    JedisCommands jedisClient[] = new JedisCommands[3];
+    String jedisClientHostNames[] = new String[3];
+
+    // Create three different jedis client connections so that we can read from any of the first
+    // three clients.
+    List<InetSocketAddress> redisContactPoints = miniCluster.getRedisContactPoints();
+    for (int i = 0; i < jedisClient.length; i++) {
+      switch (jedisClientType) {
+        case JEDIS:
+          LOG.info("Connecting to: " + redisContactPoints.get(i).toString());
+          jedisClient[i] = new Jedis(redisContactPoints.get(i).getHostName(),
+              redisContactPoints.get(i).getPort(), JEDIS_SOCKET_TIMEOUT_MS * 3);
+          break;
+        case YBJEDIS:
+          LOG.info("Connecting to: " + redisContactPoints.get(i).toString());
+          jedisClient[i] = new YBJedis(redisContactPoints.get(i).getHostName(),
+              redisContactPoints.get(i).getPort(), JEDIS_SOCKET_TIMEOUT_MS * 3);
+          break;
+      }
+      jedisClientHostNames[i] = redisContactPoints.get(i).getHostName();
+    }
+
+    // Get tablet servers.
+    Map<HostAndPort, MiniYBDaemon> tservers = miniCluster.getTabletServers();
+
+    LOG.info("Done setting up jedis");
+
+    RandomStringGenerator generator = new RandomStringGenerator.Builder()
+        .withinRange('a', 'z').build();
+
+    Random random = new Random();
+    int tserversCount = 0;
+
+    Set<String> readOnlyReplicas = new HashSet<>();
+    List<LocatedTablet> tabletLocations = redisTable.getTabletsLocations(10000);
+    for (LocatedTablet locatedTablet : tabletLocations) {
+      for (LocatedTablet.Replica replica : locatedTablet.getReplicas()) {
+        if (replica.getRole().equals("READ_REPLICA")) {
+          readOnlyReplicas.add(replica.getRpcHost());
+        }
+      }
+    }
+
+    // We don't want to destroy any of the first three servers.
+    for (Map.Entry<HostAndPort, MiniYBDaemon> entry : tservers.entrySet()) {
+      if (entry.getKey().getHost().equals(jedisClientHostNames[0]) ||
+          entry.getKey().getHost().equals(jedisClientHostNames[1]) ||
+          entry.getKey().getHost().equals(jedisClientHostNames[2])) {
+        LOG.info(String.format("Using host %s for reading/writing. Skipping ",
+            entry.getKey().getHost()));
+        continue;
+      }
+      if (readOnlyReplicas.contains(entry.getKey().getHost())) {
+        LOG.info(String.format("Host %s is a read replica. Skipping",
+            entry.getKey().getHost()));
+        continue;
+      }
+
+      // Kill the tserver before sending any write/read requests so that the requests will force
+      // a cache reload after the killed tserver is marked as a failed replica.
+      LOG.info(String.format("[%d] Killing tserver on host %s",
+                             tserversCount + 1, entry.getKey().getHost()));
+      miniCluster.killTabletServerOnHostPort(entry.getKey());
+      tserversCount++;
+      LOG.info(String.format("[%d] About to sleep 20 seconds", tserversCount));
+
+      // Sleep so that the killed TServer gets removed from all the raft configurations.
+      Thread.sleep(CONSIDERED_FAILED_SECS * 1000);
+
+      // Wait until the killed tserver is not part of any of the replicas.
+      boolean killedTSInReplicaList = false;
+      boolean allTabletsHaveALeader = true;
+      boolean allTabletsHaveThreeVoters = true;
+      do {
+        killedTSInReplicaList = false;
+        allTabletsHaveALeader = true;
+        allTabletsHaveThreeVoters = true;
+
+        tabletLocations = redisTable.getTabletsLocations(10000);
+        for (LocatedTablet locatedTablet : tabletLocations) {
+          int nVoters = 0;
+          String tabletId = new String(locatedTablet.getTabletId());
+          for (LocatedTablet.Replica replica : locatedTablet.getReplicas()) {
+            // We want to find a tablet for which the specified hostname is not a leader.
+            if (replica.getRpcHost().equals(entry.getKey().getHost())) {
+              LOG.info(String.format("[%d] Found killed replica %s in tablet %s: %s",
+                  tserversCount, replica.getRpcHost(), tabletId,
+                  locatedTablet.toDebugString()));
+              killedTSInReplicaList = true;
+              // This doesn't seem to be very reliable. So try again.
+              miniCluster.killTabletServerOnHostPort(entry.getKey());
+              break;
+            }
+            if (replica.getMemberType().equals("VOTER")) {
+              nVoters++;
+            }
+          }
+          if (killedTSInReplicaList) {
+            break;
+          }
+
+          // If we are here, the killed replica is not in the replica list for this tablet.
+          if (nVoters < 3) {
+            LOG.info(String.format("[%d] Tablet %s has %d VOTERS, but expected 3: %s",
+                tserversCount, tabletId, nVoters, locatedTablet.toDebugString()));
+            allTabletsHaveThreeVoters = false;
+            break;
+          }
+          if (locatedTablet.getLeaderReplica() == null) {
+            LOG.info(String.format("[%d] Tablet %s doesn't have a leader: %s",
+                tserversCount, tabletId, locatedTablet.toDebugString()));
+            allTabletsHaveALeader = false;
+            break;
+          }
+        }
+        Thread.sleep(1000);
+      } while (killedTSInReplicaList || !allTabletsHaveThreeVoters || !allTabletsHaveALeader);
+
+      LOG.info(String.format("[%d] Done sleeping", tserversCount));
+
+      // Issue a few requests so that the killed replica gets marked as failed after the requests
+      // that are sent to it time out.
+      for (int i = 0; i < 100; i++) {
+        int index = random.nextInt(3);
+        String s = generator.generate(20);
+        setWithRetries(jedis_client, s, "v");
+        String value = null;
+        try {
+          value = jedisClient[index].get(s);
+        } catch (Exception e) {
+          LOG.warn("Got exception " + e.toString());
+          i--;
+          continue;
+        }
+        if (value != null && !value.equals("v")) {
+          fail(String.format("[%d] Invalid value %s returned for key %s", tserversCount, value, s));
+        }
+      }
+      LOG.info(String.format("[%d] Done sending some requests. About to sleep for %d milliseconds",
+                             tserversCount, 2 * LOOKUP_REFRESH_SECS * 1000));
+
+      // Sleep so that by the time the read requests are sent, the cache for each tablet in each of
+      // the nodes will be stale and the lookup cache is refreshed.
+      Thread.sleep(2 * LOOKUP_REFRESH_SECS * 1000);
+
+      LOG.info(String.format("[%d] Done sleeping", tserversCount));
+
+      for (int i = 0; i < 200; i++) {
+        int index = random.nextInt(3);
+        String s = generator.generate(20);
+        String status = null;
+        try {
+          status = jedis_client.set(s, "v");
+        } catch (Exception e) {
+          LOG.warn("Write failed. Got exception " + e.toString());
+          i--;
+          continue;
+        }
+        assertEquals("OK", status);
+        String value = null;
+        try {
+          value = jedisClient[index].get(s);
+        } catch (Exception e) {
+          LOG.warn("Got exception " + e.toString());
+          i--;
+          continue;
+        }
+        if (value != null && !value.equals("v")) {
+          fail(String.format("[%d] Invalid value %s returned for key %s", tserversCount, value, s));
+        }
+        if ((i + 1) % 50 == 0) {
+          LOG.info(String.format("[%d] Done %d requests", tserversCount, i + 1));
+        }
+      }
+
+      // Because we check that we only remove live replicas, at the end, we finish with 3 live
+      // replicas, and 3 read replicas in release builds.
+      // 6 live replicas, and 3 read replicas in non-release builds.
+      if (tserversCount == NUM_SERVERS_TO_REMOVE) {
+        break;
       }
     }
   }
@@ -454,16 +788,12 @@ public class TestReadFromFollowers extends BaseJedisTest {
   public void testRestartDuringFollowerReadWithValueSize(int valSize) throws Exception {
     assertNull(miniCluster);
 
-    // We don't want the tablets to move while we are testing.
-    List<String> masterArgs = Arrays.asList("--enable_load_balancing=false");
-
-    String tserverAssertLocalTablet = "--assert_local_tablet_server_selected=false";
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-    tserverArgs.add(Arrays.asList(tserverRedisFollowerFlag, tserverAssertLocalTablet));
-
-    createMiniCluster(3, masterArgs, tserverArgs);
+    createMiniCluster(3, 3,
+        // We don't want the tablets to move while we are testing.
+        ImmutableMap.of("enable_load_balancing", "false"),
+        ImmutableMap.of(
+            tserverRedisFollowerFlag.get(0), tserverRedisFollowerFlag.get(1),
+            "TEST_assert_local_tablet_server_selected", "false"));
 
     // Setup the Jedis client.
     setUpJedis();

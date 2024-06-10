@@ -30,7 +30,7 @@
 // under the License.
 //
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/thread.h"
 #include "yb/util/threadlocal.h"
@@ -65,6 +65,10 @@ bool ThreadRestrictions::SetIOAllowed(bool allowed) {
   bool previous_allowed = LoadTLS()->io_allowed;
   LoadTLS()->io_allowed = allowed;
   return previous_allowed;
+}
+
+bool ThreadRestrictions::IsIOAllowed() {
+  return LoadTLS()->io_allowed;
 }
 
 void ThreadRestrictions::AssertIOAllowed() {

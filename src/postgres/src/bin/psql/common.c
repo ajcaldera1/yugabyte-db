@@ -29,6 +29,8 @@
 #include "fe_utils/mbprint.h"
 
 
+#define PQmblenBounded(s, e)  strnlen(s, PQmblen(s, e))
+
 static bool DescribeQuery(const char *query, double *elapsed_msec);
 static bool ExecQueryUsingCursor(const char *query, double *elapsed_msec);
 static bool command_no_begin(const char *query);
@@ -226,7 +228,7 @@ psql_error(const char *fmt,...)
 	if (pset.queryFout && pset.queryFout != stdout)
 		fflush(pset.queryFout);
 
-	if (pset.inputfile)
+	if (pset.inputfile && !GetVariable(pset.vars, "YB_DISABLE_ERROR_PREFIX"))
 		fprintf(stderr, "%s:%s:" UINT64_FORMAT ": ", pset.progname, pset.inputfile, pset.lineno);
 	va_start(ap, fmt);
 	vfprintf(stderr, _(fmt), ap);
@@ -927,6 +929,17 @@ StoreQueryTuple(const PGresult *result)
 
 			/* concatenate prefix and column name */
 			varname = psprintf("%s%s", pset.gset_prefix, colname);
+
+			if (VariableHasHook(pset.vars, varname))
+			{
+				/* YB: the following code is commented out since we don't have pg_log_warning macro.
+				 * Porting over pg_log_warning would require other commits which can be done later.
+
+				pg_log_warning("attempt to \\gset into specially treated variable \"%s\" ignored",
+								varname);
+				*/
+				continue;
+			}
 
 			if (!PQgetisnull(result, 0, i))
 				value = PQgetvalue(result, 0, i);
@@ -1980,7 +1993,7 @@ skip_white_space(const char *query)
 
 	while (*query)
 	{
-		int			mblen = PQmblen(query, pset.encoding);
+		int			mblen = PQmblenBounded(query, pset.encoding);
 
 		/*
 		 * Note: we assume the encoding is a superset of ASCII, so that for
@@ -2017,7 +2030,7 @@ skip_white_space(const char *query)
 					query++;
 					break;
 				}
-				query += PQmblen(query, pset.encoding);
+				query += PQmblenBounded(query, pset.encoding);
 			}
 		}
 		else if (cnestlevel > 0)
@@ -2052,7 +2065,7 @@ command_no_begin(const char *query)
 	 */
 	wordlen = 0;
 	while (isalpha((unsigned char) query[wordlen]))
-		wordlen += PQmblen(&query[wordlen], pset.encoding);
+		wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 	/*
 	 * Transaction control commands.  These should include every keyword that
@@ -2083,7 +2096,7 @@ command_no_begin(const char *query)
 
 		wordlen = 0;
 		while (isalpha((unsigned char) query[wordlen]))
-			wordlen += PQmblen(&query[wordlen], pset.encoding);
+			wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 		if (wordlen == 11 && pg_strncasecmp(query, "transaction", 11) == 0)
 			return true;
@@ -2117,7 +2130,7 @@ command_no_begin(const char *query)
 
 		wordlen = 0;
 		while (isalpha((unsigned char) query[wordlen]))
-			wordlen += PQmblen(&query[wordlen], pset.encoding);
+			wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 		if (wordlen == 8 && pg_strncasecmp(query, "database", 8) == 0)
 			return true;
@@ -2133,7 +2146,7 @@ command_no_begin(const char *query)
 
 			wordlen = 0;
 			while (isalpha((unsigned char) query[wordlen]))
-				wordlen += PQmblen(&query[wordlen], pset.encoding);
+				wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 		}
 
 		if (wordlen == 5 && pg_strncasecmp(query, "index", 5) == 0)
@@ -2144,7 +2157,7 @@ command_no_begin(const char *query)
 
 			wordlen = 0;
 			while (isalpha((unsigned char) query[wordlen]))
-				wordlen += PQmblen(&query[wordlen], pset.encoding);
+				wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 			if (wordlen == 12 && pg_strncasecmp(query, "concurrently", 12) == 0)
 				return true;
@@ -2161,7 +2174,7 @@ command_no_begin(const char *query)
 
 		wordlen = 0;
 		while (isalpha((unsigned char) query[wordlen]))
-			wordlen += PQmblen(&query[wordlen], pset.encoding);
+			wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 		/* ALTER SYSTEM isn't allowed in xacts */
 		if (wordlen == 6 && pg_strncasecmp(query, "system", 6) == 0)
@@ -2184,7 +2197,7 @@ command_no_begin(const char *query)
 
 		wordlen = 0;
 		while (isalpha((unsigned char) query[wordlen]))
-			wordlen += PQmblen(&query[wordlen], pset.encoding);
+			wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 		if (wordlen == 8 && pg_strncasecmp(query, "database", 8) == 0)
 			return true;
@@ -2202,7 +2215,7 @@ command_no_begin(const char *query)
 
 			wordlen = 0;
 			while (isalpha((unsigned char) query[wordlen]))
-				wordlen += PQmblen(&query[wordlen], pset.encoding);
+				wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 			if (wordlen == 12 && pg_strncasecmp(query, "concurrently", 12) == 0)
 				return true;
@@ -2222,7 +2235,7 @@ command_no_begin(const char *query)
 
 		wordlen = 0;
 		while (isalpha((unsigned char) query[wordlen]))
-			wordlen += PQmblen(&query[wordlen], pset.encoding);
+			wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 		if (wordlen == 3 && pg_strncasecmp(query, "all", 3) == 0)
 			return true;
@@ -2258,7 +2271,7 @@ is_select_command(const char *query)
 	 */
 	wordlen = 0;
 	while (isalpha((unsigned char) query[wordlen]))
-		wordlen += PQmblen(&query[wordlen], pset.encoding);
+		wordlen += PQmblenBounded(&query[wordlen], pset.encoding);
 
 	if (wordlen == 6 && pg_strncasecmp(query, "select", 6) == 0)
 		return true;

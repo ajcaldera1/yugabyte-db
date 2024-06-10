@@ -17,9 +17,10 @@
 #ifndef MEMUTILS_H
 #define MEMUTILS_H
 
+#include "c.h"
 #include "nodes/memnodes.h"
 
-#include "yb/util/ybc_util.h"
+#include "yb/yql/pggate/util/ybc_util.h"
 
 /*
  * MaxAllocSize, MaxAllocHugeSize
@@ -84,7 +85,9 @@ extern Size GetMemoryChunkSpace(void *pointer);
 extern MemoryContext MemoryContextGetParent(MemoryContext context);
 extern bool MemoryContextIsEmpty(MemoryContext context);
 extern void MemoryContextStats(MemoryContext context);
-extern void MemoryContextStatsDetail(MemoryContext context, int max_children);
+extern void MemoryContextStatsDetail(MemoryContext context, int max_children,
+									 bool print_to_stderr);
+extern int64 MemoryContextStatsUsage(MemoryContext context, int max_children);
 extern void MemoryContextAllowInCriticalSection(MemoryContext context,
 									bool allow);
 
@@ -147,6 +150,8 @@ extern void MemoryContextCreate(MemoryContext node,
 					MemoryContext parent,
 					const char *name);
 
+extern void HandleLogMemoryContextInterrupt(void);
+extern void ProcessLogMemoryContextInterrupt(void);
 
 /*
  * Memory-context-type-specific functions
@@ -212,7 +217,6 @@ extern MemoryContext GenerationContextCreate(MemoryContext parent,
 #define ALLOCSET_START_SMALL_SIZES \
 	ALLOCSET_SMALL_MINSIZE, ALLOCSET_SMALL_INITSIZE, ALLOCSET_DEFAULT_MAXSIZE
 
-
 /*
  * Threshold above which a request in an AllocSet context is certain to be
  * allocated separately (and thereby have constant allocation overhead).
@@ -223,5 +227,69 @@ extern MemoryContext GenerationContextCreate(MemoryContext parent,
 
 #define SLAB_DEFAULT_BLOCK_SIZE		(8 * 1024)
 #define SLAB_LARGE_BLOCK_SIZE		(8 * 1024 * 1024)
+
+/*
+ * Tracking memory consumption for both PG backend and pggate tcmalloc acutal
+ * heap consumption.
+ * Global accessible in one PG backend process.
+ */
+typedef struct YbPgMemTracker
+{
+	/*
+	 * Current, at time of cutting Snapshot(), memory in bytes allocated by PG
+	 * (pggate is not included in this field)
+	 */
+	Size pg_cur_mem_bytes;
+	/*
+	 * The current allocated memory including PG, pggate and cached memory.
+	 */
+	int64_t backend_cur_allocated_mem_bytes;
+	/*
+	 * The maximum memory ever allocated by current statement including PG and
+	 * pggate
+	 */
+	Size stmt_max_mem_bytes;
+	/*
+	 * The initial base memory already allocated by PG and paggate at the
+	 * beginning of current statement
+	 */
+	Size stmt_max_mem_base_bytes;
+
+	/*
+	 * A flag to tell if pggate is inititated. This is used to track the memory
+	 * used by PG before pggate is started.
+	 * Note: the design here is that this flag is a "link" to MemTracker in the
+	 * pggate. It pushes down fundamental memory work to it, while this layer
+	 * stays as light as possible in PG.
+	 */
+	bool pggate_alive;
+} YbPgMemTracker;
+
+extern YbPgMemTracker PgMemTracker;
+
+/*
+ * Add memory consumption to PgMemTracker in bytes.
+ * sz can be negative. In this case, the max values are not
+ * updated.
+ */
+extern void YbPgMemAddConsumption(const Size sz);
+
+/*
+ * Substract the sz bytes from PgMemTracker. It doesn't update the maximum
+ * values for the backend and stmt.
+ */
+extern void YbPgMemSubConsumption(const Size sz);
+
+/*
+ * Reset the PgMemTracker's stmt fields and make it ready to
+ * track peak memory usage for a new statement.
+ */
+extern void YbPgMemResetStmtConsumption();
+
+/*
+ * Returns the resident set size (physical memory use) of a process
+ * measured in bytes, or -1 if the value cannot be determined on this OS.
+ */
+extern int64_t YbPgGetCurRSSMemUsage(int pid);
 
 #endif							/* MEMUTILS_H */

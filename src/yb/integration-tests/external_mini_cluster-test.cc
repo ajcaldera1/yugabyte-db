@@ -30,12 +30,17 @@
 // under the License.
 //
 
-#include "yb/integration-tests/external_mini_cluster.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
+
+#include "yb/integration-tests/external_mini_cluster.h"
+
 #include "yb/util/metrics.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
 #include "yb/util/test_util.h"
+
+using std::string;
 
 METRIC_DECLARE_entity(server);
 METRIC_DECLARE_gauge_uint64(threads_running);
@@ -62,7 +67,7 @@ TEST_F(EMCTest, TestBasicOperation) {
   ASSERT_OK(cluster.Start());
 
   // Verify each of the masters.
-  for (int i = 0; i < opts.num_masters; i++) {
+  for (size_t i = 0; i < opts.num_masters; i++) {
     SCOPED_TRACE(i);
     ExternalMaster* master = CHECK_NOTNULL(cluster.master(i));
     HostPort master_rpc = master->bound_rpc_hostport();
@@ -72,18 +77,17 @@ TEST_F(EMCTest, TestBasicOperation) {
     EXPECT_TRUE(HasPrefixString(master_http.ToString(), "127.0.0.1:")) << master_http.ToString();
 
     // Retrieve a thread metric, which should always be present on any master.
-    int64_t value = 0;
-    ASSERT_OK(master->GetInt64Metric(&METRIC_ENTITY_server,
-                                     "yb.master",
-                                     &METRIC_threads_running,
-                                     "value",
-                                     &value));
+    int64_t value = ASSERT_RESULT(master->GetMetric<int64>(
+        &METRIC_ENTITY_server,
+        "yb.master",
+        &METRIC_threads_running,
+        "value"));
     LOG(INFO) << "Master " << i << ": " << METRIC_threads_running.name() << '=' << value;
     EXPECT_GT(value, 0);
   }
 
   // Verify each of the tablet servers.
-  for (int i = 0; i < opts.num_tablet_servers; i++) {
+  for (size_t i = 0; i < opts.num_tablet_servers; i++) {
     SCOPED_TRACE(i);
     const ExternalTabletServer* const ts = CHECK_NOTNULL(cluster.tablet_server(i));
     const HostPort ts_rpc = ts->bound_rpc_hostport();
@@ -99,12 +103,8 @@ TEST_F(EMCTest, TestBasicOperation) {
     EXPECT_TRUE(HasPrefixString(ts_http.ToString(), expected_prefix)) << ts_http.ToString();
 
     // Retrieve a thread metric, which should always be present on any TS.
-    int64_t value = 0;
-    ASSERT_OK(ts->GetInt64Metric(&METRIC_ENTITY_server,
-                                 "yb.tabletserver",
-                                 &METRIC_threads_running,
-                                 "value",
-                                 &value));
+    int64_t value = ASSERT_RESULT(ts->GetMetric<int64>(
+        &METRIC_ENTITY_server, "yb.tabletserver", &METRIC_threads_running, "value"));
     LOG(INFO) << "TServer " << i << ": " << METRIC_threads_running.name() << '=' << value;
     EXPECT_GT(value, 0);
   }
@@ -148,6 +148,43 @@ TEST_F(EMCTest, TestUniquePorts) {
       FAIL() << "port: " << port << " already allocated.";
     }
   }
+}
+
+TEST_F(EMCTest, TestYSQLShutdown) {
+  ExternalMiniClusterOptions opts;
+  opts.num_masters = master_peer_ports_.size();
+  opts.num_tablet_servers = 3;
+  opts.master_rpc_ports = master_peer_ports_;
+  opts.enable_ysql = true;
+
+  ExternalMiniCluster cluster(opts);
+  ASSERT_OK(cluster.Start());
+
+  cluster.Shutdown();
+  for (const auto& server : cluster.daemons()) {
+    if (server) {
+      ASSERT_FALSE(server->WasUnsafeShutdown());
+    }
+  }
+}
+
+TEST_F(EMCTest, TestCallHomeCrash) {
+  ExternalMiniClusterOptions opts;
+  opts.num_masters = 1;
+  opts.num_tablet_servers = 1;
+  for (auto* server_flags : {&opts.extra_master_flags, &opts.extra_tserver_flags}) {
+    server_flags->push_back("--callhome_interval_secs=1");
+    server_flags->push_back("--callhome_url=dummy_url");
+    server_flags->push_back("--callhome_enabled=true");
+    server_flags->push_back("--TEST_callhome_destructor_sleep_ms=10000");
+  }
+
+  ExternalMiniCluster cluster(opts);
+  ASSERT_OK(cluster.Start());
+
+  // Require exit code 0 from Shutdown to assert that we did not crash.
+  ASSERT_NO_FATALS(cluster.Shutdown(
+      ExternalMiniCluster::NodeSelectionMode::ALL, RequireExitCode0::kTrue));
 }
 
 } // namespace yb

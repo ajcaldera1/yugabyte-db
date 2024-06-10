@@ -47,9 +47,11 @@
  * This file is a Win32-specific part of spinlock_internal.cc
  */
 
+#pragma once
 
 #include <windows.h>
 
+namespace yb {
 namespace base {
 namespace internal {
 
@@ -67,3 +69,4 @@ void SpinLockWake(volatile Atomic32 *w, bool all) {
 
 } // namespace internal
 } // namespace base
+} // namespace yb

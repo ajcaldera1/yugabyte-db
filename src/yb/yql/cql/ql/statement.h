@@ -15,14 +15,11 @@
 // This class represents a SQL statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_STATEMENT_H_
-#define YB_YQL_CQL_QL_STATEMENT_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/parse_tree.h"
 #include "yb/yql/cql/ql/util/statement_params.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
-
-#include "yb/common/ql_value.h"
 
 #include "yb/util/monotime.h"
 
@@ -46,12 +43,12 @@ class Statement {
   const std::string& text() const { return text_; }
 
   // Prepare the statement for execution. Optionally return prepared result if requested.
-  CHECKED_STATUS Prepare(QLProcessor *processor, const MemTrackerPtr& mem_tracker = nullptr,
-                         const bool internal = false, PreparedResult::UniPtr *result = nullptr);
+  Status Prepare(QLProcessor *processor, const MemTrackerPtr& mem_tracker = nullptr,
+                 const bool internal = false, PreparedResult::UniPtr *result = nullptr);
 
   // Execute the prepared statement.
-  CHECKED_STATUS ExecuteAsync(QLProcessor* processor, const StatementParameters& params,
-                              StatementExecutedCallback cb) const;
+  Status ExecuteAsync(QLProcessor* processor, const StatementParameters& params,
+                      StatementExecutedCallback cb) const;
 
   // Validate and return the parse tree.
   Result<const ParseTree&> GetParseTree() const;
@@ -69,6 +66,10 @@ class Statement {
   // Clear the reparsed status.
   void clear_reparsed() const {
     parse_tree_->clear_reparsed();
+  }
+
+  size_t DynamicMemoryUsage() const {
+    return sizeof(*this) + keyspace_.size() + text_.size();
   }
 
  protected:
@@ -91,5 +92,3 @@ class Statement {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_STATEMENT_H_

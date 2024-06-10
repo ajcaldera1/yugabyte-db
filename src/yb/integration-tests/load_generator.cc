@@ -14,88 +14,70 @@
 #include "yb/integration-tests/load_generator.h"
 
 #include <memory>
-#include <queue>
 #include <random>
 #include <thread>
 
-#include <gflags/gflags_declare.h>
+#include <boost/range/iterator_range.hpp>
 
 #include "yb/client/client.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
 
 #include "yb/common/common.pb.h"
-#include "yb/common/partial_row.h"
-#include "yb/gutil/strings/join.h"
+#include "yb/dockv/partial_row.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
 
-#include "yb/yql/redis/redisserver/redis_client.h"
-
 #include "yb/util/atomic.h"
-#include "yb/util/env.h"
-#include "yb/util/flags.h"
-#include "yb/util/logging.h"
+#include "yb/util/debug/leakcheck_disabler.h"
 #include "yb/util/net/sockaddr.h"
-#include "yb/util/stopwatch.h"
-#include "yb/util/subprocess.h"
-#include "yb/util/threadlocal.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+
+#include "yb/yql/redis/redisserver/redis_client.h"
+#include "yb/util/flags.h"
 
 using namespace std::literals;
 
 using std::atomic;
-using std::atomic_bool;
 using std::unique_ptr;
 
 using strings::Substitute;
 
 using std::shared_ptr;
-using yb::Status;
-using yb::ThreadPool;
-using yb::ThreadPoolBuilder;
-using yb::MonoDelta;
-using yb::MemoryOrder;
-using yb::ConditionVariable;
-using yb::Mutex;
-using yb::MutexLock;
-using yb::CountDownLatch;
-using yb::Slice;
-using yb::YBPartialRow;
-using yb::TableType;
+using std::string;
+using std::set;
+using std::ostream;
+using std::vector;
 
-using yb::client::YBClient;
-using yb::client::YBError;
 using yb::client::YBNoOp;
 using yb::client::YBSession;
-using yb::client::YBTable;
-using yb::client::YBValue;
 using yb::redisserver::RedisReply;
 
-DEFINE_bool(load_gen_verbose,
+DEFINE_NON_RUNTIME_bool(load_gen_verbose,
             false,
             "Custom verbose log messages for debugging the load test tool");
 
-DEFINE_int32(load_gen_insertion_tracker_delay_ms,
+DEFINE_NON_RUNTIME_int32(load_gen_insertion_tracker_delay_ms,
              50,
              "The interval (ms) at which the load generator's \"insertion tracker thread\" "
              "wakes in up ");
 
-DEFINE_int32(load_gen_scanner_open_retries,
+DEFINE_NON_RUNTIME_int32(load_gen_scanner_open_retries,
              10,
              "Number of times to re-try when opening a scanner");
 
-DEFINE_int32(load_gen_wait_time_increment_step_ms,
+DEFINE_NON_RUNTIME_int32(load_gen_wait_time_increment_step_ms,
              100,
              "In retry loops used in the load test we increment the wait time by this number of "
              "milliseconds after every attempt.");
 
 namespace {
-
-void ConfigureYBSession(YBSession* session) {
-  session->SetTimeout(60s);
-}
 
 string FormatWithSize(const string& s) {
   return strings::Substitute("'$0' ($1 bytes)", s, s.size());
@@ -112,7 +94,7 @@ string FormatHexForLoadTestKey(uint64_t x) {
   return buf;
 }
 
-int KeyIndexSet::NumElements() const {
+size_t KeyIndexSet::NumElements() const {
   MutexLock l(mutex_);
   return set_.size();
 }
@@ -142,7 +124,7 @@ int64_t KeyIndexSet::GetRandomKey(std::mt19937_64* random_number_generator) cons
   MutexLock l(mutex_);
   // The set iterator does not support indexing, so we probabilistically choose a random element
   // by iterating the set.
-  int n = set_.size();
+  size_t n = set_.size();
   for (int64_t x : set_) {
     if ((*random_number_generator)() % n == 0) return x;
     --n;  // Decrement the number of remaining elements we are considering.
@@ -210,7 +192,7 @@ SingleThreadedWriter* RedisNoopSessionFactory::GetWriter(MultiThreadedWriter* wr
 
 MultiThreadedAction::MultiThreadedAction(
     const string& description, int64_t num_keys, int64_t start_key, int num_action_threads,
-    int num_extra_threads, const string& client_id, atomic_bool* stop_requested_flag,
+    int num_extra_threads, const string& client_id, atomic<bool>* stop_requested_flag,
     int value_size)
     : description_(description),
       num_keys_(num_keys),
@@ -237,6 +219,7 @@ string MultiThreadedAction::GetKeyByIndex(int64_t key_index) {
 
 // Creates a human-readable string with hex characters to be used as a value in our test. This is
 // deterministic based on key_index.
+DISABLE_UBSAN
 string MultiThreadedAction::GetValueByIndex(int64_t key_index) {
   string value;
   int64_t x = key_index;
@@ -268,7 +251,7 @@ void MultiThreadedAction::WaitForCompletion() {
 
 MultiThreadedWriter::MultiThreadedWriter(
     int64_t num_keys, int64_t start_key, int num_writer_threads, SessionFactory* session_factory,
-    atomic_bool* stop_flag, int value_size, int max_num_write_errors)
+    atomic<bool>* stop_flag, int value_size, size_t max_num_write_errors)
     : MultiThreadedAction(
           "writers", num_keys, start_key, num_writer_threads, 2, session_factory->ClientId(),
           stop_flag, value_size),
@@ -397,8 +380,7 @@ bool RedisNoopSingleThreadedWriter::Write(
 }
 
 void YBSingleThreadedWriter::ConfigureSession() {
-  session_ = client_->NewSession();
-  ConfigureYBSession(session_.get());
+  session_ = client_->NewSession(60s);
 }
 
 bool YBSingleThreadedWriter::Write(
@@ -409,16 +391,11 @@ bool YBSingleThreadedWriter::Write(
   table_->AddStringColumnValue(insert->mutable_request(), "v", value_str);
   // submit a the put to apply.
   // If successful, add to inserted
-  Status apply_status = session_->Apply(insert);
-  if (!apply_status.ok()) {
-    LOG(WARNING) << "Error inserting key '" << key_str << "': "
-                 << "Apply() failed"
-                 << " (" << apply_status.ToString() << ")";
-    return false;
-  }
-  Status flush_status = session_->Flush();
-  if (!flush_status.ok()) {
-    for (const auto& error : session_->GetPendingErrors()) {
+  session_->Apply(insert);
+  const auto flush_status = session_->TEST_FlushAndGetOpsErrors();
+  const auto& status = flush_status.status;
+  if (!status.ok()) {
+    for (const auto& error : flush_status.errors) {
       // It means that key was actually written successfully, but our retry failed because
       // it was detected as duplicate request.
       if (error->status().IsAlreadyPresent()) {
@@ -428,7 +405,7 @@ bool YBSingleThreadedWriter::Write(
     }
 
     LOG(WARNING) << "Error inserting key '" << key_str << "': "
-                 << "Flush() failed (" << flush_status << ")";
+                 << "Flush() failed (" << status << ")";
     return false;
   }
   if (insert->response().status() != QLResponsePB::YQL_STATUS_OK) {
@@ -445,11 +422,7 @@ bool YBSingleThreadedWriter::Write(
 }
 
 void YBSingleThreadedWriter::HandleInsertionFailure(int64_t key_index, const string& key_str) {
-  if (session_ != nullptr) {
-    for (const auto& error : session_->GetPendingErrors()) {
-      LOG(WARNING) << "Explicit error while inserting: " << error->status().ToString();
-    }
-  }
+  // Already handled in YBSingleThreadedWriter::Write.
 }
 
 void YBSingleThreadedWriter::CloseSession() { CHECK_OK(session_->Close()); }
@@ -505,9 +478,9 @@ MultiThreadedReader::MultiThreadedReader(int64_t num_keys, int num_reader_thread
                                          SessionFactory* session_factory,
                                          atomic<int64_t>* insertion_point,
                                          const KeyIndexSet* inserted_keys,
-                                         const KeyIndexSet* failed_keys, atomic_bool* stop_flag,
-                                         int value_size, int max_num_read_errors,
-                                         bool stop_on_empty_read)
+                                         const KeyIndexSet* failed_keys, atomic<bool>* stop_flag,
+                                         int value_size, size_t max_num_read_errors,
+                                         MultiThreadedReaderOptions options)
     : MultiThreadedAction(
           "readers", num_keys, 0, num_reader_threads, 1, session_factory->ClientId(),
           stop_flag, value_size),
@@ -518,7 +491,7 @@ MultiThreadedReader::MultiThreadedReader(int64_t num_keys, int num_reader_thread
       num_reads_(0),
       num_read_errors_(0),
       max_num_read_errors_(max_num_read_errors),
-      stop_on_empty_read_(stop_on_empty_read) {}
+      options_(options) {}
 
 void MultiThreadedReader::RunActionThread(int reader_index) {
   unique_ptr<SingleThreadedReader> reader_loop(session_factory_->GetReader(this, reader_index));
@@ -544,16 +517,23 @@ void MultiThreadedReader::RunStatsThread() {
 }
 
 void MultiThreadedReader::IncrementReadErrorCount(ReadStatus read_status) {
-  DCHECK(read_status != ReadStatus::OK);
+  DCHECK(read_status != ReadStatus::kOk);
 
   if (++num_read_errors_ > max_num_read_errors_) {
     LOG(ERROR) << "Exceeded the maximum number of read errors (" << max_num_read_errors_ << ")!";
+    read_status_stopped_ = read_status;
     Stop();
   }
-
-  if (stop_on_empty_read_ && read_status == ReadStatus::NO_ROWS) {
-    LOG(ERROR) << "No empty reads allowed!";
-    Stop();
+  for (const auto& option_and_status :
+       {std::make_pair(MultiThreadedReaderOption::kStopOnEmptyRead, ReadStatus::kNoRows),
+        std::make_pair(MultiThreadedReaderOption::kStopOnInvalidRead, ReadStatus::kInvalidRead),
+        std::make_pair(MultiThreadedReaderOption::kStopOnExtraRead, ReadStatus::kExtraRows)}) {
+    if (options_.Test(option_and_status.first) && read_status == option_and_status.second) {
+      LOG(ERROR) << "Stopping due to not allowed read status: " << AsString(read_status);
+      read_status_stopped_ = read_status;
+      Stop();
+      return;
+    }
   }
 }
 
@@ -568,16 +548,15 @@ void RedisSingleThreadedReader::CloseSession() {
 }
 
 void YBSingleThreadedReader::ConfigureSession() {
-  session_ = client_->NewSession();
-  ConfigureYBSession(session_.get());
+  session_ = client_->NewSession(60s);
 }
 
 bool NoopSingleThreadedWriter::Write(
     int64_t key_index, const string& key_str, const string& value_str) {
-  YBNoOp noop(table_->get());
-  gscoped_ptr<YBPartialRow> row(table_->schema().NewRow());
+  YBNoOp noop(table_->table());
+  auto row = table_->schema().NewRow();
   CHECK_OK(row->SetBinary("k", key_str));
-  Status s = noop.Execute(*row);
+  Status s = noop.Execute(client_, *row);
   if (s.ok()) {
     return true;
   }
@@ -593,8 +572,8 @@ ReadStatus YBSingleThreadedReader::PerformRead(
     auto read_op = table_->NewReadOp();
     QLAddStringHashValue(read_op->mutable_request(), key_str);
     table_->AddColumns({"k", "v"}, read_op->mutable_request());
-    auto status = session_->ApplyAndFlush(read_op);
-    boost::optional<QLRowBlock> row_block;
+    auto status = session_->TEST_ApplyAndFlush(read_op);
+    boost::optional<qlexpr::QLRowBlock> row_block;
     if (status.ok()) {
       auto result = read_op->MakeRowBlock();
       if (!result.ok()) {
@@ -614,21 +593,21 @@ ReadStatus YBSingleThreadedReader::PerformRead(
     if (row_block->row_count() == 0) {
       LOG(ERROR) << "No rows found for key #" << key_index
                  << " (read hybrid_time: " << read_ts << ")";
-      return ReadStatus::NO_ROWS;
+      return ReadStatus::kNoRows;
     }
     if (row_block->row_count() != 1) {
       LOG(ERROR) << "Found an invalid number of rows for key #" << key_index << ": "
                  << row_block->row_count() << " (expected to find 1 row), read hybrid_time: "
                  << read_ts;
-      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-      return ReadStatus::OTHER_ERROR;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::kOtherError);
+      return ReadStatus::kOtherError;
     }
     auto row = row_block->rows()[0];
     if (row.column(0).binary_value() != key_str) {
       LOG(ERROR) << "Invalid key returned by the read operation: '" << row.column(0).binary_value()
                  << "', expected: '" << key_str << "', read hybrid_time: " << read_ts;
-      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-      return ReadStatus::OTHER_ERROR;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::kOtherError);
+      return ReadStatus::kOtherError;
     }
     auto returned_value = row.column(1).binary_value();
     if (returned_value != expected_value_str) {
@@ -636,13 +615,13 @@ ReadStatus YBSingleThreadedReader::PerformRead(
                  << "': " << FormatWithSize(returned_value)
                  << ", expected: " << FormatWithSize(expected_value_str)
                  << ", read hybrid_time: " << read_ts;
-      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::OTHER_ERROR);
-      return ReadStatus::OTHER_ERROR;
+      multi_threaded_reader_->IncrementReadErrorCount(ReadStatus::kOtherError);
+      return ReadStatus::kOtherError;
     }
     break;
   }
 
-  return ReadStatus::OK;
+  return ReadStatus::kOk;
 }
 
 void YBSingleThreadedReader::CloseSession() { CHECK_OK(session_->Close()); }
@@ -662,12 +641,12 @@ ReadStatus RedisSingleThreadedReader::PerformRead(
     LOG(INFO) << "Read the wrong value for #" << key_index << " from redis "
               << " key : " << key_str << " value : " << value_str
               << " expected : " << expected_value_str;
-    return ReadStatus::OTHER_ERROR;
+    return ReadStatus::kOtherError;
   }
 
   VLOG(2) << "Reader " << reader_index_ << " Successfully read key #" << key_index << " from redis "
           << " key : " << key_str << " value : " << value_str;
-  return ReadStatus::OK;
+  return ReadStatus::kOk;
 }
 
 void SingleThreadedReader::Run() {
@@ -693,7 +672,7 @@ void SingleThreadedReader::Run() {
 
     // Read operation returning zero rows is treated as a read error.
     // See: https://yugabyte.atlassian.net/browse/ENG-1272
-    if (read_status == ReadStatus::NO_ROWS) {
+    if (read_status == ReadStatus::kNoRows) {
       multi_threaded_reader_->IncrementReadErrorCount(read_status);
     }
   }

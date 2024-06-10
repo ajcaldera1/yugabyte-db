@@ -15,11 +15,12 @@
 #include <utility>
 #include <vector>
 
-#include <gflags/gflags.h>
 
 #include "yb/docdb/docdb.h"
 #include "yb/docdb/docdb_test_base.h"
 #include "yb/docdb/docdb_test_util.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/flags.h"
 
 // Use a lower default number of tests when running on ASAN/TSAN so as not to exceed the test time
 // limit.
@@ -31,10 +32,11 @@ static constexpr int kDefaultTestNumIter = 20000;
 static constexpr int kDefaultSnapshotVerificationTestNumIter = 15000;
 #endif
 
-DEFINE_int32(snapshot_verification_test_num_iter, kDefaultSnapshotVerificationTestNumIter,
+DEFINE_NON_RUNTIME_int32(snapshot_verification_test_num_iter,
+             kDefaultSnapshotVerificationTestNumIter,
              "Number iterations for randomized history cleanup DocDB tests.");
 
-DEFINE_int32(test_num_iter, kDefaultTestNumIter,
+DEFINE_NON_RUNTIME_int32(test_num_iter, kDefaultTestNumIter,
              "Number iterations for randomized DocDB tests, except those involving logical DocDB "
              "snapshots.");
 
@@ -43,10 +45,11 @@ constexpr int kNumUniqueSubKeys = 500;
 
 using std::vector;
 using std::pair;
-using std::sort;
 
 namespace yb {
 namespace docdb {
+
+using dockv::UseHash;
 
 namespace {
 
@@ -68,7 +71,7 @@ class RandomizedDocDBTest : public DocDBTestBase,
   RandomizedDocDBTest() : verify_history_cleanup_(true) {
   }
 
-  void Init(const UseHash use_hash) {
+  void Init(const dockv::UseHash use_hash) {
     // This test was created when this was the only supported init marker behavior.
     SetInitMarkerBehavior(InitMarkerBehavior::kRequired);
     if (load_gen_.get() != nullptr) {
@@ -81,21 +84,39 @@ class RandomizedDocDBTest : public DocDBTestBase,
     SeedRandom();
   }
 
+  Schema CreateSchema() override {
+    return Schema();
+  }
+
   ~RandomizedDocDBTest() override {}
   void RunWorkloadWithSnaphots(bool enable_history_cleanup);
 
   int num_iterations_divider() {
-    // GetSubDocument is slower when trying to resolve intents, so we reduce number of iterations
-    // in order to respect the timeout.
+    // Read path is slower when trying to resolve intents, so we reduce number of iterations in
+    // order to respect the timeout.
     return resolve_intents_ ? 2 : 1;
+  }
+
+  void CompactionWithCleanup(HybridTime cleanup_ht) {
+    const auto start_time = MonoTime::Now();
+    ASSERT_NO_FATALS(FullyCompactHistoryBefore(cleanup_ht));
+    const auto elapsed_time_ms = (MonoTime::Now() - start_time).ToMilliseconds();
+    total_compaction_time_ms_ += elapsed_time_ms;
+    LOG(INFO) << "Compaction with cleanup_ht=" << cleanup_ht << " took "
+              << elapsed_time_ms << " ms, all compactions so far: "
+              << total_compaction_time_ms_ << " ms";
   }
 
   ResolveIntentsDuringRead resolve_intents_ = ResolveIntentsDuringRead::kTrue;
   bool verify_history_cleanup_;
   std::unique_ptr<DocDBLoadGenerator> load_gen_;
+  int64_t total_compaction_time_ms_ = 0;
 };
 
 void RandomizedDocDBTest::RunWorkloadWithSnaphots(bool enable_history_cleanup) {
+  auto scope_exit = ScopeExit([this]() {
+    LOG(INFO) << "Total compaction time: " << total_compaction_time_ms_ << " ms";
+  });
   // We start doing snapshots every other iterations, but make it less frequent after a number of
   // iterations (kIterationToSwitchToInfrequentSnapshots to be precise, see the loop below).
   int snapshot_frequency = 2;
@@ -140,7 +161,7 @@ void RandomizedDocDBTest::RunWorkloadWithSnaphots(bool enable_history_cleanup) {
         // We are performing cleanup at an old hybrid_time, and don't expect it to have any effect.
         InMemDocDbState snapshot_before_cleanup;
         snapshot_before_cleanup.CaptureAt(doc_db(), HybridTime::kMax);
-        ASSERT_NO_FATALS(FullyCompactHistoryBefore(cleanup_ht));
+        ASSERT_NO_FATALS(CompactionWithCleanup(cleanup_ht));
 
         InMemDocDbState snapshot_after_cleanup;
         snapshot_after_cleanup.CaptureAt(doc_db(), HybridTime::kMax);
@@ -149,7 +170,7 @@ void RandomizedDocDBTest::RunWorkloadWithSnaphots(bool enable_history_cleanup) {
         max_history_cleanup_ht = cleanup_ht;
         cleanup_ht_and_iteration.emplace_back(cleanup_ht.value(),
                                               load_gen_->last_operation_ht().value());
-        ASSERT_NO_FATALS(FullyCompactHistoryBefore(cleanup_ht));
+        ASSERT_NO_FATALS(CompactionWithCleanup(cleanup_ht));
 
         // We expect some snapshots at hybrid_times earlier than cleanup_ht to no longer be
         // recoverable.
@@ -213,7 +234,7 @@ void RandomizedDocDBTest::RunWorkloadWithSnaphots(bool enable_history_cleanup) {
   // case we did fewer than 15000 iterations.
   RemoveEntriesWithSecondComponentHigherThan(
       &expected_cleanup_ht_and_iteration,
-      load_gen_->last_operation_ht().value());
+      narrow_cast<int>(load_gen_->last_operation_ht().value()));
 
   ASSERT_FALSE(expected_cleanup_ht_and_iteration.empty());
   ASSERT_EQ(expected_cleanup_ht_and_iteration, cleanup_ht_and_iteration);
@@ -241,7 +262,7 @@ void RandomizedDocDBTest::RunWorkloadWithSnaphots(bool enable_history_cleanup) {
   // Remove entries that don't apply to us because we did not get to do a cleanup at that
   // hybrid_time.
   RemoveEntriesWithSecondComponentHigherThan(&expected_divergent_snapshot_and_cleanup_ht,
-                                             max_history_cleanup_ht.value());
+                                             narrow_cast<int>(max_history_cleanup_ht.value()));
 
   ASSERT_EQ(expected_divergent_snapshot_and_cleanup_ht,
             load_gen_->divergent_snapshot_ht_and_cleanup_ht());

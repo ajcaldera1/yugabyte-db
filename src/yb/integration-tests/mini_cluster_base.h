@@ -11,18 +11,22 @@
 // under the License.
 //
 
-#ifndef YB_INTEGRATION_TESTS_MINI_CLUSTER_BASE_H_
-#define YB_INTEGRATION_TESTS_MINI_CLUSTER_BASE_H_
+#pragma once
 
-#include "yb/util/status.h"
-#include "yb/util/net/net_util.h"
-#include "yb/util/net/sockaddr.h"
+#include "yb/rpc/rpc_fwd.h"
+#include "yb/rpc/secure_stream.h"
+
+#include "yb/util/status_fwd.h"
+#include "yb/util/net/net_fwd.h"
 
 namespace yb {
+
+class ExternalYbController;
 
 namespace client {
 class YBClientBuilder;
 class YBClient;
+class StatefulServiceClientBase;
 } // namespace client
 
 // Base class for ExternalMiniCluster and MiniCluster with common interface required by
@@ -30,32 +34,48 @@ class YBClient;
 // for both types of mini cluster.
 class MiniClusterBase {
  public:
-  CHECKED_STATUS CreateClient(client::YBClientBuilder* builder,
-      std::shared_ptr<client::YBClient>* client) {
-    return DoCreateClient(builder, client);
-  }
 
-  CHECKED_STATUS CreateClient(std::shared_ptr<client::YBClient>* client) {
-    return DoCreateClient(nullptr /* builder */, client);
-  }
+  // Create a client configured to talk to this cluster.  Builder may contain override options for
+  // the client. The master address will be overridden to talk to the running master.
+  // If 'builder' is not specified, default options will be used.
+  // Client is wrapped into a holder which will shutdown client on holder destruction.
+  //
+  // REQUIRES: the cluster must have already been Start()ed.
 
-  HostPort GetLeaderMasterBoundRpcAddr() {
-    return DoGetLeaderMasterBoundRpcAddr();
-  }
+  // Created client won't shutdown messenger.
+  Result<std::unique_ptr<client::YBClient>> CreateClient(rpc::Messenger* messenger);
+
+  // Created client will shutdown messenger on client shutdown.
+  Result<std::unique_ptr<client::YBClient>> CreateClient(
+      client::YBClientBuilder* builder = nullptr);
+
+  Result<std::unique_ptr<client::YBClient>> CreateSecureClient(
+      const std::string& name, const std::string& host,
+      std::unique_ptr<rpc::SecureContext>* secure_context);
+
+  Result<HostPort> GetLeaderMasterBoundRpcAddr();
 
   bool running() const { return running_.load(std::memory_order_acquire); }
+
+  virtual std::vector<scoped_refptr<ExternalYbController>> yb_controller_daemons() const = 0;
 
  protected:
   virtual ~MiniClusterBase() = default;
 
   std::atomic<bool> running_ { false };
+  std::unique_ptr<rpc::SecureContext> secure_context_;
 
+  template<class Options>
+  int32_t NumTabletsPerTransactionTable(Options options) {
+    if (options.transaction_table_num_tablets > 0) {
+      return options.transaction_table_num_tablets;
+    }
+    return std::max(2, static_cast<int32_t>(options.num_tablet_servers));
+  }
  private:
-  virtual CHECKED_STATUS DoCreateClient(client::YBClientBuilder* builder,
-      std::shared_ptr<client::YBClient>* client) = 0;
-  virtual HostPort DoGetLeaderMasterBoundRpcAddr() = 0;
+  virtual void ConfigureClientBuilder(client::YBClientBuilder* builder) = 0;
+
+  virtual Result<HostPort> DoGetLeaderMasterBoundRpcAddr() = 0;
 };
 
 }  // namespace yb
-
-#endif // YB_INTEGRATION_TESTS_MINI_CLUSTER_BASE_H_

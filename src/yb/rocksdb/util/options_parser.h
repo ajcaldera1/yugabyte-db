@@ -18,6 +18,7 @@
 // under the License.
 //
 
+
 #pragma once
 
 #include <map>
@@ -26,13 +27,10 @@
 
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/util/options_helper.h"
-#include "yb/rocksdb/util/options_sanity_check.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
+#include "yb/rocksdb/util/options_sanity_check.h"
 
 namespace rocksdb {
-
-#ifndef ROCKSDB_LITE
 
 #define ROCKSDB_OPTION_FILE_MAJOR 1
 #define ROCKSDB_OPTION_FILE_MINOR 1
@@ -48,14 +46,19 @@ enum OptionSection : char {
 static const std::string opt_section_titles[] = {
     "Version", "DBOptions", "CFOptions", "TableOptions/", "Unknown"};
 
+YB_STRONGLY_TYPED_BOOL(IncludeHeader);
+YB_STRONGLY_TYPED_BOOL(IncludeFileVersion);
+
 Status PersistRocksDBOptions(const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
                              const std::vector<ColumnFamilyOptions>& cf_opts,
-                             const std::string& file_name, Env* env);
+                             const std::string& file_name, Env* env,
+                             IncludeHeader include_header = IncludeHeader::kTrue,
+                             IncludeFileVersion include_file_version = IncludeFileVersion::kTrue);
 
 class RocksDBOptionsParser {
  public:
-  explicit RocksDBOptionsParser();
+  RocksDBOptionsParser();
   ~RocksDBOptionsParser() {}
   void Reset();
 
@@ -153,7 +156,5 @@ class RocksDBOptionsParser {
   int db_version[3];
   int opt_file_version[3];
 };
-
-#endif  // !ROCKSDB_LITE
 
 }  // namespace rocksdb

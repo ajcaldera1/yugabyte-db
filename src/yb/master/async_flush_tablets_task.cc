@@ -10,27 +10,21 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/master/async_flush_tablets_task.h"
 
 #include "yb/common/wire_protocol.h"
 
-#include "yb/master/master.h"
-#include "yb/master/ts_descriptor.h"
 #include "yb/master/flush_manager.h"
-#include "yb/master/catalog_manager.h"
-
-#include "yb/rpc/messenger.h"
+#include "yb/master/master.h"
 
 #include "yb/tserver/tserver_admin.proxy.h"
-
-#include "yb/util/flag_tags.h"
-#include "yb/util/format.h"
-#include "yb/util/logging.h"
 
 namespace yb {
 namespace master {
 
 using std::string;
+using std::vector;
 using tserver::TabletServerErrorPB;
 
 ////////////////////////////////////////////////////////////
@@ -42,11 +36,15 @@ AsyncFlushTablets::AsyncFlushTablets(Master *master,
                                      const scoped_refptr<TableInfo>& table,
                                      const vector<TabletId>& tablet_ids,
                                      const FlushRequestId& flush_id,
-                                     bool is_compaction)
-    : RetrySpecificTSRpcTask(master, callback_pool, ts_uuid, table),
+                                     bool is_compaction,
+                                     bool regular_only,
+                                     LeaderEpoch epoch)
+: RetrySpecificTSRpcTaskWithTable(master, callback_pool, ts_uuid, table, std::move(epoch),
+                             /* async_task_throttler */ nullptr),
       tablet_ids_(tablet_ids),
       flush_id_(flush_id),
-      is_compaction_(is_compaction) {
+      is_compaction_(is_compaction),
+      regular_only_(regular_only) {
 }
 
 string AsyncFlushTablets::description() const {
@@ -69,24 +67,31 @@ void AsyncFlushTablets::HandleResponse(int attempt) {
         LOG(WARNING) << "TS " << permanent_uuid() << ": flush tablets failed because tablet "
                      << resp_.failed_tablet_id() << " was not found. "
                      << "No further retry: " << status.ToString();
-        TransitionToTerminalState(MonitoredTaskState::kRunning, MonitoredTaskState::kComplete);
+        // Mark response_handling_ as true to denote task state is transitioned
+        // to complete and there will be no retries.
+        response_handling_ = true;
+        TransitionToCompleteState();
         break;
       default:
         LOG(WARNING) << "TS " << permanent_uuid() << ": flush tablets failed: "
                      << status.ToString();
     }
   } else {
-    TransitionToTerminalState(MonitoredTaskState::kRunning, MonitoredTaskState::kComplete);
+    response_handling_ = true;
+    TransitionToCompleteState();
     VLOG(1) << "TS " << permanent_uuid() << ": flush tablets complete";
   }
 
-  if (state() == MonitoredTaskState::kComplete) {
+  if (state() == server::MonitoredTaskState::kComplete) {
     // TODO: this class should not know CatalogManager API,
     //       remove circular dependency between classes.
     master_->flush_manager()->HandleFlushTabletsResponse(
         flush_id_, permanent_uuid_,
         resp_.has_error() ? StatusFromPB(resp_.error().status()) : Status::OK());
   } else {
+    if (response_handling_) {
+      LOG(DFATAL) << "Expected task to be transitioned to complete state";
+    }
     VLOG(1) << "FlushTablets task is not completed";
   }
 }
@@ -95,17 +100,27 @@ bool AsyncFlushTablets::SendRequest(int attempt) {
   tserver::FlushTabletsRequestPB req;
   req.set_dest_uuid(permanent_uuid_);
   req.set_propagated_hybrid_time(master_->clock()->Now().ToUint64());
-  req.set_is_compaction(is_compaction_);
+  req.set_operation(is_compaction_ ? tserver::FlushTabletsRequestPB::COMPACT
+                                   : tserver::FlushTabletsRequestPB::FLUSH);
 
   for (const TabletId& id : tablet_ids_) {
     req.add_tablet_ids(id);
   }
+  req.set_regular_only(regular_only_);
 
+  response_handling_ = false;
   ts_admin_proxy_->FlushTabletsAsync(req, &resp_, &rpc_, BindRpcCallback());
   VLOG(1) << "Send flush tablets request to " << permanent_uuid_
           << " (attempt " << attempt << "):\n"
           << req.DebugString();
   return true;
+}
+
+void AsyncFlushTablets::Finished(const Status& status) {
+  // Call explicit handling only if reponse is not handled in AsyncFlushTablets::HandleResponse.
+  if (!response_handling_) {
+    master_->flush_manager()->HandleFlushTabletsRpcFinish(flush_id_, permanent_uuid_, status);
+  }
 }
 
 } // namespace master

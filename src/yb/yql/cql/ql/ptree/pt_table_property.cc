@@ -11,22 +11,47 @@
 // under the License.
 //
 
+#include "yb/yql/cql/ql/ptree/pt_table_property.h"
+
 #include <set>
+
+#include <boost/algorithm/string/predicate.hpp>
 
 #include "yb/client/schema.h"
 #include "yb/client/table.h"
 
-#include "yb/yql/cql/ql/ptree/pt_table_property.h"
-#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/common/schema.h"
+#include "yb/common/table_properties_constants.h"
+
+#include "yb/gutil/casts.h"
+
 #include "yb/util/stol_utils.h"
 #include "yb/util/string_case.h"
 #include "yb/util/string_util.h"
 
+#include "yb/yql/cql/ql/ptree/column_desc.h"
+#include "yb/yql/cql/ql/ptree/pt_alter_table.h"
+#include "yb/yql/cql/ql/ptree/pt_column_definition.h"
+#include "yb/yql/cql/ql/ptree/pt_create_table.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/yql/cql/ql/ptree/pt_option.h"
+#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
+
+using std::string;
+using std::ostream;
+using std::vector;
+
 namespace yb {
 namespace ql {
 
+namespace {
+
+const std::string kCompactionClassPrefix = "org.apache.cassandra.db.compaction.";
+
+}
+
 using strings::Substitute;
-using client::YBColumnSchema;
 
 // These property names need to be lowercase, since identifiers are converted to lowercase by the
 // scanner phase and as a result if we're doing string matching everything should be lowercase.
@@ -47,28 +72,23 @@ const std::map<std::string, PTTableProperty::KVProperty> PTTableProperty::kPrope
     {"max_index_interval", KVProperty::kMaxIndexInterval},
     {"read_repair_chance", KVProperty::kReadRepairChance},
     {"speculative_retry", KVProperty::kSpeculativeRetry},
-    {"transactions", KVProperty::kTransactions}
+    {"transactions", KVProperty::kTransactions},
+    {"tablets", KVProperty::kNumTablets}
 };
 
 PTTableProperty::PTTableProperty(MemoryContext *memctx,
-                   YBLocation::SharedPtr loc,
-                   const MCSharedPtr<MCString>& lhs,
-                   const PTExpr::SharedPtr& rhs)
+                                 YBLocationPtr loc,
+                                 const MCSharedPtr<MCString>& lhs,
+                                 const PTExprPtr& rhs)
     : PTProperty(memctx, loc, lhs, rhs),
       property_type_(PropertyType::kTableProperty) {}
 
 PTTableProperty::PTTableProperty(MemoryContext *memctx,
-                                 YBLocation::SharedPtr loc,
-                                 const MCSharedPtr<MCString>& name,
+                                 YBLocationPtr loc,
+                                 const PTExprPtr& expr,
                                  const PTOrderBy::Direction direction)
-    : PTProperty(memctx, loc), name_(name), direction_(direction),
+    : PTProperty(memctx, loc), order_expr_(expr), direction_(direction),
       property_type_(PropertyType::kClusteringOrder) {}
-
-PTTableProperty::PTTableProperty(MemoryContext *memctx,
-                                 YBLocation::SharedPtr loc,
-                                 const PTQualifiedName::SharedPtr tname)
-    : PTProperty(memctx, loc), property_type_(PropertyType::kCoPartitionTable),
-      copartition_table_name_(tname) {}
 
 PTTableProperty::PTTableProperty(MemoryContext *memctx,
                                  YBLocation::SharedPtr loc)
@@ -90,13 +110,13 @@ Status PTTableProperty::AnalyzeSpeculativeRetry(const string &val) {
   string numeric_val;
   if (StringEndsWith(val, common::kSpeculativeRetryMs, common::kSpeculativeRetryMsLen,
                      &numeric_val)) {
-    RETURN_NOT_OK(util::CheckedStold(numeric_val));
+    RETURN_NOT_OK(CheckedStold(numeric_val));
     return Status::OK();
   }
 
   if (StringEndsWith(val, common::kSpeculativeRetryPercentile,
                      common::kSpeculativeRetryPercentileLen, &numeric_val)) {
-    auto percentile = util::CheckedStold(numeric_val);
+    auto percentile = CheckedStold(numeric_val);
     RETURN_NOT_OK(percentile);
 
     if (*percentile < 0.0 || *percentile > 100.0) {
@@ -109,47 +129,12 @@ Status PTTableProperty::AnalyzeSpeculativeRetry(const string &val) {
   return STATUS(InvalidArgument, generic_error);
 }
 
-CHECKED_STATUS PTTableProperty::Analyze(SemContext *sem_context) {
+string PTTableProperty::name() const {
+  DCHECK_EQ(property_type_, PropertyType::kClusteringOrder);
+  return order_expr_->QLName();
+}
 
-  if (property_type_ == PropertyType::kCoPartitionTable) {
-    RETURN_NOT_OK(copartition_table_name_->AnalyzeName(sem_context, OBJECT_TABLE));
-
-    bool is_system; // ignored
-    MCVector<ColumnDesc> copartition_table_columns(sem_context->PTempMem());
-
-    // Permissions check happen in LookupTable if flag use_cassandra_authentication is enabled.
-    // TODO(hector): We need to revisit this once this feature is supported so we can decided
-    // which privileges will be needed.
-    RETURN_NOT_OK(sem_context->LookupTable(copartition_table_name_->ToTableName(),
-                                           copartition_table_name_->loc(), /* write_table = */ true,
-                                           PermissionType::CREATE_PERMISSION,
-                                           &copartition_table_, &is_system,
-                                           &copartition_table_columns));
-    if (sem_context->current_create_table_stmt()->hash_columns().size() !=
-        copartition_table_->schema().num_hash_key_columns()) {
-      return sem_context->Error(this, Substitute("The number of hash keys in the current table "
-                                "differ from the number of hash keys in '$0'.",
-                                copartition_table_name_->ToTableName().table_name()).c_str(),
-                                ErrorCode::INCOMPATIBLE_COPARTITION_SCHEMA);
-    }
-
-    int index = 0;
-    for (auto hash_col : sem_context->current_create_table_stmt()->hash_columns()) {
-      auto type = hash_col->ql_type();
-      auto base_type = copartition_table_columns[index].ql_type();
-      if (type != base_type) {
-        return sem_context->Error(this, Substitute("The hash key '$0' in the current table has a "
-                                  "different datatype from the corresponding hash key in '$1'",
-                                  hash_col->yb_name(),
-                                  copartition_table_name_->ToTableName().table_name()).c_str(),
-                                  ErrorCode::INCOMPATIBLE_COPARTITION_SCHEMA);
-      }
-      index++;
-    }
-
-    return Status::OK();
-  }
-
+Status PTTableProperty::Analyze(SemContext *sem_context) {
   // Verify we have a valid property name in the lhs.
   const auto& table_property_name = lhs_->c_str();
   auto iterator = kPropertyDataTypes.find(table_property_name);
@@ -235,10 +220,28 @@ CHECKED_STATUS PTTableProperty::Analyze(SemContext *sem_context) {
                                 Substitute("Invalid value for option '$0'. Value must be a map",
                                            table_property_name).c_str(),
                                 ErrorCode::DATATYPE_MISMATCH);
+    case KVProperty::kNumTablets:
+      RETURN_SEM_CONTEXT_ERROR_NOT_OK(GetIntValueFromExpr(rhs_, table_property_name, &int_val));
+      if (int_val < 0) {
+        return sem_context->Error(
+            this, "Number of tablets cannot be less zero", ErrorCode::INVALID_ARGUMENTS);
+      }
+      if (int_val > FLAGS_max_num_tablets_for_table) {
+        return sem_context->Error(
+            this, "Number of tablets exceeds system limit", ErrorCode::INVALID_ARGUMENTS);
+      }
+      break;
   }
 
   PTAlterTable *alter_table = sem_context->current_alter_table();
   if (alter_table != nullptr) {
+    // Some table properties are not supported in ALTER TABLE.
+    if (iterator->second == KVProperty::kNumTablets) {
+      return sem_context->Error(this,
+                                "Changing the number of tablets is not supported",
+                                ErrorCode::FEATURE_NOT_SUPPORTED);
+    }
+
     RETURN_NOT_OK(alter_table->AppendAlterProperty(sem_context, this));
   }
   return Status::OK();
@@ -255,9 +258,6 @@ std::ostream& operator<<(ostream& os, const PropertyType& property_type) {
     case PropertyType::kTablePropertyMap:
       os << "kTablePropertyMap";
       break;
-    case PropertyType::kCoPartitionTable:
-      os << "kCoPartitionTable";
-      break;
   }
   return os;
 }
@@ -266,10 +266,10 @@ void PTTableProperty::PrintSemanticAnalysisResult(SemContext *sem_context) {
   VLOG(3) << "SEMANTIC ANALYSIS RESULT (" << *loc_ << "):\n" << "Not yet avail";
 }
 
-CHECKED_STATUS PTTablePropertyListNode::Analyze(SemContext *sem_context) {
+Status PTTablePropertyListNode::Analyze(SemContext *sem_context) {
   // Set to ensure we don't have duplicate table properties.
   std::set<string> table_properties;
-  unordered_map<string, PTTableProperty::SharedPtr> order_tnodes;
+  std::unordered_map<string, PTTableProperty::SharedPtr> order_tnodes;
   vector<string> order_columns;
   for (PTTableProperty::SharedPtr tnode : node_list()) {
     if (tnode == nullptr) {
@@ -288,23 +288,19 @@ CHECKED_STATUS PTTablePropertyListNode::Analyze(SemContext *sem_context) {
         table_properties.insert(table_property_name);
         break;
       }
-      case PropertyType ::kCoPartitionTable: {
-        RETURN_NOT_OK(tnode->Analyze(sem_context));
-        break;
-      }
       case PropertyType::kClusteringOrder: {
-        const auto &column_name = tnode->name().c_str();
-        const PTColumnDefinition *col = sem_context->GetColumnDefinition(tnode->name());
+        const MCString column_name(tnode->name().c_str(), sem_context->PTempMem());
+        const PTColumnDefinition *col = sem_context->GetColumnDefinition(column_name);
         if (col == nullptr || !col->is_primary_key() || col->is_hash_key()) {
           return sem_context->Error(tnode, "Not a clustering key column",
                                     ErrorCode::INVALID_TABLE_PROPERTY);
         }
         // Insert column_name only the first time we see it.
-        if (order_tnodes.find(column_name) == order_tnodes.end()) {
-          order_columns.push_back(column_name);
+        if (order_tnodes.find(column_name.c_str()) == order_tnodes.end()) {
+          order_columns.push_back(column_name.c_str());
         }
         // If a column ordering was set more than once, we use the last order provided.
-        order_tnodes[column_name] = tnode;
+        order_tnodes[column_name.c_str()] = tnode;
         break;
       }
     }
@@ -330,9 +326,9 @@ CHECKED_STATUS PTTablePropertyListNode::Analyze(SemContext *sem_context) {
       return sem_context->Error(tnode, msg.c_str(), ErrorCode::INVALID_TABLE_PROPERTY);
     }
     if (tnode->direction() == PTOrderBy::Direction::kASC) {
-      pc->set_sorting_type(ColumnSchema::SortingType::kAscending);
+      pc->set_sorting_type(SortingType::kAscending);
     } else if (tnode->direction() == PTOrderBy::Direction::kDESC) {
-      pc->set_sorting_type(ColumnSchema::SortingType::kDescending);
+      pc->set_sorting_type(SortingType::kDescending);
     }
     ++order_column_iter;
   }
@@ -350,11 +346,6 @@ Status PTTableProperty::SetTableProperty(yb::TableProperties *table_property) co
 
   // Clustering order not handled here.
   if (property_type_ == PropertyType::kClusteringOrder) {
-    return Status::OK();
-  }
-
-  if (property_type_ == PropertyType::kCoPartitionTable) {
-    table_property->SetCopartitionTableId(copartition_table_id());
     return Status::OK();
   }
 
@@ -393,13 +384,16 @@ Status PTTableProperty::SetTableProperty(yb::TableProperties *table_property) co
     case KVProperty::kTransactions:
       LOG(ERROR) << "Not primitive table property " << table_property_name;
       break;
+    case KVProperty::kNumTablets:
+      int64_t val;
+      auto status = GetIntValueFromExpr(rhs_, table_property_name, &val);
+      if (!status.ok()) {
+        return status.CloneAndAppend("Invalid value for tablets");
+      }
+      table_property->SetNumTablets(trim_cast<int32_t>(val));
+      break;
   }
   return Status::OK();
-}
-
-TableId PTTableProperty::copartition_table_id() const {
-  DCHECK_EQ(property_type_, PropertyType::kCoPartitionTable);
-  return copartition_table_->id();
 }
 
 const std::map<string, PTTablePropertyMap::PropertyMapType> PTTablePropertyMap::kPropertyDataTypes
@@ -411,7 +405,7 @@ const std::map<string, PTTablePropertyMap::PropertyMapType> PTTablePropertyMap::
 };
 
 PTTablePropertyMap::PTTablePropertyMap(MemoryContext *memctx,
-                                       YBLocation::SharedPtr loc)
+                                       YBLocationPtr loc)
     : PTTableProperty(memctx, loc) {
   property_type_ = PropertyType::kTablePropertyMap;
   map_elements_ = TreeListNode<PTTableProperty>::MakeShared(memctx, loc);
@@ -420,7 +414,7 @@ PTTablePropertyMap::PTTablePropertyMap(MemoryContext *memctx,
 PTTablePropertyMap::~PTTablePropertyMap() {
 }
 
-CHECKED_STATUS PTTablePropertyMap::Analyze(SemContext *sem_context) {
+Status PTTablePropertyMap::Analyze(SemContext *sem_context) {
   // Verify we have a valid property name in the lhs.
   const auto &property_name = lhs_->c_str();
   auto iterator = kPropertyDataTypes.find(property_name);
@@ -515,11 +509,9 @@ Status PTTablePropertyMap::AnalyzeCompaction() {
       }
       class_name = std::dynamic_pointer_cast<PTConstText>(tnode->rhs())->Eval()->c_str();
       if (class_name.find('.') == string::npos) {
-        if (class_name.length() < Compaction::kClassPrefixLen ||
-            class_name.substr(Compaction::kClassPrefixLen) !=
-            Compaction::kClassPrefix) {
+        if (!boost::starts_with(class_name, kCompactionClassPrefix)) {
           LOG(INFO) << "Inserting prefix into class name";
-          class_name.insert(0, Compaction::kClassPrefix);
+          class_name.insert(0, kCompactionClassPrefix);
         }
       }
       class_subproperties_iter = Compaction::kClassSubproperties.find(class_name);
@@ -657,13 +649,8 @@ Status PTTablePropertyMap::AnalyzeCompaction() {
   }
 
   if (!invalid_subproperties.empty()) {
-    string list = "[";
-    for (auto i = 0; i < invalid_subproperties.size() - 1; i++) {
-      list += (invalid_subproperties[i] + ", ");
-    }
-    list += (invalid_subproperties.back() + "]");
-    return STATUS(InvalidArgument,
-                  Substitute("Properties specified $0 are not understood by $1", list, class_name));
+    return STATUS_FORMAT(InvalidArgument, "Properties specified $0 are not understood by $1",
+                         invalid_subproperties, class_name);
   }
   return Status::OK();
 }

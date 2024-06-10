@@ -34,21 +34,29 @@
 #include <mutex>
 #include <vector>
 
+#include "yb/consensus/log.h"
+#include "yb/consensus/log.messages.h"
 #include "yb/consensus/log-test-base.h"
 #include "yb/consensus/log_index.h"
+
 #include "yb/gutil/algorithm.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/util/locks.h"
+#include "yb/util/metrics.h"
 #include "yb/util/random.h"
+#include "yb/util/status_log.h"
+#include "yb/util/stopwatch.h"
 #include "yb/util/thread.h"
+#include "yb/util/flags.h"
 
 // TODO: Semantics of the Log and Appender thread interactions changed and now multi-threaded
 // writing is no longer allowed, or to be more precise, does no longer guarantee the ordering of
 // events being written, across threads.
-DEFINE_int32(num_writer_threads, 1, "Number of threads writing to the log");
-DEFINE_int32(num_batches_per_thread, 2000, "Number of batches per thread");
-DEFINE_int32(num_ops_per_batch_avg, 5, "Target average number of ops per batch");
+DEFINE_NON_RUNTIME_int32(num_writer_threads, 1, "Number of threads writing to the log");
+DEFINE_NON_RUNTIME_int32(num_batches_per_thread, 2000, "Number of batches per thread");
+DEFINE_NON_RUNTIME_int32(num_ops_per_batch_avg, 5, "Target average number of ops per batch");
 
 namespace yb {
 namespace log {
@@ -99,40 +107,39 @@ class MultiThreadedLogTest : public LogTestBase {
     CountDownLatch latch(FLAGS_num_batches_per_thread);
     vector<Status> errors;
     for (int i = 0; i < FLAGS_num_batches_per_thread; i++) {
-      LogEntryBatch* entry_batch;
+      std::shared_ptr<LWLogEntryBatchPB> entry_batch_pb;
       ReplicateMsgs batch_replicates;
       int num_ops = static_cast<int>(random_.Normal(
           static_cast<double>(FLAGS_num_ops_per_batch_avg), 1.0));
       DVLOG(1) << num_ops << " ops in this batch";
       num_ops =  std::max(num_ops, 1);
       {
-        std::lock_guard<simple_spinlock> lock_guard(lock_);
+        std::lock_guard lock_guard(lock_);
         for (int j = 0; j < num_ops; j++) {
-          auto replicate = std::make_shared<ReplicateMsg>();
-          int32_t index = current_index_++;
-          OpId* op_id = replicate->mutable_id();
+          auto replicate = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
+          auto index = current_index_++;
+          auto* op_id = replicate->mutable_id();
           op_id->set_term(0);
           op_id->set_index(index);
 
           replicate->set_op_type(WRITE_OP);
           replicate->set_hybrid_time(clock_->Now().ToUint64());
 
-          tserver::WriteRequestPB* request = replicate->mutable_write_request();
-          AddTestRowInsert(index, 0, "this is a test insert", request);
-          request->set_tablet_id(kTestTablet);
+          tserver::WriteRequestPB request;
+          AddTestRowInsert(narrow_cast<int32_t>(index), 0, "this is a test insert", &request);
+          request.set_tablet_id(kTestTablet);
           batch_replicates.push_back(replicate);
         }
 
-        auto entry_batch_pb = CreateBatchFromAllocatedOperations(batch_replicates);
-
-        ASSERT_OK(log_->Reserve(REPLICATE, &entry_batch_pb, &entry_batch));
+        entry_batch_pb = CreateBatchFromAllocatedOperations(batch_replicates);
       } // lock_guard scope
+
       auto cb = new CustomLatchCallback(&latch, &errors);
-      entry_batch->SetReplicates(batch_replicates);
-      ASSERT_OK(log_->AsyncAppend(entry_batch, cb->AsStatusCallback()));
+      ASSERT_OK(log_->TEST_ReserveAndAppend(
+          std::move(entry_batch_pb), batch_replicates, cb->AsStatusCallback()));
     }
     LOG_TIMING(INFO, strings::Substitute("thread $0 waiting to append and sync $1 batches",
-                                        thread_id, FLAGS_num_batches_per_thread)) {
+                                         thread_id, FLAGS_num_batches_per_thread)) {
       latch.Wait();
     }
     for (const Status& status : errors) {
@@ -160,7 +167,7 @@ class MultiThreadedLogTest : public LogTestBase {
 
 TEST_F(MultiThreadedLogTest, TestAppends) {
   BuildLog();
-  int start_current_id = current_index_;
+  auto start_current_id = current_index_;
   LOG_TIMING(INFO, strings::Substitute("inserting $0 batches($1 threads, $2 per-thread)",
                                       FLAGS_num_writer_threads * FLAGS_num_batches_per_thread,
                                       FLAGS_num_batches_per_thread, FLAGS_num_writer_threads)) {
@@ -169,10 +176,9 @@ TEST_F(MultiThreadedLogTest, TestAppends) {
   ASSERT_OK(log_->Close());
 
   std::unique_ptr<LogReader> reader;
-  ASSERT_OK(LogReader::Open(fs_manager_->env(), NULL, kTestTablet,
+  ASSERT_OK(LogReader::Open(fs_manager_->env(), nullptr, "Log reader: ",
                             fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet),
-                            fs_manager_->uuid(),
-                            NULL, &reader));
+                            nullptr, nullptr, &reader));
   SegmentSequence segments;
   ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
 

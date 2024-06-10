@@ -33,19 +33,21 @@
 #include <memory>
 #include <set>
 #include <unordered_map>
+
 #include <boost/optional.hpp>
 
 #include "yb/client/client-test-util.h"
 #include "yb/client/table_handle.h"
+
 #include "yb/common/wire_protocol.h"
+
 #include "yb/gutil/map-util.h"
+
 #include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/integration-tests/test_workload.h"
 
+
 using yb::client::CountTableRows;
-using yb::client::YBTable;
-using yb::client::YBTableName;
-using std::shared_ptr;
 using yb::itest::TServerDetails;
 using yb::tablet::TABLET_DATA_TOMBSTONED;
 using std::set;
@@ -68,7 +70,7 @@ class ClientFailoverITest : public ExternalMiniClusterITestBase {
 TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   const MonoDelta kTimeout = MonoDelta::FromSeconds(30);
 
-  vector<string> ts_flags = { "--enable_remote_bootstrap=false" };
+  vector<string> ts_flags = { "--TEST_enable_remote_bootstrap=false" };
   vector<string> master_flags = {"--catalog_manager_wait_for_new_tablets_to_elect_leader=false"};
 
   // Start up with 4 tablet servers.
@@ -86,10 +88,10 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   const string& tablet_id = tablets[0];
 
   // Record the locations of the tablet replicas and the one TS that doesn't have a replica.
-  int missing_replica_index = -1;
-  set<int> replica_indexes;
+  ssize_t missing_replica_index = -1;
+  std::set<ssize_t> replica_indexes;
   unordered_map<string, itest::TServerDetails*> active_ts_map;
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     if (inspect_->ListTabletsOnTS(i).empty()) {
       missing_replica_index = i;
     } else {
@@ -101,7 +103,7 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
                                        kTimeout));
     }
   }
-  int leader_index = *replica_indexes.begin();
+  auto leader_index = *replica_indexes.begin();
   TServerDetails* leader = ts_map_[cluster_->tablet_server(leader_index)->uuid()].get();
   for (auto retries_left = kNumberOfRetries; ;) {
     TServerDetails *current_leader = nullptr;
@@ -150,7 +152,7 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   ASSERT_OK(itest::DeleteTablet(leader, tablet_id, TABLET_DATA_TOMBSTONED,
                                 boost::none, kTimeout));
 
-  int old_leader_index = leader_index;
+  ssize_t old_leader_index = leader_index;
   // old_leader - node that was leader before we started to elect a new leader
   TServerDetails* old_leader = leader;
 
@@ -204,9 +206,9 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
                                                      itest::CommittedEntryType::CONFIG));
 
   TServerDetails* to_add = ts_map_[cluster_->tablet_server(missing_replica_index)->uuid()].get();
-  ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::RaftPeerPB::PRE_VOTER,
+  ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::PeerMemberType::PRE_VOTER,
                       boost::none, kTimeout));
-  HostPort hp = HostPortFromPB(leader->registration.common().private_rpc_addresses(0));
+  HostPort hp = HostPortFromPB(leader->registration->common().private_rpc_addresses(0));
   ASSERT_OK(StartRemoteBootstrap(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
 
   const string& new_ts_uuid = cluster_->tablet_server(missing_replica_index)->uuid();
@@ -232,7 +234,7 @@ TEST_F(ClientFailoverITest, TestDeleteLeaderWhileScanning) {
   ASSERT_EQ(workload.rows_inserted(), CountTableRows(table));
 
   // Rotate leaders among the replicas and verify the new leader is the designated one each time.
-  for (const auto ts_map : active_ts_map) {
+  for (const auto& ts_map : active_ts_map) {
     for (auto retries_left = kNumberOfRetries; ; --retries_left) {
       TServerDetails* current_leader = nullptr;
       TServerDetails* new_leader = ts_map.second;

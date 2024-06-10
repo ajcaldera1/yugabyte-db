@@ -13,20 +13,20 @@
 //
 //
 
-#ifndef YB_UTIL_NET_NET_FWD_H
-#define YB_UTIL_NET_NET_FWD_H
+#pragma once
 
 namespace boost {
 namespace asio {
+
+class io_context;
+typedef io_context io_service;
+
 namespace ip {
 
 class address;
 
 template <typename InternetProtocol>
 class basic_endpoint;
-
-template <typename InternetProtocol>
-class basic_resolver;
 
 template <typename InternetProtocol>
 class basic_resolver_results;
@@ -41,12 +41,11 @@ namespace yb {
 
 typedef boost::asio::ip::address IpAddress;
 typedef boost::asio::ip::basic_endpoint<boost::asio::ip::tcp> Endpoint;
+class DnsResolver;
 class HostPort;
+class InetAddress;
 class Tunnel;
-typedef boost::asio::ip::basic_resolver<boost::asio::ip::tcp> Resolver;
+typedef boost::asio::io_service IoService;
 typedef boost::asio::ip::basic_resolver_results<boost::asio::ip::tcp> ResolverResults;
 
-
 } // namespace yb
-
-#endif // YB_UTIL_NET_NET_FWD_H

@@ -17,10 +17,10 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #pragma once
+
 #include "yb/rocksdb/perf_context.h"
-#include "yb/rocksdb/util/perf_step_timer.h"
-#include "yb/rocksdb/util/stop_watch.h"
 
 namespace rocksdb {
 
@@ -43,14 +43,14 @@ namespace rocksdb {
   perf_step_timer_ ## metric.Start();
 
 // Declare and set start time of the timer
-#define PERF_TIMER_GUARD(metric)                                      \
-  PerfStepTimer perf_step_timer_ ## metric(&(perf_context.metric));   \
+#define PERF_TIMER_GUARD(metric)                                          \
+  ::yb::PerfStepTimer perf_step_timer_ ## metric(&(perf_context.metric)); \
   perf_step_timer_ ## metric.Start();
 
-#define PERF_CONDITIONAL_TIMER_FOR_MUTEX_GUARD(metric, condition)       \
-  PerfStepTimer perf_step_timer_##metric(&(perf_context.metric), true); \
-  if ((condition)) {                                                    \
-    perf_step_timer_##metric.Start();                                   \
+#define PERF_CONDITIONAL_TIMER_FOR_MUTEX_GUARD(metric, condition)             \
+  ::yb::PerfStepTimer perf_step_timer_##metric(&(perf_context.metric), true); \
+  if ((condition)) {                                                          \
+    perf_step_timer_##metric.Start();                                         \
   }
 
 // Update metric with time elapsed since last START. start time is reset
@@ -64,4 +64,4 @@ namespace rocksdb {
 
 #endif
 
-}
+} // namespace rocksdb

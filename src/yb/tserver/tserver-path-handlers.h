@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TSERVER_TSERVER_PATH_HANDLERS_H
-#define YB_TSERVER_TSERVER_PATH_HANDLERS_H
+#pragma once
 
 #include <string>
 #include <sstream>
@@ -59,34 +58,43 @@ class TabletServerPathHandlers {
 
   ~TabletServerPathHandlers();
 
-  CHECKED_STATUS Register(Webserver* server);
+  Status Register(Webserver* server);
 
  private:
+  void HandleTablesPage(const Webserver::WebRequest& req,
+                        Webserver::WebResponse* resp);
   void HandleTabletsPage(const Webserver::WebRequest& req,
-                         std::stringstream* output);
-  void HandleTabletPage(const Webserver::WebRequest& req,
-                        std::stringstream* output);
-  void HandleTransactionsPage(const Webserver::WebRequest& req,
-                              std::stringstream* output);
-  void HandleTabletSVGPage(const Webserver::WebRequest& req,
-                           std::stringstream* output);
-  void HandleLogAnchorsPage(const Webserver::WebRequest& req,
-                            std::stringstream* output);
-  void HandleConsensusStatusPage(const Webserver::WebRequest& req,
-                                 std::stringstream* output);
+                         Webserver::WebResponse* resp);
+  void HandleOperationsPage(const Webserver::WebRequest& req,
+                            Webserver::WebResponse* resp);
+  void HandleRemoteBootstrapsPage(const Webserver::WebRequest& req,
+                                  Webserver::WebResponse* resp);
   void HandleDashboardsPage(const Webserver::WebRequest& req,
-                            std::stringstream* output);
+                            Webserver::WebResponse* resp);
+  void HandleIntentsDBPage(const Webserver::WebRequest& req,
+                           Webserver::WebResponse* resp);
   void HandleMaintenanceManagerPage(const Webserver::WebRequest& req,
-                                    std::stringstream* output);
+                                    Webserver::WebResponse* resp);
+  void HandleXClusterPage(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleXClusterJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+  void HandleHealthCheck(const Webserver::WebRequest& req,
+                         Webserver::WebResponse* resp);
+  void HandleVersionInfoDump(const Webserver::WebRequest& req,
+                              Webserver::WebResponse* resp);
+  void HandleListMasterServers(const Webserver::WebRequest& req,
+                               Webserver::WebResponse* resp);
+  void HandleTabletsJSON(const Webserver::WebRequest& req,
+                         Webserver::WebResponse* resp);
+  void HandleTabletMetaCacheJSON(const Webserver::WebRequest& req, Webserver::WebResponse* resp);
+
   std::string ConsensusStatePBToHtml(const consensus::ConsensusStatePB& cstate) const;
   std::string GetDashboardLine(const std::string& link,
                                const std::string& text, const std::string& desc);
 
-  TabletServer* tserver_;
+  TabletServer* const tserver_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletServerPathHandlers);
 };
 
 } // namespace tserver
 } // namespace yb
-#endif /* YB_TSERVER_TSERVER_PATH_HANDLERS_H */

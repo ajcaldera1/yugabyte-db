@@ -52,6 +52,8 @@
 #include "rewrite/rewriteHandler.h"
 #include "utils/rel.h"
 
+/* YB includes. */
+#include "miscadmin.h"
 #include "pg_yb_utils.h"
 
 static List *expand_targetlist(List *tlist, int command_type,
@@ -121,7 +123,7 @@ preprocess_targetlist(PlannerInfo *root)
 	 */
 	tlist = parse->targetList;
 	if (command_type == CMD_INSERT || command_type == CMD_UPDATE ||
-			(IsYugaByteEnabled() && command_type == CMD_DELETE && parse->returningList != NULL))
+			(command_type == CMD_DELETE && IsYBRelation(target_relation) && parse->returningList != NULL))
 		tlist = expand_targetlist(tlist, command_type,
 								  result_relation, target_relation);
 
@@ -143,14 +145,28 @@ preprocess_targetlist(PlannerInfo *root)
 
 		if (rc->allMarkTypes & ~(1 << ROW_MARK_COPY))
 		{
-			/* Need to fetch TID */
-			var = makeVar(rc->rti,
-						  SelfItemPointerAttributeNumber,
-						  TIDOID,
-						  -1,
-						  InvalidOid,
-						  0);
-			snprintf(resname, sizeof(resname), "ctid%u", rc->rowmarkId);
+			if (IsYBRelationById(getrelid(rc->rti, range_table)))
+			{
+				/* Need to fetch YB TID */
+				var = makeVar(rc->rti,
+								YBTupleIdAttributeNumber,
+								BYTEAOID,
+								-1,
+								InvalidOid,
+								0);
+				snprintf(resname, sizeof(resname), "ybctid%u", rc->rowmarkId);
+			}
+			else
+			{
+				/* Need to fetch TID */
+				var = makeVar(rc->rti,
+								SelfItemPointerAttributeNumber,
+								TIDOID,
+								-1,
+								InvalidOid,
+								0);
+				snprintf(resname, sizeof(resname), "ctid%u", rc->rowmarkId);
+			}
 			tle = makeTargetEntry((Expr *) var,
 								  list_length(tlist) + 1,
 								  pstrdup(resname),
@@ -265,9 +281,11 @@ expand_targetlist(List *tlist, int command_type,
 	List	   *new_tlist = NIL;
 	ListCell   *tlist_item;
 	int			attrno,
-				numattrs;
+				numattrs,
+				tlist_length;
 
 	tlist_item = list_head(tlist);
+	tlist_length = list_length(tlist);
 
 	/*
 	 * The rewriter should have already ensured that the TLEs are in correct
@@ -277,6 +295,25 @@ expand_targetlist(List *tlist, int command_type,
 	 * sure we have all the user attributes in the right order.
 	 */
 	numattrs = RelationGetNumberOfAttributes(rel);
+
+	/*
+	 * For YB during YSQL upgrade, the list might be prepended with the oid
+	 * column, so we deal with it first.
+	 */
+	if (IsYsqlUpgrade)
+	{
+		for (int i = 0; i < tlist_length; ++i)
+		{
+			TargetEntry *tle = lfirst_node(TargetEntry, tlist_item);
+			if (tle && tle->resno < 1)
+			{
+				new_tlist = lappend(new_tlist, tle);
+				tlist_item = lnext(tlist_item);
+			}
+			else
+				break;
+		}
+	}
 
 	for (attrno = 1; attrno <= numattrs; attrno++)
 	{
@@ -381,16 +418,29 @@ expand_targetlist(List *tlist, int command_type,
 					// This case is added only for DELETE from YugaByte table with RETURNING clause.
 					if (IsYugaByteEnabled())
 					{
-						// Query all attribute in the YugaByte relation.
-						new_expr = (Node *) makeVar(result_relation,
-													attrno,
-													atttype,
-													atttypmod,
-													attcollation,
-													0);
+						if (att_tup->attisdropped) {
+						/* Insert NULL for dropped column */
+							new_expr = (Node *) makeConst(INT4OID,
+														  -1,
+														  InvalidOid,
+														  sizeof(int32),
+														  (Datum) 0,
+														  true, /* isnull */
+														  true /* byval */ );
+						}
+						else
+						{
+							// Query all attribute in the YugaByte relation.
+							new_expr = (Node *) makeVar(result_relation,
+														attrno,
+														atttype,
+														atttypmod,
+														attcollation,
+														0);
+						}
 						break;
 					}
-					/* FALLTHROUGH */
+					switch_fallthrough();
 				default:
 					elog(ERROR, "unrecognized command_type: %d",
 						 (int) command_type);

@@ -11,12 +11,14 @@
 // under the License.
 //
 
-#ifndef YB_CONSENSUS_REPLICATE_MSGS_HOLDER_H
-#define YB_CONSENSUS_REPLICATE_MSGS_HOLDER_H
+#pragma once
 
 #include <google/protobuf/repeated_field.h>
 
 #include "yb/consensus/consensus_fwd.h"
+
+#include "yb/util/mem_tracker.h"
+#include "yb/util/memory/arena.h"
 
 namespace yb {
 namespace consensus {
@@ -26,7 +28,8 @@ class ReplicateMsgsHolder {
   ReplicateMsgsHolder() : ops_(nullptr) {}
 
   explicit ReplicateMsgsHolder(
-      google::protobuf::RepeatedPtrField<ReplicateMsg>* ops, ReplicateMsgs messages);
+      google::protobuf::RepeatedPtrField<ReplicateMsg>* ops, ReplicateMsgs messages,
+      ScopedTrackedConsumption consumption);
 
   ReplicateMsgsHolder(ReplicateMsgsHolder&& rhs);
   void operator=(ReplicateMsgsHolder&& rhs);
@@ -51,9 +54,24 @@ class ReplicateMsgsHolder {
   // object as other peers. Since the PB request_ itself can't hold reference counts, this holds
   // them.
   ReplicateMsgs messages_;
+
+  ScopedTrackedConsumption consumption_;
+};
+
+class LWReplicateMsgsHolder {
+ public:
+  LWReplicateMsgsHolder() = default;
+
+  explicit LWReplicateMsgsHolder(ReplicateMsgs messages, ScopedTrackedConsumption consumption);
+  LWReplicateMsgsHolder(LWReplicateMsgsHolder&& rhs);
+  void operator=(LWReplicateMsgsHolder&& rhs);
+
+  void Reset();
+ private:
+  ReplicateMsgs messages_;
+
+  ScopedTrackedConsumption consumption_;
 };
 
 }  // namespace consensus
 }  // namespace yb
-
-#endif // YB_CONSENSUS_REPLICATE_MSGS_HOLDER_H

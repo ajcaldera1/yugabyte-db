@@ -11,18 +11,23 @@
 // under the License.
 //
 
-#ifndef YB_CLIENT_PERMISSIONS_H
-#define YB_CLIENT_PERMISSIONS_H
+#pragma once
+
+#include <condition_variable>
+#include <shared_mutex>
 
 #include <boost/optional.hpp>
 
-#include "yb/common/entity_ids.h"
+#include "yb/common/entity_ids_types.h"
 #include "yb/common/roles_permissions.h"
-#include "yb/master/master.pb.h"
+
+#include "yb/master/master_dcl.fwd.h"
+
+#include "yb/rpc/io_thread_pool.h"
+
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
-#include "yb/rpc/io_thread_pool.h"
-#include "yb/rpc/scheduler.h"
+
 #include "yb/yql/cql/ql/ptree/pt_option.h"
 
 namespace yb {
@@ -67,16 +72,17 @@ class RolePermissions {
   std::unordered_map<std::string, Permissions> resource_permissions_;
 };
 
-using RolesPermissionsMap = std::unordered_map<RoleName, RolePermissions>;
-
-enum class CacheCheckMode {
-  NO_RETRY,
-  RETRY,
+struct RoleAuthInfo {
+  std::string salted_hash;
+  bool can_login;
 };
+
+using RolesPermissionsMap = std::unordered_map<RoleName, RolePermissions>;
+using RolesAuthInfoMap = std::unordered_map<RoleName, RoleAuthInfo>;
 
 class PermissionsCache {
  public:
-  explicit PermissionsCache(std::shared_ptr<client::YBClient> client,
+  explicit PermissionsCache(client::YBClient* client,
                             bool automatically_update_cache = true);
 
   ~PermissionsCache();
@@ -106,6 +112,9 @@ class PermissionsCache {
                                       const RoleName &role_name,
                                       const PermissionType &permission);
 
+  Result<std::string> salted_hash(const RoleName& role_name);
+  Result<bool> can_login(const RoleName& role_name);
+
  private:
   void ScheduleGetPermissionsFromMaster(bool now);
 
@@ -116,10 +125,11 @@ class PermissionsCache {
   boost::optional<uint64_t> version_;
 
   // Client used to send the request to the master.
-  std::shared_ptr<client::YBClient> client_;
+  client::YBClient* const client_;
 
   // role name -> RolePermissions.
   std::shared_ptr<RolesPermissionsMap> roles_permissions_map_;
+  std::shared_ptr<RolesAuthInfoMap> roles_auth_info_map_;
 
   // Used to modify the internal state.
   mutable simple_spinlock permissions_cache_lock_;
@@ -140,5 +150,3 @@ class PermissionsCache {
 } // namespace namespace internal
 } // namespace client
 } // namespace yb
-
-#endif // YB_CLIENT_PERMISSIONS_H

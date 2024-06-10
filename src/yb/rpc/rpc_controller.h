@@ -29,18 +29,19 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_RPC_RPC_CONTROLLER_H
-#define YB_RPC_RPC_CONTROLLER_H
+#pragma once
 
 #include <memory>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/macros.h"
+
 #include "yb/rpc/rpc_fwd.h"
+
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -50,8 +51,9 @@ class ErrorStatusPB;
 
 // Controller for managing properties of a single RPC call, on the client side.
 //
-// An RpcController maps to exactly one call and is not thread-safe. The client
-// may use this class prior to sending an RPC in order to set properties such
+// An RpcController maps to exactly one call and is not thread-safe. RpcController can be reused
+// for another call to avoid extra destruction/construction, see RpcController::Reset.
+// The client may use this class prior to sending an RPC in order to set properties such
 // as the call's timeout.
 //
 // After the call has been sent (e.g using Proxy::AsyncRequest()) the user
@@ -70,6 +72,7 @@ class RpcController {
   void Swap(RpcController* other);
 
   // Reset this controller so it may be used with another call.
+  // Note that reset doesn't reset controller's properties except the call itself.
   void Reset();
 
   // Return true if the call has finished.
@@ -91,7 +94,9 @@ class RpcController {
   // * a network error occurred which caused the connection to be torn
   //   down
   // * the call timed out
-  CHECKED_STATUS status() const;
+  Status status() const;
+
+  Status thread_pool_failure() const;
 
   // If status() returns a RemoteError object, then this function returns
   // the error response provided by the server. Service implementors may
@@ -121,20 +126,47 @@ class RpcController {
   // Using an uninitialized deadline means the call won't time out.
   void set_deadline(const MonoTime& deadline);
 
+  void set_deadline(CoarseTimePoint deadline);
+
   void set_allow_local_calls_in_curr_thread(bool al) { allow_local_calls_in_curr_thread_ = al; }
   bool allow_local_calls_in_curr_thread() const { return allow_local_calls_in_curr_thread_; }
+
+  // Sets where to invoke callback on receiving response to the async call.
+  // For sync calls callback is always executed on reactor thread.
+  void set_invoke_callback_mode(InvokeCallbackMode invoke_callback_mode) {
+    invoke_callback_mode_ = invoke_callback_mode;
+  }
+
+  InvokeCallbackMode invoke_callback_mode() { return invoke_callback_mode_; }
 
   // Return the configured timeout.
   MonoDelta timeout() const;
 
-  // Fills the 'sidecar' parameter with the slice pointing to the i-th
-  // sidecar upon success.
-  //
-  // Should only be called if the call's finished, but the controller has not
-  // been Reset().
-  //
-  // May fail if index is invalid.
-  CHECKED_STATUS GetSidecar(int idx, Slice* sidecar) const;
+  Sidecars& outbound_sidecars();
+
+  std::unique_ptr<Sidecars> MoveOutboundSidecars();
+
+  // Assign sidecar with specified index to out.
+  Result<RefCntSlice> ExtractSidecar(size_t idx) const;
+
+  size_t GetSidecarsCount() const;
+
+  // Transfer all sidecars to specified context.
+  size_t TransferSidecars(Sidecars* dest);
+
+  int32_t call_id() const;
+
+  CallResponsePtr response() const;
+
+  Result<CallResponsePtr> CheckedResponse() const;
+
+  std::string CallStateDebugString() const;
+  // When call is present, marks the call as Failed by passing Forced timeout status.
+  void MarkCallAsFailed();
+
+  // Test only flag which is transferred to OutboundCall during its preparation time. This is used
+  // to reproduce the stuck RPC scenario seen in production.
+  void TEST_force_stuck_outbound_call() { TEST_disable_outbound_call_response_processing = true; }
 
  private:
   friend class OutboundCall;
@@ -147,11 +179,13 @@ class RpcController {
   // Once the call is sent, it is tracked here.
   OutboundCallPtr call_;
   bool allow_local_calls_in_curr_thread_ = false;
+  InvokeCallbackMode invoke_callback_mode_ = InvokeCallbackMode::kThreadPoolNormal;
+
+  std::unique_ptr<Sidecars> outbound_sidecars_;
+  bool TEST_disable_outbound_call_response_processing = false;
 
   DISALLOW_COPY_AND_ASSIGN(RpcController);
 };
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_RPC_CONTROLLER_H

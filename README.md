@@ -1,275 +1,131 @@
-<img src="https://s3-us-west-2.amazonaws.com/assets.yugabyte.com/yb-db-logo.png" align="center" height="56" alt="YugaByte DB"/>
+<img src="https://cloud.yugabyte.com/logo-big.png" align="center" alt="YugabyteDB" width="50%"/>
 
 ---------------------------------------
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Documentation Status](https://readthedocs.org/projects/ansicolortags/badge/?version=latest)](https://docs.yugabyte.com/)
 [![Ask in forum](https://img.shields.io/badge/ask%20us-forum-orange.svg)](https://forum.yugabyte.com/)
-[![Slack chat](https://img.shields.io/badge/chat-Slack-brightgreen.svg)](https://www.yugabyte.com/slack)
-[![Analytics](https://yugabyte.appspot.com/UA-104956980-4/home?pixel&useReferer)](https://github.com/YugaByte/ga-beacon)
+[![Slack chat](https://img.shields.io/badge/Slack:-%23yugabyte_db-blueviolet.svg?logo=slack)](https://communityinviter.com/apps/yugabyte-db/register)
+[![Analytics](https://yugabyte.appspot.com/UA-104956980-4/home?pixel&useReferer)](https://github.com/yugabyte/ga-beacon)
 
-YugaByte Database is the high-performance SQL database for building internet-scale, globally-distributed applications.  This repository contains the Community Edition of the YugaByte Database.
+# What is YugabyteDB? 
 
-## Table of Contents
+**YugabyteDB** is a **high-performance, cloud-native, [distributed SQL](https://www.yugabyte.com/tech/distributed-sql/) database** that aims to support **all PostgreSQL features**. It is best suited for **cloud-native OLTP (i.e., real-time, business-critical) applications** that need absolute **data correctness** and require at least one of the following: **scalability, high tolerance to failures, or globally-distributed deployments.**
 
-- [About YugaByte DB](#about-yugabyte-db)
-- [Architecture](#architecture)
-- [Getting Started](#getting-started)
-- [Developing Apps](#developing-apps)
-- [Building YugaByte code](#building-yugabyte-code)
-    - [Prerequisites for CentOS 7](#prerequisites-for-centos-7)
-    - [Prerequisites for Mac OS X](#prerequisites-for-mac-os-x)
-    - [Prerequisites for drivers and sample apps](#prerequisites-for-drivers-and-sample-apps)
-    - [Building the code](#building-the-code)
-    - [Running the C++ tests](#running-the-c-tests)
-    - [Building Java code alone](#building-java-code-alone)
-    - [Running the Java tests](#running-the-java-tests)
-    - [Viewing log outputs of Java tests](#viewing-log-outputs-of-java-tests)
-- [Reporting Issues](#reporting-issues)
-- [Contributing](#contributing)
-- [License](#license)
+* [Core Features](#core-features)
+* [Get Started](#get-started)
+* [Build Apps](#build-apps)
+* [What's being worked on?](#whats-being-worked-on)
+* [Architecture](#architecture)
+* [Need Help?](#need-help)
+* [Contribute](#contribute)
+* [License](#license)
+* [Read More](#read-more)
 
-## About YugaByte DB
+# Core Features
 
-Built using a unique combination of high-performance document store, auto sharding, per-shard distributed consensus replication and multi-shard ACID transactions (inspired by Google Spanner), YugaByte DB serves both scale-out RDBMS and internet-scale OLTP workloads with low query latency, extreme resilience against failures and global data distribution. As a cloud native database, it can be deployed across public and private clouds as well as in Kubernetes environments with ease.
+* **Powerful RDBMS capabilities** Yugabyte SQL (*YSQL* for short) reuses the query layer of PostgreSQL (similar to Amazon Aurora PostgreSQL), thereby supporting most of its features (datatypes, queries, expressions, operators and functions, stored procedures, triggers, extensions, etc). Here is a detailed [list of features currently supported by YSQL](https://docs.yugabyte.com/preview/explore/ysql-language-features/postgresql-compatibility/).
 
-* See how YugaByte DB [compares with other databases](https://docs.yugabyte.com/latest/comparisons/).
-* Read more about YugaByte DB in our [docs](https://docs.yugabyte.com/latest/introduction/).
+* **Distributed transactions** The transaction design is based on the Google Spanner architecture. Strong consistency of writes is achieved by using Raft consensus for replication and cluster-wide distributed ACID transactions using *hybrid logical clocks*. *Snapshot*, *serializable* and *read committed* isolation levels are supported. Reads (queries) have strong consistency by default, but can be tuned dynamically to read from followers and read-replicas.
 
-## Architecture
+* **Continuous availability** YugabyteDB is extremely resilient to common outages with native failover and repair. YugabyteDB can be configured to tolerate disk, node, zone, region, and cloud failures automatically. For a typical deployment where a YugabyteDB cluster is deployed in one region across multiple zones on a public cloud, the RPO is 0 (meaning no data is lost on failure) and the RTO is 3 seconds (meaning the data being served by the failed node is available in 3 seconds).
 
-YugaByte DB architecture has 2 layers. At the core is DocDB, YugaByte DB's distributed document store. DocDB is the common database engine for the YugaByte Query Layer (YQL). Applications interact with YQL using the APIs listed below.
+* **Horizontal scalability** Scaling a YugabyteDB cluster to achieve more IOPS or data storage is as simple as adding nodes to the cluster.
 
-### YugaByte DB APIs
+* **Geo-distributed, multi-cloud** YugabyteDB can be deployed in public clouds and natively inside Kubernetes. It supports deployments that span three or more fault domains, such as multi-zone, multi-region, and multi-cloud deployments. It also supports xCluster asynchronous replication with unidirectional master-slave and bidirectional multi-master configurations that can be leveraged in two-region deployments. To serve (stale) data with low latencies, read replicas are also a supported feature.
 
-YugaByte DB supports two flavors of distributed SQL APIs.
+* **Multi API design** The query layer of YugabyteDB is built to be extensible. Currently, YugabyteDB supports two distributed SQL APIs: **[Yugabyte SQL (YSQL)](https://docs.yugabyte.com/preview/api/ysql/)**, a fully relational API that re-uses query layer of PostgreSQL, and **[Yugabyte Cloud QL (YCQL)](https://docs.yugabyte.com/preview/api/ycql/)**, a semi-relational SQL-like API with documents/indexing support with Apache Cassandra QL roots.
 
-* [YugaByte Structured Query Language (YSQL)](https://docs.yugabyte.com/latest/api/ysql/) - A PostgreSQL-compatible fully relational SQL API (currently in beta) with horizontal write scalability and extreme fault tolerance against infrastructure failures. This API is best fit for RDBMS workloads that need scale-out, auto failover and global data distribution while also using relational data modeling features such as JOINs, referential integrity, and multi-shard transactions.
+* **100% open source** YugabyteDB is fully open-source under the [Apache 2.0 license](https://github.com/yugabyte/yugabyte-db/blob/master/LICENSE.md). The open-source version has powerful enterprise features such as distributed backups, encryption of data-at-rest, in-flight TLS encryption, change data capture, read replicas, and more.
 
-* [YugaByte Cloud Query Language (YCQL)](https://docs.yugabyte.com/latest/api/ycql/) - A SQL-based flexible-schema API with strong consistency, multi-shard transactions, globally-consistent secondary indexes and a native JSONB column type. This API has its roots in the Cassandra Query Language and is best fit for internet-scale OLTP apps that need a semi-relational SQL highly optimized for write-intensive applications as well as blazing-fast query needs. 
+Read more about YugabyteDB in our [FAQ](https://docs.yugabyte.com/preview/faq/general/).
 
-### DocDB, YugaByte DB's Distributed Document Store
+# Get Started
 
-[DocDB](https://docs.yugabyte.com/latest/architecture/docdb/) builds on top of the popular [RocksDB](https://rocksdb.org/) project by transforming RocksDB from a key-value store (with only primitive data types) to a document store (with complex data types). Every key is stored as a separate document in DocDB, irrespective of the API responsible for managing the key. DocDB’s sharding, replication/fault-tolerance and distributed ACID transactions architecture are all based on the the [Google Spanner](https://ai.google/research/pubs/pub39966) design first published in 2012.
+* [Quick Start](https://docs.yugabyte.com/preview/quick-start/)
+* Try running a real-world demo application:
+  * [Microservices-oriented e-commerce app](https://github.com/yugabyte/yugastore-java)
+  * [Streaming IoT app with Kafka and Spark Streaming](https://docs.yugabyte.com/preview/develop/realworld-apps/iot-spark-kafka-ksql/)
 
-## Getting Started
+Cannot find what you are looking for? Have a question? Please post your questions or comments on our Community [Slack](https://communityinviter.com/apps/yugabyte-db/register) or [Forum](https://forum.yugabyte.com).
 
-Here are a few resources for getting started with YugaByte DB:
+# Build Apps
 
-* [Quick start guide](http://docs.yugabyte.com/latest/quick-start/) - install, create a local cluster and read/write from YugaByte DB.
-* [Explore core features](https://docs.yugabyte.com/latest/explore/) - automatic sharding & re-balancing, linear scalability, fault tolerance, tunable reads and more.
-* [Ecosystem integrations](https://docs.yugabyte.com/latest/develop/ecosystem-integrations/) - integrations with Apache Kafka/KSQL, Apache Spark, JanusGraph, KairosDB, Presto and more.
-* [Real world apps](https://docs.yugabyte.com/latest/develop/realworld-apps/) - sample real-world, end-to-end applications built using YugaByte DB.
-* [Architecture docs](https://docs.yugabyte.com/latest/architecture/) - to understand how YugaByte DB is designed and how it works
+YugabyteDB supports many languages and client drivers, including Java, Go, NodeJS, Python, and more. For a complete list, including examples, see [Drivers and ORMs](https://docs.yugabyte.com/preview/drivers-orms/).
 
-Cannot find what you are looking for? Have a question? We love to hear from you - please [file a GitHub issue](https://github.com/YugaByte/yugabyte-db/issues).
+# What's being worked on?
 
-## Developing Apps
+> This section was last updated in **May, 2023**.
 
-Here is a tutorial on implementing a simple Hello World application on YugaByte DB in different languages:
-* [Java](https://docs.yugabyte.com/latest/develop/client-drivers/java/) using Maven
-* [NodeJS](https://docs.yugabyte.com/latest/develop/client-drivers/nodejs/)
-* [Python](https://docs.yugabyte.com/latest/develop/client-drivers/python/)
-* [Go](https://docs.yugabyte.com/latest/develop/client-drivers/go/)
-* [C#](https://docs.yugabyte.com/latest/develop/client-drivers/csharp/)
-* [C/C++](https://docs.yugabyte.com/latest/develop/client-drivers/cpp/)
+## Current roadmap
 
-We are constantly adding documentation on how to build apps using the client drivers in various languages, as well as the ecosystem integrations we support. Please see [our app-development docs](https://docs.yugabyte.com/latest/develop/) for the latest information.
+Here is a list of some of the key features being worked on for the upcoming releases (the YugabyteDB [**v2.17 preview release**](https://www.yugabyte.com/blog/yugabytedb-217-updates/) has been released in **Jan, 2023**, and the [**v2.16 stable release**](https://www.yugabyte.com/blog/yugabytedb-216/) was released in **Jan 2023**).
 
-Once again, please post your questions or comments as a [GitHub issue](https://github.com/YugaByte/yugabyte-db/issues) if you need something.
+| Feature                                         | Status    | Release Target | Progress        |  Comments     |
+| ----------------------------------------------- | --------- | -------------- | --------------- | ------------- |
+| [Automatic tablet splitting enabled by default](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/docdb-automatic-tablet-splitting.md) | PROGRESS  | v2.18 | [Track](https://github.com/yugabyte/yugabyte-db/issues/1004) |Enables changing the number of tablets (which are splits of data) at runtime.|
+|[Upgrade to PostgreSQL v15](https://github.com/yugabyte/yugabyte-db/issues/9797)| PROGRESS| v2.21 |[Track](https://github.com/yugabyte/yugabyte-db/issues/9797)| For latest features, new PostgreSQL extensions, performance, and community fixes
+|Database live migration using YugabyteDB Voyager| PROGRESS| | [Track](https://github.com/yugabyte/yb-voyager/issues/50)|Database live migration using YugabyteDB Voyager| 
+| Support wait-on-conflict concurrency control | PROGRESS  | v2.19  | [Track](https://github.com/yugabyte/yugabyte-db/issues/5680) | Support wait-on-conflict concurrency control |
+| Support for transactions in async [xCluster replication](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/multi-region-xcluster-async-replication.md) | PROGRESS  |  v2.19  | [Track](https://github.com/yugabyte/yugabyte-db/issues/10976) | Apply transactions atomically on target cluster. |
+| YSQL-table statistics and cost based optimizer(CBO) | PROGRESS  |  v2.21 | [Track](https://github.com/yugabyte/yugabyte-db/issues/5242) | Improve YSQL query performance |
+| [YSQL-Feature support - ALTER TABLE](https://github.com/yugabyte/yugabyte-db/issues/1124) | PROGRESS | v2.21 | [Track](https://github.com/yugabyte/yugabyte-db/issues/1124) | Support for various `ALTER TABLE` variants |
+| Support for GiST indexes | PLANNING  |    | [Track](https://github.com/yugabyte/yugabyte-db/issues/1337) |Support for GiST (Generalized Search Tree) based index|
+| Connection Management | PROGRESS  |    | [Track](https://github.com/yugabyte/yugabyte-db/issues/17599) |Server side connection management|
 
-## Building YugaByte DB code
+## Recently released features
 
-### Prerequisites for CentOS 7
+| Feature                                         | Status    | Release Target | Docs / Enhancements |  Comments     |
+| ----------------------------------------------- | --------- | -------------- | ------------------- | ------------- |
+|[Faster Bulk-Data Loading in YugabyteDB](https://github.com/yugabyte/yugabyte-db/issues/11765)|  ✅ *DONE*| v2.15 |[Track](https://github.com/yugabyte/yugabyte-db/issues/11765)| Faster Bulk-Data Loading in YugabyteDB|
+|[Change Data Capture](https://github.com/yugabyte/yugabyte-db/issues/9019)|  ✅ *DONE*| v2.13 ||Change data capture (CDC) allows multiple downstream apps and services to consume the continuous and never-ending stream(s) of changes to Yugabyte databases|
+|[Support for materalized views](https://github.com/yugabyte/yugabyte-db/issues/10102) |  ✅ *DONE*| v2.13 |[Docs](https://docs.yugabyte.com/preview/explore/ysql-language-features/advanced-features/views/#materialized-views)|A materialized view is a pre-computed data set derived from a query specification and stored for later use|
+|[Geo-partitioning support](https://github.com/yugabyte/yugabyte-db/issues/9980) for the transaction status table | ✅ *DONE*| v2.13 |[Docs](https://docs.yugabyte.com/preview/explore/multi-region-deployments/row-level-geo-partitioning/)|Instead of central remote transaction execution metatda, it is now optimized for access from different regions. Since the transaction metadata is also geo partitioned, it eliminates the need for round-trip to remote regions to update transaction statuses.|
+| Transparently restart transactions |  ✅ *DONE*| v2.13 | |Decrease the incidence of transaction restart errors seen in various scenarios |
+| [Row-level geo-partitioning](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/ysql-row-level-partitioning.md) |  ✅ *DONE*| v2.13 |[Docs](https://docs.yugabyte.com/preview/explore/multi-region-deployments/row-level-geo-partitioning/)|Row-level geo-partitioning allows fine-grained control over pinning data in a user table (at a per-row level) to geographic locations, thereby allowing the data residency to be managed at the table-row level.|
+| [YSQL-Support `GIN` indexes](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/ysql-gin-indexes.md) |  ✅ *DONE*  | v2.11 | [Docs](https://docs.yugabyte.com/preview/explore/ysql-language-features/gin/) | Support for generalized inverted indexes for container data types like jsonb, tsvector, and array |
+| [YSQL-Collation Support](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/ysql-collation-support.md)  | ✅ *DONE*  | v2.11           |[Docs](https://docs.yugabyte.com/preview/explore/ysql-language-features/collations/) |Allows specifying the sort order and character classification behavior of data per-column, or even per-operation according to language and country-specific rules           |
+[YSQL-Savepoint Support](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/savepoints.md)  |  ✅ *DONE*  | v2.11     |[Docs](https://docs.yugabyte.com/preview/explore/ysql-language-features/savepoints/) | Useful for implementing complex error recovery in multi-statement transaction|
+| [xCluster replication management through Platform](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/platform-xcluster-replication-management.md) | ✅ *DONE* | v2.11           |   [Docs](https://docs.yugabyte.com/preview/yugabyte-platform/create-deployments/async-replication-platform/)     |   
+| [Spring Data YugabyteDB module](https://github.com/yugabyte/yugabyte-db/blob/master/architecture/design/spring-data-yugabytedb.md) | ✅ *DONE*  | v2.9 | [Track](https://github.com/yugabyte/yugabyte-db/issues/7956) | Bridges the gap for learning the distributed SQL concepts with familiarity and ease of Spring Data APIs |
+| Support Liquibase, Flyway, ORM schema migrations | ✅ *DONE* | v2.9           |           [Docs](https://blog.yugabyte.com/schema-versioning-in-yugabytedb-using-flyway/)      | 
+| [Support `ALTER TABLE` add primary key](https://github.com/yugabyte/yugabyte-db/issues/1124) | ✅ *DONE* | v2.9 | [Track](https://github.com/yugabyte/yugabyte-db/issues/1124) |  |
+| [YCQL-LDAP Support](https://github.com/yugabyte/yugabyte-db/issues/4421) |  ✅ *DONE*  | v2.8           |[Docs](https://docs.yugabyte.com/preview/secure/authentication/ldap-authentication-ycql/#root)  | support LDAP authentication in YCQL API |             
+| [Platform Alerting and Notification](https://blog.yugabyte.com/yugabytedb-2-8-alerts-and-notifications/) | ✅ *DONE* | v2.8  |  [Docs](https://docs.yugabyte.com/preview/yugabyte-platform/alerts-monitoring/alert/) |  To get notified in real time about database alerts, user defined alert policies notify you when a performance metric rises above or falls below a threshold you set.|      
+| [Platform API](https://blog.yugabyte.com/yugabytedb-2-8-api-automated-operations/) | ✅ *DONE* | v2.8           |   [Docs](https://api-docs.yugabyte.com/docs/yugabyte-platform/ZG9jOjIwMDY0MTA4-platform-api-overview)              |   Securely Deploy YugabyteDB Clusters Using Infrastructure-as-Code|            
 
-CentOS 7 is the main recommended development and production platform for YugaByte.
+# Architecture
 
-Update packages on your system, install development tools and additional packages:
+<img src="https://raw.githubusercontent.com/yugabyte/yugabyte-db/master/architecture/images/yb-architecture.jpg" align="center" alt="YugabyteDB Architecture"/>
 
-```bash
-sudo yum update
-sudo yum groupinstall -y 'Development Tools'
-sudo yum install -y ruby perl-Digest epel-release ccache git python2-pip
-sudo yum install -y cmake3 ctest3
-```
+Review detailed architecture in our [Docs](https://docs.yugabyte.com/preview/architecture/).
 
-Also we expect `cmake` / `ctest` binaries to be at least version 3. On CentOS one way to achive
-this is to symlink them into `/usr/local/bin`.
+# Need Help?
 
-```bash
-sudo ln -s /usr/bin/cmake3 /usr/local/bin/cmake
-sudo ln -s /usr/bin/ctest3 /usr/local/bin/ctest
-```
+* You can ask questions, find answers, and help others on our Community [Slack](https://communityinviter.com/apps/yugabyte-db/register), [Forum](https://forum.yugabyte.com), [Stack Overflow](https://stackoverflow.com/questions/tagged/yugabyte-db), as well as Twitter [@Yugabyte](https://twitter.com/yugabyte)
 
-You could also symlink them into another directory that is on your PATH.
+* Please use [GitHub issues](https://github.com/yugabyte/yugabyte-db/issues) to report issues or request new features.
 
-We also use [Linuxbrew](https://github.com/linuxbrew/brew) to provide some of the third-party
-dependencies on CentOS. During the build we install Linuxbrew in a separate directory,
-`~/.linuxbrew-yb-build/linuxbrew-<version>`, so that it does not conflict with any other Linuxbrew
-installation on your workstation, and does not contain any unnecessary packages that would
-interfere with the build.
+* To Troubleshoot YugabyteDB, cluser/node level issues, Please refer to [Troubleshooting documentation](https://docs.yugabyte.com/preview/troubleshoot/)
 
-We don't need to add `~/.linuxbrew-yb-build/linuxbrew-<version>/bin` to PATH. The build scripts
-will automatically discover this Linuxbrew installation.
+# Contribute
 
-### Prerequisites for Ubuntu 18.04
+As an open-source project with a strong focus on the user community, we welcome contributions as GitHub pull requests. See our [Contributor Guides](https://docs.yugabyte.com/preview/contribute/) to get going. Discussions and RFCs for features happen on the design discussions section of our [Forum](https://forum.yugabyte.com).
 
-In addition to (corresponding) steps required for CentOS 7, the following steps are required for additional packages that need to be installed:
+# License
 
-```bash
-sudo apt-get update
-sudo apt-get install uuid-dev libbz2-dev libreadline-dev maven
-```
+Source code in this repository is variously licensed under the Apache License 2.0 and the Polyform Free Trial License 1.0.0. A copy of each license can be found in the [licenses](licenses) directory.
 
-### Prerequisites for Mac OS X
+The build produces two sets of binaries:
 
-Install [Homebrew](https://brew.sh/):
+* The entire database with all its features (including the enterprise ones) are licensed under the Apache License 2.0
+* The  binaries that contain `-managed` in the artifact and help run a managed service are licensed under the Polyform Free Trial License 1.0.0.
 
-```bash
-/usr/bin/ruby -e "$(
-  curl -fsSL https://raw.githubusercontent.com/Homebrew/install/master/install)"
-```
+> By default, the build options generate only the Apache License 2.0 binaries.
 
-Install the following packages using Homebrew:
-```
-brew install autoconf automake bash bison ccache cmake coreutils flex gnu-tar icu4c libtool maven \
-             ninja pkg-config pstree wget zlib python@2
-```
+# Read More
 
-Also YugaByte DB build scripts rely on Bash 4. Make sure that `which bash` outputs
-`/usr/local/bin/bash` before proceeding. You may need to put `/usr/local/bin` as the first directory
-on PATH in your `~/.bashrc` to achieve that.
-
-### Prerequisites for drivers and sample apps
-
-YugaByte DB core is written in C++, but the repository contains Java code needed to run sample
-applications. To build the Java part, you need:
-* JDK 8
-* [Apache Maven](https://maven.apache.org/).
-
-Also make sure Maven's `bin` directory is added to your PATH, e.g. by adding to your `~/.bashrc`
-```
-export PATH=$HOME/tools/apache-maven-3.5.0/bin:$PATH
-```
-if you've installed Maven into `~/tools/apache-maven-3.5.0`.
-
-For building YugaByte DB Java code, you'll need to install Java and Apache Maven.
-
-**Java driver**
-
-YugaByte DB and Apache Cassandra use different approaches to split data between nodes. In order to
-route client requests to the right server without extra hops, we provide a [custom
-load balancing policy](https://goo.gl/At7kvu) in [our modified version
-](https://github.com/yugabyte/cassandra-java-driver) of Datastax's Apache Cassandra Java driver.
-
-The latest version of our driver is available on Maven Central. You can build your application
-using our driver by adding the following Maven dependency to your application:
-
-```
-<dependency>
-  <groupId>com.yugabyte</groupId>
-  <artifactId>cassandra-driver-core</artifactId>
-  <version>3.2.0-yb-18</version>
-</dependency>
-```
-
-### Building the code
-
-Assuming this repository is checked out in `~/code/yugabyte-db`, do the following:
-
-```
-cd ~/code/yugabyte-db
-./yb_build.sh release --with-assembly
-```
-
-The above command will build the release configuration, put the C++ binaries in
-`build/release-gcc-dynamic-community`, and will also create the `build/latest` symlink to that
-directory. Then it will build the Java code as well. The `--with-assembly` flag tells the build
-script to build the `yb-sample-apps.jar` file containing sample Java apps.
-
-For Linux it will first make sure our custom Linuxbrew distribution is installed into
-`~/.linuxbrew-yb-build/linuxbrew-<version>`.
-
-### Running the C++ tests
-
-To run all the C++ tests you can use following command:
-```
-./yb_build.sh release --ctest
-```
-
-If you omit `release` argument, it will run java tests against debug YugaByte build.
-
-To run specific test:
-
-```
-./yb_build.sh release --cxx-test util_monotime-test
-```
-
-Also you can run specific sub-test:
-
-```
-./yb_build.sh release --cxx-test util_monotime-test --gtest_filter TestMonoTime.TestCondition
-```
-
-### Building Java code alone
-
-You can skip building C++ code, this can be useful when you only need to rebuild Java code:
-```
-cd ~/code/yugabyte-db
-./yb_build.sh --scb
-```
-
-### Running the Java tests
-
-Given that you've already built C++ and Java code you can run Java tests using following command:
-```
-./yb_build.sh release --scb --sj --java-tests
-```
-
-If you omit `release` argument, it will run java tests against debug YugaByte build, so you should then either
-build debug binaries with `./yb_build.sh` or omit `--scb` and then it will build debug binaries automatically.
-
-Alternatively, to run specific test:
-```
-./yb_build.sh release --scb --sj --java-test org.yb.client.TestYBClient
-```
-
-To run a specific Java sub-test within a test file use the # syntax, for example:
-```
-./yb_build.sh release --scb --sj --java-test org.yb.client.TestYBClient#testClientCreateDestroy
-```
-
-###  Viewing log outputs of Java tests
-
-You can find Java tests output in corresponding directory (you might
-need to change `yb-client` to respective Java tests module):
-```
-$ ls -1 java/yb-client/target/surefire-reports/
-TEST-org.yb.client.TestYBClient.xml
-org.yb.client.TestYBClient-output.txt
-org.yb.client.TestYBClient.testAffinitizedLeaders.stderr.txt
-org.yb.client.TestYBClient.testAffinitizedLeaders.stdout.txt
-…
-org.yb.client.TestYBClient.testWaitForLoadBalance.stderr.txt
-org.yb.client.TestYBClient.testWaitForLoadBalance.stdout.txt
-org.yb.client.TestYBClient.txt
-```
-Note that the YB logs are contained in the output file now.
-
-## Reporting Issues
-
-Please use [GitHub issues](https://github.com/YugaByte/yugabyte-db/issues) to report issues.
-
-To live chat with our engineers, use our [Slack channel](https://www.yugabyte.com/slack).
-
-## Contributing
-
-We accept contributions as GitHub pull requests. Our code style is available
-[here](https://goo.gl/Hkt5BU)
-(mostly based on [Google C++ Style Guide](https://google.github.io/styleguide/cppguide.html)).
-
-## License
-
-YugaByte DB Community Edition is distributed under an Apache 2.0 license. See the
-[LICENSE.txt](https://github.com/YugaByte/yugabyte-db/blob/master/LICENSE.txt) file for
-details.
+* To see our updates, go to [The Distributed SQL Blog](https://blog.yugabyte.com/).
+* For an in-depth design and the YugabyteDB architecture, see our [design specs](https://github.com/yugabyte/yugabyte-db/tree/master/architecture/design).
+* Tech Talks and [Videos](https://www.youtube.com/c/YugaByte).
+* See how YugabyteDB [compares with other databases](https://docs.yugabyte.com/preview/faq/comparisons/).

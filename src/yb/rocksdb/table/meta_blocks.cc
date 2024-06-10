@@ -17,6 +17,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/rocksdb/table/meta_blocks.h"
 
 #include <map>
@@ -24,17 +25,48 @@
 
 #include "yb/rocksdb/db/table_properties_collector.h"
 #include "yb/rocksdb/table.h"
-#include "yb/rocksdb/table_properties.h"
 #include "yb/rocksdb/table/block.h"
+#include "yb/rocksdb/table/block_builder.h"
 #include "yb/rocksdb/table/format.h"
 #include "yb/rocksdb/table/internal_iterator.h"
 #include "yb/rocksdb/table/table_properties_internal.h"
 #include "yb/rocksdb/util/coding.h"
+#include "yb/rocksdb/util/file_reader_writer.h"
+#include "yb/util/flags.h"
+
+DEFINE_UNKNOWN_bool(verify_encrypted_meta_block_checksums, true,
+            "Whether to verify checksums for meta blocks of encrypted SSTables.");
 
 namespace rocksdb {
 
+namespace {
+
+constexpr auto kMetaIndexBlockRestartInterval = 1;
+
+// We use kKeyDeltaEncodingSharedPrefix format for property blocks, but since
+// kPropertyBlockRestartInterval == 1 every key in these blocks will still have zero shared prefix
+// length and will be stored fully.
+constexpr auto kPropertyBlockKeyValueEncodingFormat =
+    KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix;
+constexpr auto kPropertyBlockRestartInterval = 1;
+
+ReadOptions CreateMetaBlockReadOptions(RandomAccessFileReader* file) {
+  ReadOptions read_options;
+
+  // We need to verify checksums for meta blocks in order to recover from the encryption format
+  // issue described at https://github.com/yugabyte/yugabyte-db/issues/3707.
+  // However, we only do that for encrypted files in order to prevent lots of RocksDB unit tests
+  // from failing as described at https://github.com/yugabyte/yugabyte-db/issues/3974.
+  read_options.verify_checksums = file->file()->IsEncrypted() &&
+                                  FLAGS_verify_encrypted_meta_block_checksums;
+  return read_options;
+}
+
+}  // namespace
+
 MetaIndexBuilder::MetaIndexBuilder()
-    : meta_index_block_(new BlockBuilder(1 /* restart interval */)) {}
+    : meta_index_block_(new BlockBuilder(
+          kMetaIndexBlockRestartInterval, kMetaIndexBlockKeyValueEncodingFormat)) {}
 
 void MetaIndexBuilder::Add(const std::string& key,
                            const BlockHandle& handle) {
@@ -51,7 +83,8 @@ Slice MetaIndexBuilder::Finish() {
 }
 
 PropertyBlockBuilder::PropertyBlockBuilder()
-    : properties_block_(new BlockBuilder(1 /* restart interval */)) {}
+    : properties_block_(
+          new BlockBuilder(kPropertyBlockRestartInterval, kPropertyBlockKeyValueEncodingFormat)) {}
 
 void PropertyBlockBuilder::Add(const std::string& name,
                                const std::string& val) {
@@ -160,19 +193,17 @@ Status ReadProperties(const Slice& handle_value, RandomAccessFileReader* file,
   }
 
   BlockContents block_contents;
-  ReadOptions read_options;
-  read_options.verify_checksums = false;
-  Status s;
-  s = ReadBlockContents(file, footer, read_options, handle, &block_contents,
-                        env, nullptr /* mem_tracker */, false);
+  ReadOptions read_options = CreateMetaBlockReadOptions(file);
+  Status s = ReadBlockContents(file, footer, read_options, handle, &block_contents,
+                               env, nullptr /* mem_tracker */, false);
 
   if (!s.ok()) {
     return s;
   }
 
   Block properties_block(std::move(block_contents));
-  std::unique_ptr<InternalIterator> iter(
-      properties_block.NewIterator(BytewiseComparator()));
+  std::unique_ptr<InternalIterator> iter(properties_block.NewIterator(
+      BytewiseComparator(), kPropertyBlockKeyValueEncodingFormat));
 
   auto new_table_properties = new TableProperties();
   // All pre-defined properties of type uint64_t
@@ -247,16 +278,15 @@ Status ReadTableProperties(RandomAccessFileReader* file, uint64_t file_size,
 
   auto metaindex_handle = footer.metaindex_handle();
   BlockContents metaindex_contents;
-  ReadOptions read_options;
-  read_options.verify_checksums = false;
+  ReadOptions read_options = CreateMetaBlockReadOptions(file);
   s = ReadBlockContents(file, footer, read_options, metaindex_handle,
                         &metaindex_contents, env, nullptr /* mem_tracker */, false);
   if (!s.ok()) {
     return s;
   }
   Block metaindex_block(std::move(metaindex_contents));
-  std::unique_ptr<InternalIterator> meta_iter(
-      metaindex_block.NewIterator(BytewiseComparator()));
+  std::unique_ptr<InternalIterator> meta_iter(metaindex_block.NewIterator(
+      BytewiseComparator(), kMetaIndexBlockKeyValueEncodingFormat));
 
   // -- Read property block
   bool found_properties_block = true;
@@ -302,8 +332,7 @@ Status FindMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
 
   auto metaindex_handle = footer.metaindex_handle();
   BlockContents metaindex_contents;
-  ReadOptions read_options;
-  read_options.verify_checksums = false;
+  ReadOptions read_options = CreateMetaBlockReadOptions(file);
   s = ReadBlockContents(file, footer, read_options, metaindex_handle,
                         &metaindex_contents, env, mem_tracker, false);
   if (!s.ok()) {
@@ -312,7 +341,8 @@ Status FindMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   Block metaindex_block(std::move(metaindex_contents));
 
   std::unique_ptr<InternalIterator> meta_iter;
-  meta_iter.reset(metaindex_block.NewIterator(BytewiseComparator()));
+  meta_iter.reset(
+      metaindex_block.NewIterator(BytewiseComparator(), kMetaIndexBlockKeyValueEncodingFormat));
 
   return FindMetaBlock(meta_iter.get(), meta_block_name, block_handle);
 }
@@ -332,8 +362,7 @@ Status ReadMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   // Reading metaindex block
   auto metaindex_handle = footer.metaindex_handle();
   BlockContents metaindex_contents;
-  ReadOptions read_options;
-  read_options.verify_checksums = false;
+  ReadOptions read_options = CreateMetaBlockReadOptions(file);
   status = ReadBlockContents(file, footer, read_options, metaindex_handle,
                              &metaindex_contents, env, mem_tracker, false);
   if (!status.ok()) {
@@ -344,7 +373,8 @@ Status ReadMetaBlock(RandomAccessFileReader* file, uint64_t file_size,
   Block metaindex_block(std::move(metaindex_contents));
 
   std::unique_ptr<InternalIterator> meta_iter;
-  meta_iter.reset(metaindex_block.NewIterator(BytewiseComparator()));
+  meta_iter.reset(
+      metaindex_block.NewIterator(BytewiseComparator(), kMetaIndexBlockKeyValueEncodingFormat));
 
   BlockHandle block_handle;
   status = FindMetaBlock(meta_iter.get(), meta_block_name, &block_handle);

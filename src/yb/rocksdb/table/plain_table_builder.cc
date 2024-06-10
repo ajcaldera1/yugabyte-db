@@ -18,31 +18,26 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
+
 #include "yb/rocksdb/table/plain_table_builder.h"
 
 #include <assert.h>
 
-#include <string>
 #include <limits>
 #include <map>
 
 #include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/filter_policy.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/table.h"
-#include "yb/rocksdb/table/plain_table_factory.h"
-#include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/table/block_builder.h"
 #include "yb/rocksdb/table/bloom_block.h"
-#include "yb/rocksdb/table/plain_table_index.h"
 #include "yb/rocksdb/table/format.h"
 #include "yb/rocksdb/table/meta_blocks.h"
 #include "yb/rocksdb/util/coding.h"
-#include "yb/rocksdb/util/crc32c.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/stop_watch.h"
+
+#include "yb/util/status_log.h"
 
 namespace rocksdb {
 
@@ -142,6 +137,7 @@ void PlainTableBuilder::Add(const Slice& key, const Slice& value) {
   // temp buffer for metadata bytes between key and value.
   char meta_bytes_buf[6];
   size_t meta_bytes_buf_size = 0;
+  last_key_.assign(key.cdata(), key.size());
 
   ParsedInternalKey internal_key;
   ParseInternalKey(key, &internal_key);
@@ -161,8 +157,7 @@ void PlainTableBuilder::Add(const Slice& key, const Slice& value) {
   assert(offset_ <= std::numeric_limits<uint32_t>::max());
   auto prev_offset = static_cast<uint32_t>(offset_);
   // Write out the key
-  encoder_.AppendKey(key, file_, &offset_, meta_bytes_buf,
-                     &meta_bytes_buf_size);
+  CHECK_OK(encoder_.AppendKey(key, file_, &offset_, meta_bytes_buf, &meta_bytes_buf_size));
   if (SaveIndexInFile()) {
     index_builder_->AddKeyPrefix(GetPrefix(internal_key), prev_offset);
   }
@@ -173,10 +168,10 @@ void PlainTableBuilder::Add(const Slice& key, const Slice& value) {
       EncodeVarint32(meta_bytes_buf + meta_bytes_buf_size, value_size);
   assert(end_ptr <= meta_bytes_buf + sizeof(meta_bytes_buf));
   meta_bytes_buf_size = end_ptr - meta_bytes_buf;
-  file_->Append(Slice(meta_bytes_buf, meta_bytes_buf_size));
+  CHECK_OK(file_->Append(Slice(meta_bytes_buf, meta_bytes_buf_size)));
 
   // Write value
-  file_->Append(value);
+  CHECK_OK(file_->Append(value));
   offset_ += value_size + meta_bytes_buf_size;
 
   properties_.num_entries++;
@@ -312,5 +307,8 @@ uint64_t PlainTableBuilder::BaseFileSize() const {
   return TotalFileSize();
 }
 
+const std::string& PlainTableBuilder::LastKey() const {
+  return last_key_;
+}
+
 }  // namespace rocksdb
-#endif  // ROCKSDB_LITE

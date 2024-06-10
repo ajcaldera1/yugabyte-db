@@ -29,34 +29,27 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_MASTER_CATALOG_MANAGER_INTERNAL_H
-#define YB_MASTER_CATALOG_MANAGER_INTERNAL_H
+#pragma once
 
 #include "yb/common/wire_protocol.h"
-#include "yb/gutil/basictypes.h"
-#include "yb/master/catalog_manager.h"
-#include "yb/rpc/rpc_context.h"
+
+
+#include "yb/master/master_error.h"
 
 namespace yb {
+
 namespace master {
 
-// Non-template helpers.
+static const std::string kRelnamespaceNotFoundErrorStr =
+    "Not found or invalid relnamespace oid for table oid ";
 
-inline CHECKED_STATUS SetupError(MasterErrorPB* error,
-                                 MasterErrorPB::Code code,
-                                 const Status& s) {
+inline Status SetupError(MasterErrorPB* error, MasterErrorPB::Code code, const Status& s) {
   StatusToPB(s, error->mutable_status());
   error->set_code(code);
   return s;
 }
 
-// Template helpers.
-
-// If 's' indicates that the node is no longer the leader, setup
-// Service::UnavailableError as the error, set NOT_THE_LEADER as the
-// error code and return true.
-template<class RespClass>
-CHECKED_STATUS CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* resp) {
+inline Status CheckIfNoLongerLeader(const Status& s) {
   // TODO (KUDU-591): This is a bit of a hack, as right now
   // there's no way to propagate why a write to a consensus configuration has
   // failed. However, since we use Status::IllegalState()/IsAborted() to
@@ -64,65 +57,45 @@ CHECKED_STATUS CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* re
   // that is no longer the leader, this suffices until we
   // distinguish this cause of write failure more explicitly.
   if (s.IsIllegalState() || s.IsAborted()) {
-    Status new_status = STATUS(ServiceUnavailable,
-        "operation requested can only be executed on a leader master, but this"
-        " master is no longer the leader", s.ToString());
-    ignore_result(SetupError(resp->mutable_error(), MasterErrorPB::NOT_THE_LEADER, new_status));
+    return STATUS(ServiceUnavailable,
+        "Operation requested can only be executed on a leader master, but this"
+        " master is no longer the leader", s.ToString(),
+        MasterError(MasterErrorPB::NOT_THE_LEADER));
   }
 
   return s;
 }
 
-////////////////////////////////////////////////////////////
-// CatalogManager::ScopedLeaderSharedLock
-////////////////////////////////////////////////////////////
-
-template<typename RespClass>
-bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedOrRespond(
-    RespClass* resp, rpc::RpcContext* rpc) {
-  if (PREDICT_FALSE(!catalog_status_.ok())) {
-    StatusToPB(catalog_status_, resp->mutable_error()->mutable_status());
-    resp->mutable_error()->set_code(MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED);
-    rpc->RespondSuccess();
-    return false;
-  }
-  return true;
-}
-
-template<typename RespClass, typename ErrorClass>
-bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespondInternal(
-    RespClass* resp,
-    rpc::RpcContext* rpc) {
-  const Status* status = &catalog_status_;
-  if (PREDICT_TRUE(status->ok())) {
-    status = &leader_status_;
-    if (PREDICT_TRUE(status->ok())) {
-      return true;
-    }
+// If 's' indicates that the node is no longer the leader, setup
+// Service::UnavailableError as the error, set NOT_THE_LEADER as the
+// error code and return true.
+template<class RespClass>
+Status CheckIfNoLongerLeaderAndSetupError(const Status& s, RespClass* resp) {
+  auto new_status = CheckIfNoLongerLeader(s);
+  if (MasterError(new_status) == MasterErrorPB::NOT_THE_LEADER) {
+    return SetupError(resp->mutable_error(), MasterErrorPB::NOT_THE_LEADER, new_status);
   }
 
-  StatusToPB(*status, resp->mutable_error()->mutable_status());
-  resp->mutable_error()->set_code(ErrorClass::NOT_THE_LEADER);
-  rpc->RespondSuccess();
-  return false;
+  return s;
 }
 
-template<typename RespClass>
-bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespond(
-    RespClass* resp,
-    rpc::RpcContext* rpc) {
-  return CheckIsInitializedAndIsLeaderOrRespondInternal<RespClass, MasterErrorPB>(resp, rpc);
+inline Status CheckStatus(const Status& status, const char* action) {
+  if (status.ok()) {
+    return status;
+  }
+
+  const Status s = status.CloneAndPrepend(std::string("An error occurred while ") + action);
+  LOG(WARNING) << s;
+  return s;
 }
 
-// Variation of the above method which uses TabletServerErrorPB instead.
-template<typename RespClass>
-bool CatalogManager::ScopedLeaderSharedLock::CheckIsInitializedAndIsLeaderOrRespondTServer(
-    RespClass* resp,
-    rpc::RpcContext* rpc) {
-  return CheckIsInitializedAndIsLeaderOrRespondInternal<RespClass, tserver::TabletServerErrorPB>
-      (resp, rpc);
+inline Status CheckLeaderStatus(const Status& status, const char* action) {
+  return CheckIfNoLongerLeader(CheckStatus(status, action));
 }
 
+template <class RespClass>
+Status CheckLeaderStatusAndSetupError(const Status& status, const char* action, RespClass* resp) {
+  return CheckIfNoLongerLeaderAndSetupError(CheckStatus(status, action), resp);
+}
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_CATALOG_MANAGER_INTERNAL_H

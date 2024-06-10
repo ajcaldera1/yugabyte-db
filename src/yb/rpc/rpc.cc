@@ -36,34 +36,40 @@
 #include <string>
 #include <thread>
 
-#include "yb/gutil/basictypes.h"
+#include "yb/ash/wait_state.h"
+
 #include "yb/gutil/strings/substitute.h"
 
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/rpc_header.pb.h"
 
-#include "yb/util/flag_tags.h"
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
 #include "yb/util/random_util.h"
+#include "yb/util/source_location.h"
+#include "yb/util/status_format.h"
+#include "yb/util/trace.h"
 #include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 using namespace std::placeholders;
 
-DEFINE_int64(rpcs_shutdown_timeout_ms, 15000 * yb::kTimeMultiplier,
+DEFINE_UNKNOWN_int64(rpcs_shutdown_timeout_ms, 15000 * yb::kTimeMultiplier,
              "Timeout for a batch of multiple RPCs invoked in parallel to shutdown.");
-DEFINE_int64(rpcs_shutdown_extra_delay_ms, 5000 * yb::kTimeMultiplier,
+DEFINE_UNKNOWN_int64(rpcs_shutdown_extra_delay_ms, 5000 * yb::kTimeMultiplier,
              "Extra allowed time for a single RPC command to complete after its deadline.");
-DEFINE_int64(retryable_rpc_single_call_timeout_ms, 2500 * yb::kTimeMultiplier,
-             "Timeout of single RPC call in retryable RPC command.");
-DEFINE_int32(
-    min_backoff_ms_exponent, 7,
-    "Min amount of backoff delay if the server responds with TOO BUSY (default: 128ms). "
-    "Set this to some amount, during which the server might have recovered.");
-DEFINE_int32(
-    max_backoff_ms_exponent, 16,
-    "Max amount of backoff delay if the server responds with TOO BUSY (default: 64 sec). "
-    "Set this to some duration, past which you are okay having no backoff for a Ddos "
-    "style build-up, during times when the server is overloaded, and unable to recover.");
+DEFINE_UNKNOWN_int32(min_backoff_ms_exponent, 7,
+             "Min amount of backoff delay if the server responds with TOO BUSY (default: 128ms). "
+             "Set this to some amount, during which the server might have recovered.");
+DEFINE_UNKNOWN_int32(max_backoff_ms_exponent, 16,
+             "Max amount of backoff delay if the server responds with TOO BUSY (default: 64 sec). "
+             "Set this to some duration, past which you are okay having no backoff for a Ddos "
+             "style build-up, during times when the server is overloaded, and unable to recover.");
+
+DEFINE_UNKNOWN_int32(linear_backoff_ms, 1,
+             "Number of milliseconds added to delay while using linear backoff strategy.");
+
 TAG_FLAG(min_backoff_ms_exponent, hidden);
 TAG_FLAG(min_backoff_ms_exponent, advanced);
 TAG_FLAG(max_backoff_ms_exponent, hidden);
@@ -71,16 +77,28 @@ TAG_FLAG(max_backoff_ms_exponent, advanced);
 
 namespace yb {
 
-using std::shared_ptr;
-using strings::Substitute;
+using std::string;
 using strings::SubstituteAndAppend;
 
 namespace rpc {
 
+RpcCommand::RpcCommand() : trace_(Trace::MaybeGetNewTraceForParent(Trace::CurrentTrace())) {
+}
+
+RpcCommand::~RpcCommand() {}
+
+RpcRetrier::RpcRetrier(CoarseTimePoint deadline, Messenger* messenger, ProxyCache *proxy_cache)
+    : start_(CoarseMonoClock::now()),
+      deadline_(deadline),
+      messenger_(messenger),
+      proxy_cache_(*proxy_cache) {
+  DCHECK(deadline != CoarseTimePoint());
+}
+
 bool RpcRetrier::HandleResponse(
     RpcCommand* rpc, Status* out_status, RetryWhenBusy retry_when_busy) {
-  ignore_result(DCHECK_NOTNULL(rpc));
-  ignore_result(DCHECK_NOTNULL(out_status));
+  DCHECK_ONLY_NOTNULL(rpc);
+  DCHECK_ONLY_NOTNULL(out_status);
 
   // Always retry a TOO_BUSY error.
   Status controller_status = controller_.status();
@@ -104,51 +122,64 @@ bool RpcRetrier::HandleResponse(
 
 Status RpcRetrier::DelayedRetry(
     RpcCommand* rpc, const Status& why_status, BackoffStrategy strategy) {
-  if (!why_status.ok() && (last_error_.ok() || last_error_.IsTimedOut())) {
-    last_error_ = why_status;
-  }
   // Add some jitter to the retry delay.
   //
   // If the delay causes us to miss our deadline, RetryCb will fail the
   // RPC on our behalf.
   // makes the call redundant by then.
-  int num_ms =
-      (strategy == BackoffStrategy::kExponential
-           ? 1 << std::min(
-                 FLAGS_min_backoff_ms_exponent + attempt_num_, FLAGS_max_backoff_ms_exponent)
-           : attempt_num_) +
-      RandomUniformInt(0, 4);
+  if (strategy == BackoffStrategy::kExponential) {
+    retry_delay_ = fit_bounds<MonoDelta>(
+        retry_delay_ * 2,
+        1ms * (1ULL << (FLAGS_min_backoff_ms_exponent + 1)),
+        1ms * (1ULL << FLAGS_max_backoff_ms_exponent));
+  } else {
+    retry_delay_ += 1ms * FLAGS_linear_backoff_ms;
+  }
+
+  return DoDelayedRetry(rpc, why_status);
+}
+
+Status RpcRetrier::DelayedRetry(RpcCommand* rpc, const Status& why_status, MonoDelta add_delay) {
+  retry_delay_ += add_delay;
+  return DoDelayedRetry(rpc, why_status);
+}
+
+Status RpcRetrier::DoDelayedRetry(RpcCommand* rpc, const Status& why_status) {
+  if (!why_status.ok() && (last_error_.ok() || last_error_.IsTimedOut())) {
+    last_error_ = why_status;
+  }
   attempt_num_++;
 
   RpcRetrierState expected_state = RpcRetrierState::kIdle;
   while (!state_.compare_exchange_strong(expected_state, RpcRetrierState::kScheduling)) {
     if (expected_state == RpcRetrierState::kFinished) {
-      auto result = STATUS_FORMAT(IllegalState, "Retry of finished command: $0", rpc);
-      LOG(WARNING) << result;
-      return result;
+      auto status = STATUS_FORMAT(IllegalState, "Retry of finished command: $0", rpc);
+      LOG(WARNING) << status;
+      return status;
     }
     if (expected_state == RpcRetrierState::kWaiting) {
-      auto result = STATUS_FORMAT(IllegalState, "Retry of already waiting command: $0", rpc);
-      LOG(WARNING) << result;
-      return result;
+      auto status = STATUS_FORMAT(IllegalState, "Retry of already waiting command: $0", rpc);
+      LOG(WARNING) << status;
+      return status;
     }
   }
 
   auto retain_rpc = rpc->shared_from_this();
-  task_id_ = messenger_->ScheduleOnReactor(
-      std::bind(&RpcRetrier::DoRetry, this, rpc, _1), MonoDelta::FromMilliseconds(num_ms),
-      SOURCE_LOCATION(), messenger_);
+  auto task_id_result = messenger_->ScheduleOnReactor(
+      std::bind(&RpcRetrier::DoRetry, this, rpc, _1),
+      retry_delay_ + MonoDelta::FromMilliseconds(RandomUniformInt(0, 4)),
+      SOURCE_LOCATION());
 
-  // Scheduling state can be changed only in this method, so we expected both
-  // exchanges below to succeed.
+  // Scheduling state can be changed only in this method, so we expected both exchanges below to
+  // succeed.
   expected_state = RpcRetrierState::kScheduling;
-  if (task_id_.load(std::memory_order_acquire) == kInvalidTaskId) {
-    auto result = STATUS_FORMAT(IllegalState, "Failed to schedule: $0", rpc);
-    LOG(WARNING) << result;
+  if (!task_id_result.ok()) {
+    task_id_.store(kInvalidTaskId, std::memory_order_release);
     CHECK(state_.compare_exchange_strong(
         expected_state, RpcRetrierState::kFinished, std::memory_order_acq_rel));
-    return result;
+    return task_id_result.status();
   }
+  task_id_.store(*task_id_result, std::memory_order_release);
   CHECK(state_.compare_exchange_strong(
       expected_state, RpcRetrierState::kWaiting, std::memory_order_acq_rel));
   return Status::OK();
@@ -172,19 +203,20 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
   }
   task_id_ = kInvalidTaskId;
   if (!run) {
-    rpc->Finished(STATUS_FORMAT(
-        Aborted, "$0 aborted: $1", rpc->ToString(), yb::rpc::ToString(expected_state)));
+    auto status = STATUS_FORMAT(
+        Aborted, "$0 aborted: $1", rpc->ToString(), yb::rpc::ToString(expected_state));
+    VTRACE_TO(1, rpc->trace(), "Rpc Finished with status $0", status.ToString());
+    rpc->Finished(status);
     return;
   }
   Status new_status = status;
   if (new_status.ok()) {
     // Has this RPC timed out?
-    if (deadline_.Initialized()) {
-      MonoTime now = MonoTime::Now();
-      if (deadline_.ComesBefore(now)) {
-        string err_str = Substitute(
-          "$0 passed its deadline $1 (now: $2)", rpc->ToString(),
-          deadline_.ToString(), now.ToString());
+    if (deadline_ != CoarseTimePoint::max()) {
+      auto now = CoarseMonoClock::Now();
+      if (deadline_ < now) {
+        string err_str = Format(
+          "$0 passed its deadline $1 (passed: $2)", *rpc, deadline_, now - start_);
         if (!last_error_.ok()) {
           SubstituteAndAppend(&err_str, ": $0", last_error_.ToString());
         }
@@ -194,6 +226,7 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
   }
   if (new_status.ok()) {
     controller_.Reset();
+    VTRACE_TO(1, rpc->trace(), "Sending Rpc");
     rpc->SendRpc();
   } else {
     // Service unavailable here means that we failed to to schedule delayed task, i.e. reactor
@@ -201,6 +234,7 @@ void RpcRetrier::DoRetry(RpcCommand* rpc, const Status& status) {
     if (new_status.IsServiceUnavailable()) {
       new_status = STATUS_FORMAT(Aborted, "Aborted because of $0", new_status);
     }
+    VTRACE_TO(1, rpc->trace(), "Rpc Finished with status $0", new_status.ToString());
     rpc->Finished(new_status);
   }
   expected_state = RpcRetrierState::kRunning;
@@ -246,12 +280,18 @@ std::string RpcRetrier::ToString() const {
                 deadline_);
 }
 
-RpcController* RpcRetrier::PrepareController(MonoDelta single_call_timeout) {
-  if (!single_call_timeout) {
-    single_call_timeout = MonoDelta::FromMilliseconds(FLAGS_retryable_rpc_single_call_timeout_ms);
-  }
-  controller_.set_deadline(std::min(deadline_, MonoTime::Now() + single_call_timeout));
+RpcController* RpcRetrier::PrepareController() {
+  controller_.set_timeout(deadline_ - CoarseMonoClock::now());
   return &controller_;
+}
+
+void Rpc::ScheduleRetry(const Status& status) {
+  auto retry_status = mutable_retrier()->DelayedRetry(this, status);
+  if (!retry_status.ok()) {
+    LOG(WARNING) << "Failed to schedule retry: " << retry_status;
+    VTRACE_TO(1, trace(), "Rpc Finished with status $0", retry_status.ToString());
+    Finished(retry_status);
+  }
 }
 
 Rpcs::Rpcs(std::mutex* mutex) {
@@ -263,17 +303,17 @@ Rpcs::Rpcs(std::mutex* mutex) {
   }
 }
 
-MonoTime Rpcs::DoRequestAbortAll(RequestShutdown shutdown) {
+CoarseTimePoint Rpcs::DoRequestAbortAll(RequestShutdown shutdown) {
   std::vector<Calls::value_type> calls;
   {
-    std::lock_guard<std::mutex> lock(*mutex_);
+    std::lock_guard lock(*mutex_);
     if (!shutdown_) {
       shutdown_ = shutdown;
       calls.reserve(calls_.size());
       calls.assign(calls_.begin(), calls_.end());
     }
   }
-  auto deadline = MonoTime::Now() + std::chrono::milliseconds(FLAGS_rpcs_shutdown_timeout_ms);
+  auto deadline = CoarseMonoClock::now() + FLAGS_rpcs_shutdown_timeout_ms * 1ms;
   // It takes some time to complete rpc command after its deadline has passed.
   // So we add extra time for it.
   auto single_call_extra_delay = std::chrono::milliseconds(FLAGS_rpcs_shutdown_extra_delay_ms);
@@ -292,11 +332,11 @@ void Rpcs::Shutdown() {
     std::unique_lock<std::mutex> lock(*mutex_);
     while (!calls_.empty()) {
       LOG(INFO) << "Waiting calls: " << calls_.size();
-      if (cond_.wait_until(lock, deadline.ToSteadyTimePoint()) == std::cv_status::timeout) {
+      if (cond_.wait_until(lock, deadline) == std::cv_status::timeout) {
         break;
       }
     }
-    CHECK(calls_.empty()) << "Calls: " << yb::ToString(calls_);
+    CHECK(calls_.empty()) << "Calls: " << AsString(calls_);
   }
 }
 
@@ -307,7 +347,7 @@ void Rpcs::Register(RpcCommandPtr call, Handle* handle) {
 }
 
 Rpcs::Handle Rpcs::Register(RpcCommandPtr call) {
-  std::lock_guard<std::mutex> lock(*mutex_);
+  std::lock_guard lock(*mutex_);
   if (shutdown_) {
     call->Abort();
     return InvalidHandle();
@@ -316,12 +356,23 @@ Rpcs::Handle Rpcs::Register(RpcCommandPtr call) {
   return --calls_.end();
 }
 
-void Rpcs::RegisterAndStart(RpcCommandPtr call, Handle* handle) {
+bool Rpcs::RegisterAndStart(RpcCommandPtr call, Handle* handle) {
   CHECK(*handle == calls_.end());
   Register(std::move(call), handle);
-  if (*handle != InvalidHandle()) {
-    (***handle).SendRpc();
+  if (*handle == InvalidHandle()) {
+    return false;
   }
+
+  VTRACE_TO(1, (***handle).trace(), "Sending Rpc");
+  (***handle).SendRpc();
+  return true;
+}
+
+Status Rpcs::RegisterAndStartStatus(RpcCommandPtr call, Handle* handle) {
+  if (RegisterAndStart(call, handle)) {
+    return Status::OK();
+  }
+  return STATUS(InternalError, "Failed to send RPC");
 }
 
 RpcCommandPtr Rpcs::Unregister(Handle* handle) {
@@ -330,16 +381,16 @@ RpcCommandPtr Rpcs::Unregister(Handle* handle) {
   }
   auto result = **handle;
   {
-    std::lock_guard<std::mutex> lock(*mutex_);
+    std::lock_guard lock(*mutex_);
     calls_.erase(*handle);
-    cond_.notify_one();
+    YB_PROFILE(cond_.notify_one());
   }
   *handle = calls_.end();
   return result;
 }
 
 Rpcs::Handle Rpcs::Prepare() {
-  std::lock_guard<std::mutex> lock(*mutex_);
+  std::lock_guard lock(*mutex_);
   if (shutdown_) {
     return InvalidHandle();
   }
@@ -349,32 +400,6 @@ Rpcs::Handle Rpcs::Prepare() {
 
 void Rpcs::RequestAbortAll() {
   DoRequestAbortAll(RequestShutdown::kFalse);
-}
-
-void Rpcs::Abort(std::initializer_list<Handle*> list) {
-  std::vector<RpcCommandPtr> to_abort;
-  {
-    std::lock_guard<std::mutex> lock(*mutex_);
-    for (auto& handle : list) {
-      if (*handle != calls_.end()) {
-        to_abort.push_back(**handle);
-      }
-    }
-  }
-  if (to_abort.empty()) {
-    return;
-  }
-  for (auto& rpc : to_abort) {
-    rpc->Abort();
-  }
-  {
-    std::unique_lock<std::mutex> lock(*mutex_);
-    for (auto& handle : list) {
-      while (*handle != calls_.end()) {
-        cond_.wait(lock);
-      }
-    }
-  }
 }
 
 } // namespace rpc

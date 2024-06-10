@@ -15,11 +15,9 @@
 // Tree node definitions for INSERT INTO ... VALUES clause.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_INSERT_VALUES_CLAUSE_H_
-#define YB_YQL_CQL_QL_PTREE_PT_INSERT_VALUES_CLAUSE_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/list_node.h"
-#include "yb/yql/cql/ql/ptree/pt_expr.h"
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
 
 namespace yb {
@@ -35,7 +33,7 @@ class PTInsertValuesClause : public PTCollection {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTInsertValuesClause(MemoryContext* memctx,
-                       YBLocation::SharedPtr loc,
+                       YBLocationPtr loc,
                        PTExprListNode::SharedPtr tuple);
   virtual ~PTInsertValuesClause();
 
@@ -45,12 +43,17 @@ class PTInsertValuesClause : public PTCollection {
     return MCMakeShared<PTInsertValuesClause>(memctx, std::forward<TypeArgs>(args)...);
   }
 
+  // Node type.
+  TreeNodeOpcode opcode() const override {
+    return TreeNodeOpcode::kPTInsertValuesClause;
+  }
+
   // Add a tree node at the end.
   void Append(const PTExprListNode::SharedPtr& tnode);
   void Prepend(const PTExprListNode::SharedPtr& tnode);
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override;
+  Status Analyze(SemContext* sem_context) override;
   void PrintSemanticAnalysisResult(SemContext* sem_context);
 
   // Access function for tuples_.
@@ -59,7 +62,7 @@ class PTInsertValuesClause : public PTCollection {
   }
 
   // Number of provided tuples.
-  virtual int TupleCount() const {
+  size_t TupleCount() const {
     return tuples_.size();
   }
 
@@ -71,5 +74,3 @@ class PTInsertValuesClause : public PTCollection {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif // YB_YQL_CQL_QL_PTREE_PT_INSERT_VALUES_CLAUSE_H_

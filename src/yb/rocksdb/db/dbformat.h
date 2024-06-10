@@ -21,26 +21,26 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_DB_DBFORMAT_H
-#define YB_ROCKSDB_DB_DBFORMAT_H
 
 #pragma once
 
+#include <stddef.h>
+#include <stdint.h>
 #include <stdio.h>
 
+#include <memory>
 #include <string>
-
-#include "yb/util/result.h"
+#include <unordered_map>
+#include <vector>
 
 #include "yb/rocksdb/comparator.h"
-#include "yb/rocksdb/db.h"
-#include "yb/rocksdb/filter_policy.h"
-#include "yb/util/slice.h"
+#include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/slice_transform.h"
-#include "yb/rocksdb/table.h"
+#include "yb/rocksdb/status.h"
 #include "yb/rocksdb/types.h"
 #include "yb/rocksdb/util/coding.h"
-#include "yb/rocksdb/util/logging.h"
+
+#include "yb/util/slice.h"
 
 namespace rocksdb {
 
@@ -83,6 +83,10 @@ inline bool IsValueType(ValueType t) {
 static const SequenceNumber kMaxSequenceNumber =
     ((0x1ull << 56) - 1);
 
+// Size of the last component of the internal key. Appended by RocksDB, consists of encoded
+// ValueType and SequenceNumber.
+constexpr auto kLastInternalComponentSize = 8;
+
 struct ParsedInternalKey {
   Slice user_key;
   SequenceNumber sequence;
@@ -96,15 +100,18 @@ struct ParsedInternalKey {
 
 // Return the length of the encoding of "key".
 inline size_t InternalKeyEncodingLength(const ParsedInternalKey& key) {
-  return key.user_key.size() + 8;
+  return key.user_key.size() + kLastInternalComponentSize;
 }
 
 // Pack a sequence number and a ValueType into a uint64_t
 extern uint64_t PackSequenceAndType(uint64_t seq, ValueType t);
 
-// Given the result of PackSequenceAndType, store the sequence number in *seq
-// and the ValueType in *t.
-extern void UnPackSequenceAndType(uint64_t packed, uint64_t* seq, ValueType* t);
+struct SequenceAndType {
+  SequenceNumber sequence;
+  ValueType type;
+};
+
+SequenceAndType UnPackSequenceAndTypeFromEnd(const void* end);
 
 // Append the serialization of "key" to *result.
 extern void AppendInternalKey(std::string* result,
@@ -119,16 +126,20 @@ extern bool ParseInternalKey(const Slice& internal_key,
 
 // Returns the user key portion of an internal key.
 inline Slice ExtractUserKey(const Slice& internal_key) {
-  assert(internal_key.size() >= 8);
-  return Slice(internal_key.data(), internal_key.size() - 8);
+  assert(internal_key.size() >= kLastInternalComponentSize);
+  return internal_key.WithoutSuffix(kLastInternalComponentSize);
 }
 
 inline ValueType ExtractValueType(const Slice& internal_key) {
-  assert(internal_key.size() >= 8);
+  assert(internal_key.size() >= kLastInternalComponentSize);
   const size_t n = internal_key.size();
-  uint64_t num = DecodeFixed64(internal_key.data() + n - 8);
+  uint64_t num = DecodeFixed64(internal_key.data() + n - kLastInternalComponentSize);
   unsigned char c = num & 0xff;
   return static_cast<ValueType>(c);
+}
+
+inline size_t RoundUpTo16(const size_t size) {
+  return (size + 15) & ~0xF;
 }
 
 // A comparator for internal keys that uses a specified comparator for
@@ -145,7 +156,7 @@ class InternalKeyComparator : public Comparator {
   virtual ~InternalKeyComparator() {}
 
   virtual const char* Name() const override;
-  virtual int Compare(const Slice& a, const Slice& b) const override;
+  virtual int Compare(Slice a, Slice b) const override;
   virtual void FindShortestSeparator(std::string* start,
                                      const Slice& limit) const override;
   virtual void FindShortSuccessor(std::string* key) const override;
@@ -212,23 +223,17 @@ class InternalKey {
   static std::string DebugString(const std::string& rep, bool hex = false);
  private:
   explicit InternalKey(const Slice& slice)
-      : rep_(slice.ToBuffer()) {
+      : rep_(slice.cdata(), slice.size()) {
   }
 };
 
 class BoundaryValuesExtractor {
  public:
-  virtual Status Decode(UserBoundaryTag tag, Slice data, UserBoundaryValuePtr* value) = 0;
-  virtual Status Extract(Slice user_key, Slice value, UserBoundaryValues* values) = 0;
+  virtual Status Extract(Slice user_key, UserBoundaryValueRefs* values) = 0;
   virtual UserFrontierPtr CreateFrontier() = 0;
  protected:
   ~BoundaryValuesExtractor() {}
 };
-
-yb::Result<FileBoundaryValues<InternalKey>> MakeFileBoundaryValues(
-    BoundaryValuesExtractor* extractor,
-    const Slice& key,
-    const Slice& value);
 
 // Create FileBoundaryValues from specified user_key, seqno, value_type.
 inline FileBoundaryValues<InternalKey> MakeFileBoundaryValues(
@@ -249,13 +254,13 @@ inline int InternalKeyComparator::Compare(
 inline bool ParseInternalKey(const Slice& internal_key,
                              ParsedInternalKey* result) {
   const size_t n = internal_key.size();
-  if (n < 8) return false;
-  uint64_t num = DecodeFixed64(internal_key.data() + n - 8);
+  if (n < kLastInternalComponentSize) return false;
+  uint64_t num = DecodeFixed64(internal_key.data() + n - kLastInternalComponentSize);
   unsigned char c = num & 0xff;
   result->sequence = num >> 8;
   result->type = static_cast<ValueType>(c);
   assert(result->type <= ValueType::kMaxValue);
-  result->user_key = Slice(internal_key.data(), n - 8);
+  result->user_key = Slice(internal_key.data(), n - kLastInternalComponentSize);
   return IsValueType(result->type);
 }
 
@@ -263,19 +268,19 @@ inline bool ParseInternalKey(const Slice& internal_key,
 // Guarantees not to invalidate ikey.data().
 inline void UpdateInternalKey(std::string* ikey, uint64_t seq, ValueType t) {
   size_t ikey_sz = ikey->size();
-  assert(ikey_sz >= 8);
+  assert(ikey_sz >= kLastInternalComponentSize);
   uint64_t newval = (seq << 8) | t;
 
   // Note: Since C++11, strings are guaranteed to be stored contiguously and
   // string::operator[]() is guaranteed not to change ikey.data().
-  EncodeFixed64(&(*ikey)[ikey_sz - 8], newval);
+  EncodeFixed64(&(*ikey)[ikey_sz - kLastInternalComponentSize], newval);
 }
 
 // Get the sequence number from the internal key
 inline uint64_t GetInternalKeySeqno(const Slice& internal_key) {
   const size_t n = internal_key.size();
-  assert(n >= 8);
-  uint64_t num = DecodeFixed64(internal_key.data() + n - 8);
+  assert(n >= kLastInternalComponentSize);
+  uint64_t num = DecodeFixed64(internal_key.data() + n - kLastInternalComponentSize);
   return num >> 8;
 }
 
@@ -301,7 +306,7 @@ class LookupKey {
 
   // Return the user key
   Slice user_key() const {
-    return Slice(kstart_, static_cast<size_t>(end_ - kstart_ - 8));
+    return Slice(kstart_, static_cast<size_t>(end_ - kstart_ - kLastInternalComponentSize));
   }
 
  private:
@@ -329,87 +334,177 @@ inline LookupKey::~LookupKey() {
 class IterKey {
  public:
   IterKey()
-      : buf_(space_), buf_size_(sizeof(space_)), key_(buf_), key_size_(0) {}
+      : buf_(space_), buf_size_(sizeof(space_)), key_(buf_, static_cast<size_t>(0)) {}
 
-  ~IterKey() { ResetBuffer(); }
+  IterKey(const IterKey&) = delete;
+  void operator=(const IterKey&) = delete;
 
-  Slice GetKey() const { return Slice(key_, key_size_); }
+  ~IterKey() { ReleaseBuffer(); }
+
+  Slice GetKey() const { return key_; }
 
   Slice GetUserKey() const {
-    assert(key_size_ >= 8);
-    return Slice(key_, key_size_ - 8);
+    assert(key_.size() >= kLastInternalComponentSize);
+    return key_.WithoutSuffix(kLastInternalComponentSize);
   }
 
-  size_t Size() const { return key_size_; }
+  inline size_t Size() const { return key_.size(); }
 
-  void Clear() { key_size_ = 0; }
+  void Clear() { key_ = Slice(); }
 
   // Append "non_shared_data" to its back, from "shared_len"
   // This function is used in Block::Iter::ParseNextKey
   // shared_len: bytes in [0, shard_len-1] would be remained
-  // non_shared_data: data to be append, its length must be >= non_shared_len
+  // non_shared_data: data to be appended, its length must be >= non_shared_len
   void TrimAppend(const size_t shared_len, const char* non_shared_data,
                   const size_t non_shared_len) {
-    assert(shared_len <= key_size_);
+    assert(shared_len <= key_.size());
     size_t total_size = shared_len + non_shared_len;
 
     if (IsKeyPinned() /* key is not in buf_ */) {
       // Copy the key from external memory to buf_ (copy shared_len bytes)
       EnlargeBufferIfNeeded(total_size);
-      memcpy(buf_, key_, shared_len);
+      memcpy(buf_, key_.data(), shared_len);
     } else if (total_size > buf_size_) {
       // Need to allocate space, delete previous space
       char* p = new char[total_size];
-      memcpy(p, key_, shared_len);
-
-      if (buf_ != space_) {
-        delete[] buf_;
-      }
+      memcpy(p, key_.data(), shared_len);
+      ReleaseBuffer();
 
       buf_ = p;
       buf_size_ = total_size;
     }
 
     memcpy(buf_ + shared_len, non_shared_data, non_shared_len);
-    key_ = buf_;
-    key_size_ = total_size;
+    key_ = Slice(buf_, total_size);
   }
 
-  Slice SetKey(const Slice& key, bool copy = true) {
-    size_t size = key.size();
-    if (copy) {
-      // Copy key to buf_
-      EnlargeBufferIfNeeded(size);
-      memcpy(buf_, key.data(), size);
-      key_ = buf_;
-    } else {
-      // Update key_ to point to external memory
-      key_ = key.cdata();
+  // Updates key_ based on passed information about sizes of components to reuse and
+  // non_shared_data.
+  // key_ contents will be updated to:
+  // ----------------------------------------------------------------------
+  // |shared_prefix|non_shared_1|shared_middle|non_shared_2|last_component|
+  // ----------------------------------------------------------------------
+  // where (we use a Python slice like syntax below for byte array slices, end offset is exclusive):
+  // shared_prefix is: key_[0:shared_prefix_size]
+  // non_shared_1 is: non_shared_data[0:non_shared_1_size]
+  // shared_middle is:
+  //     key_[source_shared_middle_start:source_shared_middle_start + shared_middle_size]
+  // non_shared_2 is:
+  //     non_shared_data[non_shared_1_size:non_shared_1_size + non_shared_2_size]
+  // last_component is: key_[key_.size() - shared_last_component_size:key_.size()]
+  //     increased by shared_last_component_increase (as uint64_t for performance reasons).
+  // shared_last_component_size should be either 0 or kLastInternalComponentSize (8).
+  //
+  // This function might reallocate buf_ that is used to store key_ data if its size is not enough.
+  void Update(
+      const char* non_shared_data, const uint32_t shared_prefix_size,
+      const uint32_t non_shared_1_size, const uint32_t source_shared_middle_start,
+      const uint32_t shared_middle_size, const uint32_t non_shared_2_size,
+      const uint32_t shared_last_component_size, const uint64_t shared_last_component_increase) {
+    DCHECK_LE(
+        shared_prefix_size + shared_middle_size + shared_last_component_size, key_.size());
+
+    // Following constants contains offsets of respective updated key component according to the
+    // diagram above.
+    const auto new_shared_middle_start = shared_prefix_size + non_shared_1_size;
+    const auto new_non_shared_2_start = new_shared_middle_start + shared_middle_size;
+    const auto new_shared_last_component_start = new_non_shared_2_start + non_shared_2_size;
+
+    const auto new_key_size = new_shared_last_component_start + shared_last_component_size;
+
+    uint64_t last_component FASTDEBUG_FAKE_INIT(0);
+    if (shared_last_component_size > 0) {
+      // Get shared last component from key_ and increase it by shared_last_component_increase
+      // (could be 0 if we just reuse last component as is).
+      DCHECK_EQ(shared_last_component_size, kLastInternalComponentSize);
+      last_component = DecodeFixed64(key_.cend() - kLastInternalComponentSize) +
+                       shared_last_component_increase;
     }
-    key_size_ = size;
-    return Slice(key_, key_size_);
+
+    if (IsKeyPinned() /* key_ pointer was set externally and not owned by us */ ) {
+      // Copy shared_prefix and shared_middle to new positions. Since key_ was set externally by
+      // KeyIter::SetKey caller, it doesn't overlap with buf_ owned by KeyIter and we can just use
+      // memcpy.
+      EnlargeBufferIfNeeded(new_key_size);
+      memcpy(buf_, key_.data(), shared_prefix_size);
+      memcpy(buf_ + new_shared_middle_start, key_.data() + source_shared_middle_start,
+             shared_middle_size);
+    } else if (new_key_size > buf_size_) {
+      // Enlarge buf_ to be enough to store updated key and copy shared_prefix and shared_middle to
+      // new positions.
+      const auto new_buf_size = RoundUpTo16(new_key_size);
+      char* p = new char[new_buf_size];
+
+      memcpy(p, key_.data(), shared_prefix_size);
+      memcpy(p + new_shared_middle_start, key_.data() + source_shared_middle_start,
+             shared_middle_size);
+
+      ReleaseBuffer();
+
+      buf_ = p;
+      buf_size_ = new_buf_size;
+    } else {
+      // buf_ has enough size to store updated key, no need to reallocate, just move
+      // shared_middle to the new position (shared_prefix always starts at the beginning, so it is
+      // already there).
+      DCHECK_EQ(buf_, key_.cdata());
+      if (new_shared_middle_start != source_shared_middle_start && shared_middle_size > 0) {
+        memmove(
+            buf_ + new_shared_middle_start, key_.data() + source_shared_middle_start,
+            shared_middle_size);
+      }
+    }
+
+    // At this point buf_ contains shared_prefix and shared_middle at new positions for the updated
+    // key.
+    if (shared_last_component_size > 0) {
+      // Put last_component to its new place.
+      EncodeFixed64(buf_ + new_shared_last_component_start, last_component);
+    }
+
+    // Copy non-shared components.
+    memcpy(buf_ + shared_prefix_size, non_shared_data, non_shared_1_size);
+    if (non_shared_2_size > 0) {
+      memcpy(buf_ + new_non_shared_2_start, non_shared_data + non_shared_1_size, non_shared_2_size);
+    }
+    key_ = Slice(buf_, new_key_size);
+  }
+
+  Slice SetKey(Slice key, bool copy = true) {
+    if (!copy) {
+      // Update key_ to point to external memory
+      key_ = key;
+      return key;
+    }
+    size_t size = key.size();
+    // Copy key to buf_
+    EnlargeBufferIfNeeded(size);
+    key.CopyTo(buf_);
+    return key_ = Slice(buf_, size);
   }
 
   // Copies the content of key, updates the reference to the user key in ikey
   // and returns a Slice referencing the new copy.
-  Slice SetKey(const Slice& key, ParsedInternalKey* ikey) {
-    size_t key_n = key.size();
-    assert(key_n >= 8);
-    SetKey(key);
-    ikey->user_key = Slice(key_, key_n - 8);
-    return Slice(key_, key_n);
+  Slice SetKey(Slice key, ParsedInternalKey* ikey) {
+    assert(key.size() >= kLastInternalComponentSize);
+    auto result = SetKey(key);
+    ikey->user_key = result.WithoutSuffix(kLastInternalComponentSize);
+    return result;
   }
 
   // Update the sequence number in the internal key.  Guarantees not to
   // invalidate slices to the key (and the user key).
   void UpdateInternalKey(uint64_t seq, ValueType t) {
     assert(!IsKeyPinned());
-    assert(key_size_ >= 8);
+    assert(key_.size() >= kLastInternalComponentSize);
     uint64_t newval = (seq << 8) | t;
-    EncodeFixed64(&buf_[key_size_ - 8], newval);
+    EncodeFixed64(buf_ + key_.size() - kLastInternalComponentSize, newval);
   }
 
-  bool IsKeyPinned() const { return (key_ != buf_); }
+  // Returns true iff key_ is not owned by KeyIter, but instead was set externally
+  // using KeyIter::SetKey(key, /* copy = */ false).
+  bool IsKeyPinned() const { return key_.cdata() != buf_; }
 
   void SetInternalKey(const Slice& key_prefix, const Slice& user_key,
                       SequenceNumber s,
@@ -423,8 +518,7 @@ class IterKey {
     memcpy(buf_ + psize, user_key.data(), usize);
     EncodeFixed64(buf_ + usize + psize, PackSequenceAndType(s, value_type));
 
-    key_ = buf_;
-    key_size_ = psize + usize + sizeof(uint64_t);
+    key_ = Slice(buf_, psize + usize + sizeof(uint64_t));
   }
 
   void SetInternalKey(const Slice& user_key, SequenceNumber s,
@@ -434,7 +528,7 @@ class IterKey {
 
   void Reserve(size_t size) {
     EnlargeBufferIfNeeded(size);
-    key_size_ = size;
+    key_ = Slice(buf_, size);
   }
 
   void SetInternalKey(const ParsedInternalKey& parsed_key) {
@@ -456,19 +550,10 @@ class IterKey {
   }
 
  private:
-  char* buf_;
-  size_t buf_size_;
-  const char* key_;
-  size_t key_size_;
-  char space_[32];  // Avoid allocation for short keys
-
-  void ResetBuffer() {
+  void ReleaseBuffer() {
     if (buf_ != space_) {
       delete[] buf_;
-      buf_ = space_;
     }
-    buf_size_ = sizeof(space_);
-    key_size_ = 0;
   }
 
   // Enlarge the buffer size if needed based on key_size.
@@ -476,20 +561,25 @@ class IterKey {
   // larger than the static allocated buffer, another buffer is dynamically
   // allocated, until a larger key buffer is requested. In that case, we
   // reallocate buffer and delete the old one.
-  void EnlargeBufferIfNeeded(size_t key_size) {
+  void EnlargeBufferIfNeeded(const size_t key_size) {
     // If size is smaller than buffer size, continue using current buffer,
     // or the static allocated one, as default
-    if (key_size > buf_size_) {
-      // Need to enlarge the buffer.
-      ResetBuffer();
-      buf_ = new char[key_size];
-      buf_size_ = key_size;
+    if (key_size <= buf_size_) {
+      return;
     }
+
+    // Need to enlarge the buffer.
+    ReleaseBuffer();
+    const auto new_buf_size = RoundUpTo16(key_size);
+    buf_ = new char[new_buf_size];
+    buf_size_ = new_buf_size;
   }
 
   // No copying allowed
-  IterKey(const IterKey&) = delete;
-  void operator=(const IterKey&) = delete;
+  char* buf_;
+  size_t buf_size_;
+  Slice key_;
+  char space_[32];  // Avoid allocation for short keys
 };
 
 class InternalKeySliceTransform : public SliceTransform {
@@ -531,5 +621,3 @@ extern Status ReadRecordFromWriteBatch(Slice* input, char* tag,
                                        uint32_t* column_family, Slice* key,
                                        Slice* value, Slice* blob);
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_DBFORMAT_H

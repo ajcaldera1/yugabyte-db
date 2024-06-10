@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_YQL_REDIS_REDISSERVER_REDIS_SERVICE_H_
-#define YB_YQL_REDIS_REDISSERVER_REDIS_SERVICE_H_
+#pragma once
 
 #include "yb/yql/redis/redisserver/redis_fwd.h"
 #include "yb/yql/redis/redisserver/redis_service.service.h"
@@ -29,6 +28,7 @@ class RedisServiceImpl : public RedisServerServiceIf {
   RedisServiceImpl(RedisServer* server, std::string yb_tier_master_address);
   ~RedisServiceImpl();
 
+  void FillEndpoints(const rpc::RpcServicePtr& service, rpc::RpcEndpointMap* map) override;
   void Handle(yb::rpc::InboundCallPtr call) override;
 
  private:
@@ -38,5 +38,3 @@ class RedisServiceImpl : public RedisServerServiceIf {
 
 }  // namespace redisserver
 }  // namespace yb
-
-#endif  // YB_YQL_REDIS_REDISSERVER_REDIS_SERVICE_H_

@@ -12,6 +12,9 @@
 //
 package org.yb.cql;
 
+import com.datastax.driver.core.BatchStatement;
+import com.datastax.driver.core.BoundStatement;
+import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
 import com.datastax.driver.core.exceptions.TransportException;
@@ -26,18 +29,30 @@ import java.util.*;
 import static org.yb.AssertionWrappers.assertNull;
 import static org.yb.AssertionWrappers.assertTrue;
 import static org.yb.AssertionWrappers.assertEquals;
+import static org.yb.AssertionWrappers.fail;
 
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestInsertValues extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestInsertValues.class);
 
   @Override
   public int getTestMethodTimeoutSec() {
     // No need to adjust for TSAN vs. non-TSAN here, it will be done automatically.
     return 240;
+  }
+
+  @Override
+  protected Map<String, String> getTServerFlags() {
+    // testLargeInsert needs more memory than the default of 5%.
+    Map<String, String> flagMap = super.getTServerFlags();
+    flagMap.put("read_buffer_memory_limit", "-100");
+    return flagMap;
   }
 
   @Test
@@ -53,7 +68,7 @@ public class TestInsertValues extends BaseCQLTest {
   @Test
   public void testLargeInsert() throws Exception {
     final int STRING_SIZE = 64 * 1024 * 1024;
-    final String errorMessage = "YQL value too long";
+    final String errorMessage = "is longer than max value size supported";
     String tableName = "test_large_insert";
     String create_stmt = String.format(
         "CREATE TABLE %s (h int PRIMARY KEY, c varchar);", tableName);
@@ -448,5 +463,145 @@ public class TestInsertValues extends BaseCQLTest {
 
     // Verify the value is inserted.
     assertQuery("SELECT * FROM t;", "Row[1, hello]");
+  }
+
+  @Test
+  public void testInsertNewlineCharacter() throws Exception {
+    // Create table with a TIMESTAMP column and insert a value.
+    session.execute("CREATE TABLE tab (t text PRIMARY KEY);");
+    session.execute(String.format("INSERT INTO tab (t) VALUES ('\n');"));
+
+    // Verify the value.
+    Row row = runSelect("SELECT * FROM tab;").next();
+    assertEquals("\n", row.getString(0));
+  }
+
+  @Test
+  public void testInsertUnset() throws Exception {
+    session.execute("create table t (k int primary key, v1 int, v2 int);");
+
+    // First insert a key value
+    String insertPos = "insert into t (k, v1, v2) values (?, ?, ?);";
+    String insertNamed = "insert into t (k, v1, v2) values (:k, :v1, :v2);";
+    PreparedStatement insertPosStmt = session.prepare(insertPos);
+    session.execute(insertPosStmt.bind(1, 1, 1));
+    session.execute(insertPosStmt.bind(2, 2, 2));
+    session.execute(insertPosStmt.bind(3, 3, 3));
+    session.execute(insertPosStmt.bind(4, 4, 4));
+
+    // Then, insert the same PK with an unset value using positional binding
+    BoundStatement bstmt = insertPosStmt.bind().setInt(0, 1);
+    bstmt = bstmt.setInt(1, 100);
+    bstmt.unset(2);
+    session.execute(bstmt);
+
+    // Test that the originally inserted value remains unchanged
+    assertQuery("select k, v1, v2 from t where k = 1;", "Row[1, 100, 1]");
+
+    // Now, insert the same PK with an unset value using named binding
+    PreparedStatement insertNamedStmt = session.prepare(insertNamed);
+    BoundStatement bstmt1 = insertNamedStmt.bind().setInt("k", 2);
+    bstmt1 = bstmt1.setInt("v1", 200);
+    bstmt1.unset("v2");
+    session.execute(bstmt1);
+
+    // Test that the originally inserted value remains unchanged
+    assertQuery("select k, v1, v2 from t where k = 2;", "Row[2, 200, 2]");
+
+    // test if unset works within BatchStatement as well
+    BatchStatement batch = new BatchStatement();
+    BoundStatement bstmt2 = insertPosStmt.bind(3, 3, 3);
+    batch.add(bstmt2);
+    BoundStatement bstmt3 = insertPosStmt.bind().setInt(0, 4);
+    bstmt3.unset(1);
+    bstmt3 = bstmt3.setInt(2, 400);
+    batch.add(bstmt3);
+    session.execute(batch);
+
+    // Test that the originally inserted value remains unchanged
+    assertQuery("select k, v1, v2 from t where k in (3, 4);", "Row[3, 3, 3]Row[4, 4, 400]");
+  }
+
+  protected static enum Bind { BY_POS, BY_NAME };
+
+  protected void testBindExec(
+      PreparedStatement preparedStmt, Bind bindMode, int colIdx, int v1Value) throws Exception {
+    final String[] columnNames = new String[] {"h1", "h2", "r1", "r2", "v1", "v2"};
+    LOG.info("TEST: Unset column " + colIdx + " (" + columnNames[colIdx] + ") bind " + bindMode);
+    BoundStatement bstmt = preparedStmt.bind();
+
+    for (int i = 0; i < 6; ++i) {
+      if (bindMode == Bind.BY_POS) {
+        if (i == colIdx) {
+          // Unset value using binding by position.
+          bstmt.unset(colIdx);
+        } else {
+          switch (i) {
+            case 4: bstmt.setInt(4, v1Value); break; // v1
+            case 5: bstmt.setInt(5, 200); break; // v2
+            default: bstmt.setInt(i, i + 1); // PK = {1, 2, 3, 4}
+          }
+        }
+      } else { // bindMode == Bind.BY_NAME
+        if (i == colIdx) {
+          // Unset value using binding by name.
+          bstmt.unset(columnNames[colIdx]);
+        } else {
+          switch (i) {
+            case 4: bstmt.setInt(columnNames[4], v1Value); break; // v1
+            case 5: bstmt.setInt(columnNames[5], 200); break; // v2
+            default: bstmt.setInt(columnNames[i], i + 1); // PK = {1, 2, 3, 4}
+          }
+        }
+      }
+    }
+
+    if (colIdx < 4) { // PK
+      try {
+        session.execute(bstmt);
+        fail("Query did not fail with null primary key column");
+      } catch (com.datastax.driver.core.exceptions.InvalidQueryException e) {
+        LOG.info("Expected exception", e);
+        final String nullPKError = "Null Argument for Primary Key";
+        assertTrue("Error message '" + e.getMessage() + "' should contain '" + nullPKError + "'",
+            e.getMessage().contains(nullPKError));
+      }
+    } else {
+      session.execute(bstmt); // Should be successful for non-PK column.
+    }
+  }
+
+  @Test
+  public void testInsertUnsetMultiKey() throws Exception {
+    session.execute("create table t (h1 int, h2 int, r1 int, r2 int, v1 int, v2 int, " +
+                    "primary key((h1, h2), r1, r2))");
+
+    String insertPos = "insert into t (h1, h2, r1, r2, v1, v2) values (?, ?, ?, ?, ?, ?);";
+    PreparedStatement insertPosStmt = session.prepare(insertPos);
+    String insertNamed =
+        "insert into t (h1, h2, r1, r2, v1, v2) values (:h1, :h2, :r1, :r2, :v1, :v2);";
+    PreparedStatement insertNamedStmt = session.prepare(insertNamed);
+    // Insert a key value: (1, 2, 3, 4) -> (5, NULL).
+    session.execute(insertPosStmt.bind(1, 2, 3, 4, 5));
+
+    // Test hash key column h2 - expected error.
+    testBindExec(insertPosStmt, Bind.BY_POS, 1, 100);
+    testBindExec(insertNamedStmt, Bind.BY_NAME, 1, 100);
+
+    // Test range key column r2 - expected error.
+    testBindExec(insertPosStmt, Bind.BY_POS, 3, 100);
+    testBindExec(insertNamedStmt, Bind.BY_NAME, 3, 100);
+
+    // Test that the originally inserted value remains unchanged.
+    assertQuery("select * from t", "Row[1, 2, 3, 4, 5, NULL]");
+
+    // Set v2 = 6.
+    session.execute(insertPosStmt.bind(1, 2, 3, 4, 5, 6));
+
+    // Test non-key column v2. Ensure v2 is unchanged.
+    testBindExec(insertPosStmt, Bind.BY_POS, 5, 300);
+    assertQuery("select * from t", "Row[1, 2, 3, 4, 300, 6]");
+    testBindExec(insertNamedStmt, Bind.BY_NAME, 5, 400);
+    assertQuery("select * from t", "Row[1, 2, 3, 4, 400, 6]");
   }
 }

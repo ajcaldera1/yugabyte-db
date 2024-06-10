@@ -29,15 +29,13 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TABLET_TABLET_TEST_UTIL_H
-#define YB_TABLET_TABLET_TEST_UTIL_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "yb/common/common.pb.h"
-#include "yb/common/schema.h"
+#include "yb/docdb/docdb_fwd.h"
 
 #include "yb/tablet/tablet-harness.h"
 
@@ -89,7 +87,7 @@ class YBTabletTest : public YBTest {
 
   void AlterSchema(const Schema& schema);
 
-  const std::shared_ptr<TabletClass>& tablet() const {
+  const TabletPtr& tablet() const {
     return harness_->tablet();
   }
 
@@ -105,14 +103,12 @@ class YBTabletTest : public YBTest {
   std::unique_ptr<TabletHarness> harness_;
 };
 
-CHECKED_STATUS IterateToStringList(
-    common::YQLRowwiseIteratorIf* iter, std::vector<std::string>* out, int limit = INT_MAX);
+Status IterateToStringList(
+    docdb::YQLRowwiseIteratorIf* iter, const Schema& schema, std::vector<std::string>* out,
+    int limit = INT_MAX);
 
 // Dump all of the rows of the tablet into the given vector.
-CHECKED_STATUS DumpTablet(
-    const Tablet& tablet, const Schema& projection, std::vector<std::string>* out);
+Status DumpTablet(const Tablet& tablet, std::vector<std::string>* out);
 
 } // namespace tablet
 } // namespace yb
-
-#endif // YB_TABLET_TABLET_TEST_UTIL_H

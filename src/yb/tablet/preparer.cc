@@ -11,6 +11,8 @@
 // under the License.
 //
 
+#include "yb/tablet/preparer.h"
+
 #include <atomic>
 #include <condition_variable>
 #include <memory>
@@ -18,18 +20,47 @@
 #include <thread>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include <boost/range/iterator_range_core.hpp>
 
 #include "yb/consensus/consensus.h"
-#include "yb/tablet/preparer.h"
+#include "yb/consensus/consensus.pb.h"
+
+#include "yb/gutil/macros.h"
+
 #include "yb/tablet/operations/operation_driver.h"
-#include "yb/util/logging.h"
-#include "yb/util/threadpool.h"
+
+#include "yb/util/async_util.h"
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/debug-util.h"
+#include "yb/util/flags.h"
 #include "yb/util/lockfree.h"
+#include "yb/util/logging.h"
+#include "yb/util/random_util.h"
+#include "yb/util/threadpool.h"
 
-DEFINE_int32(max_group_replicate_batch_size, 16,
-             "Maximum number of operations to submit to consensus for replication in a batch.");
+DEFINE_UNKNOWN_uint64(max_group_replicate_batch_size, 16,
+              "Maximum number of operations to submit to consensus for replication in a batch.");
 
+DEFINE_UNKNOWN_double(estimated_replicate_msg_size_percentage, 0.95,
+              "The estimated percentage of replicate message size in a log entry batch.");
+
+DEFINE_test_flag(int32, preparer_batch_inject_latency_ms, 0,
+                 "Inject latency before replicating batch.");
+
+DEFINE_test_flag(bool, block_prepare_batch, false,
+                 "pause the prepare task.");
+
+DEFINE_test_flag(double, simulate_preparer_skips_run, 0.0,
+                 "Probability that the preparer will skip invoking Run after submitting an item.");
+
+DEFINE_test_flag(double, simulate_skip_process_batch, 0.0,
+                 "Probability that the preparer will skip invoking ProcessAndClearLeaderSideBatch "
+                 "after processing an item.");
+
+DECLARE_int32(protobuf_message_total_bytes_limit);
+DECLARE_uint64(rpc_max_message_size);
+
+using namespace std::literals;
 using std::vector;
 
 namespace yb {
@@ -45,19 +76,19 @@ class PreparerImpl {
  public:
   explicit PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool);
   ~PreparerImpl();
-  CHECKED_STATUS Start();
+  Status Start();
   void Stop();
 
-  CHECKED_STATUS Submit(OperationDriver* operation_driver);
+  Status Submit(OperationDriver* operation_driver);
 
   ThreadPoolToken* PoolToken() {
     return tablet_prepare_pool_token_.get();
   }
 
+  void DumpStatusHtml(std::ostream& out);
+
  private:
   using OperationDrivers = std::vector<OperationDriver*>;
-
-  scoped_refptr<yb::Thread> thread_;
 
   consensus::Consensus* const consensus_;
 
@@ -78,6 +109,13 @@ class PreparerImpl {
   // So it always greater than or equal to number of entries in queue.
   std::atomic<int64_t> active_tasks_{0};
 
+  // This flag is used in a sanity check to ensure that after this server becomes a follower,
+  // the earlier leader-side operations that are still in the preparer's queue should fail to get
+  // prepared due to old term. This sanity check will only be performed when an UpdateConsensus
+  // with follower-side operations is received while earlier leader-side operations still have not
+  // been processed, e.g. in an overloaded tablet server with lots of leader changes.
+  std::atomic<bool> prepare_should_fail_{false};
+
   MPSCQueue<OperationDriver> queue_;
 
   // This mutex/condition combination is used in Stop() in case multiple threads are calling that
@@ -87,6 +125,9 @@ class PreparerImpl {
   std::condition_variable stop_cond_;
 
   OperationDrivers leader_side_batch_;
+  size_t leader_side_batch_size_estimate_ = 0;
+  const size_t leader_side_batch_size_limit_;
+  const size_t leader_side_single_op_size_limit_;
 
   std::unique_ptr<ThreadPoolToken> tablet_prepare_pool_token_;
 
@@ -94,9 +135,14 @@ class PreparerImpl {
   consensus::ConsensusRounds rounds_to_replicate_;
 
   void Run();
+
+  // Should only be run via tablet_prepare_pool_token_
   void ProcessItem(OperationDriver* item);
 
+  // Should only be run via tablet_prepare_pool_token_
   void ProcessAndClearLeaderSideBatch();
+
+  void ProcessFailedItem(OperationDriver* item, Status status);
 
   // A wrapper around ProcessAndClearLeaderSideBatch that assumes we are currently holding the
   // mutex.
@@ -105,9 +151,13 @@ class PreparerImpl {
                          OperationDrivers::iterator end);
 };
 
-PreparerImpl::PreparerImpl(consensus::Consensus* consensus,
-                                     ThreadPool* tablet_prepare_pool)
+PreparerImpl::PreparerImpl(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool)
     : consensus_(consensus),
+      // Reserve 5% for other LogEntryBatchPB fields in case of big batches.
+      leader_side_batch_size_limit_(
+          FLAGS_protobuf_message_total_bytes_limit * FLAGS_estimated_replicate_msg_size_percentage),
+      leader_side_single_op_size_limit_(
+          FLAGS_rpc_max_message_size * FLAGS_estimated_replicate_msg_size_percentage),
       tablet_prepare_pool_token_(tablet_prepare_pool
                                      ->NewToken(ThreadPool::ExecutionMode::SERIAL)) {
 }
@@ -140,12 +190,30 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
     return STATUS(IllegalState, "Tablet is shutting down");
   }
 
-  active_tasks_.fetch_add(1, std::memory_order_release);
-  queue_.Push(operation_driver);
+  const bool leader_side = operation_driver->is_leader_side();
+
+  // When a leader becomes a follower, we expect the leader-side operations still in the preparer's
+  // queue to fail to be prepared because their term will be too old as we try to add them to the
+  // Raft queue.
+  prepare_should_fail_.store(!leader_side, std::memory_order_release);
+
+  if (leader_side) {
+    // Prepare leader-side operations on the "preparer thread" so we can only acquire the
+    // ReplicaState lock once and append multiple operations.
+    active_tasks_.fetch_add(1, std::memory_order_release);
+    queue_.Push(operation_driver);
+  } else {
+    // For follower-side operations, there would be no benefit in preparing them on the preparer
+    // thread.
+    operation_driver->PrepareAndStartTask();
+  }
 
   auto expected = false;
   if (!running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
     // running_ was already true, so we are not creating a task to process operations.
+    return Status::OK();
+  }
+  if (PREDICT_FALSE(RandomActWithProbability(FLAGS_TEST_simulate_preparer_skips_run))) {
     return Status::OK();
   }
   // We flipped running_ from 0 to 1. The previously running thread could go back to doing another
@@ -156,6 +224,9 @@ Status PreparerImpl::Submit(OperationDriver* operation_driver) {
 
 void PreparerImpl::Run() {
   VLOG(2) << "Starting prepare task:" << this;
+  while (GetAtomicFlag(&FLAGS_TEST_block_prepare_batch)) {
+      std::this_thread::sleep_for(100ms);
+  }
   for (;;) {
     while (OperationDriver *item = queue_.Pop()) {
       active_tasks_.fetch_sub(1, std::memory_order_release);
@@ -163,65 +234,129 @@ void PreparerImpl::Run() {
     }
     ProcessAndClearLeaderSideBatch();
     std::unique_lock<std::mutex> stop_lock(stop_mtx_);
-    running_.store(false, std::memory_order_release);
-    // Check whether tasks we added while we were setting running to false.
-    if (active_tasks_.load(std::memory_order_acquire)) {
-      // Got more operations, try stay in the loop.
-      bool expected = false;
-      if (running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-        continue;
+    // If load of active_tasks_ below is re-ordered by the compiler/cpu and gets to execute before
+    // exchange of running_, we could get into a state where there is a new item enqueued on queue_
+    // but no newly submitted task of type PreparerImpl::Run. And the current thread executing
+    // PreparerImpl::Run could return as well which would put us in a "stuck" state.
+    //
+    // Use of acquire-release ordering for running_.exchange prevents any subsequent atomic
+    // operations in this thread from being re-ordered before the state of running_ is set to false,
+    // thus preventing the situation described above.
+    if (PREDICT_TRUE(running_.exchange(false, std::memory_order_acq_rel))) {
+      // Check whether tasks were added while we were switching running to false.
+      if (active_tasks_.load(std::memory_order_acquire)) {
+        // Got more operations, try stay in the loop.
+        bool expected = false;
+        if (running_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
+          continue;
+        }
+        // If someone else has flipped running_ to true, we can safely exit this function because
+        // another task is already submitted to the same token.
       }
-      // If someone else has flipped running_ to true, we can safely exit this function because
-      // another task is already submitted to the same token.
+    } else {
+      LOG(DFATAL) << "running_ is false when there's an active thread executing PreparerImpl::Run. "
+                  << "Getting into this state may affect throughput or halt workloads.";
     }
     if (stop_requested_.load(std::memory_order_acquire)) {
       VLOG(2) << "Prepare task's Run() function is returning because stop is requested.";
-      stop_cond_.notify_all();
+      YB_PROFILE(stop_cond_.notify_all());
     }
     VLOG(2) << "Returning from prepare task after inactivity: " << this;
     return;
   }
 }
 
+namespace {
+
+bool ShouldApplySeparately(OperationType operation_type) {
+  switch (operation_type) {
+    // For certain operations types we have to apply them in a batch of their own.
+    // E.g. ChangeMetadataOperation::Prepare calls Tablet::CreatePreparedChangeMetadata, which
+    // acquires the schema lock. Because of this, we must not attempt to process two
+    // ChangeMetadataOperations in one batch, otherwise we'll deadlock.
+    //
+    // Also, for infrequently occuring operations batching has little performance benefit in
+    // general.
+    case OperationType::kChangeMetadata: FALLTHROUGH_INTENDED;
+    case OperationType::kSnapshot: FALLTHROUGH_INTENDED;
+    case OperationType::kTruncate: FALLTHROUGH_INTENDED;
+    case OperationType::kSplit: FALLTHROUGH_INTENDED;
+    case OperationType::kEmpty: FALLTHROUGH_INTENDED;
+    case OperationType::kHistoryCutoff: FALLTHROUGH_INTENDED;
+    case OperationType::kChangeAutoFlagsConfig:
+    case OperationType::kClone:
+      return true;
+
+    case OperationType::kWrite: FALLTHROUGH_INTENDED;
+    case OperationType::kUpdateTransaction:
+      return false;
+  }
+  FATAL_INVALID_ENUM_VALUE(OperationType, operation_type);
+}
+
+}  // anonymous namespace
+
 void PreparerImpl::ProcessItem(OperationDriver* item) {
   CHECK_NOTNULL(item);
 
-  if (item->is_leader_side()) {
-    // ChangeMetadataOperation::Prepare calls Tablet::CreatePreparedChangeMetadata, which acquires
-    // the schema lock. Because of this, we must not attempt to process two AlterSchemaOperations in
-    // one batch, otherwise we'll deadlock. Furthermore, for simplicity, we choose to process each
-    // AlterSchemaOperation in a batch of its own.
-    auto operation_type = item->operation_type();
-    const bool apply_separately = operation_type == OperationType::kChangeMetadata ||
-                                  operation_type == OperationType::kEmpty;
-    const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
+  LOG_IF(DFATAL, !item->is_leader_side()) << "Processing follower-side item";
 
-    // Don't add more than the max number of operations to a batch, and also don't add
-    // operations bound to different terms, so as not to fail unrelated operations
-    // unnecessarily in case of a bound term mismatch.
-    if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
-        (!leader_side_batch_.empty() &&
-            bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
-      ProcessAndClearLeaderSideBatch();
-    }
-    leader_side_batch_.push_back(item);
-    if (apply_separately) {
-      ProcessAndClearLeaderSideBatch();
-    }
-  } else {
-    // We found a non-leader-side operation. We need to process the accumulated batch of
-    // leader-side operations first, and then process this other operation.
+  auto operation_type = item->operation_type();
+
+  const bool apply_separately = ShouldApplySeparately(operation_type);
+  const int64_t bound_term = apply_separately ? -1 : item->consensus_round()->bound_term();
+
+  const auto item_replicate_msg_size = item->ReplicateMsgSize();
+  // The item size exceeds size limit, we cannot handle it.
+  if (item_replicate_msg_size > leader_side_single_op_size_limit_) {
     ProcessAndClearLeaderSideBatch();
-    item->PrepareAndStartTask();
+    ProcessFailedItem(
+        item,
+        STATUS_FORMAT(
+            InvalidArgument,
+            "Operation replicate msg size ($0) exceeds limit of leader side single op size ($1)",
+            item_replicate_msg_size,
+            leader_side_single_op_size_limit_));
+    return;
+  }
+  // Don't add more than the max number of operations to a batch, and also don't add
+  // operations bound to different terms, so as not to fail unrelated operations
+  // unnecessarily in case of a bound term mismatch.
+  if (leader_side_batch_.size() >= FLAGS_max_group_replicate_batch_size ||
+      leader_side_batch_size_estimate_ + item_replicate_msg_size > leader_side_batch_size_limit_ ||
+      (!leader_side_batch_.empty() &&
+          bound_term != leader_side_batch_.back()->consensus_round()->bound_term())) {
+    ProcessAndClearLeaderSideBatch();
+  }
+  leader_side_batch_.push_back(item);
+  leader_side_batch_size_estimate_ += item_replicate_msg_size;
+  if (apply_separately) {
+    ProcessAndClearLeaderSideBatch();
+  }
+}
+
+void PreparerImpl::ProcessFailedItem(OperationDriver* item, Status status) {
+  DCHECK_EQ(leader_side_batch_.size(), 0);
+  Status s = item->PrepareAndStart();
+  if (s.ok()) {
+    item->consensus_round()->NotifyReplicationFailed(status);
+  } else {
+    item->HandleFailure(s);
   }
 }
 
 void PreparerImpl::ProcessAndClearLeaderSideBatch() {
+  if (PREDICT_FALSE(RandomActWithProbability(FLAGS_TEST_simulate_skip_process_batch))) {
+    return;
+  }
+
   if (leader_side_batch_.empty()) {
     return;
   }
 
-  VLOG(2) << "Preparing a batch of " << leader_side_batch_.size() << " leader-side operations";
+  VLOG(2) << "Preparing a batch of " << leader_side_batch_.size()
+          << " leader-side operations, estimated size: " << leader_side_batch_size_estimate_
+          << " bytes";
 
   auto iter = leader_side_batch_.begin();
   auto replication_subbatch_begin = iter;
@@ -253,6 +388,7 @@ void PreparerImpl::ProcessAndClearLeaderSideBatch() {
   ReplicateSubBatch(replication_subbatch_begin, replication_subbatch_end);
 
   leader_side_batch_.clear();
+  leader_side_batch_size_estimate_ = 0;
 }
 
 void PreparerImpl::ReplicateSubBatch(
@@ -278,17 +414,53 @@ void PreparerImpl::ReplicateSubBatch(
     rounds_to_replicate_.push_back((*batch_iter)->consensus_round());
   }
 
-  const Status s = consensus_->ReplicateBatch(&rounds_to_replicate_);
+  AtomicFlagSleepMs(&FLAGS_TEST_preparer_batch_inject_latency_ms);
+  // Have to save this value before calling replicate batch.
+  // Because the following scenario is legal:
+  // Operation successfully processed by ReplicateBatch, but ReplicateBatch did not return yet.
+  // Submit of follower side operation is called from another thread.
+  bool should_fail = prepare_should_fail_.load(std::memory_order_acquire);
+  const Status s = consensus_->ReplicateBatch(rounds_to_replicate_);
   rounds_to_replicate_.clear();
 
-  if (PREDICT_FALSE(!s.ok())) {
-    VLOG(2) << "ReplicateBatch failed with status " << s.ToString()
-            << ", treating all " << std::distance(batch_begin, batch_end) << " operations as "
-            << "failed with that status";
-    // Treat all the operations in the batch as failed.
-    for (auto batch_iter = batch_begin; batch_iter != batch_end; ++batch_iter) {
-      (*batch_iter)->ReplicationFailed(s);
+  if (s.ok() && should_fail) {
+    LOG(DFATAL) << "Operations should fail, but was successfully prepared: "
+                << AsString(boost::make_iterator_range(batch_begin, batch_end));
+  }
+}
+
+void PreparerImpl::DumpStatusHtml(std::ostream& out) {
+  out << "<div>" << "stop_requested: " << stop_requested_ << "</div>" << std::endl;
+  out << "<div>" << "running: " << running_ << "</div>" << std::endl;
+  out << "<div>" << "stopped: " << stopped_ << "</div>" << std::endl;
+  out << "<div>" << "active_tasks: " << active_tasks_ << "</div>" << std::endl;
+  out << "<div>" << "prepare_should_fail: " << prepare_should_fail_ << "</div>" << std::endl;
+  auto get_ops_status = MakeFuture<Status>([&](auto callback) {
+    auto s = tablet_prepare_pool_token_->SubmitFunc([&, cb = std::move(callback)]() {
+      out << "<div>" << "queue ops:</div>" << std::endl;
+      out << "<ul>" << std::endl;
+      for (const auto& op : queue_) {
+        out << "<li>" << op.ToString() << "</li>" << std::endl;
+      }
+      out << "</ul>" << std::endl;
+
+      out << "<div>" << "leader batched ops: " << leader_side_batch_.size()
+          << "</div>" << std::endl;
+      out << "<ul>" << std::endl;
+      for (const auto& op : leader_side_batch_) {
+        out << "<li>" << op->ToString() << "</li>" << std::endl;
+      }
+      out << "</ul>" << std::endl;
+
+      cb(Status::OK());
+    });
+    if (!s.ok()) {
+      out << "<div>" << "Error generating preparer ops status" << s << "</div>" << std::endl;
     }
+  }).get();
+  if (!get_ops_status.ok()) {
+    out << "<div>" << "Error generating preparer ops status"
+        << get_ops_status << "</div>" << std::endl;
   }
 }
 
@@ -318,6 +490,10 @@ Status Preparer::Submit(OperationDriver* operation_driver) {
 
 ThreadPoolToken* Preparer::PoolToken() {
   return impl_->PoolToken();
+}
+
+void Preparer::DumpStatusHtml(std::ostream& out) {
+  return impl_->DumpStatusHtml(out);
 }
 
 }  // namespace tablet

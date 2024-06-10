@@ -18,7 +18,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -30,7 +30,7 @@ import java.util.Random;
 
 import static org.yb.AssertionWrappers.*;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgWrapper extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgWrapper.class);
 
@@ -44,10 +44,10 @@ public class TestPgWrapper extends BasePgSQLTest {
       statement.execute("CREATE DATABASE dbtest");
 
       // Database already exists.
-      runInvalidQuery(statement, "CREATE DATABASE dbtest");
+      runInvalidQuery(statement, "CREATE DATABASE dbtest", "already exists");
 
-      // TODO Drop database not yet supported.
-      runInvalidQuery(statement,"DROP DATABASE dbtest");
+      // Drop database.
+      statement.execute("DROP DATABASE dbtest");
 
       // -------------------------------------------------------------------------------------------
       // Test Table
@@ -58,14 +58,17 @@ public class TestPgWrapper extends BasePgSQLTest {
       statement.execute("CREATE TABLE test2(v text, r float, h bigint, PRIMARY KEY (h, r))");
 
       // Table already exists.
-      runInvalidQuery(statement, getSimpleTableCreationStatement("test", "v"));
+      runInvalidQuery(
+          statement,
+          getSimpleTableCreationStatement("test", "v", PartitioningMode.HASH),
+          "already exists");
 
-      // TODO Drop table not yet supported.
+      // Drop tables.
       statement.execute("DROP TABLE test");
       statement.execute("DROP TABLE test2");
 
       // Table does not exist.
-      runInvalidQuery(statement, "DROP TABLE test3");
+      runInvalidQuery(statement, "DROP TABLE test3", "does not exist");
     }
   }
 
@@ -183,8 +186,8 @@ public class TestPgWrapper extends BasePgSQLTest {
         assertEquals(i, rs.getInt("v3"));
       }
     }
-    Connection connection2 = createConnection();
-    try (Statement statement = connection2.createStatement()) {
+    try (Connection connection2 = getConnectionBuilder().connect();
+        Statement statement = connection2.createStatement()) {
       statement.execute("INSERT INTO testdefaultvaluetable(k, v3) VALUES(1000, 3)");
       ResultSet rs = statement.executeQuery("SELECT * FROM testdefaultvaluetable WHERE k = 1000");
       assertTrue(rs.next());
@@ -256,7 +259,7 @@ public class TestPgWrapper extends BasePgSQLTest {
     try (Statement statement = connection.createStatement()) {
       statement.execute(
           "CREATE TABLE testnotnullconstraint (k int primary key, v1 text not null)");
-      thrown.expect(org.postgresql.util.PSQLException.class);
+      thrown.expect(com.yugabyte.util.PSQLException.class);
       thrown.expectMessage("null value in column \"v1\" violates not-null constraint");
       statement.execute("INSERT INTO testnotnullconstraint(k, v1) VALUES (1, null)");
     }
@@ -268,7 +271,7 @@ public class TestPgWrapper extends BasePgSQLTest {
       statement.execute(
           "CREATE TABLE testcheckconstraint (k int primary key, v1 int CHECK (v1 > 9));");
 
-      thrown.expect(org.postgresql.util.PSQLException.class);
+      thrown.expect(com.yugabyte.util.PSQLException.class);
       thrown.expectMessage("new row for relation \"testcheckconstraint\" violates check " +
           "constraint \"testcheckconstraint_v1_check\"");
       statement.execute("INSERT INTO testcheckconstraint(k, v1) VALUES (1, -1)");

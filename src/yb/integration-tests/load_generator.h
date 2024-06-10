@@ -11,22 +11,31 @@
 // under the License.
 //
 
-#ifndef YB_INTEGRATION_TESTS_LOAD_GENERATOR_H_
-#define YB_INTEGRATION_TESTS_LOAD_GENERATOR_H_
+#pragma once
+
+#include <dirent.h>
+#include <signal.h>
+#include <spawn.h>
 
 #include <atomic>
 #include <iostream>
+#include <map>
 #include <memory>
-#include <mutex>
 #include <random>
 #include <set>
 #include <string>
+#include <thread>
+#include <unordered_set>
+#include <vector>
+
+#include <gtest/gtest.h>
 
 #include "yb/client/client_fwd.h"
-#include "yb/gutil/stl_util.h"
-#include "yb/util/threadpool.h"
+
 #include "yb/util/countdown_latch.h"
-#include "yb/util/test_util.h"
+#include "yb/util/status.h"
+#include "yb/util/threadpool.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb {
 
@@ -47,7 +56,7 @@ std::string FormatHexForLoadTestKey(uint64_t x);
 
 class KeyIndexSet {
  public:
-  int NumElements() const;
+  size_t NumElements() const;
   void Insert(int64_t key);
   bool Contains(int64_t key) const;
   bool RemoveIfContains(int64_t key);
@@ -63,7 +72,7 @@ class KeyIndexSet {
 class SessionFactory {
  public:
   virtual ~SessionFactory() {}
-  virtual string ClientId() = 0;
+  virtual std::string ClientId() = 0;
   virtual SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) = 0;
   virtual SingleThreadedReader* GetReader(MultiThreadedReader* reader, int idx) = 0;
 };
@@ -72,12 +81,12 @@ class YBSessionFactory : public SessionFactory {
  public:
   YBSessionFactory(yb::client::YBClient* client, yb::client::TableHandle* table);
 
-  virtual string ClientId() override;
+  virtual std::string ClientId() override;
   SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) override;
   SingleThreadedReader* GetReader(MultiThreadedReader* reader, int idx) override;
 
  protected:
-  yb::client::YBClient* client_;
+  yb::client::YBClient* const client_;
   yb::client::TableHandle* table_;
 };
 
@@ -91,19 +100,19 @@ class NoopSessionFactory : public YBSessionFactory {
 
 class RedisSessionFactory : public SessionFactory {
  public:
-  explicit RedisSessionFactory(const string& redis_server_address);
+  explicit RedisSessionFactory(const std::string& redis_server_address);
 
-  virtual string ClientId() override;
+  virtual std::string ClientId() override;
   SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) override;
   SingleThreadedReader* GetReader(MultiThreadedReader* reader, int idx) override;
 
  protected:
-  string redis_server_addresses_;
+  std::string redis_server_addresses_;
 };
 
 class RedisNoopSessionFactory : public RedisSessionFactory {
  public:
-  explicit RedisNoopSessionFactory(const string& redis_server_address)
+  explicit RedisNoopSessionFactory(const std::string& redis_server_address)
       : RedisSessionFactory(redis_server_address) {}
 
   SingleThreadedWriter* GetWriter(MultiThreadedWriter* writer, int idx) override;
@@ -166,7 +175,7 @@ class MultiThreadedWriter : public MultiThreadedAction {
   // object's lifetime.
   MultiThreadedWriter(
       int64_t num_keys, int64_t start_key, int num_writer_threads, SessionFactory* session_factory,
-      std::atomic_bool* stop_flag, int value_size, int max_num_write_errors);
+      std::atomic<bool>* stop_flag, int value_size, size_t max_num_write_errors);
 
   void Start() override;
   std::atomic<int64_t>* InsertionPoint() { return &inserted_up_to_inclusive_; }
@@ -174,7 +183,7 @@ class MultiThreadedWriter : public MultiThreadedAction {
   const KeyIndexSet* FailedKeys() const { return &failed_keys_; }
 
   int64_t num_writes() { return next_key_.load() - start_key_; }
-  int num_write_errors() { return failed_keys_.NumElements(); }
+  size_t num_write_errors() { return failed_keys_.NumElements(); }
   void AssertSucceeded() { ASSERT_EQ(num_write_errors(), 0); }
 
   void set_pause_flag(std::atomic<bool>* pause_flag) { pause_flag_ = pause_flag; }
@@ -197,7 +206,7 @@ class MultiThreadedWriter : public MultiThreadedAction {
   std::atomic<int64_t> next_key_;
   std::atomic<int64_t> inserted_up_to_inclusive_;
 
-  int max_num_write_errors_ = 0;
+  size_t max_num_write_errors_ = 0;
   std::atomic<bool>* pause_flag_ = nullptr;
 };
 
@@ -214,12 +223,12 @@ class SingleThreadedWriter {
   const int writer_index_;
 
  private:
-  virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) = 0;
+  virtual bool Write(int64_t key_index, const std::string& key_str, const std::string& value_str) = 0;
   virtual void ConfigureSession() = 0;
   virtual void CloseSession() = 0;
 
   // Returns true if the calling writer thread should stop.
-  virtual void HandleInsertionFailure(int64_t key_index, const string& key_str) = 0;
+  virtual void HandleInsertionFailure(int64_t key_index, const std::string& key_str) = 0;
 
   std::atomic<bool>* pause_flag_ = nullptr;
 };
@@ -232,15 +241,15 @@ class YBSingleThreadedWriter : public SingleThreadedWriter {
       : SingleThreadedWriter(writer, writer_index), client_(client), table_(table) {}
 
  protected:
-  client::YBClient* client_;
+  client::YBClient* const client_;
   client::TableHandle* table_;
   std::shared_ptr<client::YBSession> session_;
 
  private:
-  virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) override;
+  virtual bool Write(int64_t key_index, const std::string& key_str, const std::string& value_str) override;
   virtual void ConfigureSession() override;
   virtual void CloseSession() override;
-  virtual void HandleInsertionFailure(int64_t key_index, const string& key_str) override;
+  virtual void HandleInsertionFailure(int64_t key_index, const std::string& key_str) override;
 };
 
 class NoopSingleThreadedWriter : public YBSingleThreadedWriter {
@@ -250,33 +259,33 @@ class NoopSingleThreadedWriter : public YBSingleThreadedWriter {
       int reader_index) : YBSingleThreadedWriter(reader, client, table, reader_index) {}
 
  private:
-  virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) override;
+  virtual bool Write(int64_t key_index, const std::string& key_str, const std::string& value_str) override;
 };
 
 class RedisSingleThreadedWriter : public SingleThreadedWriter {
  public:
   RedisSingleThreadedWriter(
-      MultiThreadedWriter* writer, string redis_server_addrs, int writer_index)
+      MultiThreadedWriter* writer, std::string redis_server_addrs, int writer_index)
       : SingleThreadedWriter(writer, writer_index), redis_server_addresses_(redis_server_addrs) {}
 
  protected:
-  virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) override;
+  virtual bool Write(int64_t key_index, const std::string& key_str, const std::string& value_str) override;
   virtual void ConfigureSession() override;
   virtual void CloseSession() override;
-  virtual void HandleInsertionFailure(int64_t key_index, const string& key_str) override;
+  virtual void HandleInsertionFailure(int64_t key_index, const std::string& key_str) override;
 
   std::vector<std::shared_ptr<RedisClient>> clients_;
-  const string redis_server_addresses_;
+  const std::string redis_server_addresses_;
 };
 
 class RedisNoopSingleThreadedWriter : public RedisSingleThreadedWriter {
  public:
   RedisNoopSingleThreadedWriter(
-      MultiThreadedWriter* writer, string redis_server_addr, int writer_index)
+      MultiThreadedWriter* writer, std::string redis_server_addr, int writer_index)
       : RedisSingleThreadedWriter(writer, redis_server_addr, writer_index) {}
 
  protected:
-  virtual bool Write(int64_t key_index, const string& key_str, const string& value_str) override;
+  virtual bool Write(int64_t key_index, const std::string& key_str, const std::string& value_str) override;
 };
 // ------------------------------------------------------------------------------------------------
 // SingleThreadedScanner
@@ -297,7 +306,9 @@ class SingleThreadedScanner {
 // MultiThreadedReader
 // ------------------------------------------------------------------------------------------------
 
-enum class ReadStatus { OK, NO_ROWS, OTHER_ERROR };
+YB_DEFINE_ENUM(ReadStatus, (kOk)(kNoRows)(kInvalidRead)(kExtraRows)(kOtherError));
+YB_DEFINE_ENUM(MultiThreadedReaderOption, (kStopOnEmptyRead)(kStopOnExtraRead)(kStopOnInvalidRead));
+using MultiThreadedReaderOptions = EnumBitSet<MultiThreadedReaderOption>;
 
 class MultiThreadedReader : public MultiThreadedAction {
  public:
@@ -306,13 +317,21 @@ class MultiThreadedReader : public MultiThreadedAction {
                       std::atomic<int64_t>* insertion_point,
                       const KeyIndexSet* inserted_keys,
                       const KeyIndexSet* failed_keys,
-                      std::atomic_bool* stop_flag, int value_size,
-                      int max_num_read_errors, bool stop_on_empty_read);
+                      std::atomic<bool>* stop_flag, int value_size,
+                      size_t max_num_read_errors,
+                      MultiThreadedReaderOptions options = MultiThreadedReaderOptions{
+                          MultiThreadedReaderOption::kStopOnEmptyRead,
+                          MultiThreadedReaderOption::kStopOnExtraRead,
+                          MultiThreadedReaderOption::kStopOnInvalidRead});
 
   void IncrementReadErrorCount(ReadStatus read_status);
 
   int64_t num_reads() { return num_reads_; }
-  int64_t num_read_errors() { return num_read_errors_.load(); }
+  size_t num_read_errors() { return num_read_errors_.load(); }
+
+  // Returns read status that caused stop of the reader.
+  ReadStatus read_status_stopped() { return read_status_stopped_; }
+
   void AssertSucceeded() { ASSERT_EQ(num_read_errors(), 0); }
 
  protected:
@@ -329,9 +348,10 @@ class MultiThreadedReader : public MultiThreadedAction {
   const KeyIndexSet* failed_keys_;
 
   std::atomic<int64_t> num_reads_;
-  std::atomic<int64_t> num_read_errors_;
-  const int max_num_read_errors_;
-  const bool stop_on_empty_read_;
+  std::atomic<size_t> num_read_errors_;
+  const size_t max_num_read_errors_;
+  MultiThreadedReaderOptions options_;
+  ReadStatus read_status_stopped_ = ReadStatus::kOk;
 };
 
 class SingleThreadedReader {
@@ -348,7 +368,7 @@ class SingleThreadedReader {
 
  private:
   virtual ReadStatus PerformRead(
-      int64_t key_index, const string& key_str, const string& expected_value) = 0;
+      int64_t key_index, const std::string& key_str, const std::string& expected_value) = 0;
   virtual void ConfigureSession() = 0;
   virtual void CloseSession() = 0;
 
@@ -363,13 +383,13 @@ class YBSingleThreadedReader : public SingleThreadedReader {
       : SingleThreadedReader(reader, reader_index), client_(client), table_(table) {}
 
  protected:
-  client::YBClient* client_;
+  client::YBClient* const client_;
   client::TableHandle* table_;
   std::shared_ptr<client::YBSession> session_;
 
  private:
   virtual ReadStatus PerformRead(
-      int64_t key_index, const string& key_str, const string& expected_value) override;
+      int64_t key_index, const std::string& key_str, const std::string& expected_value) override;
   virtual void ConfigureSession() override;
   virtual void CloseSession() override;
 
@@ -377,12 +397,12 @@ class YBSingleThreadedReader : public SingleThreadedReader {
 
 class RedisSingleThreadedReader : public SingleThreadedReader {
  public:
-  RedisSingleThreadedReader(MultiThreadedReader* reader, string redis_server_addr, int reader_index)
+  RedisSingleThreadedReader(MultiThreadedReader* reader, std::string redis_server_addr, int reader_index)
       : SingleThreadedReader(reader, reader_index), redis_server_addresses_(redis_server_addr) {}
 
  private:
   virtual ReadStatus PerformRead(
-      int64_t key_index, const string& key_str, const string& expected_value) override;
+      int64_t key_index, const std::string& key_str, const std::string& expected_value) override;
   virtual void ConfigureSession() override;
   virtual void CloseSession() override;
 
@@ -392,5 +412,3 @@ class RedisSingleThreadedReader : public SingleThreadedReader {
 
 }  // namespace load_generator
 }  // namespace yb
-
-#endif  // YB_INTEGRATION_TESTS_LOAD_GENERATOR_H_

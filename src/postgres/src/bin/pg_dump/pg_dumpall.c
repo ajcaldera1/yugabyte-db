@@ -23,11 +23,12 @@
 #include "dumputils.h"
 #include "pg_backup.h"
 #include "common/file_utils.h"
+#include "common/string.h"
 #include "fe_utils/connect.h"
 #include "fe_utils/string_utils.h"
 
 /* version string we expect back from pg_dump */
-#define PGDUMP_VERSIONSTR "pg_dump (PostgreSQL) " PG_VERSION "\n"
+#define PGDUMP_VERSIONSTR "ysql_dump (YSQL) " PG_VERSION "\n"
 
 
 static void help(void);
@@ -40,7 +41,7 @@ static void dropTablespaces(PGconn *conn);
 static void dumpTablespaces(PGconn *conn);
 static void dropDBs(PGconn *conn);
 static void dumpUserConfig(PGconn *conn, const char *username);
-static void dumpDatabases(PGconn *conn);
+static void dumpDatabases(PGconn *conn, const char *pgdb);
 static void dumpTimestamp(const char *msg);
 static int	runPgDump(const char *dbname, const char *create_opts);
 static void buildShSecLabels(PGconn *conn,
@@ -52,6 +53,7 @@ static PGconn *connectDatabase(const char *dbname, const char *connstr, const ch
 static char *constructConnStr(const char **keywords, const char **values);
 static PGresult *executeQuery(PGconn *conn, const char *query);
 static void executeCommand(PGconn *conn, const char *query);
+static void ybProcessTablespaceSpcOptions(PGconn *conn, PQExpBuffer *buf, char *spcoptions);
 
 static char pg_dump_bin[MAXPGPATH];
 static const char *progname;
@@ -78,6 +80,9 @@ static int	no_unlogged_table_data = 0;
 static int	no_role_passwords = 0;
 static int	server_version;
 static int	load_via_partition_root = 0;
+static int	include_yb_metadata = 0;	/* In this mode DDL statements include YB specific
+										 * metadata such as tablet partitions. */
+static int	dump_single_database = 0;	/* Dump only one DB specified by '--database' argument. */
 
 static char role_catalog[10];
 #define PG_AUTHID "pg_authid"
@@ -85,6 +90,8 @@ static char role_catalog[10];
 
 static FILE *OPF;
 static char *filename = NULL;
+
+static char *masterHosts = NULL;
 
 #define exit_nicely(code) exit(code)
 
@@ -113,6 +120,7 @@ main(int argc, char *argv[])
 		{"password", no_argument, NULL, 'W'},
 		{"no-privileges", no_argument, NULL, 'x'},
 		{"no-acl", no_argument, NULL, 'x'},
+		{"masters", required_argument, NULL, 'm'},
 
 		/*
 		 * the following options don't have an equivalent short option letter
@@ -137,6 +145,8 @@ main(int argc, char *argv[])
 		{"no-subscriptions", no_argument, &no_subscriptions, 1},
 		{"no-sync", no_argument, NULL, 4},
 		{"no-unlogged-table-data", no_argument, &no_unlogged_table_data, 1},
+		{"include-yb-metadata", no_argument, &include_yb_metadata, 1},
+		{"dump-single-database", no_argument, &dump_single_database, 1},
 
 		{NULL, 0, NULL, 0}
 	};
@@ -159,7 +169,7 @@ main(int argc, char *argv[])
 				ret;
 	int			optindex;
 
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_dump"));
+	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("ysql_dump"));
 
 	progname = get_progname(argv[0]);
 
@@ -172,12 +182,12 @@ main(int argc, char *argv[])
 		}
 		if (strcmp(argv[1], "--version") == 0 || strcmp(argv[1], "-V") == 0)
 		{
-			puts("pg_dumpall (PostgreSQL) " PG_VERSION);
+			puts("ysql_dumpall (YSQL) " PG_VERSION);
 			exit_nicely(0);
 		}
 	}
 
-	if ((ret = find_other_exec(argv[0], "pg_dump", PGDUMP_VERSIONSTR,
+	if ((ret = find_other_exec(argv[0], "ysql_dump", PGDUMP_VERSIONSTR,
 							   pg_dump_bin)) < 0)
 	{
 		char		full_path[MAXPGPATH];
@@ -187,14 +197,14 @@ main(int argc, char *argv[])
 
 		if (ret == -1)
 			fprintf(stderr,
-					_("The program \"pg_dump\" is needed by %s "
+					_("The program \"ysql_dump\" is needed by %s "
 					  "but was not found in the\n"
 					  "same directory as \"%s\".\n"
 					  "Check your installation.\n"),
 					progname, full_path);
 		else
 			fprintf(stderr,
-					_("The program \"pg_dump\" was found by \"%s\"\n"
+					_("The program \"ysql_dump\" was found by \"%s\"\n"
 					  "but was not the same version as %s.\n"
 					  "Check your installation.\n"),
 					full_path, progname);
@@ -203,7 +213,7 @@ main(int argc, char *argv[])
 
 	pgdumpopts = createPQExpBuffer();
 
-	while ((c = getopt_long(argc, argv, "acd:E:f:gh:l:oOp:rsS:tU:vwWx", long_options, &optindex)) != -1)
+	while ((c = getopt_long(argc, argv, "acd:E:f:gh:l:m:oOp:rsS:tU:vwWx", long_options, &optindex)) != -1)
 	{
 		switch (c)
 		{
@@ -242,6 +252,10 @@ main(int argc, char *argv[])
 
 			case 'l':
 				pgdb = pg_strdup(optarg);
+				break;
+
+			case 'm':           /* DEPRECATED and NOT USED: YB master hosts */
+				masterHosts = pg_strdup(optarg);
 				break;
 
 			case 'o':
@@ -406,6 +420,8 @@ main(int argc, char *argv[])
 		appendPQExpBufferStr(pgdumpopts, " --no-subscriptions");
 	if (no_unlogged_table_data)
 		appendPQExpBufferStr(pgdumpopts, " --no-unlogged-table-data");
+	if (include_yb_metadata)
+		appendPQExpBufferStr(pgdumpopts, " --include-yb-metadata");
 
 	/*
 	 * If there was a database specified on the command line, use that,
@@ -496,7 +512,7 @@ main(int argc, char *argv[])
 	if (quote_all_identifiers && server_version >= 90100)
 		executeCommand(conn, "SET quote_all_identifiers = true");
 
-	fprintf(OPF, "--\n-- PostgreSQL database cluster dump\n--\n\n");
+	fprintf(OPF, "--\n-- YSQL database cluster dump\n--\n\n");
 	if (verbose)
 		dumpTimestamp("Started on");
 
@@ -560,13 +576,14 @@ main(int argc, char *argv[])
 	}
 
 	if (!globals_only && !roles_only && !tablespaces_only)
-		dumpDatabases(conn);
+		/* Dump one DB only with '--dump-single-database'. */
+		dumpDatabases(conn, dump_single_database ? pgdb : NULL);
 
 	PQfinish(conn);
 
 	if (verbose)
 		dumpTimestamp("Completed on");
-	fprintf(OPF, "--\n-- PostgreSQL database cluster dump complete\n--\n\n");
+	fprintf(OPF, "--\n-- YSQL database cluster dump complete\n--\n\n");
 
 	if (filename)
 	{
@@ -584,7 +601,7 @@ main(int argc, char *argv[])
 static void
 help(void)
 {
-	printf(_("%s extracts a PostgreSQL database cluster into an SQL script file.\n\n"), progname);
+	printf(_("%s extracts a YSQL database cluster into an SQL script file.\n\n"), progname);
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
 
@@ -606,11 +623,16 @@ help(void)
 	printf(_("  -S, --superuser=NAME         superuser user name to use in the dump\n"));
 	printf(_("  -t, --tablespaces-only       dump only tablespaces, no databases or roles\n"));
 	printf(_("  -x, --no-privileges          do not dump privileges (grant/revoke)\n"));
+	printf(_("  --dump-single-database       dump only one DB specified by '--database' argument\n"));
 	printf(_("  --binary-upgrade             for use by upgrade utilities only\n"));
 	printf(_("  --column-inserts             dump data as INSERT commands with column names\n"));
 	printf(_("  --disable-dollar-quoting     disable dollar quoting, use SQL standard quoting\n"));
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
+	printf(_("  --include-yb-metadata        include Yugabyte-specific metadata, uses extended\n"
+			 "                               YSQL syntax not compatible with PostgreSQL.\n"
+			 "                               (As of now, doesn't automatically include some things\n"
+			 "                               like SPLIT details).\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));
 	printf(_("  --no-comments                do not dump comments\n"));
@@ -625,6 +647,8 @@ help(void)
 	printf(_("  --use-set-session-authorization\n"
 			 "                               use SET SESSION AUTHORIZATION commands instead of\n"
 			 "                               ALTER OWNER commands to set ownership\n"));
+	printf(_("  -m, --masters=HOST:PORT      DEPRECATED and NOT USED\n"
+			 "                               comma-separated list of YB-Master hosts and ports\n"));
 
 	printf(_("\nConnection options:\n"));
 	printf(_("  -d, --dbname=CONNSTR     connect using connection string\n"));
@@ -638,7 +662,7 @@ help(void)
 
 	printf(_("\nIf -f/--file is not used, then the SQL script will be written to the standard\n"
 			 "output.\n\n"));
-	printf(_("Report bugs to <pgsql-bugs@postgresql.org>.\n"));
+	printf(_("Report bugs on https://github.com/YugaByte/yugabyte-db/issues/new\n"));
 }
 
 
@@ -829,11 +853,21 @@ dumpRoles(PGconn *conn)
 	i_is_current_user = PQfnumber(res, "is_current_user");
 
 	if (PQntuples(res) > 0)
+	{
 		fprintf(OPF, "--\n-- Roles\n--\n\n");
+
+		if (include_yb_metadata)
+			fprintf(OPF, "-- Set variable ignore_existing_roles (if not already set)\n"
+						 "\\if :{?ignore_existing_roles}\n"
+						 "\\else\n"
+						 "\\set ignore_existing_roles false\n"
+						 "\\endif\n\n");
+	}
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
 		const char *rolename;
+		char	   *frolename;
 		Oid			auth_oid;
 
 		auth_oid = atooid(PQgetvalue(res, i, i_oid));
@@ -856,6 +890,7 @@ dumpRoles(PGconn *conn)
 							  auth_oid);
 		}
 
+		frolename = pg_strdup(fmtId(rolename));
 		/*
 		 * We dump CREATE ROLE followed by ALTER ROLE to ensure that the role
 		 * will acquire the right properties even if it already exists (ie, it
@@ -866,8 +901,25 @@ dumpRoles(PGconn *conn)
 		 */
 		if (!binary_upgrade ||
 			strcmp(PQgetvalue(res, i, i_is_current_user), "f") == 0)
-			appendPQExpBuffer(buf, "CREATE ROLE %s;\n", fmtId(rolename));
-		appendPQExpBuffer(buf, "ALTER ROLE %s WITH", fmtId(rolename));
+		{
+			if (include_yb_metadata)
+				appendPQExpBuffer(buf,
+					"\\set role_exists false\n"
+					"\\if :ignore_existing_roles\n"
+					"    SELECT EXISTS(SELECT 1 FROM pg_roles WHERE rolname = '%s')"
+					" AS role_exists \\gset\n"
+					"\\endif\n"
+					"\\if :role_exists\n"
+					"    \\echo 'Role %s already exists.'\n"
+					"\\else\n    ", frolename, frolename);
+
+			appendPQExpBuffer(buf, "CREATE ROLE %s;\n", frolename);
+
+			if (include_yb_metadata)
+				appendPQExpBufferStr(buf, "\\endif\n");
+		}
+
+		appendPQExpBuffer(buf, "ALTER ROLE %s WITH", frolename);
 
 		if (strcmp(PQgetvalue(res, i, i_rolsuper), "t") == 0)
 			appendPQExpBufferStr(buf, " SUPERUSER");
@@ -923,7 +975,7 @@ dumpRoles(PGconn *conn)
 
 		if (!no_comments && !PQgetisnull(res, i, i_rolcomment))
 		{
-			appendPQExpBuffer(buf, "COMMENT ON ROLE %s IS ", fmtId(rolename));
+			appendPQExpBuffer(buf, "COMMENT ON ROLE %s IS ", frolename);
 			appendStringLiteralConn(buf, PQgetvalue(res, i, i_rolcomment), conn);
 			appendPQExpBufferStr(buf, ";\n");
 		}
@@ -933,7 +985,11 @@ dumpRoles(PGconn *conn)
 							 "ROLE", rolename,
 							 buf);
 
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\n");
+
 		fprintf(OPF, "%s", buf->data);
+		free(frolename);
 	}
 
 	/*
@@ -1147,7 +1203,7 @@ dumpTablespaces(PGconn *conn)
 						   "(SELECT pg_catalog.array_agg(acl) FROM (SELECT pg_catalog.unnest(pg_catalog.acldefault('t',spcowner)) AS acl "
 						   "EXCEPT SELECT pg_catalog.unnest(coalesce(spcacl,pg_catalog.acldefault('t',spcowner)))) as foo)"
 						   "AS rspcacl,"
-						   "array_to_string(spcoptions, ', '),"
+						   "spcoptions,"
 						   "pg_catalog.shobj_description(oid, 'pg_tablespace') "
 						   "FROM pg_catalog.pg_tablespace "
 						   "WHERE spcname !~ '^pg_' "
@@ -1189,7 +1245,16 @@ dumpTablespaces(PGconn *conn)
 						   "ORDER BY 1");
 
 	if (PQntuples(res) > 0)
+	{
 		fprintf(OPF, "--\n-- Tablespaces\n--\n\n");
+
+		if (include_yb_metadata)
+			fprintf(OPF, "-- Set variable ignore_existing_tablespaces (if not already set)\n"
+						 "\\if :{?ignore_existing_tablespaces}\n"
+						 "\\else\n"
+						 "\\set ignore_existing_tablespaces false\n"
+						 "\\endif\n\n");
+	}
 
 	for (i = 0; i < PQntuples(res); i++)
 	{
@@ -1207,16 +1272,32 @@ dumpTablespaces(PGconn *conn)
 		/* needed for buildACLCommands() */
 		fspcname = pg_strdup(fmtId(spcname));
 
+		if (include_yb_metadata)
+			appendPQExpBuffer(buf,
+				"\\set tablespace_exists false\n"
+				"\\if :ignore_existing_tablespaces\n"
+				"    SELECT EXISTS(SELECT 1 FROM pg_tablespace WHERE spcname = '%s')"
+				" AS tablespace_exists \\gset\n"
+				"\\endif\n"
+				"\\if :tablespace_exists\n"
+				"    \\echo 'Tablespace %s already exists.'\n"
+				"\\else\n    ", fspcname, fspcname);
+
 		appendPQExpBuffer(buf, "CREATE TABLESPACE %s", fspcname);
 		appendPQExpBuffer(buf, " OWNER %s", fmtId(spcowner));
 
 		appendPQExpBufferStr(buf, " LOCATION ");
 		appendStringLiteralConn(buf, spclocation, conn);
+		if (spcoptions && spcoptions[0] != '\0')
+		{
+			appendPQExpBufferStr(buf, " WITH (");
+			ybProcessTablespaceSpcOptions(conn, &buf, spcoptions);
+			appendPQExpBufferStr(buf, ")");
+		}
 		appendPQExpBufferStr(buf, ";\n");
 
-		if (spcoptions && spcoptions[0] != '\0')
-			appendPQExpBuffer(buf, "ALTER TABLESPACE %s SET (%s);\n",
-							  fspcname, spcoptions);
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\\endif\n");
 
 		if (!skip_acls &&
 			!buildACLCommands(fspcname, NULL, NULL, "TABLESPACE",
@@ -1241,6 +1322,9 @@ dumpTablespaces(PGconn *conn)
 							 "TABLESPACE", spcname,
 							 buf);
 
+		if (include_yb_metadata)
+			appendPQExpBufferStr(buf, "\n");
+
 		fprintf(OPF, "%s", buf->data);
 
 		free(fspcname);
@@ -1251,6 +1335,23 @@ dumpTablespaces(PGconn *conn)
 	fprintf(OPF, "\n\n");
 }
 
+/*
+ * Vanilla PG does not have strings in spcoptions column in pg_tablespace.
+ * Since YB tablespaces have JSON strings in its options, process using
+ * appendRelOptionsArray and append to 'buf'.
+ */
+static void
+ybProcessTablespaceSpcOptions(PGconn *conn, PQExpBuffer *buf, char *spcoptions)
+{
+	int encoding = PQclientEncoding(conn);
+	bool std_strings = PQparameterStatus(conn, "standard_conforming_strings");
+	bool res = appendReloptionsArray(*buf, spcoptions, "", encoding, std_strings);
+	if (!res)
+	{
+		fprintf(stderr, "WARNING: could not parse reloptions array\n");
+		exit_nicely(1);
+	}
+}
 
 /*
  * Dump commands to drop each database.
@@ -1351,7 +1452,7 @@ dumpUserConfig(PGconn *conn, const char *username)
  * Dump contents of databases.
  */
 static void
-dumpDatabases(PGconn *conn)
+dumpDatabases(PGconn *conn, const char *pgdb)
 {
 	PGresult   *res;
 	int			i;
@@ -1378,6 +1479,9 @@ dumpDatabases(PGconn *conn)
 		char	   *dbname = PQgetvalue(res, i, 0);
 		const char *create_opts;
 		int			ret;
+
+		if (pgdb && strcmp(dbname, pgdb) != 0)
+			continue;
 
 		/* Skip template0, even if it's not marked !datallowconn. */
 		if (strcmp(dbname, "template0") == 0)
@@ -1414,7 +1518,7 @@ dumpDatabases(PGconn *conn)
 		ret = runPgDump(dbname, create_opts);
 		if (ret != 0)
 		{
-			fprintf(stderr, _("%s: pg_dump failed on database \"%s\", exiting\n"), progname, dbname);
+			fprintf(stderr, _("%s: ysql_dump failed on database \"%s\", exiting\n"), progname, dbname);
 			exit_nicely(1);
 		}
 
@@ -1448,6 +1552,12 @@ runPgDump(const char *dbname, const char *create_opts)
 
 	appendPQExpBuffer(cmd, "\"%s\" %s %s", pg_dump_bin,
 					  pgdumpopts->data, create_opts);
+
+	/*
+	 * DEPRECATED: Custom YB-Master host/port to use.
+	 */
+	if (masterHosts != NULL)
+		fprintf(stderr, "WARNING: ignoring the deprecated argument --masters (-m)\n");
 
 	/*
 	 * If we have a filename, use the undocumented plain-append pg_dump
@@ -1530,14 +1640,10 @@ connectDatabase(const char *dbname, const char *connection_string,
 	const char **keywords = NULL;
 	const char **values = NULL;
 	PQconninfoOption *conn_opts = NULL;
-	static bool have_password = false;
-	static char password[100];
+	static char *password = NULL;
 
-	if (prompt_password == TRI_YES && !have_password)
-	{
-		simple_prompt("Password: ", password, sizeof(password), false);
-		have_password = true;
-	}
+	if (prompt_password == TRI_YES && !password)
+		password = simple_prompt("Password: ", false);
 
 	/*
 	 * Start the connection.  Loop until we have a password if requested by
@@ -1617,7 +1723,7 @@ connectDatabase(const char *dbname, const char *connection_string,
 			values[i] = pguser;
 			i++;
 		}
-		if (have_password)
+		if (password)
 		{
 			keywords[i] = "password";
 			values[i] = password;
@@ -1645,12 +1751,11 @@ connectDatabase(const char *dbname, const char *connection_string,
 
 		if (PQstatus(conn) == CONNECTION_BAD &&
 			PQconnectionNeedsPassword(conn) &&
-			!have_password &&
+			!password &&
 			prompt_password != TRI_NO)
 		{
 			PQfinish(conn);
-			simple_prompt("Password: ", password, sizeof(password), false);
-			have_password = true;
+			password = simple_prompt("Password: ", false);
 			new_pass = true;
 		}
 	} while (new_pass);

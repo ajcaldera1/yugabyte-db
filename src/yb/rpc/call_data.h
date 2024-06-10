@@ -11,64 +11,95 @@
 // under the License.
 //
 
-#ifndef YB_RPC_CALL_DATA_H
-#define YB_RPC_CALL_DATA_H
+#pragma once
+
+#include "yb/rpc/rpc_fwd.h"
+
+#include "yb/util/memory/memory_usage.h"
+#include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 namespace rpc {
 
 struct CallData {
  public:
-  CallData() : data_(nullptr), size_(0) {}
+  CallData() : buffer_(EmptyBuffer()) {}
 
-  explicit CallData(size_t size)
-      : data_(size ? static_cast<char*>(malloc(size)) : nullptr), size_(size) {}
+  explicit CallData(size_t size) : buffer_(RefCntBuffer(size)) {}
+  explicit CallData(RefCntSlice slice) : buffer_(std::move(slice)) {}
+
+  class ShouldRejectTag {};
+
+  CallData(size_t size, ShouldRejectTag) {}
 
   CallData(const CallData&) = delete;
   void operator=(const CallData&) = delete;
 
-  CallData(CallData&& rhs) : data_(rhs.data_), size_(rhs.size_) {
-    rhs.data_ = nullptr;
-    rhs.size_ = 0;
-  }
-
-  CallData& operator=(CallData&& rhs) {
-    Reset();
-    std::swap(data_, rhs.data_);
-    std::swap(size_, rhs.size_);
-    return *this;
-  }
-
-  ~CallData() {
-    Reset();
-  }
-
-  void Reset() {
-    if (data_) {
-      free(data_);
-    }
-    size_ = 0;
-    data_ = nullptr;
-  }
+  CallData(CallData&& rhs) = default;
+  CallData& operator=(CallData&& rhs) = default;
 
   bool empty() const {
-    return size_ == 0;
+    return buffer_.empty();
   }
 
   char* data() const {
-    return data_;
+    return const_cast<char*>(buffer_.data());
+  }
+
+  bool should_reject() const { return !buffer_; }
+
+  void Reset() {
+    buffer_.Reset();
   }
 
   size_t size() const {
-    return size_;
+    return buffer_.size();
+  }
+
+  Slice AsSlice() const {
+    return buffer_.AsSlice();
+  }
+
+  const RefCntBuffer& holder() const {
+    return buffer_.holder();
+  }
+
+  size_t DynamicMemoryUsage() const { return buffer_.DynamicMemoryUsage(); }
+
+ private:
+  static RefCntSlice EmptyBuffer() {
+    static RefCntBuffer result(0);
+    return RefCntSlice(result);
+  }
+
+  RefCntSlice buffer_;
+};
+
+class ReceivedSidecars {
+ public:
+  Result<RefCntSlice> Extract(const RefCntBuffer& buffer, size_t idx) const;
+
+  Result<SidecarHolder> GetHolder(const RefCntBuffer& buffer, size_t idx) const;
+
+  size_t Transfer(const RefCntBuffer& buffer, Sidecars* dest);
+
+  Status Parse(Slice message, const boost::iterator_range<const uint32_t*>& offsets);
+
+  size_t DynamicMemoryUsage() const {
+    return GetFlatDynamicMemoryUsageOf(sidecar_bounds_);
+  }
+
+  size_t GetCount() const {
+    return sidecar_bounds_.size() > 0 ? sidecar_bounds_.size() - 1 : 0;
   }
 
  private:
-  char* data_;
-  size_t size_;
+  static constexpr size_t kMinBufferForSidecarSlices = 16;
+  // Slices of data for rpc sidecars. They point into memory owned by transfer_.
+  // Number of sidecars should be obtained from header_.
+  boost::container::small_vector<const uint8_t*, kMinBufferForSidecarSlices> sidecar_bounds_;
 };
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_CALL_DATA_H

@@ -1291,6 +1291,50 @@ include_dir 'conf.d'
       </listitem>
      </varlistentry>
 
+     <varlistentry id="guc-ssl-min-protocol-version" xreflabel="ssl_min_protocol_version">
+      <term><varname>ssl_min_protocol_version</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>ssl_min_protocol_version</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the minimum SSL/TLS protocol version to use.  Valid values are
+        currently: <literal>TLSv1</literal>, <literal>TLSv1.1</literal>,
+        <literal>TLSv1.2</literal>, <literal>TLSv1.3</literal>.  Older
+        versions of the <productname>OpenSSL</productname> library do not
+        support all values; an error will be raised if an unsupported setting
+        is chosen.  Protocol versions before TLS 1.0, namely SSL version 2 and
+        3, are always disabled.
+       </para>
+
+       <para>
+        The default is <literal>TLSv1</literal>, mainly to support older
+        versions of the <productname>OpenSSL</productname> library.  You might
+        want to set this to a higher value if all software components can
+        support the newer protocol versions.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-ssl-max-protocol-version" xreflabel="ssl_max_protocol_version">
+      <term><varname>ssl_max_protocol_version</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>ssl_max_protocol_version</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Sets the maximum SSL/TLS protocol version to use.  Valid values are as
+        for <xref linkend="guc-ssl-min-protocol-version"/>, with addition of
+        an empty string, which allows any protocol version.  The default is to
+        allow any version.  Setting the maximum protocol version is mainly
+        useful for testing or if some component has issues working with a
+        newer protocol.
+       </para>
+      </listitem>
+     </varlistentry>
+
      <varlistentry id="guc-ssl-dh-params-file" xreflabel="ssl_dh_params_file">
       <term><varname>ssl_dh_params_file</varname> (<type>string</type>)
       <indexterm>
@@ -1647,6 +1691,31 @@ include_dir 'conf.d'
         the server will not allow this variable to be set to an unsafe
         value.  However, not all platforms provide the information,
         so caution is recommended in selecting a value.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-shared-memory-type" xreflabel="shared_memory_type">
+      <term><varname>shared_memory_type</varname> (<type>enum</type>)
+      <indexterm>
+       <primary><varname>shared_memory_type</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+      <listitem>
+       <para>
+        Specifies the shared memory implementation that the server
+        should use for the main shared memory region that holds
+        <productname>PostgreSQL</productname>'s shared buffers and other
+        shared data.  Possible values are <literal>mmap</literal> (for
+        anonymous shared memory allocated using <function>mmap</function>),
+        <literal>sysv</literal> (for System V shared memory allocated via
+        <function>shmget</function>) and <literal>windows</literal> (for Windows
+        shared memory).  Not all values are supported on all platforms; the
+        first supported option is the default for that platform.  The use of
+        the <literal>sysv</literal> option, which is not the default on any
+        platform, is generally discouraged because it typically requires
+        non-default kernel settings to allow for large allocations (see <xref
+        linkend="sysvipc"/>).
        </para>
       </listitem>
      </varlistentry>
@@ -5151,6 +5220,12 @@ local0.*    /var/log/postgresql
         </para>
 
         <para>
+         This overrides <xref linkend="guc-log-min-duration-sample"/>,
+         meaning that queries with duration exceeding this setting are not
+         subject to sampling and are always logged.
+        </para>
+
+        <para>
          For clients using extended query protocol, durations of the Parse,
          Bind, and Execute steps are logged independently.
         </para>
@@ -5171,6 +5246,111 @@ local0.*    /var/log/postgresql
        </note>
        </listitem>
       </varlistentry>
+
+     <varlistentry id="guc-log-min-duration-sample" xreflabel="log_min_duration_sample">
+      <term><varname>log_min_duration_sample</varname> (<type>integer</type>)
+      <indexterm>
+       <primary><varname>log_min_duration_sample</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+       <listitem>
+        <para>
+         Allows to sample the logging of the duration of each completed
+         statement if the statement ran for at least the specified amount of
+         time. If this value is specified without units, it is taken as milliseconds.
+         Setting this to zero samples all statement durations.
+         Minus-one (the default) disables sampling statement durations.
+         For example, if you set it to <literal>250ms</literal>
+         then all SQL statements that run 250ms or longer will be considered
+         for sampling, with sample rate is controlled by <xref linkend="guc-log-statement-sample-rate"/>. 
+         Enabling this parameter can be helpful when the traffic too high to
+         sample all queries.
+         Only superusers can change this setting.
+        </para>
+
+        <para>
+         This option has lower priority than <xref linkend="guc-log-min-duration-statement"/>,
+         meaning that statements with durations exceeding <xref linkend="guc-log-min-duration-statement"/>
+         are not subject to sampling and are always logged.
+        </para>
+
+        <para>
+         For clients using extended query protocol, durations of the Parse,
+         Bind, and Execute steps are logged independently.
+        </para>
+
+       <note>
+        <para>
+         When using this option together with
+         <xref linkend="guc-log-statement"/>,
+         the text of statements that are logged because of
+         <varname>log_statement</varname> will not be repeated in the
+         duration log message.
+         If you are not using <application>syslog</application>, it is recommended
+         that you log the PID or session ID using
+         <xref linkend="guc-log-line-prefix"/>
+         so that you can link the statement message to the later
+         duration message using the process ID or session ID.
+        </para>
+       </note>
+       </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-log-statement-sample-rate" xreflabel="log_statement_sample_rate">
+      <term><varname>log_statement_sample_rate</varname> (<type>real</type>)
+      <indexterm>
+       <primary><varname>log_statement_sample_rate</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+       <listitem>
+        <para>
+         Determines the fraction of statements with duration exceeding
+         <xref linkend="guc-log-min-duration-sample"/> to be logged.
+         This is a statistical parameter, for example <literal>0.5</literal>
+         means there is statistically one in two chances to log the statement.
+         The default is <literal>1.0</literal>, meaning log all such
+         statements.
+         Setting this to zero disables sampling logging, same as setting
+         <varname>log_min_duration_sample</varname> to
+         <literal>-1</literal>.
+         <varname>log_statement_sample_rate</varname> is helpful when the
+         traffic is too high to log all queries.
+         Only superusers can change this setting.
+        </para>
+       <note>
+        <para>
+         Like all statement-logging options, this option can add significant
+         overhead.
+        </para>
+       </note>
+       </listitem>
+     </varlistentry>
+
+     <varlistentry id="guc-log-transaction-sample-rate" xreflabel="log_transaction_sample_rate">
+      <term><varname>log_transaction_sample_rate</varname> (<type>real</type>)
+      <indexterm>
+       <primary><varname>log_transaction_sample_rate</varname> configuration parameter</primary>
+      </indexterm>
+      </term>
+       <listitem>
+        <para>
+         Set the fraction of transactions whose statements are all logged,
+         in addition to statements logged for other reasons.  It applies to
+         each new transaction regardless of its statements' durations.
+         The default is <literal>0</literal>, meaning not to log statements
+         from any additional transaction.  Setting this to <literal>1</literal>
+         logs all statements for all transactions.
+         <varname>log_transaction_sample_rate</varname> is helpful to track a
+         sample of transaction.
+        </para>
+       <note>
+        <para>
+         Like all statement-logging options, this option can add significant
+         overhead.
+        </para>
+       </note>
+       </listitem>
+     </varlistentry>
 
      </variablelist>
 
@@ -6485,6 +6665,10 @@ COPY postgres_log FROM '/full/path/to/logfile.csv' WITH csv;
         be searched <emphasis>before</emphasis> searching any of the path items.
        </para>
 
+       <!-- To further split hairs, funcname('foo') does not use the temporary
+            schema, even when it considers typname='funcname'.  This paragraph
+            refers to function names in a loose sense, "pg_proc.proname or
+            func_name grammar production". -->
        <para>
         Likewise, the current session's temporary-table schema,
         <literal>pg_temp_<replaceable>nnn</replaceable></literal>, is always searched if it

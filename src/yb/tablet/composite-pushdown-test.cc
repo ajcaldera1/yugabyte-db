@@ -30,14 +30,38 @@
 // under the License.
 //
 
-#include <glog/logging.h>
+#include <algorithm>
+#include <limits>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
+#include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
+
+#include "yb/docdb/read_operation_data.h"
+
+#include "yb/dockv/partial_row.h"
+
+#include "yb/gutil/strings/numbers.h"
+#include "yb/gutil/strings/substitute.h"
+
+#include "yb/qlexpr/ql_rowblock.h"
+
+#include "yb/tablet/local_tablet_writer.h"
+#include "yb/tablet/read_result.h"
+#include "yb/tablet/tablet-test-util.h"
 #include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet-test-base.h"
+
+#include "yb/util/env.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
+
+using std::string;
+using std::vector;
 
 namespace yb {
 namespace tablet {
@@ -47,12 +71,11 @@ const char* const kTestHostnames[] = { "foo", "foobar", "baz", nullptr };
 class CompositePushdownTest : public YBTabletTest {
  public:
   CompositePushdownTest()
-      : YBTabletTest(Schema({ ColumnSchema("year", INT16, false, true),
-                              ColumnSchema("month", INT8, false, true),
-                              ColumnSchema("day", INT8, false, true),
-                              ColumnSchema("hostname", STRING, false, true),
-                              ColumnSchema("data", STRING) },
-                            4)) {
+      : YBTabletTest(Schema({ ColumnSchema("year", DataType::INT16, ColumnKind::HASH),
+                              ColumnSchema("month", DataType::INT8, ColumnKind::HASH),
+                              ColumnSchema("day", DataType::INT8, ColumnKind::HASH),
+                              ColumnSchema("hostname", DataType::STRING, ColumnKind::HASH),
+                              ColumnSchema("data", DataType::STRING) })) {
   }
 
   void SetUp() override {
@@ -62,10 +85,10 @@ class CompositePushdownTest : public YBTabletTest {
   }
 
   void FillTestTablet() {
-    uint32_t nrows = 10 * 12 * 28;
+    int nrows = 10 * 12 * 28;
     int i = 0;
 
-    LocalTabletWriter writer(tablet().get());
+    LocalTabletWriter writer(tablet());
     for (int16_t year = 2000; year <= 2010; year++) {
       for (int8_t month = 1; month <= 12; month++) {
         for (int8_t day = 1; day <= 28; day++) {
@@ -105,17 +128,19 @@ class CompositePushdownTest : public YBTabletTest {
   };
 
   void ScanTablet(QLReadRequestPB* req, vector<string> *results) {
-    ReadHybridTime read_time = ReadHybridTime::SingleTime(tablet()->SafeTime());
+    ReadHybridTime read_time = ReadHybridTime::SingleTime(ASSERT_RESULT(tablet()->SafeTime()));
     QLReadRequestResult result;
     TransactionMetadataPB transaction;
     QLAddColumns(schema_, {}, req);
+    WriteBuffer rows_data(1024);
     EXPECT_OK(tablet()->HandleQLReadRequest(
-        CoarseTimePoint::max() /* deadline */, read_time, *req, transaction, &result));
+        docdb::ReadOperationData::FromReadTime(read_time), *req, transaction, &result, &rows_data));
 
     ASSERT_EQ(QLResponsePB::YQL_STATUS_OK, result.response.status())
         << "Error: " << result.response.error_message();
 
-    auto row_block = CreateRowBlock(QLClient::YQL_CLIENT_CQL, schema_, result.rows_data);
+    auto row_block = qlexpr::CreateRowBlock(
+        QLClient::YQL_CLIENT_CQL, schema_, rows_data.ToBuffer());
     for (const auto& row : row_block->rows()) {
       results->push_back(row.ToString());
     }

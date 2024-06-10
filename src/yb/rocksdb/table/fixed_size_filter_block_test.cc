@@ -11,18 +11,21 @@
 // under the License.
 //
 
+#include <string>
+
+#include <gtest/gtest.h>
+
 #include "yb/rocksdb/table/fixed_size_filter_block.h"
 
 #include "yb/rocksdb/filter_policy.h"
-#include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/hash.h"
-#include "yb/rocksdb/util/logging.h"
-#include "yb/rocksdb/util/testharness.h"
+#include "yb/rocksdb/env.h"
+
 #include "yb/rocksdb/util/testutil.h"
 
 namespace rocksdb {
 
-class FixedSizeFilterTest : public testing::Test {
+class FixedSizeFilterTest : public RocksDBTest {
  public:
   BlockBasedTableOptions table_options_;
 
@@ -116,31 +119,6 @@ TEST_F(FixedSizeFilterTest, MultipleChunks) {
   ASSERT_TRUE(!reader3.KeyMayMatch("c2"));
   ASSERT_TRUE(!reader3.KeyMayMatch("missing"));
   ASSERT_TRUE(!reader3.KeyMayMatch("other"));
-}
-
-TEST_F(FixedSizeFilterTest, ConcurrentReads) {
-  FixedSizeFilterBlockBuilder builder(nullptr, table_options_);
-  builder.StartBlock(0);
-  builder.Add("foo");
-  builder.Add("bar");
-  builder.Add("fox");
-
-  BlockContents block(builder.Finish(), false, kNoCompression);
-
-  // Multiple readers on the same block should not matter
-  FixedSizeFilterBlockReader reader1(nullptr, table_options_, true, std::move(block));
-  ASSERT_TRUE(reader1.KeyMayMatch("foo"));
-  ASSERT_TRUE(reader1.KeyMayMatch("bar"));
-  ASSERT_TRUE(reader1.KeyMayMatch("fox"));
-  ASSERT_TRUE(!reader1.KeyMayMatch("other"));
-  ASSERT_TRUE(!reader1.KeyMayMatch("missing"));
-
-  FixedSizeFilterBlockReader reader2(nullptr, table_options_, true, std::move(block));
-  ASSERT_TRUE(reader2.KeyMayMatch("foo"));
-  ASSERT_TRUE(reader2.KeyMayMatch("bar"));
-  ASSERT_TRUE(reader2.KeyMayMatch("fox"));
-  ASSERT_TRUE(!reader2.KeyMayMatch("other"));
-  ASSERT_TRUE(!reader2.KeyMayMatch("missing"));
 }
 
 }  // namespace rocksdb

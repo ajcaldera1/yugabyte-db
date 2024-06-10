@@ -23,17 +23,14 @@
 //
 // Must not be included from any .h files to avoid polluting the namespace
 // with macros.
-#ifndef YB_ROCKSDB_UTIL_LOGGING_H
-#define YB_ROCKSDB_UTIL_LOGGING_H
 
 #pragma once
 
-#include <stdio.h>
 #include <stdint.h>
+#include <stdio.h>
 
 #include <string>
 
-#include "yb/rocksdb/port/port.h"
 #include "yb/util/slice.h"
 
 namespace rocksdb {
@@ -75,5 +72,3 @@ extern std::string EscapeString(const Slice& value);
 extern bool ConsumeDecimalNumber(Slice* in, uint64_t* val);
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_UTIL_LOGGING_H

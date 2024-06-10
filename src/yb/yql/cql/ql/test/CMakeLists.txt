@@ -11,13 +11,12 @@
 # under the License.
 #
 
-add_library(ql_test ql-test-base.cc)
-target_link_libraries(ql_test
-                      ql_api
-                      yb_client
-                      yb_client_test_util
-                      integration-tests)
-add_dependencies(ql_test ql_api)
+set(YB_PCH_PREFIX ql)
+set(YB_PCH_PATH ../)
+
+ADD_YB_TEST_LIBRARY(ql_test
+                    SRCS ql-test-base.cc
+                    DEPS ql_api yb_client yb_client_test_util integration-tests)
 
 set(YB_TEST_LINK_LIBS ql_test ${YB_MIN_TEST_LIBS})
 ADD_YB_TEST(ql-parser-test)
@@ -37,6 +36,7 @@ ADD_YB_TEST(ql-static-column-test)
 ADD_YB_TEST(ql-arith-test)
 ADD_YB_TEST(ql-select-expr-test)
 ADD_YB_TEST(ql-role-test)
+ADD_YB_TEST(ql-alter-table-test)
 
 # Due to some reasons ybcmd is implemented as a gtest, although it is really a tool and not
 # intended to be run as a test. So, we put it in usual binary directory and don't add as a test.

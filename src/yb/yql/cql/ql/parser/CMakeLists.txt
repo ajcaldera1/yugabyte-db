@@ -11,13 +11,6 @@
 # under the License.
 #
 
-if (APPLE)
-  set(CMAKE_PREFIX_PATH "${HOMEBREW_OPT_DIR}/flex" ${CMAKE_PREFIX_PATH})
-  set(CMAKE_PREFIX_PATH "${HOMEBREW_OPT_DIR}/bison" ${CMAKE_PREFIX_PATH})
-  set(BISON_EXECUTABLE "${HOMEBREW_OPT_DIR}/bison/bin/bison")
-  set(FLEX_EXECUTABLE "${HOMEBREW_OPT_DIR}/flex/bin/flex")
-endif()
-
 find_package(BISON)
 find_package(FLEX)
 
@@ -57,8 +50,22 @@ add_custom_command(
 set(PARSER_CUSTOM_FLAGS
     "-Wno-tautological-undefined-compare -Wno-implicit-fallthrough -Wno-null-conversion")
 
+set(PARSER_CUSTOM_FLAGS "${PARSER_CUSTOM_FLAGS} -Wno-shorten-64-to-32")
+if(IS_CLANG AND "${COMPILER_VERSION}" VERSION_GREATER_EQUAL "14.0.0")
+  set(PARSER_CUSTOM_FLAGS "${PARSER_CUSTOM_FLAGS} -Wno-unused-but-set-variable")
+endif()
+if(IS_GCC AND "${COMPILER_VERSION}" MATCHES "^13[.].*$")
+  # To work around this issue:
+  # https://gist.githubusercontent.com/mbautin/199bb4a5011148ae93afe38887bc120a/raw
+  string(APPEND PARSER_CUSTOM_FLAGS " -Wno-nonnull-compare")
+endif()
+
 set_source_files_properties(${SCANNER_LEX_L_CC} ${PARSER_GRAM_Y_CC_FINAL} PROPERTIES
                             COMPILE_FLAGS ${PARSER_CUSTOM_FLAGS})
+
+add_custom_target(
+    ql_parser_flex_bison_output
+    DEPENDS ${PARSER_GRAM_Y_CC_FINAL} ${PARSER_GRAM_Y_HH_FINAL} ${SCANNER_LEX_L_CC})
 
 add_library(ql_parser
             parser.cc
@@ -77,3 +84,5 @@ target_link_libraries(ql_parser
                       ql_util
                       yb_util)
 add_dependencies(ql_parser ql_ptree)
+
+yb_use_pch(ql_parser ql)

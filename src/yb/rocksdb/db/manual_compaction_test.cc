@@ -18,17 +18,17 @@
 // under the License.
 //
 // Test for issue 178: a manual compaction causes deleted data to reappear.
-#include <iostream>
+
 #include <sstream>
-#include <cstdlib>
 
-#include "yb/rocksdb/db.h"
+#include <gtest/gtest.h>
+
 #include "yb/rocksdb/compaction_filter.h"
-#include "yb/util/slice.h"
-#include "yb/rocksdb/write_batch.h"
+#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/util/testharness.h"
-#include "yb/rocksdb/port/port.h"
 
+#include "yb/util/test_macros.h"
+#include "yb/rocksdb/util/testutil.h"
 #include "yb/util/tsan_util.h"
 
 using namespace rocksdb;  // NOLINT
@@ -47,12 +47,12 @@ std::string Key2(int i) {
   return Key1(i) + "_xxx";
 }
 
-class ManualCompactionTest : public testing::Test {
+class ManualCompactionTest : public RocksDBTest {
  public:
   ManualCompactionTest() {
     // Get rid of any state from an old run.
     dbname_ = rocksdb::test::TmpDir() + "/rocksdb_cbug_test";
-    DestroyDB(dbname_, rocksdb::Options());
+    CHECK_OK(DestroyDB(dbname_, rocksdb::Options()));
     LOG(INFO) << "Starting test with " << kNumKeys;
   }
 
@@ -89,24 +89,25 @@ TEST_F(ManualCompactionTest, CompactTouchesAllKeys) {
     options.compaction_filter = new DestroyAllCompactionFilter();
     ASSERT_OK(DB::Open(options, dbname_, &db));
 
-    db->Put(WriteOptions(), Slice("key1"), Slice("destroy"));
-    db->Put(WriteOptions(), Slice("key2"), Slice("destroy"));
-    db->Put(WriteOptions(), Slice("key3"), Slice("value3"));
-    db->Put(WriteOptions(), Slice("key4"), Slice("destroy"));
+    ASSERT_OK(db->Put(WriteOptions(), Slice("key1"), Slice("destroy")));
+    ASSERT_OK(db->Put(WriteOptions(), Slice("key2"), Slice("destroy")));
+    ASSERT_OK(db->Put(WriteOptions(), Slice("key3"), Slice("value3")));
+    ASSERT_OK(db->Put(WriteOptions(), Slice("key4"), Slice("destroy")));
 
     Slice key4("key4");
-    db->CompactRange(CompactRangeOptions(), nullptr, &key4);
+    ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, &key4));
     Iterator* itr = db->NewIterator(ReadOptions());
     itr->SeekToFirst();
-    ASSERT_TRUE(itr->Valid());
+    ASSERT_TRUE(ASSERT_RESULT(itr->CheckedValid()));
     ASSERT_EQ("key3", itr->key().ToString());
     itr->Next();
-    ASSERT_TRUE(!itr->Valid());
+    ASSERT_TRUE(!ASSERT_RESULT(itr->CheckedValid()));
+    ASSERT_OK(itr->status());
     delete itr;
 
     delete options.compaction_filter;
     delete db;
-    DestroyDB(dbname_, options);
+    ASSERT_OK(DestroyDB(dbname_, options));
   }
 }
 
@@ -148,12 +149,12 @@ TEST_F(ManualCompactionTest, Test) {
   rocksdb::Slice greatest(end_key.data(), end_key.size());
 
   // commenting out the line below causes the example to work correctly
-  db->CompactRange(CompactRangeOptions(), &least, &greatest);
+  ASSERT_OK(db->CompactRange(CompactRangeOptions(), &least, &greatest));
 
   // count the keys
   rocksdb::Iterator* iter = db->NewIterator(rocksdb::ReadOptions());
   int num_keys = 0;
-  for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+  for (iter->SeekToFirst(); ASSERT_RESULT(iter->CheckedValid()); iter->Next()) {
     num_keys++;
   }
   delete iter;
@@ -161,7 +162,7 @@ TEST_F(ManualCompactionTest, Test) {
 
   // close database
   delete db;
-  DestroyDB(dbname_, rocksdb::Options());
+  ASSERT_OK(DestroyDB(dbname_, rocksdb::Options()));
 }
 
 }  // anonymous namespace

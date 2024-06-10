@@ -24,10 +24,7 @@ std::string FileNumbersHolder::ToString() const {
 FileNumbersHolder FileNumbersProvider::NewFileNumber() {
   // No need to lock because VersionSet::next_file_number_ is atomic.
   auto file_number = versions_->NewFileNumber();
-  {
-    std::lock_guard<SpinMutex> l(mutex_);
-    fset_.insert(file_number);
-  }
+  AddFileNumber(file_number);
   auto holder = FileNumbersHolder(this);
   holder.Add(file_number);
   return holder;
@@ -40,25 +37,33 @@ FileNumbersHolder FileNumbersProvider::CreateHolder() {
 FileNumber FileNumbersProvider::NewFileNumber(FileNumbersHolder* holder) {
   // No need to lock because VersionSet::next_file_number_ is atomic.
   auto file_number = versions_->NewFileNumber();
-  std::lock_guard<SpinMutex> l(mutex_);
+  std::lock_guard l(mutex_);
   fset_.insert(file_number);
   holder->Add(file_number);
   return file_number;
 }
 
 bool FileNumbersProvider::HasFileNumber(FileNumber file_number) const {
-  std::lock_guard<SpinMutex> l(mutex_);
+  std::lock_guard l(mutex_);
   return fset_.count(file_number) > 0;
 }
 
 std::string FileNumbersProvider::ToString() const {
-  std::lock_guard<SpinMutex> l(mutex_);
+  std::lock_guard l(mutex_);
   return yb::ToString(fset_);
 }
 
+void FileNumbersProvider::AddFileNumber(FileNumber file_number) {
+  std::lock_guard l(mutex_);
+  fset_.insert(file_number);
+}
+
 void FileNumbersProvider::RemoveFileNumber(FileNumber file_number) {
-  std::lock_guard<SpinMutex> l(mutex_);
-  fset_.erase(file_number);
+  std::lock_guard l(mutex_);
+  auto iter = fset_.find(file_number);
+  if (iter != fset_.end()) {
+    fset_.erase(iter);
+  }
 }
 
 }  // namespace rocksdb

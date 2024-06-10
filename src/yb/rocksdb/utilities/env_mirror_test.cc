@@ -18,15 +18,16 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
 #include "yb/rocksdb/utilities/env_mirror.h"
 #include "yb/rocksdb/util/mock_env.h"
 #include "yb/rocksdb/util/testharness.h"
 
+#include "yb/rocksdb/util/testutil.h"
+
 namespace rocksdb {
 
-class EnvMirrorTest : public testing::Test {
+class EnvMirrorTest : public RocksDBTest {
  public:
   Env* default_;
   MockEnv* a_, *b_;
@@ -226,13 +227,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr, "SKIPPED as EnvMirror is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

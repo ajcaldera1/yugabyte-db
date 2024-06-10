@@ -26,7 +26,7 @@ int main() {
 }
 #else
 
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/slice_transform.h"
@@ -96,7 +96,7 @@ void TableReaderBenchmark(const Options& opts, const EnvOptions& env_options,
   std::string dbname = test::TmpDir() + "/rocksdb_table_reader_bench_db";
   WriteOptions wo;
   Env* env = Env::Default();
-  TableBuilder* tb = nullptr;
+  std::unique_ptr<TableBuilder> tb = nullptr;
   DB* db = nullptr;
   Status s;
   const ImmutableCFOptions ioptions(opts);
@@ -264,21 +264,20 @@ void TableReaderBenchmark(const Options& opts, const EnvOptions& env_options,
 }  // namespace
 }  // namespace rocksdb
 
-DEFINE_bool(query_empty, false, "query non-existing keys instead of existing "
+DEFINE_UNKNOWN_bool(query_empty, false, "query non-existing keys instead of existing "
             "ones.");
-DEFINE_int32(num_keys1, 4096, "number of distinguish prefix of keys");
-DEFINE_int32(num_keys2, 512, "number of distinguish keys for each prefix");
-DEFINE_int32(iter, 3, "query non-existing keys instead of existing ones");
-DEFINE_int32(prefix_len, 16, "Prefix length used for iterators and indexes");
-DEFINE_bool(iterator, false, "For test iterator");
-DEFINE_bool(through_db, false, "If enable, a DB instance will be created and "
+DEFINE_UNKNOWN_int32(num_keys1, 4096, "number of distinguish prefix of keys");
+DEFINE_UNKNOWN_int32(num_keys2, 512, "number of distinguish keys for each prefix");
+DEFINE_UNKNOWN_int32(iter, 3, "query non-existing keys instead of existing ones");
+DEFINE_UNKNOWN_int32(prefix_len, 16, "Prefix length used for iterators and indexes");
+DEFINE_UNKNOWN_bool(iterator, false, "For test iterator");
+DEFINE_UNKNOWN_bool(through_db, false, "If enable, a DB instance will be created and "
             "the query will be against DB. Otherwise, will be directly against "
             "a table reader.");
-DEFINE_bool(mmap_read, true, "Whether use mmap read");
-DEFINE_string(table_factory, "block_based",
-              "Table factory to use: `block_based` (default), `plain_table` or "
-              "`cuckoo_hash`.");
-DEFINE_string(time_unit, "microsecond",
+DEFINE_UNKNOWN_bool(mmap_read, true, "Whether use mmap read");
+DEFINE_UNKNOWN_string(table_factory, "block_based",
+              "Table factory to use: `block_based` (default) or `plain_table`.");
+DEFINE_UNKNOWN_string(time_unit, "microsecond",
               "The time unit used for measuring performance. User can specify "
               "`microsecond` (default) or `nanosecond`");
 
@@ -298,19 +297,7 @@ int main(int argc, char** argv) {
   options.create_if_missing = true;
   options.compression = rocksdb::CompressionType::kNoCompression;
 
-  if (FLAGS_table_factory == "cuckoo_hash") {
-#ifndef ROCKSDB_LITE
-    options.allow_mmap_reads = FLAGS_mmap_read;
-    env_options.use_mmap_reads = FLAGS_mmap_read;
-    rocksdb::CuckooTableOptions table_options;
-    table_options.hash_table_ratio = 0.75;
-    tf.reset(rocksdb::NewCuckooTableFactory(table_options));
-#else
-    fprintf(stderr, "Plain table is not supported in lite mode\n");
-    exit(1);
-#endif  // ROCKSDB_LITE
-  } else if (FLAGS_table_factory == "plain_table") {
-#ifndef ROCKSDB_LITE
+  if (FLAGS_table_factory == "plain_table") {
     options.allow_mmap_reads = FLAGS_mmap_read;
     env_options.use_mmap_reads = FLAGS_mmap_read;
 
@@ -322,10 +309,6 @@ int main(int argc, char** argv) {
     tf.reset(new rocksdb::PlainTableFactory(plain_table_options));
     options.prefix_extractor.reset(rocksdb::NewFixedPrefixTransform(
         FLAGS_prefix_len));
-#else
-    fprintf(stderr, "Cuckoo table is not supported in lite mode\n");
-    exit(1);
-#endif  // ROCKSDB_LITE
   } else if (FLAGS_table_factory == "block_based") {
     tf.reset(new rocksdb::BlockBasedTableFactory());
   } else {

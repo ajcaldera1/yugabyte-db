@@ -158,6 +158,10 @@ CreateStatistics(CreateStatsStmt *stmt)
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * Since stats objects aren't members of extensions (see comments
+			 * below), no need for checkMembershipInCurrentExtension here.
+			 */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("statistics object \"%s\" already exists, skipping",
@@ -523,4 +527,14 @@ ChooseExtendedStatisticNameAddition(List *exprs)
 			break;
 	}
 	return pstrdup(buf);
+}
+
+/*
+ * YB wrapper for invoking the static ChooseExtendedStatisticName function.
+ */
+char *
+YbChooseExtendedStatisticName(const char *name1, const char *name2,
+							  const char *label, Oid namespaceid)
+{
+	return ChooseExtendedStatisticName(name1, name2, label, namespaceid);
 }

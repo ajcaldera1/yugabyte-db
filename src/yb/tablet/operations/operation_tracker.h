@@ -30,15 +30,14 @@
 // under the License.
 //
 
-#ifndef YB_TABLET_OPERATIONS_OPERATION_TRACKER_H
-#define YB_TABLET_OPERATIONS_OPERATION_TRACKER_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "yb/gutil/gscoped_ptr.h"
+#include "yb/common/opid.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/tablet/operations/operation.h"
 #include "yb/util/locks.h"
@@ -59,30 +58,41 @@ class OperationDriver;
 // It will remove itself by calling Release().
 class OperationTracker {
  public:
-  OperationTracker();
+  explicit OperationTracker(const std::string& log_prefix);
   ~OperationTracker();
 
   // Adds a operation to the set of tracked operations.
   //
   // In the event that the tracker's memory limit is exceeded, returns a
   // ServiceUnavailable status.
-  CHECKED_STATUS Add(OperationDriver* driver);
+  Status Add(OperationDriver* driver);
 
   // Removes the operation from the pending list.
   // Also triggers the deletion of the Operation object, if its refcount == 0.
-  void Release(OperationDriver* driver);
+  void Release(OperationDriver* driver, OpIds* applied_op_ids);
 
   // Populates list of currently-running operations into 'pending_out' vector.
   std::vector<scoped_refptr<OperationDriver>> GetPendingOperations() const;
 
   // Returns number of pending operations.
-  int GetNumPendingForTests() const;
+  size_t TEST_GetNumPending() const;
 
   void WaitForAllToFinish() const;
-  CHECKED_STATUS WaitForAllToFinish(const MonoDelta& timeout) const;
+  Status WaitForAllToFinish(const MonoDelta& timeout) const;
 
   void StartInstrumentation(const scoped_refptr<MetricEntity>& metric_entity);
   void StartMemoryTracking(const std::shared_ptr<MemTracker>& parent_mem_tracker);
+
+  // Post-tracker is called when operation tracker finishes tracking memory for corresponding op id.
+  // So post-tracker could start tracking this memory in case it is still keeping memory for this
+  // op id.
+  void SetPostTracker(std::function<void(const OpId&)> post_tracker) {
+    post_tracker_ = std::move(post_tracker);
+  }
+
+  const std::string& LogPrefix() const {
+    return log_prefix_;
+  }
 
  private:
   struct Metrics {
@@ -100,32 +110,34 @@ class OperationTracker {
   // Decrements relevant metric counters.
   void DecrementCounters(const OperationDriver& driver) const;
 
-  mutable simple_spinlock lock_;
+  std::vector<scoped_refptr<OperationDriver>> GetPendingOperationsUnlocked() const REQUIRES(mutex_);
+
+  const std::string log_prefix_;
+
+  mutable std::mutex mutex_;
+  mutable std::condition_variable cond_;
 
   // Per-operation state that is tracked along with the operation itself.
   struct State {
-    State();
-
     // Approximate memory footprint of the operation.
-    int64_t memory_footprint;
+    int64_t memory_footprint = 0;
   };
 
-  // Protected by 'lock_'.
   typedef std::unordered_map<
       scoped_refptr<OperationDriver>,
       State,
       ScopedRefPtrHashFunctor,
       ScopedRefPtrEqualsFunctor> OperationMap;
-  OperationMap pending_operations_;
+  OperationMap pending_operations_ GUARDED_BY(mutex_);
 
-  gscoped_ptr<Metrics> metrics_;
+  std::unique_ptr<Metrics> metrics_;
 
   std::shared_ptr<MemTracker> mem_tracker_;
+
+  std::function<void(const OpId&)> post_tracker_;
 
   DISALLOW_COPY_AND_ASSIGN(OperationTracker);
 };
 
 }  // namespace tablet
 }  // namespace yb
-
-#endif // YB_TABLET_OPERATIONS_OPERATION_TRACKER_H

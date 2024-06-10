@@ -23,11 +23,8 @@
 
 #include "yb/rocksdb/util/histogram.h"
 
-#include <assert.h>
 #include <math.h>
-#include <stdio.h>
 
-#include "yb/rocksdb/port/port.h"
 #include "yb/gutil/port.h"
 
 namespace rocksdb {
@@ -96,7 +93,9 @@ void HistogramImpl::Clear() {
   num_ = 0;
   sum_ = 0;
   sum_squares_ = 0;
-  memset(buckets_, 0, sizeof buckets_);
+  for (int i = 0; i < kHistogramNumBuckets; ++i) {
+    set_bucket(i, 0);
+  }
 }
 
 bool HistogramImpl::Empty() { return num_ == 0; }
@@ -217,11 +216,7 @@ void HistogramImpl::Data(HistogramData * const data) const {
   data->sum = sum_;
   data->min = min();
   data->max = max();
-  data->median = Median();
-  data->percentile95 = Percentile(95);
-  data->percentile99 = Percentile(99);
   data->average = Average();
-  data->standard_deviation = StandardDeviation();
 }
 
 } // namespace rocksdb

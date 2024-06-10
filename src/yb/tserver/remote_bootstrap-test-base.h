@@ -29,20 +29,23 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TSERVER_REMOTE_BOOTSTRAP_TEST_BASE_H_
-#define YB_TSERVER_REMOTE_BOOTSTRAP_TEST_BASE_H_
+#pragma once
 
 #include <string>
 
-#include "yb/tserver/tablet_server-test-base.h"
-
+#include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/opid_util.h"
+
 #include "yb/gutil/strings/fastmem.h"
 #include "yb/tablet/metadata.pb.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_peer.h"
+
 #include "yb/tserver/remote_bootstrap.pb.h"
+#include "yb/tserver/tablet_server-test-base.h"
+
 #include "yb/util/crc.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/test_util.h"
@@ -117,5 +120,3 @@ class RemoteBootstrapTest : public TabletServerTestBase {
 
 } // namespace tserver
 } // namespace yb
-
-#endif // YB_TSERVER_REMOTE_BOOTSTRAP_TEST_BASE_H_

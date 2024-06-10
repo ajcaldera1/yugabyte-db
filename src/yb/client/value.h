@@ -29,17 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CLIENT_VALUE_H
-#define YB_CLIENT_VALUE_H
+#pragma once
 
-#ifdef YB_HEADERS_NO_STUBS
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
-#else
-#include "yb/client/stubs.h"
-#endif
 #include "yb/util/slice.h"
-
 
 namespace yb {
 namespace client {
@@ -81,4 +75,3 @@ class YBValue {
 
 } // namespace client
 } // namespace yb
-#endif /* YB_CLIENT_VALUE_H */

@@ -32,13 +32,14 @@
 package org.yb.client;
 
 import com.google.protobuf.Message;
-import static org.yb.master.Master.*;
+import static org.yb.master.MasterClusterOuterClass.*;
+import static org.yb.master.MasterTypes.*;
 
 import org.yb.annotations.InterfaceAudience;
 import org.yb.util.Pair;
 import org.yb.util.ServerInfo;
-import org.yb.Common.HostPortPB;
-import org.jboss.netty.buffer.ChannelBuffer;
+import org.yb.CommonNet.HostPortPB;
+import io.netty.buffer.ByteBuf;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -50,7 +51,7 @@ public class ListTabletServersRequest extends YRpc<ListTabletServersResponse> {
     super(masterTable);
   }
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     final ListTabletServersRequestPB.Builder builder = ListTabletServersRequestPB.newBuilder();
     return toChannelBuffer(header, builder.build());

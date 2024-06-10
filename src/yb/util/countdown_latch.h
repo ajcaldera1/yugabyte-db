@@ -29,13 +29,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_COUNTDOWN_LATCH_H
-#define YB_UTIL_COUNTDOWN_LATCH_H
+#pragma once
 
-#include "yb/gutil/macros.h"
+#include <atomic>
+
 #include "yb/util/condition_variable.h"
 #include "yb/util/monotime.h"
 #include "yb/util/mutex.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -45,7 +46,8 @@ namespace yb {
 class CountDownLatch {
  public:
   // Initialize the latch with the given initial count.
-  explicit CountDownLatch(int count);
+  explicit CountDownLatch(uint64_t count);
+  ~CountDownLatch();
 
   // Decrement the count of this latch by 'amount'
   // If the new count is less than or equal to zero, then all waiting threads are woken up.
@@ -63,15 +65,14 @@ class CountDownLatch {
   // If the count is already zero, this returns immediately.
   void Wait() const;
 
-  // Waits for the count on the latch to reach zero, or until 'until' time is reached.
+  // Waits for the count on the latch to reach zero, or until 'when' time is reached.
   // Returns true if the count became zero, false otherwise.
-  bool WaitUntil(const MonoTime& when) const {
-    return WaitFor(when - MonoTime::Now());
-  }
+  bool WaitUntil(MonoTime when) const;
+  bool WaitUntil(CoarseTimePoint when) const;
 
   // Waits for the count on the latch to reach zero, or until 'delta' time elapses.
   // Returns true if the count became zero, false otherwise.
-  bool WaitFor(const MonoDelta& delta) const;
+  bool WaitFor(MonoDelta delta) const;
 
   // Reset the latch with the given count. This is equivalent to reconstructing
   // the latch. If 'count' is 0, and there are currently waiters, those waiters
@@ -79,17 +80,23 @@ class CountDownLatch {
   void Reset(uint64_t count);
   uint64_t count() const;
 
+  auto CountDownCallback() {
+    return [this] {
+      this->CountDown();
+    };
+  }
+
  private:
   mutable Mutex lock_;
   ConditionVariable cond_;
 
-  uint64_t count_;
+  std::atomic<uint64_t> count_;
 
   DISALLOW_COPY_AND_ASSIGN(CountDownLatch);
 };
 
 // Utility class which calls latch->CountDown() in its destructor.
-class CountDownOnScopeExit {
+class NODISCARD_CLASS CountDownOnScopeExit {
  public:
   explicit CountDownOnScopeExit(CountDownLatch *latch) : latch_(latch) {}
   ~CountDownOnScopeExit() {
@@ -103,5 +110,3 @@ class CountDownOnScopeExit {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_COUNTDOWN_LATCH_H

@@ -57,10 +57,13 @@
 #include "catalog/pg_ts_parser.h"
 #include "catalog/pg_ts_template.h"
 #include "catalog/pg_transform.h"
+#include "catalog/pg_yb_catalog_version.h"
+#include "catalog/pg_yb_tablegroup.h"
 #include "commands/dbcommands.h"
 #include "commands/event_trigger.h"
 #include "commands/extension.h"
 #include "commands/proclang.h"
+#include "commands/tablegroup.h"
 #include "commands/tablespace.h"
 #include "foreign/foreign.h"
 #include "miscadmin.h"
@@ -111,6 +114,7 @@ static void ExecGrant_Function(InternalGrant *grantStmt);
 static void ExecGrant_Language(InternalGrant *grantStmt);
 static void ExecGrant_Largeobject(InternalGrant *grantStmt);
 static void ExecGrant_Namespace(InternalGrant *grantStmt);
+static void ExecGrant_Tablegroup(InternalGrant *grantStmt);
 static void ExecGrant_Tablespace(InternalGrant *grantStmt);
 static void ExecGrant_Type(InternalGrant *grantStmt);
 
@@ -141,6 +145,7 @@ static void recordExtensionInitPriv(Oid objoid, Oid classoid, int objsubid,
 						Acl *new_acl);
 static void recordExtensionInitPrivWorker(Oid objoid, Oid classoid, int objsubid,
 							  Acl *new_acl);
+static bool YbCheckAclCopiesEqual(Acl *old_acl, Acl *new_acl);
 
 
 #ifdef ACLDEBUG
@@ -268,6 +273,9 @@ restrict_and_check_grant(bool is_grant, AclMode avail_goptions, bool all_privs,
 			break;
 		case OBJECT_SCHEMA:
 			whole_mask = ACL_ALL_RIGHTS_SCHEMA;
+			break;
+		case OBJECT_YBTABLEGROUP:
+			whole_mask = ACL_ALL_RIGHTS_TABLEGROUP;
 			break;
 		case OBJECT_TABLESPACE:
 			whole_mask = ACL_ALL_RIGHTS_TABLESPACE;
@@ -492,6 +500,10 @@ ExecuteGrantStmt(GrantStmt *stmt)
 			all_privileges = ACL_ALL_RIGHTS_FUNCTION;
 			errormsg = gettext_noop("invalid privilege type %s for routine");
 			break;
+		case OBJECT_YBTABLEGROUP:
+			all_privileges = ACL_ALL_RIGHTS_TABLEGROUP;
+			errormsg = gettext_noop("invalid privilege type %s for tablegroup");
+			break;
 		case OBJECT_TABLESPACE:
 			all_privileges = ACL_ALL_RIGHTS_TABLESPACE;
 			errormsg = gettext_noop("invalid privilege type %s for tablespace");
@@ -606,6 +618,9 @@ ExecGrantStmt_oids(InternalGrant *istmt)
 			break;
 		case OBJECT_SCHEMA:
 			ExecGrant_Namespace(istmt);
+			break;
+		case OBJECT_YBTABLEGROUP:
+			ExecGrant_Tablegroup(istmt);
 			break;
 		case OBJECT_TABLESPACE:
 			ExecGrant_Tablespace(istmt);
@@ -739,6 +754,16 @@ objectNamesToOids(ObjectType objtype, List *objnames)
 
 				routid = LookupFuncWithArgs(OBJECT_ROUTINE, func, false);
 				objects = lappend_oid(objects, routid);
+			}
+			break;
+		case OBJECT_YBTABLEGROUP:
+			foreach(cell, objnames)
+			{
+				char	   *grpname = strVal(lfirst(cell));
+				Oid				grpoid;
+
+				grpoid = get_tablegroup_oid(grpname, false);
+				objects = lappend_oid(objects, grpoid);
 			}
 			break;
 		case OBJECT_TABLESPACE:
@@ -1011,6 +1036,10 @@ ExecAlterDefaultPrivilegesStmt(ParseState *pstate, AlterDefaultPrivilegesStmt *s
 			all_privileges = ACL_ALL_RIGHTS_FUNCTION;
 			errormsg = gettext_noop("invalid privilege type %s for routine");
 			break;
+		case OBJECT_YBTABLEGROUP:
+			all_privileges = ACL_ALL_RIGHTS_TABLEGROUP;
+			errormsg = gettext_noop("invalid privilege type %s for tablegroup");
+			break;
 		case OBJECT_TYPE:
 			all_privileges = ACL_ALL_RIGHTS_TYPE;
 			errormsg = gettext_noop("invalid privilege type %s for type");
@@ -1216,6 +1245,16 @@ SetDefaultACL(InternalDefaultACL *iacls)
 				this_privileges = ACL_ALL_RIGHTS_SCHEMA;
 			break;
 
+		case OBJECT_YBTABLEGROUP:
+			if (OidIsValid(iacls->nspid))
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_GRANT_OPERATION),
+						 errmsg("cannot use IN SCHEMA clause when using GRANT/REVOKE ON TABLEGROUPS")));
+			objtype = DEFACLOBJ_TABLEGROUP;
+			if (iacls->all_privs && this_privileges == ACL_NO_RIGHTS)
+				this_privileges = ACL_ALL_RIGHTS_TABLEGROUP;
+			break;
+
 		default:
 			elog(ERROR, "unrecognized objtype: %d",
 				 (int) iacls->objtype);
@@ -1384,6 +1423,9 @@ SetDefaultACL(InternalDefaultACL *iacls)
 		ReleaseSysCache(tuple);
 
 	heap_close(rel, RowExclusiveLock);
+
+	/* prevent error when processing duplicate objects */
+	CommandCounterIncrement();
 }
 
 
@@ -1442,6 +1484,9 @@ RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid)
 			case DEFACLOBJ_NAMESPACE:
 				iacls.objtype = OBJECT_SCHEMA;
 				break;
+			case DEFACLOBJ_TABLEGROUP:
+				iacls.objtype = OBJECT_YBTABLEGROUP;
+				break;
 			default:
 				/* Shouldn't get here */
 				elog(ERROR, "unexpected default ACL type: %d",
@@ -1490,6 +1535,9 @@ RemoveRoleFromObjectACL(Oid roleid, Oid classid, Oid objid)
 			case NamespaceRelationId:
 				istmt.objtype = OBJECT_SCHEMA;
 				break;
+			case YbTablegroupRelationId:
+				istmt.objtype = OBJECT_YBTABLEGROUP;
+				switch_fallthrough();
 			case TableSpaceRelationId:
 				istmt.objtype = OBJECT_TABLESPACE;
 				break;
@@ -1724,6 +1772,13 @@ ExecGrant_Attribute(InternalGrant *istmt, Oid relOid, const char *relname,
 								 NameStr(pg_attribute_tuple->attname));
 
 	/*
+	 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+	 * original column acl value is null, we cannot skip catalog update.
+	 */
+	Acl *yb_copy_of_old_acl =
+		(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+	/*
 	 * Generate new ACL.
 	 */
 	new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
@@ -1731,6 +1786,16 @@ ExecGrant_Attribute(InternalGrant *istmt, Oid relOid, const char *relname,
 								   istmt->behavior, istmt->grantees,
 								   col_privileges, grantorId,
 								   ownerId);
+
+	/* Skip catalog update if there is no ACL change. */
+	if (IsYugaByteEnabled() &&
+		yb_copy_of_old_acl &&
+		YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+	{
+		pfree(new_acl);
+		ReleaseSysCache(attr_tuple);
+		return;
+	}
 
 	/*
 	 * We need the members of both old and new ACLs so we can correct the
@@ -2003,6 +2068,13 @@ ExecGrant_Relation(InternalGrant *istmt)
 										 0, NULL);
 
 			/*
+			 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+			 * original column acl value is null, we cannot skip catalog update.
+			 */
+			Acl *yb_copy_of_old_acl =
+				(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+			/*
 			 * Generate new ACL.
 			 */
 			new_acl = merge_acl_with_grant(old_acl,
@@ -2014,34 +2086,39 @@ ExecGrant_Relation(InternalGrant *istmt)
 										   grantorId,
 										   ownerId);
 
-			/*
-			 * We need the members of both old and new ACLs so we can correct
-			 * the shared dependency information.
-			 */
-			nnewmembers = aclmembers(new_acl, &newmembers);
+			/* Skip catalog update if there is no ACL change. */
+			if (!(IsYugaByteEnabled() &&
+				  yb_copy_of_old_acl &&
+				  YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl))))
+			{
+				/*
+				 * We need the members of both old and new ACLs so we can correct
+				 * the shared dependency information.
+				 */
+				nnewmembers = aclmembers(new_acl, &newmembers);
 
-			/* finished building new ACL value, now insert it */
-			MemSet(values, 0, sizeof(values));
-			MemSet(nulls, false, sizeof(nulls));
-			MemSet(replaces, false, sizeof(replaces));
+				/* finished building new ACL value, now insert it */
+				MemSet(values, 0, sizeof(values));
+				MemSet(nulls, false, sizeof(nulls));
+				MemSet(replaces, false, sizeof(replaces));
 
-			replaces[Anum_pg_class_relacl - 1] = true;
-			values[Anum_pg_class_relacl - 1] = PointerGetDatum(new_acl);
+				replaces[Anum_pg_class_relacl - 1] = true;
+				values[Anum_pg_class_relacl - 1] = PointerGetDatum(new_acl);
 
-			newtuple = heap_modify_tuple(tuple, RelationGetDescr(relation),
-										 values, nulls, replaces);
+				newtuple = heap_modify_tuple(tuple, RelationGetDescr(relation),
+											 values, nulls, replaces);
 
-			CatalogTupleUpdate(relation, &newtuple->t_self, newtuple);
+				CatalogTupleUpdate(relation, &newtuple->t_self, newtuple);
 
-			/* Update initial privileges for extensions */
-			recordExtensionInitPriv(relOid, RelationRelationId, 0, new_acl);
+				/* Update initial privileges for extensions */
+				recordExtensionInitPriv(relOid, RelationRelationId, 0, new_acl);
 
-			/* Update the shared dependency ACL info */
-			updateAclDependencies(RelationRelationId, relOid, 0,
-								  ownerId,
-								  noldmembers, oldmembers,
-								  nnewmembers, newmembers);
-
+				/* Update the shared dependency ACL info */
+				updateAclDependencies(RelationRelationId, relOid, 0,
+									  ownerId,
+									  noldmembers, oldmembers,
+									  nnewmembers, newmembers);
+			}
 			pfree(new_acl);
 		}
 
@@ -2197,12 +2274,29 @@ ExecGrant_Database(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2319,12 +2413,29 @@ ExecGrant_Fdw(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2445,12 +2556,29 @@ ExecGrant_ForeignServer(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2569,12 +2697,29 @@ ExecGrant_Function(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2700,12 +2845,29 @@ ExecGrant_Language(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2838,12 +3000,28 @@ ExecGrant_Largeobject(InternalGrant *istmt)
 									 loname, 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2964,12 +3142,29 @@ ExecGrant_Namespace(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -2997,6 +3192,148 @@ ExecGrant_Namespace(InternalGrant *istmt)
 		updateAclDependencies(NamespaceRelationId, HeapTupleGetOid(tuple), 0,
 							  ownerId,
 							  noldmembers, oldmembers,
+							  nnewmembers, newmembers);
+
+		ReleaseSysCache(tuple);
+
+		pfree(new_acl);
+
+		/* prevent error when processing duplicate objects */
+		CommandCounterIncrement();
+	}
+
+	heap_close(relation, RowExclusiveLock);
+}
+
+static void
+ExecGrant_Tablegroup(InternalGrant *istmt)
+{
+	Relation	relation;
+	ListCell   *cell;
+
+	if (MyDatabaseColocated)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot set privileges of an implicit tablegroup "
+						"in a colocated database")));
+
+	if (istmt->all_privs && istmt->privileges == ACL_NO_RIGHTS)
+		istmt->privileges = ACL_ALL_RIGHTS_TABLEGROUP;
+
+	relation = heap_open(YbTablegroupRelationId, RowExclusiveLock);
+
+	foreach(cell, istmt->objects)
+	{
+		Oid			grpId = lfirst_oid(cell);
+		Form_pg_yb_tablegroup pg_yb_tablegroup_tuple;
+		Datum		aclDatum;
+		bool		isNull;
+		AclMode		avail_goptions;
+		AclMode		this_privileges;
+		Acl		   *old_acl;
+		Acl		   *new_acl;
+		Oid			grantorId;
+		Oid			ownerId;
+		HeapTuple	newtuple;
+		Datum		values[Natts_pg_yb_tablegroup];
+		bool		nulls[Natts_pg_yb_tablegroup];
+		bool		replaces[Natts_pg_yb_tablegroup];
+		int			noldmembers;
+		int			nnewmembers;
+		Oid		   *oldmembers;
+		Oid		   *newmembers;
+		HeapTuple	tuple;
+
+		tuple = SearchSysCache1(YBTABLEGROUPOID, ObjectIdGetDatum(grpId));
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "cache lookup failed for tablegroup %u", grpId);
+
+		pg_yb_tablegroup_tuple = (Form_pg_yb_tablegroup) GETSTRUCT(tuple);
+
+		/*
+		 * Get owner ID and working copy of existing ACL. If there's no ACL,
+		 * substitute the proper default.
+		 */
+		ownerId = pg_yb_tablegroup_tuple->grpowner;
+		aclDatum = heap_getattr(tuple, Anum_pg_yb_tablegroup_grpacl,
+								RelationGetDescr(relation), &isNull);
+		if (isNull)
+		{
+			old_acl = acldefault(OBJECT_YBTABLEGROUP, ownerId);
+			/* There are no old member roles according to the catalogs */
+			noldmembers = 0;
+			oldmembers = NULL;
+		}
+		else
+		{
+			old_acl = DatumGetAclPCopy(aclDatum);
+			/* Get the roles mentioned in the existing ACL */
+			noldmembers = aclmembers(old_acl, &oldmembers);
+		}
+
+		/* Determine ID to do the grant as, and available grant options */
+		select_best_grantor(GetUserId(), istmt->privileges,
+							old_acl, ownerId,
+							&grantorId, &avail_goptions);
+
+		/*
+		 * Restrict the privileges to what we can actually grant, and emit the
+		 * standards-mandated warning and error messages.
+		 */
+		this_privileges =
+				restrict_and_check_grant(istmt->is_grant, avail_goptions,
+										 istmt->all_privs, istmt->privileges,
+										 grpId, grantorId, OBJECT_YBTABLEGROUP,
+										 NameStr(pg_yb_tablegroup_tuple->grpname),
+										 0, NULL);
+
+		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
+		 * Generate new ACL.
+		 */
+		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
+									   istmt->grant_option, istmt->behavior,
+									   istmt->grantees, this_privileges,
+									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
+
+		/*
+		 * We need the members of both old and new ACLs so we can correct the
+		 * shared dependency information.
+		 */
+		nnewmembers = aclmembers(new_acl, &newmembers);
+
+		/* finished building new ACL value, now insert it */
+		MemSet(values, 0, sizeof(values));
+		MemSet(nulls, false, sizeof(nulls));
+		MemSet(replaces, false, sizeof(replaces));
+
+		replaces[Anum_pg_yb_tablegroup_grpacl - 1] = true;
+		values[Anum_pg_yb_tablegroup_grpacl - 1] = PointerGetDatum(new_acl);
+
+		newtuple = heap_modify_tuple(tuple, RelationGetDescr(relation), values,
+									 nulls, replaces);
+
+		CatalogTupleUpdate(relation, &newtuple->t_self, newtuple);
+
+		/* Update the shared dependency ACL info */
+		updateAclDependencies(YbTablegroupRelationId, HeapTupleGetOid(tuple), 0,
+							  ownerId, noldmembers, oldmembers,
 							  nnewmembers, newmembers);
 
 		ReleaseSysCache(tuple);
@@ -3088,12 +3425,29 @@ ExecGrant_Tablespace(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -3222,12 +3576,29 @@ ExecGrant_Type(InternalGrant *istmt)
 									 0, NULL);
 
 		/*
+		 * The original old_acl is pfree'd by merge_acl_with_grant. If the
+		 * original column acl value is null, we cannot skip catalog update.
+		 */
+		Acl *yb_copy_of_old_acl =
+			(IsYugaByteEnabled() && !isNull) ? aclcopy(old_acl) : NULL;
+
+		/*
 		 * Generate new ACL.
 		 */
 		new_acl = merge_acl_with_grant(old_acl, istmt->is_grant,
 									   istmt->grant_option, istmt->behavior,
 									   istmt->grantees, this_privileges,
 									   grantorId, ownerId);
+
+		/* Skip catalog update if there is no ACL change. */
+		if (IsYugaByteEnabled() &&
+			yb_copy_of_old_acl &&
+			YbCheckAclCopiesEqual(yb_copy_of_old_acl, aclcopy(new_acl)))
+		{
+			ReleaseSysCache(tuple);
+			pfree(new_acl);
+			continue;
+		}
 
 		/*
 		 * We need the members of both old and new ACLs so we can correct the
@@ -3445,8 +3816,14 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_TABLE:
 						msg = gettext_noop("permission denied for table %s");
 						break;
+					case OBJECT_YBTABLEGROUP:
+						msg = gettext_noop("permission denied for tablegroup %s");
+						break;
 					case OBJECT_TABLESPACE:
 						msg = gettext_noop("permission denied for tablespace %s");
+						break;
+					case OBJECT_YBPROFILE:
+						msg = gettext_noop("permission denied for profile %s");
 						break;
 					case OBJECT_TSCONFIGURATION:
 						msg = gettext_noop("permission denied for text search configuration %s");
@@ -3576,6 +3953,9 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_STATISTIC_EXT:
 						msg = gettext_noop("must be owner of statistics object %s");
 						break;
+					case OBJECT_YBTABLEGROUP:
+						msg = gettext_noop("must be owner of tablegroup %s");
+						break;
 					case OBJECT_TABLESPACE:
 						msg = gettext_noop("must be owner of tablespace %s");
 						break;
@@ -3609,6 +3989,7 @@ aclcheck_error(AclResult aclerr, ObjectType objtype,
 					case OBJECT_DEFACL:
 					case OBJECT_DOMCONSTRAINT:
 					case OBJECT_PUBLICATION_REL:
+					case OBJECT_YBPROFILE:
 					case OBJECT_ROLE:
 					case OBJECT_TRANSFORM:
 					case OBJECT_TSPARSER:
@@ -3699,6 +4080,8 @@ pg_aclmask(ObjectType objtype, Oid table_oid, AttrNumber attnum, Oid roleid,
 			elog(ERROR, "grantable rights not supported for statistics objects");
 			/* not reached, but keep compiler quiet */
 			return ACL_NO_RIGHTS;
+		case OBJECT_YBTABLEGROUP:
+			return pg_tablegroup_aclmask(table_oid, roleid, mask, how);
 		case OBJECT_TABLESPACE:
 			return pg_tablespace_aclmask(table_oid, roleid, mask, how);
 		case OBJECT_FDW:
@@ -3859,6 +4242,8 @@ pg_class_aclmask(Oid table_oid, Oid roleid,
 		IsSystemClass(table_oid, classForm) &&
 		classForm->relkind != RELKIND_VIEW &&
 		!superuser_arg(roleid) &&
+		/* yb_db_admin is allowed to update pg_yb_catalog_version. */
+		!(IsYbDbAdminUser(roleid) && table_oid == YBCatalogVersionRelationId) &&
 		!allowSystemTableMods)
 	{
 #ifdef ACLDEBUG
@@ -3870,7 +4255,7 @@ pg_class_aclmask(Oid table_oid, Oid roleid,
 	/*
 	 * Otherwise, superusers bypass all permission-checking.
 	 */
-	if (superuser_arg(roleid))
+	if (superuser_arg(roleid) || IsYbDbAdminUser(roleid))
 	{
 #ifdef ACLDEBUG
 		elog(DEBUG2, "OID %u is superuser, home free", roleid);
@@ -4176,7 +4561,7 @@ pg_namespace_aclmask(Oid nsp_oid, Oid roleid,
 	Oid			ownerId;
 
 	/* Superusers bypass all permission checking. */
-	if (superuser_arg(roleid))
+	if (superuser_arg(roleid) || (IsYbExtensionUser(roleid) && creating_extension))
 		return mask;
 
 	/*
@@ -4244,6 +4629,68 @@ pg_namespace_aclmask(Oid nsp_oid, Oid roleid,
 }
 
 /*
+ * Exported routine for examining a user's privileges for a tablegroup
+ */
+AclMode
+pg_tablegroup_aclmask(Oid grp_oid, Oid roleid,
+					  AclMode mask, AclMaskHow how)
+{
+	AclMode		result;
+	HeapTuple	tuple;
+	Datum		aclDatum;
+	bool		isNull;
+	Acl		   *acl;
+	Oid			ownerId;
+
+	/* First check that the pg_tablegroup catalog actually exists. */
+	if (!YbTablegroupCatalogExists) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Tablegroup system catalog does not exist.")));
+	}
+
+	/* Superusers bypass all permission checking. */
+	if (superuser_arg(roleid))
+		return mask;
+
+	/*
+	 * Get the tablegroup's ACL from pg_yb_tablegroup
+	 */
+	tuple = SearchSysCache1(YBTABLEGROUPOID, ObjectIdGetDatum(grp_oid));
+	if (!HeapTupleIsValid(tuple))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+		 			 errmsg("tablegroup with OID %u does not exist", grp_oid)));
+
+	ownerId = ((Form_pg_yb_tablegroup) GETSTRUCT(tuple))->grpowner;
+
+	aclDatum = SysCacheGetAttr(YBTABLEGROUPOID, tuple,
+							   Anum_pg_yb_tablegroup_grpacl, &isNull);
+
+	if (isNull)
+	{
+		/* No ACL, so build default ACL */
+		acl = acldefault(OBJECT_YBTABLEGROUP, ownerId);
+		aclDatum = (Datum) 0;
+	}
+	else
+	{
+		/* detoast ACL if necessary */
+		acl = DatumGetAclP(aclDatum);
+	}
+
+	result = aclmask(acl, roleid, ownerId, mask, how);
+
+	/* if we have a detoasted copy, free it */
+	if (acl && (Pointer) acl != DatumGetPointer(aclDatum))
+		pfree(acl);
+
+	ReleaseSysCache(tuple);
+
+	return result;
+}
+
+/*
  * Exported routine for examining a user's privileges for a tablespace
  */
 AclMode
@@ -4257,8 +4704,8 @@ pg_tablespace_aclmask(Oid spc_oid, Oid roleid,
 	Acl		   *acl;
 	Oid			ownerId;
 
-	/* Superusers bypass all permission checking. */
-	if (superuser_arg(roleid))
+	/* Superusers and yb_db_admin role bypass all permission checking. */
+	if (superuser_arg(roleid) || IsYbDbAdminUser(roleid))
 		return mask;
 
 	/*
@@ -4696,6 +5143,18 @@ pg_namespace_aclcheck(Oid nsp_oid, Oid roleid, AclMode mode)
 }
 
 /*
+ * Exported routine for checking a user's access privileges to a tablegroup
+ */
+AclResult
+pg_tablegroup_aclcheck(Oid grp_oid, Oid roleid, AclMode mode)
+{
+	if (pg_tablegroup_aclmask(grp_oid, roleid, mode, ACLMASK_ANY) != 0)
+		return ACLCHECK_OK;
+	else
+		return ACLCHECK_NO_PRIV;
+}
+
+/*
  * Exported routine for checking a user's access privileges to a tablespace
  */
 AclResult
@@ -4948,6 +5407,40 @@ pg_namespace_ownercheck(Oid nsp_oid, Oid roleid)
 }
 
 /*
+ * Ownership check for a tablegroup (specified by OID).
+ */
+bool
+pg_tablegroup_ownercheck(Oid grp_oid, Oid roleid)
+{
+	HeapTuple	grptuple;
+	Oid			grpowner;
+
+	/* Ensure that the pg_yb_tablegroup catalog actually exists. */
+	if (!YbTablegroupCatalogExists) {
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("Tablegroup system catalog does not exist.")));
+	}
+
+	/* Superusers and yb_db_admin role bypass all permission checking. */
+	if (superuser_arg(roleid) || IsYbDbAdminUser(GetUserId()))
+		return true;
+
+	/* Search syscache for the tablegroup */
+	grptuple = SearchSysCache1(YBTABLEGROUPOID, ObjectIdGetDatum(grp_oid));
+	if (!HeapTupleIsValid(grptuple))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("tablegroup with OID %u does not exist", grp_oid)));
+
+	grpowner = ((Form_pg_yb_tablegroup) GETSTRUCT(grptuple))->grpowner;
+
+	ReleaseSysCache(grptuple);
+
+	return has_privs_of_role(roleid, grpowner);
+}
+
+/*
  * Ownership check for a tablespace (specified by OID).
  */
 bool
@@ -4956,8 +5449,8 @@ pg_tablespace_ownercheck(Oid spc_oid, Oid roleid)
 	HeapTuple	spctuple;
 	Oid			spcowner;
 
-	/* Superusers bypass all permission checking. */
-	if (superuser_arg(roleid))
+	/* Superusers and yb_db_admin role bypass all permission checking. */
+	if (superuser_arg(roleid) || IsYbDbAdminUser(roleid))
 		return true;
 
 	/* Search syscache for pg_tablespace */
@@ -5145,8 +5638,8 @@ pg_event_trigger_ownercheck(Oid et_oid, Oid roleid)
 	HeapTuple	tuple;
 	Oid			ownerId;
 
-	/* Superusers bypass all permission checking. */
-	if (superuser_arg(roleid))
+	/* Superusers and yb_db_admin bypass all permission checking. */
+	if (superuser_arg(roleid) || IsYbDbAdminUser(roleid))
 		return true;
 
 	tuple = SearchSysCache1(EVENTTRIGGEROID, ObjectIdGetDatum(et_oid));
@@ -5467,10 +5960,6 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 	if (IsBootstrapProcessingMode())
 		return NULL;
 
-	/* TODO Do not support default permissions in YugaByte yet. */
-	if (IsYugaByteEnabled())
-		return NULL;
-
 	/* Check if object type is supported in pg_default_acl */
 	switch (objtype)
 	{
@@ -5492,6 +5981,10 @@ get_user_default_acl(ObjectType objtype, Oid ownerId, Oid nsp_oid)
 
 		case OBJECT_SCHEMA:
 			defaclobjtype = DEFACLOBJ_NAMESPACE;
+			break;
+
+		case OBJECT_YBTABLEGROUP:
+			defaclobjtype = DEFACLOBJ_TABLEGROUP;
 			break;
 
 		default:
@@ -6056,4 +6549,22 @@ recordExtensionInitPrivWorker(Oid objoid, Oid classoid, int objsubid, Acl *new_a
 	CommandCounterIncrement();
 
 	heap_close(relation, RowExclusiveLock);
+}
+
+/*
+ * Returns true if the two copies of ACLs are equal.
+ * NB: both old_acl and new_acl are pfree'd.
+ */
+static bool YbCheckAclCopiesEqual(Acl *old_acl, Acl *new_acl)
+{
+	Assert(IsYugaByteEnabled());
+	Assert(old_acl);
+	Assert(new_acl);
+
+	aclitemsort(old_acl);
+	aclitemsort(new_acl);
+	bool is_equal = aclequal(old_acl, new_acl);
+	pfree(old_acl);
+	pfree(new_acl);
+	return is_equal;
 }

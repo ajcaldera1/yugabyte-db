@@ -18,7 +18,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/cache.h"
@@ -26,13 +25,15 @@
 #include "yb/rocksdb/utilities/memory_util.h"
 #include "yb/rocksdb/utilities/stackable_db.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
-#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
+#include "yb/util/string_util.h"
+#include "yb/util/test_util.h"
+
 namespace rocksdb {
 
-class MemoryTest : public testing::Test {
+class MemoryTest : public RocksDBTest {
  public:
   MemoryTest() : kDbDir(test::TmpDir() + "/memory_test"), rnd_(301) {
     assert(Env::Default()->CreateDirIfMissing(kDbDir).ok());
@@ -122,7 +123,7 @@ TEST_F(MemoryTest, DISABLED_SharedBlockCacheTotal) {
   BlockBasedTableOptions bbt_opts;
   bbt_opts.block_cache = NewLRUCache(4096 * 1000 * 10);
   for (int i = 0; i < kNumDBs; ++i) {
-    DestroyDB(GetDBName(i), opt);
+    ASSERT_OK(DestroyDB(GetDBName(i), opt));
     DB* db = nullptr;
     ASSERT_OK(DB::Open(opt, GetDBName(i), &db));
     dbs.push_back(db);
@@ -135,16 +136,15 @@ TEST_F(MemoryTest, DISABLED_SharedBlockCacheTotal) {
     for (int i = 0; i < kNumDBs; ++i) {
       for (int j = 0; j < 100; ++j) {
         keys_by_db[i].emplace_back(RandomString(kKeySize));
-        dbs[i]->Put(WriteOptions(), keys_by_db[i].back(),
-                    RandomString(kValueSize));
+        ASSERT_OK(dbs[i]->Put(WriteOptions(), keys_by_db[i].back(), RandomString(kValueSize)));
       }
-      dbs[i]->Flush(FlushOptions());
+      ASSERT_OK(dbs[i]->Flush(FlushOptions()));
     }
   }
   for (int i = 0; i < kNumDBs; ++i) {
     for (auto& key : keys_by_db[i]) {
       std::string value;
-      dbs[i]->Get(ReadOptions(), key, &value);
+      ASSERT_OK(dbs[i]->Get(ReadOptions(), key, &value));
     }
     UpdateUsagesHistory(dbs);
   }
@@ -180,7 +180,7 @@ TEST_F(MemoryTest, DISABLED_MemTableAndTableReadersTotal) {
   };
 
   for (int i = 0; i < kNumDBs; ++i) {
-    DestroyDB(GetDBName(i), opt);
+    ASSERT_OK(DestroyDB(GetDBName(i), opt));
     std::vector<ColumnFamilyHandle*> handles;
     dbs.emplace_back();
     vec_handles.emplace_back();
@@ -192,8 +192,8 @@ TEST_F(MemoryTest, DISABLED_MemTableAndTableReadersTotal) {
   for (int p = 0; p < opt.min_write_buffer_number_to_merge / 2; ++p) {
     for (int i = 0; i < kNumDBs; ++i) {
       for (auto* handle : vec_handles[i]) {
-        dbs[i]->Put(WriteOptions(), handle, RandomString(kKeySize),
-                    RandomString(kValueSize));
+        ASSERT_OK(dbs[i]->Put(
+            WriteOptions(), handle, RandomString(kKeySize), RandomString(kValueSize)));
         UpdateUsagesHistory(dbs);
       }
     }
@@ -215,11 +215,11 @@ TEST_F(MemoryTest, DISABLED_MemTableAndTableReadersTotal) {
   // Create an iterator and flush all memtables for each db
   for (int i = 0; i < kNumDBs; ++i) {
     iters.push_back(dbs[i]->NewIterator(ReadOptions()));
-    dbs[i]->Flush(FlushOptions());
+    ASSERT_OK(dbs[i]->Flush(FlushOptions()));
 
     for (int j = 0; j < 100; ++j) {
       std::string value;
-      dbs[i]->Get(ReadOptions(), RandomString(kKeySize), &value);
+      ASSERT_OK(dbs[i]->Get(ReadOptions(), RandomString(kKeySize), &value));
     }
 
     UpdateUsagesHistory(dbs);
@@ -278,12 +278,3 @@ int main(int argc, char** argv) {
   return 0;
 #endif
 }
-
-#else
-#include <cstdio>
-
-int main(int argc, char** argv) {
-  printf("Skipped in RocksDBLite as utilities are not supported.\n");
-  return 0;
-}
-#endif  // !ROCKSDB_LITE

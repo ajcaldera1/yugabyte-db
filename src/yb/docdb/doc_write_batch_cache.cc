@@ -17,9 +17,9 @@
 #include <algorithm>
 #include <sstream>
 
-#include "yb/docdb/doc_key.h"
+#include "yb/dockv/doc_key.h"
 #include "yb/docdb/docdb-internal.h"
-#include "yb/docdb/primitive_value.h"
+#include "yb/dockv/primitive_value.h"
 #include "yb/util/bytes_formatter.h"
 
 using std::back_inserter;
@@ -29,47 +29,44 @@ using std::ostringstream;
 using std::pair;
 using std::sort;
 using std::string;
-using std::tuple;
 using std::vector;
-
-using yb::util::FormatBytesAsStr;
 
 namespace yb {
 namespace docdb {
 
-void DocWriteBatchCache::Put(const KeyBytes& key_bytes, const DocWriteBatchCache::Entry& entry) {
-    DOCDB_DEBUG_LOG(
-      "Writing to DocWriteBatchCache: encoded_key_prefix=$0, gen_ht=$1, value_type=$2",
-      BestEffortDocDBKeyToStr(key_bytes),
-      entry.doc_hybrid_time.ToString(),
-      ToString(entry.value_type));
-
-  prefix_to_gen_ht_[key_bytes.AsStringRef()] = entry;
+void DocWriteBatchCache::Put(
+    const dockv::KeyBytes& key_bytes, const DocWriteBatchCache::Entry& entry) {
+  DOCDB_DEBUG_LOG(
+    "Writing to DocWriteBatchCache: encoded_key_prefix=$0, gen_ht=$1, value_type=$2",
+    dockv::BestEffortDocDBKeyToStr(key_bytes),
+    entry.doc_hybrid_time.ToString(),
+    ToString(entry.value_type));
+  prefix_to_gen_ht_[key_bytes.data()] = entry;
 }
 
 boost::optional<DocWriteBatchCache::Entry> DocWriteBatchCache::Get(
-    const KeyBytes& encoded_key_prefix) {
-  auto iter = prefix_to_gen_ht_.find(encoded_key_prefix.AsStringRef());
+    const dockv::KeyBytes& encoded_key_prefix) {
+  auto iter = prefix_to_gen_ht_.find(encoded_key_prefix.data());
 #ifdef DOCDB_DEBUG
   if (iter == prefix_to_gen_ht_.end()) {
     DOCDB_DEBUG_LOG("DocWriteBatchCache contained no entry for $0",
-                    BestEffortDocDBKeyToStr(encoded_key_prefix));
+                    dockv::BestEffortDocDBKeyToStr(encoded_key_prefix));
   } else {
     DOCDB_DEBUG_LOG("DocWriteBatchCache entry found for key $0: $1",
-                    BestEffortDocDBKeyToStr(encoded_key_prefix), EntryToStr(iter->second));
+                    dockv::BestEffortDocDBKeyToStr(encoded_key_prefix), EntryToStr(iter->second));
   }
 #endif
   return iter == prefix_to_gen_ht_.end() ? boost::optional<Entry>() : iter->second;
 }
 
 string DocWriteBatchCache::ToDebugString() {
-  vector<pair<string, Entry>> sorted_contents;
+  vector<pair<KeyBuffer, Entry>> sorted_contents;
   copy(prefix_to_gen_ht_.begin(), prefix_to_gen_ht_.end(), back_inserter(sorted_contents));
   sort(sorted_contents.begin(), sorted_contents.end());
   ostringstream ss;
   ss << "DocWriteBatchCache[" << endl;
   for (const auto& kv : sorted_contents) {
-    ss << "  " << BestEffortDocDBKeyToStr(KeyBytes(kv.first)) << " -> "
+    ss << "  " << dockv::BestEffortDocDBKeyToStr(kv.first.AsSlice()) << " -> "
        << EntryToStr(kv.second) << endl;
   }
   ss << "]";
@@ -80,11 +77,13 @@ string DocWriteBatchCache::EntryToStr(const Entry& entry) {
   ostringstream ss;
   ss << "("
      << entry.doc_hybrid_time.ToString() << ", "
-     << entry.value_type << ", "
-     << ((entry.user_timestamp == Value::kInvalidUserTimestamp) ?
-        string("InvalidUserTimestamp") :
-        std::to_string(entry.user_timestamp)) << ", "
-     << entry.found_exact_key_prefix
+     << entry.value_type << ", ";
+  if (entry.user_timestamp == dockv::ValueControlFields::kInvalidTimestamp) {
+    ss << "InvalidUserTimestamp";
+  } else {
+    ss << entry.user_timestamp;
+  }
+  ss << ", " << entry.found_exact_key_prefix
      << ")";
   return ss.str();
 }

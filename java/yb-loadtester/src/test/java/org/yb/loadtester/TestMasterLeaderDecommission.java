@@ -19,9 +19,6 @@ import static org.yb.AssertionWrappers.assertTrue;
 import com.google.common.net.HostAndPort;
 
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.yb.minicluster.MiniYBCluster;
 
 import java.util.*;
 
@@ -40,14 +37,16 @@ public class TestMasterLeaderDecommission extends TestClusterBase {
     loadTesterRunnable.waitNumOpsIncrement(NUM_OPS_INCREMENT);
     // Disable heartbeats for all tservers.
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
-      assertTrue(client.setFlag(hp, "tserver_disable_heartbeat_test_only", "true"));
+      assertTrue(client.setFlag(
+            hp, "TEST_tserver_disable_heartbeat", "true", true));
     }
 
     // Disable becoming leader in 2 master followers.
     HostAndPort leaderMasterHp = client.getLeaderMasterHostAndPort();
     for (HostAndPort hp : miniCluster.getMasters().keySet()) {
       if (!hp.equals(leaderMasterHp)) {
-        assertTrue(client.setFlag(hp, "do_not_start_election_test_only", "true"));
+        assertTrue(client.setFlag(
+              hp, "TEST_do_not_start_election_test_only", "true", true));
       }
     }
 
@@ -59,19 +58,20 @@ public class TestMasterLeaderDecommission extends TestClusterBase {
 
     // Enable heartbeats for all tservers.
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
-      assertTrue(client.setFlag(hp, "tserver_disable_heartbeat_test_only", "false"));
+      assertTrue(client.setFlag(
+            hp, "TEST_tserver_disable_heartbeat", "false", true));
     }
 
     // Wait for tservers to find and heartbeat to new master.
-    Thread.sleep(MiniYBCluster.TSERVER_HEARTBEAT_TIMEOUT_MS * 5);
+    Thread.sleep(miniCluster.getClusterParameters().getTServerHeartbeatTimeoutMs() * 5);
 
     for (HostAndPort hp : miniCluster.getTabletServers().keySet()) {
       String masters = client.getMasterAddresses(hp);
       // Assert each tserver knows only the list of all 3 masters
       // as it should have heartbeated to master leader.
       assertEquals(3, masters.split(",").length);
-      assertFalse(masters.contains(leaderMasterHp.getHostText()));
-      assertTrue(masters.contains(newMaster.iterator().next().getHostText()));
+      assertFalse(masters.contains(leaderMasterHp.getHost()));
+      assertTrue(masters.contains(newMaster.iterator().next().getHost()));
     }
 
     // Wait for some ops and verify no failures in load tester.

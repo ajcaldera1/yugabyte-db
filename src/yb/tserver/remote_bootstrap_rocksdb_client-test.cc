@@ -13,26 +13,20 @@
 
 #include <algorithm>
 
+#include "yb/tablet/tablet_snapshots.h"
+
 #include "yb/tserver/remote_bootstrap_client-test.h"
 
-
-using std::shared_ptr;
+using std::vector;
 
 namespace yb {
 namespace tserver {
 
-using consensus::GetRaftConfigLeader;
-using consensus::RaftPeerPB;
-using tablet::TabletMetadata;
 using tablet::TabletStatusListener;
 
 class RemoteBootstrapRocksDBClientTest : public RemoteBootstrapClientTest {
  public:
   RemoteBootstrapRocksDBClientTest() : RemoteBootstrapClientTest(YQL_TABLE_TYPE) {}
-
-  void SetUp() override {
-    RemoteBootstrapClientTest::SetUp();
-  }
 };
 
 // Basic begin / end remote bootstrap session.
@@ -45,21 +39,26 @@ TEST_F(RemoteBootstrapRocksDBClientTest, TestBeginEndSession) {
 // Basic RocksDB files download unit test.
 TEST_F(RemoteBootstrapRocksDBClientTest, TestDownloadRocksDBFiles) {
   TabletStatusListener listener(meta_);
-  ASSERT_OK(client_->DownloadRocksDBFiles());
-  auto tablet_peer_checkpoint_dir = tablet_peer_->tablet()->GetLastRocksDBCheckpointDirForTest();
+  ASSERT_OK(client_->FetchAll(&listener));
+  auto tablet_peer_checkpoint_dir =
+      tablet_peer_->tablet()->snapshots().TEST_LastRocksDBCheckpointDir();
 
   vector<std::string> rocksdb_files;
+  LOG(INFO) << "RocksDB dir: " << meta_->rocksdb_dir();
   ASSERT_OK(fs_manager_->ListDir(meta_->rocksdb_dir(), &rocksdb_files));
 
   vector<std::string> tablet_peer_checkpoint_files;
   ASSERT_OK(tablet_peer_->tablet_metadata()->fs_manager()->ListDir(tablet_peer_checkpoint_dir,
                                                                    &tablet_peer_checkpoint_files));
 
-  ASSERT_EQ(rocksdb_files.size(), tablet_peer_checkpoint_files.size());
   std::sort(rocksdb_files.begin(), rocksdb_files.end());
   std::sort(tablet_peer_checkpoint_files.begin(), tablet_peer_checkpoint_files.end());
+
+  ASSERT_EQ(rocksdb_files.size(), tablet_peer_checkpoint_files.size())
+      << AsString(rocksdb_files) << " vs " << AsString(tablet_peer_checkpoint_files);
+
   // Verify that the client has the same files that the leader has.
-  for (int i = 0; i < rocksdb_files.size(); ++i) {
+  for (size_t i = 0; i < rocksdb_files.size(); ++i) {
     auto local_rocksdb_file = rocksdb_files[i];
     auto tablet_peer_rocksdb_file = tablet_peer_checkpoint_files[i];
     ASSERT_EQ(local_rocksdb_file, tablet_peer_rocksdb_file);

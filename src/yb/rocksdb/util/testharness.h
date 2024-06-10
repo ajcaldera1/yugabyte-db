@@ -21,14 +21,11 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_UTIL_TESTHARNESS_H
-#define YB_ROCKSDB_UTIL_TESTHARNESS_H
+#pragma once
 
 #include <string>
-#include <gtest/gtest.h>
 
 #include "yb/rocksdb/env.h"
-#include "yb/util/test_macros.h"
 
 namespace rocksdb {
 namespace test {
@@ -43,5 +40,3 @@ int RandomSeed();
 
 }  // namespace test
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_UTIL_TESTHARNESS_H

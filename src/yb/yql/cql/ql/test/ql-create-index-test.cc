@@ -13,10 +13,10 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master.h"
+#include "yb/yql/cql/ql/ptree/pt_create_index.h"
 #include "yb/yql/cql/ql/test/ql-test-base.h"
 
+using std::string;
 
 namespace yb {
 namespace master {
@@ -26,11 +26,7 @@ class Master;
 namespace ql {
 
 #define EXEC_DUPLICATE_OBJECT_CREATE_STMT(stmt)                                \
-  do {                                                                  \
-    Status s = processor->Run(stmt);                                    \
-    EXPECT_FALSE(s.ok());                                               \
-    EXPECT_FALSE(s.ToString().find("Duplicate Object. Object") == string::npos); \
-  } while (false)
+  EXEC_INVALID_STMT_WITH_ERROR(stmt, "Duplicate Object. Object")
 
 class TestQLCreateIndex : public QLTestBase {
  public:
@@ -100,7 +96,7 @@ TEST_F(TestQLCreateIndex, TestQLCreateIndexDefaultName) {
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(name);"));
   // Get Index name from the Parse Tree and check it.
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_name_idx");
@@ -109,7 +105,7 @@ TEST_F(TestQLCreateIndex, TestQLCreateIndexDefaultName) {
   // Test index over 2-3 columns.
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(name, surname);"));
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_name_surname_idx");
@@ -118,7 +114,7 @@ TEST_F(TestQLCreateIndex, TestQLCreateIndexDefaultName) {
   // Check that the covering columns are not included into the index name.
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(surname, name) INCLUDE (kids);"));
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_surname_name_idx");
@@ -126,7 +122,7 @@ TEST_F(TestQLCreateIndex, TestQLCreateIndexDefaultName) {
 
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource((surname, name), id);"));
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_surname_name_id_idx");
@@ -154,7 +150,7 @@ TEST_F(TestQLCreateIndex, TestQLSpecialSymbolsInIndexDefaultName) {
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(\"Capital\");"));
   // Test Capital symbol.
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_Capital_idx");
@@ -163,7 +159,7 @@ TEST_F(TestQLCreateIndex, TestQLSpecialSymbolsInIndexDefaultName) {
   // Test spaces.
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(\"Capital With Spaces\");"));
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource_CapitalWithSpaces_idx");
@@ -172,7 +168,7 @@ TEST_F(TestQLCreateIndex, TestQLSpecialSymbolsInIndexDefaultName) {
   // Test different unprintable symbols.
   EXEC_VALID_STMT(CreateIndexStmt("ON human_resource(\"!@#$%^&*-=+()[]{}<>/\\\\,.;:\"\"'\");"));
   {
-    TreeNode::SharedPtr root = processor->GetLastParseTree()->root();
+    TreeNodePtr root = processor->GetLastParseTreeRoot();
     ASSERT_EQ(TreeNodeOpcode::kPTCreateIndex, root->opcode());
     PTCreateIndex::SharedPtr node = std::static_pointer_cast<PTCreateIndex>(root);
     ASSERT_STREQ(node->name()->c_str(), "human_resource__idx");
@@ -180,6 +176,50 @@ TEST_F(TestQLCreateIndex, TestQLSpecialSymbolsInIndexDefaultName) {
 
   EXEC_VALID_STMT("DROP TABLE human_resource;");
 }
+
+TEST_F(TestQLCreateIndex, TestQLCreateIndexExpr) {
+  // Init the simulated cluster.
+  ASSERT_NO_FATALS(CreateSimulatedCluster());
+
+  // Get an available processor.
+  TestQLProcessor *processor = GetQLProcessor();
+
+  // Create the table.
+  const string table = "tabj(\"j->'a'->>'b'\" int, \"j->'a'->>'c'\" int, j jsonb,"
+                       "     primary key (\"j->'a'->>'b'\"))"
+                       "  with transactions = {'enabled':true};";
+  EXEC_VALID_STMT(CreateTableStmt(table));
+
+  // Create valid indexes - no name conflict because no column has the same name as jsonb index.
+  EXEC_VALID_STMT(CreateIndexStmt("jdx1 ON tabj(j->'a'->>'d');"));
+  EXEC_VALID_STMT(CreateIndexStmt("ON tabj(j->'a'->>'d');"));
+
+  EXEC_VALID_STMT(CreateIndexStmt("jdx2 ON tabj(j->'a'->>'d', \"j->'a'->>'c'\");"));
+  EXEC_VALID_STMT(CreateIndexStmt("ON tabj(j->'a'->>'d', \"j->'a'->>'c'\");"));
+
+  // Create valid indexes - no name conflict because "j->'a'->>'c'" is not included.
+  EXEC_VALID_STMT(CreateIndexStmt("jdx3 ON tabj(j->'a'->>'c');"));
+  EXEC_VALID_STMT(CreateIndexStmt("ON tabj(j->'a'->>'c');"));
+
+  // Create invalid index due to duplicate column name "j->'a'->>'b'".
+  EXEC_INVALID_STMT(CreateIndexStmt("jdx4 ON tabj(j->'a'->>'b');"));
+  EXEC_INVALID_STMT(CreateIndexStmt("ON tabj(j->'a'->>'b');"));
+
+  // Create invalid index due to duplicate column name "j->'a'->>'c'".
+  EXEC_INVALID_STMT(CreateIndexStmt("jdx5 ON tabj(j->'a'->>'c') include(\"j->'a'->>'c'\");"));
+  EXEC_INVALID_STMT(CreateIndexStmt("ON tabj(j->'a'->>'c') include(\"j->'a'->>'c'\");"));
+
+  EXEC_INVALID_STMT(CreateIndexStmt("jdx6 ON tabj(j->'a'->>'c', \"j->'a'->>'c'\");"));
+  EXEC_INVALID_STMT(CreateIndexStmt("jdx7 ON tabj(\"j->'a'->>'c'\", j->'a'->>'c');"));
+
+  // Testing name escaping.
+  EXEC_VALID_STMT(CreateTableStmt("tab_escape"
+                                  "  (\"C$_col_C$_\" INT PRIMARY KEY,"
+                                  "   \"C$_col->>'$J_attr'\" JSONB)"
+                                  "  with transactions = {'enabled':true};"));
+  EXEC_VALID_STMT(CreateIndexStmt("jdx8 ON tab_escape"
+                                  "  (\"C$_col->>'$J_attr'\"->>'\"J$_attr->>C$_col\"');"));
+} // v1
 
 } // namespace ql
 } // namespace yb

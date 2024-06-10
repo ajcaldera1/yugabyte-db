@@ -118,7 +118,6 @@ static int ldapServiceLookup(const char *purl, PQconninfoOption *options,
  * fall back options if they are not specified by arguments or defined
  * by environment variables
  */
-#define DefaultHost		"localhost"
 #define DefaultTty		""
 #define DefaultOption	""
 #define DefaultAuthtype		  ""
@@ -1132,7 +1131,7 @@ connectOptions2(PGconn *conn)
 	{
 		if (conn->dbName)
 			free(conn->dbName);
-		conn->dbName = strdup(conn->pguser);
+		conn->dbName = strdup("yugabyte");
 		if (!conn->dbName)
 			goto oom_error;
 	}
@@ -2737,6 +2736,19 @@ keep_going:						/* We will come back to here until there is
 				pollres = pqsecure_open_client(conn);
 				if (pollres == PGRES_POLLING_OK)
 				{
+					/*
+					 * At this point we should have no data already buffered.
+					 * If we do, it was received before we performed the SSL
+					 * handshake, so it wasn't encrypted and indeed may have
+					 * been injected by a man-in-the-middle.
+					 */
+					if (conn->inCursor != conn->inEnd)
+					{
+						appendPQExpBufferStr(&conn->errorMessage,
+											 libpq_gettext("received unencrypted data after SSL response\n"));
+						goto error_return;
+					}
+
 					/* SSL handshake done, ready to send startup packet */
 					conn->status = CONNECTION_MADE;
 					return PGRES_POLLING_WRITING;
@@ -5378,8 +5390,18 @@ conninfo_add_defaults(PQconninfoOption *options, PQExpBuffer errorMessage)
 		 */
 		if (strcmp(option->keyword, "user") == 0)
 		{
-		  /* YugaByte default username to "postgres" */
-			option->val = strdup("postgres");
+			/* Yugabyte default username to "yugabyte" */
+			option->val = strdup("yugabyte");
+			continue;
+		}
+
+		/*
+		 * Special handling for "dbname" option.
+		 */
+		if (strcmp(option->keyword, "dbname") == 0)
+		{
+			/* Yugabyte default dbname to "yugabyte" */
+			option->val = strdup("yugabyte");
 			continue;
 		}
 	}
@@ -6647,11 +6669,13 @@ pqGetHomeDirectory(char *buf, int bufsize)
 	char		pwdbuf[BUFSIZ];
 	struct passwd pwdstr;
 	struct passwd *pwd = NULL;
+	const char* home = NULL;
 
 	(void) pqGetpwuid(geteuid(), &pwdstr, pwdbuf, sizeof(pwdbuf), &pwd);
-	if (pwd == NULL)
+	home = (pwd == NULL ? getenv("HOME") : pwd->pw_dir);
+	if (home == NULL)
 		return false;
-	strlcpy(buf, pwd->pw_dir, bufsize);
+	strlcpy(buf, home, bufsize);
 	return true;
 #else
 	char		tmppath[MAX_PATH];

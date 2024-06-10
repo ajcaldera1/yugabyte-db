@@ -46,8 +46,6 @@
 // The last four implementations are designed for situations in which
 // iteration over the entire collection is rare since doing so requires all the
 // keys to be copied into a sorted data structure.
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_MEMTABLEREP_H
-#define ROCKSDB_INCLUDE_ROCKSDB_MEMTABLEREP_H
 
 #pragma once
 
@@ -55,9 +53,9 @@
 #include <stdlib.h>
 
 #include <memory>
-#include <stdexcept>
 
 #include "yb/util/slice.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace rocksdb {
 
@@ -104,11 +102,11 @@ class MemTableRep {
   // Like Insert(handle), but may be called concurrent with other calls
   // to InsertConcurrently for other handles
   virtual void InsertConcurrently(KeyHandle handle) {
-#ifndef ROCKSDB_LITE
     throw std::runtime_error("concurrent insert not supported");
-#else
-    abort();
-#endif
+  }
+
+  virtual bool Erase(KeyHandle handle, const KeyComparator& comparator) {
+    return false;
   }
 
   // Returns true iff an entry that compares equal to key is in the collection.
@@ -152,33 +150,32 @@ class MemTableRep {
     // Initialize an iterator over the specified collection.
     // The returned iterator is not valid.
     // explicit Iterator(const MemTableRep* collection);
-    virtual ~Iterator() {}
+    virtual ~Iterator() = default;
 
-    // Returns true iff the iterator is positioned at a valid node.
-    virtual bool Valid() const = 0;
-
-    // Returns the key at the current position.
-    // REQUIRES: Valid()
-    virtual const char* key() const = 0;
+    // Returns the entry at the current position. Null if iterator is not valid.
+    virtual const char* Entry() const = 0;
 
     // Advances to the next position.
     // REQUIRES: Valid()
-    virtual void Next() = 0;
+    // Returns the same value as would be returned by Entry after this method is invoked.
+    virtual const char* Next() = 0;
 
     // Advances to the previous position.
     // REQUIRES: Valid()
-    virtual void Prev() = 0;
+    virtual const char* Prev() = 0;
 
     // Advance to the first entry with a key >= target
-    virtual void Seek(const Slice& internal_key, const char* memtable_key) = 0;
+    virtual const char* Seek(Slice internal_key) = 0;
+
+    virtual const char* SeekMemTableKey(Slice internal_key, const char* memtable_key) = 0;
 
     // Position at the first entry in collection.
     // Final state of iterator is Valid() iff collection is not empty.
-    virtual void SeekToFirst() = 0;
+    virtual const char* SeekToFirst() = 0;
 
     // Position at the last entry in collection.
     // Final state of iterator is Valid() iff collection is not empty.
-    virtual void SeekToLast() = 0;
+    virtual const char* SeekToLast() = 0;
   };
 
   // Return an iterator over the keys in this representation.
@@ -228,7 +225,11 @@ class MemTableRepFactory {
   // Return true if the current MemTableRep supports concurrent inserts
   // Default: false
   virtual bool IsInsertConcurrentlySupported() const { return false; }
+
+  virtual bool IsInMemoryEraseSupported() const { return false; }
 };
+
+YB_STRONGLY_TYPED_BOOL(ConcurrentWrites);
 
 // This uses a skip list to store keys. It is the default.
 //
@@ -239,21 +240,37 @@ class MemTableRepFactory {
 //     seeks with consecutive keys.
 class SkipListFactory : public MemTableRepFactory {
  public:
-  explicit SkipListFactory(size_t lookahead = 0) : lookahead_(lookahead) {}
+  explicit SkipListFactory(
+      size_t lookahead = 0, ConcurrentWrites concurrent_writes = ConcurrentWrites::kTrue)
+      : lookahead_(lookahead), concurrent_writes_(concurrent_writes) {}
 
-  virtual MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
-                                         MemTableAllocator*,
-                                         const SliceTransform*,
-                                         Logger* logger) override;
-  virtual const char* Name() const override { return "SkipListFactory"; }
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
+                                 MemTableAllocator*,
+                                 const SliceTransform*,
+                                 Logger* logger) override;
+  const char* Name() const override { return "SkipListFactory"; }
 
-  bool IsInsertConcurrentlySupported() const override { return true; }
+  bool IsInsertConcurrentlySupported() const override { return concurrent_writes_; }
+
+  bool IsInMemoryEraseSupported() const override { return !concurrent_writes_; }
 
  private:
   const size_t lookahead_;
+  const ConcurrentWrites concurrent_writes_;
 };
 
-#ifndef ROCKSDB_LITE
+class CDSSkipListFactory : public MemTableRepFactory {
+ public:
+  MemTableRep* CreateMemTableRep(const MemTableRep::KeyComparator&,
+                                 MemTableAllocator*,
+                                 const SliceTransform*,
+                                 Logger* logger) override;
+
+  const char* Name() const override { return "CDSSkipListFactory"; }
+
+  bool IsInsertConcurrentlySupported() const override { return true; }
+};
+
 // This creates MemTableReps that are backed by an std::vector. On iteration,
 // the vector is sorted. This is useful for workloads where iteration is very
 // rare and writes are generally not issued after reads begin.
@@ -309,41 +326,4 @@ extern MemTableRepFactory* NewHashLinkListRepFactory(
     bool if_log_bucket_dist_when_flash = true,
     uint32_t threshold_use_skiplist = 256);
 
-// This factory creates a cuckoo-hashing based mem-table representation.
-// Cuckoo-hash is a closed-hash strategy, in which all key/value pairs
-// are stored in the bucket array itself intead of in some data structures
-// external to the bucket array.  In addition, each key in cuckoo hash
-// has a constant number of possible buckets in the bucket array.  These
-// two properties together makes cuckoo hash more memory efficient and
-// a constant worst-case read time.  Cuckoo hash is best suitable for
-// point-lookup workload.
-//
-// When inserting a key / value, it first checks whether one of its possible
-// buckets is empty.  If so, the key / value will be inserted to that vacant
-// bucket.  Otherwise, one of the keys originally stored in one of these
-// possible buckets will be "kicked out" and move to one of its possible
-// buckets (and possibly kicks out another victim.)  In the current
-// implementation, such "kick-out" path is bounded.  If it cannot find a
-// "kick-out" path for a specific key, this key will be stored in a backup
-// structure, and the current memtable to be forced to immutable.
-//
-// Note that currently this mem-table representation does not support
-// snapshot (i.e., it only queries latest state) and iterators.  In addition,
-// MultiGet operation might also lose its atomicity due to the lack of
-// snapshot support.
-//
-// Parameters:
-//   write_buffer_size: the write buffer size in bytes.
-//   average_data_size: the average size of key + value in bytes.  This value
-//     together with write_buffer_size will be used to compute the number
-//     of buckets.
-//   hash_function_count: the number of hash functions that will be used by
-//     the cuckoo-hash.  The number also equals to the number of possible
-//     buckets each key will have.
-extern MemTableRepFactory* NewHashCuckooRepFactory(
-    size_t write_buffer_size, size_t average_data_size = 64,
-    unsigned int hash_function_count = 4);
-#endif  // ROCKSDB_LITE
 }  // namespace rocksdb
-
-#endif // ROCKSDB_INCLUDE_ROCKSDB_MEMTABLEREP_H

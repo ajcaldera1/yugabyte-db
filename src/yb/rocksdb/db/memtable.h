@@ -21,8 +21,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_DB_MEMTABLE_H
-#define YB_ROCKSDB_DB_MEMTABLE_H
 
 #pragma once
 
@@ -33,17 +31,16 @@
 #include <string>
 #include <vector>
 
-#include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/skiplist.h"
-#include "yb/rocksdb/db/version_edit.h"
 #include "yb/rocksdb/db.h"
-#include "yb/rocksdb/env.h"
-#include "yb/rocksdb/memtablerep.h"
-#include "yb/rocksdb/immutable_options.h"
+#include "yb/rocksdb/db/dbformat.h"
+#include "yb/rocksdb/db/file_numbers.h"
 #include "yb/rocksdb/db/memtable_allocator.h"
+#include "yb/rocksdb/db/version_edit.h"
+#include "yb/rocksdb/env.h"
+#include "yb/rocksdb/immutable_options.h"
+#include "yb/rocksdb/memtablerep.h"
 #include "yb/rocksdb/util/concurrent_arena.h"
 #include "yb/rocksdb/util/dynamic_bloom.h"
-#include "yb/rocksdb/util/instrumented_mutex.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
 
 namespace yb {
@@ -84,6 +81,14 @@ struct MemTableOptions {
 };
 
 YB_DEFINE_ENUM(FlushState, (kNotRequested)(kRequested)(kScheduled));
+
+struct PreparedAdd {
+  SequenceNumber min_seq_no = 0;
+  size_t total_encoded_len = 0;
+  size_t num_deletes = 0;
+  Slice last_key;
+  Slice last_value;
+};
 
 // Note:  Many of the methods in this class have comments indicating that
 // external synchromization is required as these methods are not thread-safe.
@@ -137,7 +142,7 @@ class MemTable {
   // operations on the same MemTable.
   MemTable* Unref() {
     --refs_;
-    assert(refs_ >= 0);
+    DCHECK_GE(refs_, 0);
     if (refs_ <= 0) {
       return this;
     }
@@ -187,8 +192,16 @@ class MemTable {
   //
   // REQUIRES: if allow_concurrent = false, external synchronization to prevent
   // simultaneous operations on the same MemTable.
-  void Add(SequenceNumber seq, ValueType type, const Slice& key,
-           const Slice& value, bool allow_concurrent = false);
+  void Add(SequenceNumber seq, ValueType type, const SliceParts& key,
+           const SliceParts& value, bool allow_concurrent = false);
+
+  KeyHandle PrepareAdd(
+      SequenceNumber s, ValueType type, const SliceParts& key, const SliceParts& value,
+      PreparedAdd* prepared_add);
+
+  void ApplyPreparedAdd(
+      const KeyHandle* handle, size_t count, const PreparedAdd& prepared_add,
+      bool allow_concurrent);
 
   // If memtable contains a value for key, store it in *value and return true.
   // If memtable contains a deletion for key, store a NotFound() error
@@ -225,6 +238,8 @@ class MemTable {
   void Update(SequenceNumber seq,
               const Slice& key,
               const Slice& value);
+
+  bool Erase(const Slice& key);
 
   // If prev_value for key exists, attempts to update it inplace.
   // else returns false
@@ -341,15 +356,30 @@ class MemTable {
   const MemTableOptions* GetMemTableOptions() const { return &moptions_; }
 
   void UpdateFrontiers(const UserFrontiers& value) {
+    std::lock_guard l(frontiers_mutex_);
     if (frontiers_) {
       frontiers_->MergeFrontiers(value);
     } else {
       frontiers_ = value.Clone();
     }
   }
+
+  // Frontiers accessors might return stale frontiers if invoked after records have been written to
+  // the memtable, but before frontiers are updated.
+  UserFrontierPtr GetFrontier(UpdateUserValueType type) const;
+
   const UserFrontiers* Frontiers() const { return frontiers_.get(); }
 
   std::string ToString() const;
+
+  bool FullyErased() const {
+    return num_entries_.load(std::memory_order_acquire) ==
+           num_erased_.load(std::memory_order_acquire);
+  }
+
+  uint64_t data_size() const {
+    return data_size_.load(std::memory_order_relaxed);
+  }
 
  private:
 
@@ -363,17 +393,21 @@ class MemTable {
   const size_t kArenaBlockSize;
   ConcurrentArena arena_;
   MemTableAllocator allocator_;
-  unique_ptr<MemTableRep> table_;
+  std::unique_ptr<MemTableRep> table_;
 
   // Total data size of all data inserted
   std::atomic<uint64_t> data_size_;
   std::atomic<uint64_t> num_entries_;
   std::atomic<uint64_t> num_deletes_;
+  std::atomic<uint64_t> num_erased_{0};
 
   // These are used to manage memtable flushes to storage
-  bool flush_in_progress_; // started the flush
-  bool flush_completed_;   // finished the flush
-  uint64_t file_number_;    // filled up after flush is complete
+  bool flush_in_progress_;        // started the flush
+  bool flush_completed_;          // finished the flush
+  uint64_t file_number_;          // filled up after flush is complete
+  // Filled up after flush is complete to prevent file from being deleted util it is added into the
+  // VersionSet.
+  FileNumbersHolder file_number_holder_;
 
   // The updates to be applied to the transaction log when this
   // memtable is flushed to storage.
@@ -401,6 +435,7 @@ class MemTable {
 
   Env* env_;
 
+  mutable SpinMutex frontiers_mutex_;
   std::unique_ptr<UserFrontiers> frontiers_;
 
   // Returns a heuristic flush decision
@@ -408,6 +443,8 @@ class MemTable {
 
   // Updates flush_state_ using ShouldFlushNow()
   void UpdateFlushState();
+
+  std::vector<char> erase_key_buffer_;
 
   // No copying allowed
   MemTable(const MemTable&) = delete;
@@ -417,5 +454,3 @@ class MemTable {
 extern const char* EncodeKey(std::string* scratch, const Slice& target);
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_MEMTABLE_H

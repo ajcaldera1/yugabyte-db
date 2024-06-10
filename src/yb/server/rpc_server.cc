@@ -30,39 +30,37 @@
 // under the License.
 //
 
+#include "yb/server/rpc_server.h"
+
 #include <list>
 #include <string>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include <boost/preprocessor/cat.hpp>
+#include <boost/preprocessor/stringize.hpp>
 
 #include "yb/gutil/casts.h"
-#include "yb/gutil/gscoped_ptr.h"
-#include "yb/gutil/strings/substitute.h"
-#include "yb/rpc/acceptor.h"
+
 #include "yb/rpc/messenger.h"
 #include "yb/rpc/service_if.h"
 #include "yb/rpc/service_pool.h"
-#include "yb/rpc/thread_pool.h"
-#include "yb/server/rpc_server.h"
-#include "yb/util/flag_tags.h"
+
+#include "yb/util/atomic.h"
+#include "yb/util/flags.h"
+#include "yb/util/metric_entity.h"
+#include "yb/util/monotime.h"
+#include "yb/util/net/net_util.h"
 #include "yb/util/status.h"
 
 using yb::rpc::Messenger;
-using yb::rpc::ServiceIf;
-using std::shared_ptr;
 using std::string;
-using std::vector;
-using strings::Substitute;
-using std::unique_ptr;
-using std::make_unique;
 
-DEFINE_string(rpc_bind_addresses, "0.0.0.0",
+DEFINE_UNKNOWN_string(rpc_bind_addresses, "0.0.0.0",
               "Comma-separated list of addresses to bind to for RPC connections. "
               "Currently, ephemeral ports (i.e. port 0) are not allowed.");
 TAG_FLAG(rpc_bind_addresses, stable);
 
-DEFINE_bool(rpc_server_allow_ephemeral_ports, false,
+DEFINE_UNKNOWN_bool(rpc_server_allow_ephemeral_ports, false,
             "Allow binding to ephemeral ports. This can cause problems, so currently "
             "only allowed in tests.");
 TAG_FLAG(rpc_server_allow_ephemeral_ports, unsafe);
@@ -82,7 +80,9 @@ RpcServer::RpcServer(const std::string& name, RpcServerOptions opts,
     : name_(name),
       server_state_(UNINITIALIZED),
       options_(std::move(opts)),
-      connection_context_factory_(std::move(connection_context_factory)) {}
+      connection_context_factory_(std::move(connection_context_factory)) {
+        LOG(INFO) << "yb::server::RpcServer created at " << this;
+      }
 
 RpcServer::~RpcServer() {
   Shutdown();
@@ -93,7 +93,7 @@ string RpcServer::ToString() const {
   return "RpcServer";
 }
 
-Status RpcServer::Init(const shared_ptr<Messenger>& messenger) {
+Status RpcServer::Init(Messenger* messenger) {
   CHECK_EQ(server_state_, UNINITIALIZED);
   messenger_ = messenger;
 
@@ -132,8 +132,8 @@ Status RpcServer::RegisterService(size_t queue_limit,
 
   rpc::ThreadPool& thread_pool = messenger_->ThreadPool(priority);
 
-  scoped_refptr<rpc::ServicePool> service_pool =
-    new rpc::ServicePool(queue_limit, &thread_pool, std::move(service), metric_entity);
+  scoped_refptr<rpc::ServicePool> service_pool(new rpc::ServicePool(
+      queue_limit, &thread_pool, &messenger_->scheduler(), std::move(service), metric_entity));
   RETURN_NOT_OK(messenger_->RegisterService(service_name, service_pool));
   return Status::OK();
 }
@@ -173,12 +173,12 @@ void RpcServer::Shutdown() {
   if (messenger_) {
     messenger_->ShutdownThreadPools();
     messenger_->ShutdownAcceptor();
-    WARN_NOT_OK(messenger_->UnregisterAllServices(), "Unable to unregister our services");
+    messenger_->UnregisterAllServices();
   }
 }
 
-const rpc::ServicePool* RpcServer::service_pool(const string& service_name) const {
-  return down_cast<rpc::ServicePool*>(messenger_->rpc_service(service_name).get());
+const rpc::ServicePool* RpcServer::TEST_service_pool(const string& service_name) const {
+  return down_cast<rpc::ServicePool*>(messenger_->TEST_rpc_service(service_name).get());
 }
 
 } // namespace server

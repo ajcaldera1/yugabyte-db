@@ -18,6 +18,8 @@
 #ifndef IPC_H
 #define IPC_H
 
+#include <stdatomic.h>
+
 typedef void (*pg_on_exit_callback) (int code, Datum arg);
 typedef void (*shmem_startup_hook_type) (void);
 
@@ -62,8 +64,8 @@ typedef void (*shmem_startup_hook_type) (void);
 
 
 /* ipc.c */
-extern PGDLLIMPORT bool proc_exit_inprogress;
-extern PGDLLIMPORT bool shmem_exit_inprogress;
+extern PGDLLIMPORT atomic_bool proc_exit_inprogress;
+extern PGDLLIMPORT atomic_bool shmem_exit_inprogress;
 
 extern void proc_exit(int code) pg_attribute_noreturn();
 extern void shmem_exit(int code);
@@ -76,6 +78,6 @@ extern void on_exit_reset(void);
 /* ipci.c */
 extern PGDLLIMPORT shmem_startup_hook_type shmem_startup_hook;
 
-extern void CreateSharedMemoryAndSemaphores(bool makePrivate, int port);
+extern void CreateSharedMemoryAndSemaphores(int port);
 
 #endif							/* IPC_H */

@@ -15,85 +15,197 @@
 
 #include "yb/client/transaction_manager.h"
 
-#include "yb/rpc/rpc.h"
-#include "yb/rpc/thread_pool.h"
+#include "yb/client/client.h"
+#include "yb/client/meta_cache.h"
+#include "yb/client/table.h"
+#include "yb/client/yb_table_name.h"
+
+#include "yb/master/catalog_manager.h"
+
 #include "yb/rpc/tasks_pool.h"
 
-#include "yb/util/random_util.h"
+#include "yb/server/server_base_options.h"
+
+#include "yb/util/flags.h"
+#include "yb/util/format.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/string_util.h"
 #include "yb/util/thread_restrictions.h"
 
-#include "yb/client/client.h"
+DEFINE_UNKNOWN_uint64(transaction_manager_workers_limit, 50,
+              "Max number of workers used by transaction manager");
 
-#include "yb/common/transaction.h"
+DEFINE_UNKNOWN_uint64(transaction_manager_queue_limit, 500,
+              "Max number of tasks used by transaction manager");
 
-#include "yb/master/master_defaults.h"
+DEFINE_test_flag(string, transaction_manager_preferred_tablet, "",
+                 "For testing only. If non-empty, transaction manager will try to use the status "
+                 "tablet with id matching this flag, if present in the list of status tablets.");
+
+DECLARE_string(placement_cloud);
+DECLARE_string(placement_region);
+DECLARE_string(placement_zone);
 
 namespace yb {
 namespace client {
 
 namespace {
 
-const YBTableName kTransactionTableName(master::kSystemNamespaceName, kTransactionsTableName);
+// Cache of tablet ids of the global transaction table and any transaction tables with
+// the same placement.
+class TransactionTableState {
+ public:
+  explicit TransactionTableState(LocalTabletFilter local_tablet_filter)
+      : local_tablet_filter_(local_tablet_filter) {
+  }
 
-// Exists - table exists.
-// Updating - intermediate state, we are currently updating local cache of tablets.
-// Resolved - final state, when all tablets are resolved and written to cache.
-YB_DEFINE_ENUM(TransactionTableStatus, (kExists)(kUpdating)(kResolved));
-
-void InvokeCallback(const LocalTabletFilter& filter, const std::vector<TabletId>& tablets,
-                    const PickStatusTabletCallback& callback) {
-  if (filter) {
-    std::vector<const TabletId*> ids;
-    ids.reserve(tablets.size());
-    for (const auto& id : tablets) {
-      ids.push_back(&id);
-    }
-    filter(&ids);
-    if (!ids.empty()) {
-      callback(*RandomElement(ids));
+  void InvokeCallback(const PickStatusTabletCallback& callback,
+                      TransactionLocality locality) EXCLUDES(mutex_) {
+    SharedLock<yb::RWMutex> lock(mutex_);
+    const auto& tablets = PickTabletList(locality);
+    if (tablets.empty()) {
+      callback(STATUS_FORMAT(
+          IllegalState, "No $0 transaction tablets found", TransactionLocality_Name(locality)));
       return;
     }
-    LOG(WARNING) << "No local transaction status tablet";
+    if (PickStatusTabletId(tablets, callback)) {
+      return;
+    }
+    YB_LOG_EVERY_N_SECS(WARNING, 1) << "No local transaction status tablet found";
+    callback(RandomElement(tablets));
   }
-  callback(RandomElement(tablets));
-}
 
-struct TransactionTableState {
-  LocalTabletFilter local_tablet_filter;
-  std::atomic<TransactionTableStatus> status{TransactionTableStatus::kExists};
-  std::vector<TabletId> tablets;
+  bool IsInitialized() {
+    return initialized_.load();
+  }
+
+  void UpdateStatusTablets(uint64_t new_version,
+                           TransactionStatusTablets&& tablets) EXCLUDES(mutex_) {
+    std::lock_guard lock(mutex_);
+    if (!initialized_.load() || status_tablets_version_ < new_version) {
+      tablets_ = std::move(tablets);
+      has_placement_local_tablets_.store(!tablets_.placement_local_tablets.empty());
+      status_tablets_version_ = new_version;
+      initialized_.store(true);
+    }
+  }
+
+  bool HasAnyPlacementLocalStatusTablets() {
+    return has_placement_local_tablets_.load();
+  }
+
+  uint64_t GetStatusTabletsVersion() EXCLUDES(mutex_) {
+    std::lock_guard lock(mutex_);
+    return status_tablets_version_;
+  }
+
+ private:
+  // Picks a status tablet id from 'tablets' filtered by 'filter'. Returns true if a
+  // tablet id was picked successfully, and false if there were no applicable tablet ids.
+  bool PickStatusTabletId(const std::vector<TabletId>& tablets,
+                          const PickStatusTabletCallback& callback) REQUIRES_SHARED(mutex_) {
+    if (tablets.empty()) {
+      return false;
+    }
+    if (PREDICT_FALSE(!FLAGS_TEST_transaction_manager_preferred_tablet.empty()) &&
+        std::find(tablets.begin(), tablets.end(),
+                  FLAGS_TEST_transaction_manager_preferred_tablet) != tablets.end()) {
+      callback(FLAGS_TEST_transaction_manager_preferred_tablet);
+      return true;
+    }
+    if (local_tablet_filter_) {
+      std::vector<const TabletId*> ids;
+      ids.reserve(tablets.size());
+      for (const auto& id : tablets) {
+        ids.push_back(&id);
+      }
+      local_tablet_filter_(&ids);
+      if (!ids.empty()) {
+        callback(*RandomElement(ids));
+        return true;
+      }
+      return false;
+    }
+    callback(RandomElement(tablets));
+    return true;
+  }
+
+  const std::vector<TabletId>& PickTabletList(TransactionLocality locality)
+      REQUIRES_SHARED(mutex_) {
+    if (tablets_.placement_local_tablets.empty()) {
+      return tablets_.global_tablets;
+    }
+    switch (locality) {
+      case TransactionLocality::GLOBAL:
+        return tablets_.global_tablets;
+      case TransactionLocality::LOCAL:
+        return tablets_.placement_local_tablets;
+    }
+    FATAL_INVALID_ENUM_VALUE(TransactionLocality, locality);
+  }
+
+  LocalTabletFilter local_tablet_filter_;
+
+  // Set to true once transaction tablets have been loaded at least once. global_tablets
+  // is assumed to have at least one entry in it if this is true.
+  std::atomic<bool> initialized_{false};
+
+  // Set to true if there are any placement local transaction tablets.
+  std::atomic<bool> has_placement_local_tablets_{false};
+
+  // Locks the version/tablet lists. A read lock is acquired when picking
+  // tablets, and a write lock is acquired when updating tablet lists.
+  RWMutex mutex_;
+
+  uint64_t status_tablets_version_ GUARDED_BY(mutex_) = 0;
+
+  TransactionStatusTablets tablets_ GUARDED_BY(mutex_);
 };
 
-// Picks status tablet for transaction.
-class PickStatusTabletTask {
+const CloudInfoPB& GetPlacementFromGFlags() {
+  static GoogleOnceType once = GOOGLE_ONCE_INIT;
+  static CloudInfoPB cloud_info;
+  auto set_placement_from_gflags = [](CloudInfoPB* cloud_info) {
+    cloud_info->set_placement_cloud(FLAGS_placement_cloud);
+    cloud_info->set_placement_region(FLAGS_placement_region);
+    cloud_info->set_placement_zone(FLAGS_placement_zone);
+  };
+  GoogleOnceInitArg(
+      &once, static_cast<void (*)(CloudInfoPB*)>(set_placement_from_gflags), &cloud_info);
+
+  return cloud_info;
+}
+
+// Loads transaction tablets list to cache.
+class LoadStatusTabletsTask {
  public:
-  PickStatusTabletTask(const YBClientPtr& client,
-                       TransactionTableState* table_state,
-                       PickStatusTabletCallback callback)
-      : client_(client), table_state_(table_state),
-        callback_(std::move(callback)) {
+  LoadStatusTabletsTask(YBClient* client,
+                        TransactionTableState* table_state,
+                        uint64_t version,
+                        PickStatusTabletCallback callback = PickStatusTabletCallback(),
+                        TransactionLocality locality = TransactionLocality::GLOBAL)
+      : client_(client), table_state_(table_state), version_(version), callback_(callback),
+        locality_(locality) {
   }
 
   void Run() {
     // TODO(dtxn) async
-    std::vector<TabletId> tablets;
-    auto status = client_->GetTablets(kTransactionTableName, 0, &tablets, /* ranges */ nullptr);
-    if (!status.ok()) {
-      callback_(status);
+    auto tablets = GetTransactionStatusTablets();
+    if (!tablets.ok()) {
+      YB_LOG_EVERY_N_SECS(ERROR, 1) << "Failed to get tablets of txn status tables: "
+                                    << tablets.status();
+      if (callback_) {
+        callback_(tablets.status());
+      }
       return;
-    }
-    if (tablets.empty()) {
-      callback_(STATUS_FORMAT(IllegalState, "No tablets in table $0", kTransactionTableName));
-      return;
-    }
-    auto expected = TransactionTableStatus::kExists;
-    if (table_state_->status.compare_exchange_strong(
-        expected, TransactionTableStatus::kUpdating, std::memory_order_acq_rel)) {
-      table_state_->tablets = tablets;
-      table_state_->status.store(TransactionTableStatus::kResolved, std::memory_order_release);
     }
 
-    InvokeCallback(table_state_->local_tablet_filter, tablets, callback_);
+    table_state_->UpdateStatusTablets(version_, std::move(*tablets));
+
+    if (callback_) {
+      table_state_->InvokeCallback(callback_, locality_);
+    }
   }
 
   void Done(const Status& status) {
@@ -101,25 +213,31 @@ class PickStatusTabletTask {
       callback_(status);
     }
     callback_ = PickStatusTabletCallback();
-    client_.reset();
+    client_ = nullptr;
   }
 
  private:
+  Result<TransactionStatusTablets> GetTransactionStatusTablets() {
+    return client_->GetTransactionStatusTablets(GetPlacementFromGFlags());
+  }
 
-  YBClientPtr client_;
+  YBClient* client_;
   TransactionTableState* table_state_;
+  uint64_t version_;
   PickStatusTabletCallback callback_;
+  TransactionLocality locality_;
 };
 
 class InvokeCallbackTask {
  public:
   InvokeCallbackTask(TransactionTableState* table_state,
-                     PickStatusTabletCallback callback)
-      : table_state_(table_state), callback_(std::move(callback)) {
+                     PickStatusTabletCallback callback,
+                     TransactionLocality locality)
+      : table_state_(table_state), callback_(std::move(callback)), locality_(locality) {
   }
 
   void Run() {
-    InvokeCallback(table_state_->local_tablet_filter, table_state_->tablets, callback_);
+    table_state_->InvokeCallback(callback_, locality_);
   }
 
   void Done(const Status& status) {
@@ -132,38 +250,73 @@ class InvokeCallbackTask {
  private:
   TransactionTableState* table_state_;
   PickStatusTabletCallback callback_;
+  TransactionLocality locality_;
 };
-
-constexpr size_t kQueueLimit = 150;
-constexpr size_t kMaxWorkers = 50;
-
 } // namespace
 
 class TransactionManager::Impl {
  public:
-  explicit Impl(const YBClientPtr& client, const scoped_refptr<ClockBase>& clock,
+  explicit Impl(YBClient* client, const scoped_refptr<ClockBase>& clock,
                 LocalTabletFilter local_tablet_filter)
       : client_(client),
         clock_(clock),
         table_state_{std::move(local_tablet_filter)},
-        thread_pool_("TransactionManager", kQueueLimit, kMaxWorkers),
-        tasks_pool_(kQueueLimit),
-        invoke_callback_tasks_(kQueueLimit) {
+        thread_pool_(rpc::ThreadPoolOptions {
+          .name = "TransactionManager",
+          .max_workers = FLAGS_transaction_manager_workers_limit,
+        }),
+        tasks_pool_(FLAGS_transaction_manager_queue_limit),
+        invoke_callback_tasks_(FLAGS_transaction_manager_queue_limit) {
     CHECK(clock);
   }
 
-  void PickStatusTablet(PickStatusTabletCallback callback) {
-    if (table_state_.status.load(std::memory_order_acquire) == TransactionTableStatus::kResolved) {
-      if (ThreadRestrictions::IsWaitAllowed()) {
-        InvokeCallback(table_state_.local_tablet_filter, table_state_.tablets, callback);
-      } else if (!invoke_callback_tasks_.Enqueue(&thread_pool_, &table_state_, callback)) {
-        callback(STATUS_FORMAT(ServiceUnavailable,
-                              "Invoke callback queue overflow, number of tasks: $0",
-                              invoke_callback_tasks_.size()));
+  ~Impl() {
+    Shutdown();
+  }
+
+  void UpdateTransactionTablesVersion(
+      uint64_t version, UpdateTransactionTablesVersionCallback callback) {
+    if (table_state_.GetStatusTabletsVersion() >= version) {
+      if (callback) {
+        callback(Status::OK());
       }
       return;
     }
-    if (!tasks_pool_.Enqueue(&thread_pool_, client_, &table_state_, std::move(callback))) {
+
+    PickStatusTabletCallback cb;
+    if (callback) {
+      cb = [callback](const Result<std::string>& result) {
+        return callback(ResultToStatus(result));
+      };
+    }
+
+    if (!tasks_pool_.Enqueue(&thread_pool_, client_, &table_state_, version, std::move(cb))) {
+      YB_LOG_EVERY_N_SECS(ERROR, 1) << "Update tasks overflow, number of tasks: "
+                                    << tasks_pool_.size();
+      if (callback) {
+        callback(STATUS_FORMAT(ServiceUnavailable,
+                               "Update tasks queue overflow, number of tasks: $0",
+                               tasks_pool_.size()));
+      }
+    }
+  }
+
+  void PickStatusTablet(PickStatusTabletCallback callback, TransactionLocality locality) {
+    if (table_state_.IsInitialized()) {
+      if (ThreadRestrictions::IsWaitAllowed()) {
+        table_state_.InvokeCallback(callback, locality);
+      } else if (!invoke_callback_tasks_.Enqueue(
+            &thread_pool_, &table_state_, callback, locality)) {
+        callback(STATUS_FORMAT(ServiceUnavailable,
+                               "Invoke callback queue overflow, number of tasks: $0",
+                               invoke_callback_tasks_.size()));
+      }
+      return;
+    }
+
+    if (!tasks_pool_.Enqueue(
+        &thread_pool_, client_, &table_state_, 0 /* version */, callback,
+        locality)) {
       callback(STATUS_FORMAT(ServiceUnavailable, "Tasks overflow, exists: $0", tasks_pool_.size()));
     }
   }
@@ -172,7 +325,7 @@ class TransactionManager::Impl {
     return clock_;
   }
 
-  const YBClientPtr& client() const {
+  YBClient* client() const {
     return client_;
   }
 
@@ -197,31 +350,44 @@ class TransactionManager::Impl {
     thread_pool_.Shutdown();
   }
 
+  bool PlacementLocalTransactionsPossible() {
+    return table_state_.HasAnyPlacementLocalStatusTablets();
+  }
+
+  uint64_t GetLoadedStatusTabletsVersion() {
+    return table_state_.GetStatusTabletsVersion();
+  }
+
  private:
-  YBClientPtr client_;
+  YBClient* const client_;
   scoped_refptr<ClockBase> clock_;
   TransactionTableState table_state_;
   std::atomic<bool> closed_{false};
+
   yb::rpc::ThreadPool thread_pool_; // TODO async operations instead of pool
-  yb::rpc::TasksPool<PickStatusTabletTask> tasks_pool_;
+  yb::rpc::TasksPool<LoadStatusTabletsTask> tasks_pool_;
   yb::rpc::TasksPool<InvokeCallbackTask> invoke_callback_tasks_;
   yb::rpc::Rpcs rpcs_;
 };
 
 TransactionManager::TransactionManager(
-    const YBClientPtr& client, const scoped_refptr<ClockBase>& clock,
+    YBClient* client, const scoped_refptr<ClockBase>& clock,
     LocalTabletFilter local_tablet_filter)
     : impl_(new Impl(client, clock, std::move(local_tablet_filter))) {}
 
-TransactionManager::~TransactionManager() {
-  impl_->Shutdown();
+TransactionManager::~TransactionManager() = default;
+
+void TransactionManager::UpdateTransactionTablesVersion(
+    uint64_t version, UpdateTransactionTablesVersionCallback callback) {
+  impl_->UpdateTransactionTablesVersion(version, std::move(callback));
 }
 
-void TransactionManager::PickStatusTablet(PickStatusTabletCallback callback) {
-  impl_->PickStatusTablet(std::move(callback));
+void TransactionManager::PickStatusTablet(
+    PickStatusTabletCallback callback, TransactionLocality locality) {
+  impl_->PickStatusTablet(std::move(callback), locality);
 }
 
-const YBClientPtr& TransactionManager::client() const {
+YBClient* TransactionManager::client() const {
   return impl_->client();
 }
 
@@ -244,6 +410,21 @@ HybridTimeRange TransactionManager::NowRange() const {
 void TransactionManager::UpdateClock(HybridTime time) {
   impl_->UpdateClock(time);
 }
+
+bool TransactionManager::PlacementLocalTransactionsPossible() {
+  return impl_->PlacementLocalTransactionsPossible();
+}
+
+uint64_t TransactionManager::GetLoadedStatusTabletsVersion() {
+  return impl_->GetLoadedStatusTabletsVersion();
+}
+
+void TransactionManager::Shutdown() {
+  impl_->Shutdown();
+}
+
+TransactionManager::TransactionManager(TransactionManager&& rhs) = default;
+TransactionManager& TransactionManager::operator=(TransactionManager&& rhs) = default;
 
 } // namespace client
 } // namespace yb

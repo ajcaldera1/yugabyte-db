@@ -23,6 +23,16 @@
 /* If you change these, update backend/utils/misc/postgresql.sample.conf */
 #define DEFAULT_SEQ_PAGE_COST  1.0
 #define DEFAULT_RANDOM_PAGE_COST  4.0
+
+#define YB_DEFAULT_INTERCLOUD_COST 10.0
+#define	YB_DEFAULT_INTERREGION_COST 10.0
+#define	YB_DEFAULT_INTERZONE_COST 9.5
+#define YB_DEFAULT_LOCAL_COST 9.4
+
+#define YB_DEFAULT_PER_TUPLE_COST 10.0
+
+#define YB_DEFAULT_FETCH_COST 4.0
+
 #define DEFAULT_CPU_TUPLE_COST	0.01
 #define DEFAULT_CPU_INDEX_TUPLE_COST 0.005
 #define DEFAULT_CPU_OPERATOR_COST  0.0025
@@ -30,6 +40,41 @@
 #define DEFAULT_PARALLEL_SETUP_COST  1000.0
 
 #define DEFAULT_EFFECTIVE_CACHE_SIZE  524288	/* measured in pages */
+
+#define YB_DEFAULT_DOCDB_BLOCK_SIZE 32768
+
+/* LSM Lookup costs */
+#define YB_DEFAULT_DOCDB_NEXT_CPU_CYCLES 50
+#define YB_DEFAULT_SEEK_COST_FACTOR 50
+#define YB_DEFAULT_BACKWARD_SEEK_COST_FACTOR 10
+
+/* DocDB row decode and process cost */
+#define YB_DEFAULT_DOCDB_MERGE_CPU_CYCLES 50
+
+/* DocDB storage filter cost */
+#define YB_DEFAULT_DOCDB_REMOTE_FILTER_OVERHEAD_CYCLES 20
+
+/* Network transfer cost */
+#define YB_DEFAULT_LOCAL_LATENCY_COST 180.0
+#define YB_DEFAULT_LOCAL_THROUGHPUT_COST 80000.0
+
+/*
+ * TODO : Since we cannot currently estimate the number of key value pairs per
+ * tuple, we use a constant heuristic value of 3.
+ */
+#define YB_DEFAULT_NUM_KEY_VALUE_PAIRS_PER_TUPLE 3
+/*
+ * TODO : Since we cannot currently estimate the number of SST files per
+ * table, we use a constant heuristic value of 3.
+ */
+#define YB_DEFAULT_NUM_SST_FILES_PER_TABLE 3
+
+/*
+ * TODO : To avoid expensive seek for a key, DocDB performs a series of nexts
+ * in hope to find the key among the following tuples. This configurable
+ * parameter should be exposed in PG code to be used here.
+ */
+#define MAX_NEXTS_TO_AVOID_SEEK 2
 
 typedef enum
 {
@@ -47,6 +92,22 @@ typedef enum
 /* parameter variables and flags */
 extern PGDLLIMPORT double seq_page_cost;
 extern PGDLLIMPORT double random_page_cost;
+
+extern PGDLLIMPORT double yb_network_fetch_cost;
+extern PGDLLIMPORT double yb_intercloud_cost;
+extern PGDLLIMPORT double yb_interregion_cost;
+extern PGDLLIMPORT double yb_interzone_cost;
+extern PGDLLIMPORT double yb_local_cost;
+
+extern PGDLLIMPORT double yb_seq_block_cost;
+extern PGDLLIMPORT double yb_random_block_cost;
+extern PGDLLIMPORT int yb_docdb_merge_cpu_cycles;
+extern PGDLLIMPORT int yb_docdb_remote_filter_overhead_cycles;
+extern PGDLLIMPORT double yb_docdb_next_cpu_cycles;
+extern PGDLLIMPORT double yb_local_latency_cost;
+extern PGDLLIMPORT double yb_local_throughput_cost;
+extern PGDLLIMPORT double yb_seek_cost_factor;
+
 extern PGDLLIMPORT double cpu_tuple_cost;
 extern PGDLLIMPORT double cpu_index_tuple_cost;
 extern PGDLLIMPORT double cpu_operator_cost;
@@ -59,6 +120,7 @@ extern PGDLLIMPORT bool enable_seqscan;
 extern PGDLLIMPORT bool enable_indexscan;
 extern PGDLLIMPORT bool enable_indexonlyscan;
 extern PGDLLIMPORT bool enable_bitmapscan;
+extern PGDLLIMPORT bool yb_enable_bitmapscan;
 extern PGDLLIMPORT bool enable_tidscan;
 extern PGDLLIMPORT bool enable_sort;
 extern PGDLLIMPORT bool enable_hashagg;
@@ -73,22 +135,41 @@ extern PGDLLIMPORT bool enable_parallel_append;
 extern PGDLLIMPORT bool enable_parallel_hash;
 extern PGDLLIMPORT bool enable_partition_pruning;
 extern PGDLLIMPORT int constraint_exclusion;
+extern PGDLLIMPORT bool yb_enable_geolocation_costing;
+
+/*
+ * If true, we will always prefer batched nested loop join plans over nested
+ * loop join plans.
+ */
+extern PGDLLIMPORT bool yb_enable_batchednl;
+extern PGDLLIMPORT bool yb_enable_parallel_append;
 
 extern double clamp_row_est(double nrows);
 extern double index_pages_fetched(double tuples_fetched, BlockNumber pages,
 					double index_pages, PlannerInfo *root);
+extern void yb_cost_seqscan(Path *path, PlannerInfo *root,
+				RelOptInfo *baserel, ParamPathInfo *param_info);
 extern void cost_seqscan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 			 ParamPathInfo *param_info);
 extern void cost_samplescan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 				ParamPathInfo *param_info);
+extern void yb_cost_index(IndexPath *path, PlannerInfo *root,
+		   double loop_count, bool partial_path);
 extern void cost_index(IndexPath *path, PlannerInfo *root,
 		   double loop_count, bool partial_path);
 extern void cost_bitmap_heap_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
 					  ParamPathInfo *param_info,
 					  Path *bitmapqual, double loop_count);
+extern void yb_cost_bitmap_table_scan(Path *path, PlannerInfo *root, RelOptInfo *baserel,
+					  ParamPathInfo *param_info,
+					  Path *bitmapqual, double loop_count);
 extern void cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root);
+extern void yb_cost_bitmap_and_node(BitmapAndPath *path, PlannerInfo *root);
 extern void cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root);
+extern void yb_cost_bitmap_or_node(BitmapOrPath *path, PlannerInfo *root);
 extern void cost_bitmap_tree_node(Path *path, Cost *cost, Selectivity *selec);
+extern void yb_cost_bitmap_tree_node(Path *path, Cost *cost, Selectivity *selec,
+					  int *ybctid_width);
 extern void cost_tidscan(Path *path, PlannerInfo *root,
 			 RelOptInfo *baserel, List *tidquals, ParamPathInfo *param_info);
 extern void cost_subqueryscan(SubqueryScanPath *path, PlannerInfo *root,

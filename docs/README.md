@@ -1,7 +1,5 @@
-# YugaByteDB Docs
+# YugabyteDB Documentation
 
-The documents in this repo are meant for:
-- committers and contributors working on the codebase
-- folks interested in learning how YugaByte works under the hood in great detail
+The `docs` folder contains everything you need to build the [YugabyteDB documentation site](https://docs.yugabyte.com/).
 
-If you are interested in using YugaByteDB, please check the [docs on our website](https://docs.yugabyte.com/).
+If you'd like to contribute to the YugabyteDB docs, you'll find everything you need in the [Contribute to the documentation](https://docs.yugabyte.com/preview/contribute/docs/) page.

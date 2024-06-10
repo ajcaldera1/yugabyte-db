@@ -15,19 +15,23 @@
 // This module is to define CQL processor. Each processor will be handling one and only one request
 // at a time. As a result all processing code in this module and the modules that it is calling
 // does not need to be thread safe.
+// Notably, this does NOT apply to Reschedule implementation methods, which are called from
+// different ExecContexts, so non-thread-safe fields should not be referenced there.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_CQLSERVER_CQL_PROCESSOR_H_
-#define YB_YQL_CQL_CQLSERVER_CQL_PROCESSOR_H_
+#pragma once
+
+#include <memory>
 
 #include "yb/rpc/service_if.h"
 
-#include "yb/yql/cql/cqlserver/cql_message.h"
+#include "yb/yql/cql/cqlserver/cqlserver_fwd.h"
 #include "yb/yql/cql/cqlserver/cql_rpc.h"
 #include "yb/yql/cql/cqlserver/cql_statement.h"
 
 #include "yb/yql/cql/ql/ql_processor.h"
 #include "yb/yql/cql/ql/statement.h"
+#include "yb/yql/cql/ql/util/cql_message.h"
 
 namespace yb {
 namespace cqlserver {
@@ -50,13 +54,12 @@ class CQLMetrics : public ql::QLMetrics {
 
   scoped_refptr<AtomicGauge<int64_t>> cql_processors_alive_;
   scoped_refptr<Counter> cql_processors_created_;
+
+  scoped_refptr<AtomicGauge<int64_t>> parsers_alive_;
+  scoped_refptr<Counter> parsers_created_;
 };
 
-
 // A list of CQL processors and position in the list.
-class CQLProcessor;
-using CQLProcessorList = std::list<std::unique_ptr<CQLProcessor>>;
-using CQLProcessorListPos = CQLProcessorList::iterator;
 
 class CQLProcessor : public ql::QLProcessor {
  public:
@@ -67,37 +70,69 @@ class CQLProcessor : public ql::QLProcessor {
   // Processing an inbound call.
   void ProcessCall(rpc::InboundCallPtr call);
 
+  // Release the processor back to the CQLServiceImpl.
+  void Release();
+
+  void Shutdown();
+
  protected:
   bool NeedReschedule() override;
   void Reschedule(rpc::ThreadPoolTask* task) override;
+  CoarseTimePoint GetDeadline() const override;
 
  private:
+  bool CheckAuthentication(const ql::CQLRequest& req) const;
+
   // Process a CQL request.
-  CQLResponse* ProcessRequest(const CQLRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::CQLRequest& req);
 
   // Process specific CQL requests.
-  CQLResponse* ProcessRequest(const OptionsRequest& req);
-  CQLResponse* ProcessRequest(const StartupRequest& req);
-  CQLResponse* ProcessRequest(const PrepareRequest& req);
-  CQLResponse* ProcessRequest(const ExecuteRequest& req);
-  CQLResponse* ProcessRequest(const QueryRequest& req);
-  CQLResponse* ProcessRequest(const BatchRequest& req);
-  CQLResponse* ProcessRequest(const AuthResponseRequest& req);
-  CQLResponse* ProcessRequest(const RegisterRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::OptionsRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::StartupRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::PrepareRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::ExecuteRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::QueryRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::BatchRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::AuthResponseRequest& req);
+  std::unique_ptr<ql::CQLResponse> ProcessRequest(const ql::RegisterRequest& req);
 
   // Get a prepared statement and adds it to the set of statements currently being executed.
-  std::shared_ptr<const CQLStatement> GetPreparedStatement(const CQLMessage::QueryId& id);
+  Result<std::shared_ptr<const CQLStatement>> GetPreparedStatement(
+      const ql::CQLMessage::QueryId& id, SchemaVersion version);
 
   // Statement executed callback.
   void StatementExecuted(const Status& s, const ql::ExecutedResult::SharedPtr& result = nullptr);
 
   // Process statement execution result and error.
-  CQLResponse* ProcessResult(const ql::ExecutedResult::SharedPtr& result);
-  CQLResponse* ProcessError(const Status& s,
-                            boost::optional<CQLMessage::QueryId> query_id = boost::none);
+  std::unique_ptr<ql::CQLResponse> ProcessResult(const ql::ExecutedResult::SharedPtr& result);
+  std::unique_ptr<ql::CQLResponse> ProcessAuthResult(const std::string& saved_hash, bool can_login);
+  std::unique_ptr<ql::CQLResponse> ProcessError(
+      const Status& s,
+      boost::optional<ql::CQLMessage::QueryId> query_id = boost::none);
 
   // Send response back to client.
-  void SendResponse(const CQLResponse& response);
+  void PrepareAndSendResponse(const std::unique_ptr<ql::CQLResponse>& response);
+  void SendResponse(const ql::CQLResponse& response);
+
+  void UpdateAshQueryId(const ql::CQLMessage::QueryId& query_id);
+
+  ql::CQLMessage::QueryId GetPrepQueryId() const {
+    return request_ && request_->opcode() == ql::CQLMessage::Opcode::EXECUTE
+        ? static_cast<const ql::ExecuteRequest&>(*request_).query_id() : "";
+  }
+
+  ql::CQLMessage::QueryId GetUnprepQueryId() const {
+    return request_ && request_->opcode() == ql::CQLMessage::Opcode::QUERY
+        ? CQLStatement::GetQueryId(ql_env_.CurrentKeyspace(),
+                                   static_cast<const ql::QueryRequest&>(*request_).query()) : "";
+  }
+
+  const std::unordered_map<std::string, std::vector<std::string>> kSupportedOptions = {
+      {ql::CQLMessage::kCQLVersionOption,
+          {"3.0.0" /* minimum */, "3.4.2" /* current */}},
+      {ql::CQLMessage::kCompressionOption,
+          {ql::CQLMessage::kLZ4Compression, ql::CQLMessage::kSnappyCompression}}
+  };
 
   // Pointer to the containing CQL service implementation.
   CQLServiceImpl* const service_impl_;
@@ -112,7 +147,7 @@ class CQLProcessor : public ql::QLProcessor {
 
   // Current call, request, prepared statements and parse trees being processed.
   CQLInboundCallPtr call_;
-  std::shared_ptr<const CQLRequest> request_;
+  std::shared_ptr<const ql::CQLRequest> request_;
   std::unordered_set<std::shared_ptr<const CQLStatement>> stmts_;
   std::unordered_set<ql::ParseTree::UniPtr> parse_trees_;
 
@@ -125,6 +160,8 @@ class CQLProcessor : public ql::QLProcessor {
 
   // Statement executed callback.
   ql::StatementExecutedCallback statement_executed_cb_;
+
+  ScopedTrackedConsumption consumption_;
 
   //----------------------------------------------------------------------------------------------
 
@@ -141,7 +178,7 @@ class CQLProcessor : public ql::QLProcessor {
     void Run() override {
       auto processor = processor_;
       processor_ = nullptr;
-      std::unique_ptr<CQLResponse> response(processor->ProcessRequest(*processor->request_));
+      std::unique_ptr<ql::CQLResponse> response(processor->ProcessRequest(*processor->request_));
       if (response != nullptr) {
         processor->SendResponse(*response);
       }
@@ -159,5 +196,3 @@ class CQLProcessor : public ql::QLProcessor {
 
 }  // namespace cqlserver
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_CQLSERVER_CQL_PROCESSOR_H_

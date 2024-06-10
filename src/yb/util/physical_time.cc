@@ -21,19 +21,21 @@
 
 #include "yb/util/atomic.h"
 #include "yb/util/errno.h"
-#include "yb/util/flag_tags.h"
+#include "yb/util/flags.h"
+#include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
-DEFINE_uint64(max_clock_sync_error_usec, 10 * 1000 * 1000,
-              "Maximum allowed clock synchronization error as reported by NTP "
-              "before the server will abort.");
-DEFINE_bool(disable_clock_sync_error, true,
+DEFINE_RUNTIME_uint64(max_clock_sync_error_usec, 10 * 1000 * 1000,
+    "Maximum allowed clock synchronization error as reported by NTP "
+    "before the server will abort.");
+TAG_FLAG(max_clock_sync_error_usec, advanced);
+DEFINE_UNKNOWN_bool(disable_clock_sync_error, true,
             "Whether or not we should keep running if we detect a clock synchronization issue.");
 TAG_FLAG(disable_clock_sync_error, advanced);
-TAG_FLAG(max_clock_sync_error_usec, advanced);
-TAG_FLAG(max_clock_sync_error_usec, runtime);
 
-DEFINE_uint64(max_clock_skew_usec, 50000,
+DEFINE_UNKNOWN_uint64(max_clock_skew_usec, 500 * 1000,
               "Transaction read clock skew in usec. "
               "This is the maximum allowed time delta between servers of a single cluster.");
 
@@ -64,7 +66,7 @@ class WallClockImpl : public PhysicalClock {
 
 #if !defined(__APPLE__)
 
-CHECKED_STATUS CallAdjTime(timex* tx) {
+Status CallAdjTime(timex* tx) {
   // Set mode to 0 to query the current time.
   tx->modes = 0;
   int rc = ntp_adjtime(tx);
@@ -119,6 +121,10 @@ class AdjTimeClockImpl : public PhysicalClock {
 
 } // namespace
 
+std::string PhysicalTime::ToString() const {
+  return YB_STRUCT_TO_STRING(time_point, max_error);
+}
+
 const PhysicalClockPtr& WallClock() {
   static PhysicalClockPtr instance = std::make_shared<WallClockImpl>();
   return instance;
@@ -132,11 +138,11 @@ const PhysicalClockPtr& AdjTimeClock() {
 #endif
 
 Result<PhysicalTime> MockClock::Now() {
-  return CheckClockSyncError(value_.load(std::memory_order_acquire));
+  return CheckClockSyncError(value_.load(boost::memory_order_acquire));
 }
 
 void MockClock::Set(const PhysicalTime& value) {
-  value_.store(value, std::memory_order_release);
+  value_.store(value, boost::memory_order_release);
 }
 
 PhysicalClockPtr MockClock::AsClock() {

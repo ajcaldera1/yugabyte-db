@@ -30,14 +30,12 @@
 // under the License.
 //
 // Utility methods for dealing with file paths.
-#ifndef YB_UTIL_PATH_UTIL_H
-#define YB_UTIL_PATH_UTIL_H
+#pragma once
 
 #include <string>
 
-#include "yb/util/status.h"
-#include "yb/util/env.h"
-
+#include "yb/util/status_fwd.h"
+#include "yb/util/result.h"
 namespace yb {
 
 class Env;
@@ -82,5 +80,17 @@ Status SetupRootDir(
 // environment variable.
 Status CheckODirectTempFileCreationInDir(Env* env, const std::string& dir_path);
 
+namespace path_utils {
+// Return the path of a yb-tool.
+Result<std::string> GetToolPath(const std::string& rel_path, const std::string& tool_name);
+
+inline Result<std::string> GetToolPath(const std::string& tool_name) {
+  return GetToolPath("../bin", tool_name);
+}
+
+inline Result<std::string> GetPgToolPath(const std::string& tool_name) {
+  return GetToolPath("../postgres/bin", tool_name);
+}
+
+}  // namespace path_utils
 } // namespace yb
-#endif /* YB_UTIL_PATH_UTIL_H */

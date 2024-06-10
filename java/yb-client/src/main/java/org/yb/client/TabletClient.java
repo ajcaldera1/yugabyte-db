@@ -42,36 +42,30 @@
 package org.yb.client;
 
 import com.stumbleupon.async.Deferred;
-
-import org.jboss.netty.channel.ConnectTimeoutException;
-import org.jboss.netty.handler.timeout.ReadTimeoutException;
-import org.yb.WireProtocol;
-import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
-import org.yb.rpc.RpcHeader;
-import org.yb.tserver.Tserver;
-import org.yb.util.Pair;
-
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.buffer.ChannelBuffers;
-import org.jboss.netty.channel.Channel;
-import org.jboss.netty.channel.ChannelEvent;
-import org.jboss.netty.channel.ChannelFuture;
-import org.jboss.netty.channel.ChannelFutureListener;
-import org.jboss.netty.channel.ChannelHandlerContext;
-import org.jboss.netty.channel.ChannelStateEvent;
-import org.jboss.netty.channel.Channels;
-import org.jboss.netty.channel.ExceptionEvent;
-import org.jboss.netty.handler.codec.replay.ReplayingDecoder;
-import org.jboss.netty.handler.codec.replay.VoidEnum;
+import io.netty.buffer.ByteBuf;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.handler.codec.ReplayingDecoder;
+import io.netty.handler.timeout.ReadTimeoutException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.yb.WireProtocol;
+import org.yb.annotations.InterfaceAudience;
+import org.yb.cdc.CdcService;
+import org.yb.master.MasterTypes;
+import org.yb.rpc.RpcHeader;
+import org.yb.tserver.TserverTypes;
+import org.yb.util.Pair;
 
-import javax.security.sasl.SaslException;
-
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Iterator;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -96,7 +90,7 @@ import java.util.concurrent.atomic.AtomicInteger;
  * channel isn't connected.
  */
 @InterfaceAudience.Private
-public class TabletClient extends ReplayingDecoder<VoidEnum> {
+public class TabletClient extends ReplayingDecoder<Void> {
 
   public static final Logger LOG = LoggerFactory.getLogger(TabletClient.class);
 
@@ -159,14 +153,14 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
       LOG.warn(getPeerUuidLoggingString() + " sending an rpc without a timeout " + rpc);
     }
     if (chan != null) {
-      final ChannelBuffer serialized = encode(rpc);
+      final ByteBuf serialized = encode(rpc);
       if (serialized == null) {  // Error during encoding.
         return;  // Stop here.  RPC has been failed already.
       }
 
       final Channel chan = this.chan;  // Volatile read.
       if (chan != null) {  // Double check if we disconnected during encode().
-        Channels.write(chan, serialized);
+        chan.writeAndFlush(serialized);
         return;
       }
     }
@@ -198,9 +192,9 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
     }
   }
 
-  private <R> ChannelBuffer encode(final YRpc<R> rpc) {
+  private <R> ByteBuf encode(final YRpc<R> rpc) {
     final int rpcid = this.rpcid.incrementAndGet();
-    ChannelBuffer payload;
+    ByteBuf payload;
     final String service = rpc.serviceName();
     final String method = rpc.method();
     try {
@@ -271,19 +265,26 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
 
     final Channel chancopy = chan;
     if (chancopy == null) {
+      LOG.warn("Channel is missing during client shutdown for {}", getPeerUuidLoggingString());
       return Deferred.fromResult(null);
     }
-    if (chancopy.isConnected()) {
-      Channels.disconnect(chancopy);   // ... this is going to set it to null.
-      // At this point, all in-flight RPCs are going to be failed.
-    }
-    if (chancopy.isBound()) {
-      Channels.unbind(chancopy);
+    String hostPort = getHostPort(chan.remoteAddress());
+    LOG.debug("Shutting down channel {}", hostPort);
+    final Deferred<Void> d = new Deferred<Void>();
+    if (chancopy.isActive()) {
+      try {
+        chancopy.disconnect().sync();   // ... this is going to set it to null.
+        // At this point, all in-flight RPCs are going to be failed.
+      } catch (InterruptedException e) {
+        LOG.warn("{} {} - failed to disconnect - interrupted",
+          getPeerUuidLoggingString(), hostPort);
+      }
+    } else {
+      LOG.warn("Channel {} is not active during shutdown", hostPort);
     }
     // It's OK to call close() on a Channel if it's already closed.
-    final ChannelFuture future = Channels.close(chancopy);
+    final ChannelFuture future = chancopy.close();
     // Now wrap the ChannelFuture in a Deferred.
-    final Deferred<Void> d = new Deferred<Void>();
     // Opportunistically check if it's already completed successfully.
     if (future.isSuccess()) {
       d.callback(null);
@@ -296,7 +297,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
             d.callback(null);
             return;
           }
-          final Throwable t = future.getCause();
+          final Throwable t = future.cause();
           if (t instanceof Exception) {
             d.callback(t);
           } else {
@@ -319,17 +320,21 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
    */
   @Override
   @SuppressWarnings("unchecked")
-  protected Object decode(ChannelHandlerContext ctx, Channel chan, ChannelBuffer buf,
-                              VoidEnum voidEnum) {
+  protected void decode(ChannelHandlerContext ctx, ByteBuf buf,
+                        List<Object> list) {
     final long start = System.nanoTime();
     final int rdx = buf.readerIndex();
     LOG.debug("------------------>> ENTERING DECODE >>------------------");
 
     if (buf == null) {
-      return null;
+      return;
     }
 
     CallResponse response = new CallResponse(buf);
+    if (response.isEmpty()) {
+      // Skip empty messages which we are using as heartbeats.
+      return;
+    }
 
     RpcHeader.ResponseHeader header = response.getHeader();
     if (!header.hasCallId()) {
@@ -342,7 +347,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
     final int rpcid = header.getCallId();
 
     @SuppressWarnings("rawtypes")
-    final YRpc rpc = rpcs_inflight.get(rpcid);
+    final YRpc rpc = rpcs_inflight.remove(rpcid);
 
     if (rpc == null) {
       final String msg = getPeerUuidLoggingString() + "Invalid rpcid: " + rpcid + " found in "
@@ -389,42 +394,45 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
           + ", rpc=" + rpc);
     }
 
-    {
-      final YRpc<?> removed = rpcs_inflight.remove(rpcid);
-      if (removed == null) {
-        // The RPC we were decoding was cleaned up already, give up.
-        throw new NonRecoverableException("RPC not found");
-      }
-    }
-
     // This check is specifically for the ERROR_SERVER_TOO_BUSY case above.
     if (retryableHeaderException != null) {
       ybClient.handleRetryableError(rpc, retryableHeaderException, this);
-      return null;
+      return;
     }
 
     // We can get this Message from within the RPC's expected type,
     // so convert it into an exception and nullify decoded so that we use the errback route.
     // Have to do it for both TS and Master errors.
     if (decoded != null) {
-      if (decoded.getSecond() instanceof Tserver.TabletServerErrorPB) {
-        Tserver.TabletServerErrorPB error = (Tserver.TabletServerErrorPB) decoded.getSecond();
+      if (decoded.getSecond() instanceof TserverTypes.TabletServerErrorPB) {
+        TserverTypes.TabletServerErrorPB error =
+            (TserverTypes.TabletServerErrorPB) decoded.getSecond();
         exception = dispatchTSErrorOrReturnException(rpc, error);
         if (exception == null) {
           // It was taken care of.
-          return null;
+          return;
         } else {
           // We're going to errback.
           decoded = null;
         }
-
-      } else if (decoded.getSecond() instanceof Master.MasterErrorPB) {
-        Master.MasterErrorPB error = (Master.MasterErrorPB) decoded.getSecond();
+      } else if (decoded.getSecond() instanceof MasterTypes.MasterErrorPB) {
+        MasterTypes.MasterErrorPB error = (MasterTypes.MasterErrorPB) decoded.getSecond();
         exception = dispatchMasterErrorOrReturnException(rpc, error);
         if (exception == null) {
           // Exception was taken care of.
-          return null;
+          return;
         } else {
+          decoded = null;
+        }
+      }
+      else if (decoded.getSecond() instanceof CdcService.CDCErrorPB) {
+        CdcService.CDCErrorPB error = (CdcService.CDCErrorPB) decoded.getSecond();
+        exception = dispatchCDCErrorOrReturnException(rpc, error);
+        if (exception == null) {
+          // It was taken care of.
+          return;
+        } else {
+          // We're going to errback.
           decoded = null;
         }
       }
@@ -445,7 +453,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
       LOG.debug("------------------<< LEAVING  DECODE <<------------------"
           + " time elapsed: " + ((System.nanoTime() - start) / 1000) + "us");
     }
-    return null;  // Stop processing here.  The Deferred does everything else.
+    return;  // Stop processing here.  The Deferred does everything else.
   }
 
   /**
@@ -456,20 +464,20 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
    * @return An exception if we couldn't dispatch the error, or null.
    */
   private Exception dispatchTSErrorOrReturnException(YRpc rpc,
-                                                     Tserver.TabletServerErrorPB error) {
+                                                     TserverTypes.TabletServerErrorPB error) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     TabletServerErrorException ex = new TabletServerErrorException(uuid, error);
-    if (error.getCode() == Tserver.TabletServerErrorPB.Code.TABLET_NOT_FOUND) {
+    if (error.getCode() == TserverTypes.TabletServerErrorPB.Code.TABLET_NOT_FOUND) {
       ybClient.handleTabletNotFound(rpc, ex, this);
       // we're not calling rpc.callback() so we rely on the client to retry that RPC
     } else if (code == WireProtocol.AppStatusPB.ErrorCode.SERVICE_UNAVAILABLE ||
                code == WireProtocol.AppStatusPB.ErrorCode.LEADER_NOT_READY_TO_SERVE ||
                error.getCode() ==
-                 Tserver.TabletServerErrorPB.Code.LEADER_NOT_READY_CHANGE_CONFIG ||
+                 TserverTypes.TabletServerErrorPB.Code.LEADER_NOT_READY_CHANGE_CONFIG ||
                error.getCode() ==
-                 Tserver.TabletServerErrorPB.Code.LEADER_NOT_READY_TO_STEP_DOWN ||
+                 TserverTypes.TabletServerErrorPB.Code.LEADER_NOT_READY_TO_STEP_DOWN ||
                error.getCode() ==
-                 Tserver.TabletServerErrorPB.Code.LEADER_NOT_READY_TO_SERVE) {
+                 TserverTypes.TabletServerErrorPB.Code.LEADER_NOT_READY_TO_SERVE) {
       ybClient.handleRetryableError(rpc, ex, this);
       // The following error codes are an indication that the tablet isn't a leader, or, in case
       // of LEADER_HAS_NO_LEASE, might no longer be the leader due to failing to replicate a leader
@@ -477,7 +485,42 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
     } else if (code == WireProtocol.AppStatusPB.ErrorCode.LEADER_HAS_NO_LEASE ||
                code == WireProtocol.AppStatusPB.ErrorCode.ILLEGAL_STATE ||
                code == WireProtocol.AppStatusPB.ErrorCode.ABORTED ||
-               error.getCode() == Tserver.TabletServerErrorPB.Code.NOT_THE_LEADER) {
+               error.getCode() == TserverTypes.TabletServerErrorPB.Code.NOT_THE_LEADER) {
+      ybClient.handleNotLeader(rpc, ex, this);
+    } else {
+      return ex;
+    }
+    return null;
+  }
+
+  private Exception dispatchCDCErrorOrReturnException(YRpc rpc,
+                                                     CdcService.CDCErrorPB error) {
+    WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
+    CDCErrorException ex = new CDCErrorException(uuid, error);
+    if (error.getCode() == CdcService.CDCErrorPB.Code.TABLET_NOT_RUNNING ||
+      error.getCode() == CdcService.CDCErrorPB.Code.LEADER_NOT_READY ||
+      error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER ||
+      error.getCode() == CdcService.CDCErrorPB.Code.NOT_RUNNING) {
+      // rpc.deadlineTracker.reset();
+      ybClient.handleNotLeader(rpc, ex, this);
+      // we're not calling rpc.callback() so we rely on the client to retry that RPC
+    } else if (code == WireProtocol.AppStatusPB.ErrorCode.SERVICE_UNAVAILABLE ||
+      code == WireProtocol.AppStatusPB.ErrorCode.IO_ERROR ||
+      code == WireProtocol.AppStatusPB.ErrorCode.LEADER_NOT_READY_TO_SERVE ||
+      code == WireProtocol.AppStatusPB.ErrorCode.TIMED_OUT) {
+      ybClient.handleRetryableError(rpc, ex, this);
+      // The following error codes are an indication that the tablet isn't a leader, or, in case
+      // of LEADER_HAS_NO_LEASE, might no longer be the leader due to failing to replicate a leader
+      // lease, so we retry looking up the leader anyway.
+    }
+    else if (error.getCode() == CdcService.CDCErrorPB.Code.TABLET_NOT_FOUND ||
+      code == WireProtocol.AppStatusPB.ErrorCode.NOT_FOUND) {
+      ybClient.handleTabletNotFound(rpc, ex, this);
+    }
+    else if (code == WireProtocol.AppStatusPB.ErrorCode.LEADER_HAS_NO_LEASE ||
+      code == WireProtocol.AppStatusPB.ErrorCode.ILLEGAL_STATE ||
+      code == WireProtocol.AppStatusPB.ErrorCode.ABORTED ||
+      error.getCode() == CdcService.CDCErrorPB.Code.NOT_LEADER) {
       ybClient.handleNotLeader(rpc, ex, this);
     } else {
       return ex;
@@ -493,13 +536,13 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
    * @return An exception if we couldn't dispatch the error, or null.
    */
   private Exception dispatchMasterErrorOrReturnException(YRpc rpc,
-                                                         Master.MasterErrorPB error) {
+                                                         MasterTypes.MasterErrorPB error) {
     WireProtocol.AppStatusPB.ErrorCode code = error.getStatus().getCode();
     MasterErrorException ex = new MasterErrorException(uuid, error);
-    if (error.getCode() == Master.MasterErrorPB.Code.NOT_THE_LEADER) {
+    if (error.getCode() == MasterTypes.MasterErrorPB.Code.NOT_THE_LEADER) {
       ybClient.handleNotLeader(rpc, ex, this);
-    } else if (error.getCode() == Master.MasterErrorPB.Code.CATALOG_MANAGER_NOT_INITIALIZED ||
-               error.getCode() == Master.MasterErrorPB.Code.CAN_RETRY_LOAD_BALANCE_CHECK) {
+    } else if (error.getCode() == MasterTypes.MasterErrorPB.Code.CATALOG_MANAGER_NOT_INITIALIZED ||
+               error.getCode() == MasterTypes.MasterErrorPB.Code.CAN_RETRY_LOAD_BALANCE_CHECK) {
       ybClient.handleRetryableError(rpc, ex, this);
     } else if (code == WireProtocol.AppStatusPB.ErrorCode.SERVICE_UNAVAILABLE &&
         (!(rpc instanceof GetMasterRegistrationRequest))) {
@@ -519,33 +562,30 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
    * disconnected.  The buffer for that channel is passed to this method in
    * case there's anything left in it.
    * @param ctx Unused.
-   * @param chan The channel on which the response came.
    * @param buf The buffer containing the raw RPC response.
-   * @return {@code null}, always.
+   * @param out output objects list.
+   *
    */
   @Override
-  protected Object decodeLast(final ChannelHandlerContext ctx,
-                              final Channel chan,
-                              final ChannelBuffer buf,
-                              final VoidEnum unused) {
+  protected void decodeLast(final ChannelHandlerContext ctx,
+                            final ByteBuf buf,
+                            final List<Object> out) {
     // When we disconnect, decodeLast is called instead of decode.
     // We simply check whether there's any data left in the buffer, in which
     // case we attempt to process it.  But if there's no data left, then we
     // don't even bother calling decode() as it'll complain that the buffer
     // doesn't contain enough data, which unnecessarily pollutes the logs.
-    if (buf.readable()) {
+    if (buf.isReadable()) {
       try {
-        return decode(ctx, chan, buf, unused);
+        decode(ctx, buf, out);
       } finally {
-        if (buf.readable()) {
+        if (buf.isReadable()) {
           LOG.error(getPeerUuidLoggingString() + "After decoding the last message on " + chan
               + ", there was still some undecoded bytes in the channel's"
               + " buffer (which are going to be lost): "
               + buf + '=' + Bytes.pretty(buf));
         }
       }
-    } else {
-      return null;
     }
   }
 
@@ -579,48 +619,30 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
    * @param buf Buffer to check.
    * @param nbytes Number of bytes desired.
    */
-  static void ensureReadable(final ChannelBuffer buf, final int nbytes) {
+  static void ensureReadable(final ByteBuf buf, final int nbytes) {
     buf.markReaderIndex();
     buf.skipBytes(nbytes); // can puke with Throwable
     buf.resetReaderIndex();
   }
 
   @Override
-  public void channelConnected(final ChannelHandlerContext ctx,
-                               final ChannelStateEvent e) {
-    final Channel chan = e.getChannel();
-    ChannelBuffer header = connectionHeaderPreamble();
+  public void channelActive(final ChannelHandlerContext ctx) {
+    final Channel chan = ctx.channel();
+    ByteBuf header = connectionHeaderPreamble();
     header.writerIndex(RPC_HEADER.length);
-    Channels.write(chan, header);
+    chan.writeAndFlush(header);
     becomeReady(chan);
   }
 
   @Override
-  public void handleUpstream(final ChannelHandlerContext ctx,
-                             final ChannelEvent e) throws Exception {
-    if (LOG.isDebugEnabled()) {
-      LOG.debug(getPeerUuidLoggingString() + e.toString());
-    }
-    super.handleUpstream(ctx, e);
+  public void channelInactive(ChannelHandlerContext ctx) throws Exception {
+    super.channelInactive(ctx);
+    doCleanup(ctx.channel());
   }
 
-  @Override
-  public void channelDisconnected(final ChannelHandlerContext ctx,
-                                  final ChannelStateEvent e) throws Exception {
+  public void doCleanup(Channel channel) {
     chan = null;
-    super.channelDisconnected(ctx, e);  // Let the ReplayingDecoder cleanup.
-    cleanup(e.getChannel());
-  }
-
-  @Override
-  public void channelClosed(final ChannelHandlerContext ctx,
-                            final ChannelStateEvent e) {
-    chan = null;
-    // No need to call super.channelClosed() because we already called
-    // super.channelDisconnected().  If we get here without getting a
-    // DISCONNECTED event, then we were never connected in the first place so
-    // the ReplayingDecoder has nothing to cleanup.
-    cleanup(e.getChannel());
+    cleanup(channel);
   }
 
   /**
@@ -678,34 +700,34 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
   }
 
 
+
   @Override
   public void exceptionCaught(final ChannelHandlerContext ctx,
-                              final ExceptionEvent event) {
-    final Throwable e = event.getCause();
-    final Channel c = event.getChannel();
+                              final Throwable cause) {
+    final Channel c = ctx.channel();
 
-    if (e instanceof RejectedExecutionException) {
+    if (cause instanceof RejectedExecutionException) {
       LOG.warn(getPeerUuidLoggingString() + "RPC rejected by the executor," +
-               " ignore this if we're shutting down", e);
-    } else if (e instanceof ReadTimeoutException) {
+               " ignore this if we're shutting down", cause);
+    } else if (cause instanceof ReadTimeoutException) {
       LOG.debug(getPeerUuidLoggingString() + "Encountered a read timeout");
       // Doing the cleanup here since we want to invalidate all the RPCs right _now_, and not let
       // the ReplayingDecoder continue decoding through Channels.close() below.
       cleanup(c);
     } else {
-      LOG.debug(getPeerUuidLoggingString() + "Unexpected exception " + e.getMessage() +
-                " from downstream on " + c, e);
+      LOG.debug(getPeerUuidLoggingString() + "Unexpected exception " + cause.getMessage() +
+                " from downstream on " + c, cause);
     }
     if (c.isOpen()) {
-      Channels.close(c);  // Will trigger channelClosed(), which will cleanup()
+      c.close();          // Will trigger channelClosed(), which will cleanup()
     } else {              // else: presumably a connection timeout.
       cleanup(c);         // => need to cleanup() from here directly.
     }
   }
 
 
-  private ChannelBuffer connectionHeaderPreamble() {
-    return ChannelBuffers.wrappedBuffer(RPC_HEADER);
+  private ByteBuf connectionHeaderPreamble() {
+    return Unpooled.wrappedBuffer(RPC_HEADER);
   }
 
   public void becomeReady(Channel chan) {
@@ -715,7 +737,7 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
 
   /**
    * Sends the queued RPCs to the server, once we're connected to it.
-   * This gets called after {@link #channelConnected}, once we were able to
+   * This gets called after {@link #channelActive(ChannelHandlerContext)}, once we were able to
    * handshake with the server
    */
   private void sendQueuedRpcs() {
@@ -762,6 +784,17 @@ public class TabletClient extends ReplayingDecoder<VoidEnum> {
         .append(rpcs_inflight.size())       // ~ 2
         .append(')');                       // = 1
     return buf.toString();
+  }
+
+  public static String getHostPort(SocketAddress remoteAddress) {
+    if (remoteAddress == null) {
+      return null;
+    }
+    if (!(remoteAddress instanceof InetSocketAddress)) {
+      return "Unknown address type " + remoteAddress.getClass().getSimpleName();
+    }
+    InetSocketAddress inetSocketAddress = (InetSocketAddress) remoteAddress;
+    return  inetSocketAddress.getAddress().getHostAddress() + ":" + inetSocketAddress.getPort();
   }
 
 }

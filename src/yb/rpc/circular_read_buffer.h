@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_RPC_CIRCULAR_READ_BUFFER_H
-#define YB_RPC_CIRCULAR_READ_BUFFER_H
+#pragma once
 
 #include "yb/rpc/stream.h"
 
@@ -41,6 +40,7 @@ class CircularReadBuffer : public StreamReadBuffer {
   IoVecs AppendedVecs() override;
   bool Full() override;
   void Consume(size_t count, const Slice& prepend) override;
+  size_t DataAvailable() override;
 
  private:
   ScopedTrackedConsumption consumption_;
@@ -54,5 +54,3 @@ class CircularReadBuffer : public StreamReadBuffer {
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_CIRCULAR_READ_BUFFER_H

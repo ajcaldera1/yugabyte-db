@@ -33,12 +33,18 @@ package org.yb.client;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import static org.yb.master.Master.*;
-
+import io.netty.buffer.ByteBuf;
+import org.yb.IndexInfo;
 import org.yb.Schema;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
+
+import java.util.List;
+
+import static org.yb.master.MasterDdlOuterClass.GetTableSchemaRequestPB;
+import static org.yb.master.MasterDdlOuterClass.GetTableSchemaResponsePB;
+import static org.yb.master.MasterTypes.NamespaceIdentifierPB;
+import static org.yb.master.MasterTypes.TableIdentifierPB;
 
 /**
  * RPC to fetch a table's schema
@@ -62,7 +68,7 @@ public class GetTableSchemaRequest extends YRpc<GetTableSchemaResponse> {
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     assert name != null || uuid != null;
     final GetTableSchemaRequestPB.Builder builder = GetTableSchemaRequestPB.newBuilder();
@@ -94,6 +100,7 @@ public class GetTableSchemaRequest extends YRpc<GetTableSchemaResponse> {
     final GetTableSchemaResponsePB.Builder respBuilder = GetTableSchemaResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     Schema schema = ProtobufHelper.pbToSchema(respBuilder.getSchema());
+    List<IndexInfo> indexes = ProtobufHelper.pbToIndexes(respBuilder.getIndexesList());
     GetTableSchemaResponse response = new GetTableSchemaResponse(
         deadlineTracker.getElapsedMillis(),
         tsUUID,
@@ -103,7 +110,9 @@ public class GetTableSchemaRequest extends YRpc<GetTableSchemaResponse> {
         respBuilder.getIdentifier().getTableId().toStringUtf8(),
         ProtobufHelper.pbToPartitionSchema(respBuilder.getPartitionSchema(), schema),
         respBuilder.getCreateTableDone(),
-        respBuilder.getTableType());
+        respBuilder.getTableType(),
+        indexes,
+        respBuilder.getColocated());
     return new Pair<GetTableSchemaResponse, Object>(
         response, respBuilder.hasError() ? respBuilder.getError() : null);
   }

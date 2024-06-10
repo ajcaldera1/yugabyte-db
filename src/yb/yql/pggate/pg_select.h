@@ -12,14 +12,9 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_SELECT_H_
-#define YB_YQL_PGGATE_PG_SELECT_H_
+#pragma once
 
-#include <list>
-
-#include "yb/gutil/ref_counted.h"
-
-#include "yb/yql/pggate/pg_dml.h"
+#include "yb/yql/pggate/pg_dml_read.h"
 
 namespace yb {
 namespace pggate {
@@ -28,68 +23,23 @@ namespace pggate {
 // SELECT
 //--------------------------------------------------------------------------------------------------
 
-class PgSelect : public PgDml {
+class PgSelect : public PgDmlRead {
  public:
-  // Public types.
-  typedef scoped_refptr<PgSelect> ScopedRefPtr;
-
-  // Constructors.
-  PgSelect(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
+  PgSelect(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id,
+           const PgObjectId& index_id, const PgPrepareParameters *prepare_params,
+           bool is_region_local);
   virtual ~PgSelect();
 
-  StmtOp stmt_op() const override { return StmtOp::STMT_SELECT; }
+  // Prepare query before execution.
+  Status Prepare() override;
 
-  void UseIndex(const PgObjectId& index_id);
+  // Prepare secondary index if that index is used by this query.
+  Status PrepareSecondaryIndex();
 
-  // Prepare SELECT before execution.
-  // read_time points to place where read_time for whole postgres statement is stored.
-  // It is available while statement is executed.
-  CHECKED_STATUS Prepare(uint64_t* read_time);
+  virtual Result<PgTableDescPtr> LoadTable();
 
-  // Setup internal structures for binding values during prepare.
-  void PrepareColumns();
-
-  // Find the index column associated with the given "attr_num".
-  CHECKED_STATUS FindIndexColumn(int attr_num, PgColumn **col);
-
-  // Bind an index column with an expression.
-  CHECKED_STATUS BindIndexColumn(int attnum, PgExpr *attr_value);
-
-  // Execute.
-  CHECKED_STATUS Exec();
-
-  void SetCatalogCacheVersion(const uint64_t catalog_cache_version) override {
-    read_req_->set_ysql_catalog_version(catalog_cache_version);
-  }
-
- private:
-  // Allocate column protobuf.
-  PgsqlExpressionPB *AllocColumnBindPB(PgColumn *col) override;
-  PgsqlExpressionPB *AllocIndexColumnBindPB(PgColumn *col);
-
-  // Allocate protobuf for target.
-  PgsqlExpressionPB *AllocTargetPB() override;
-  PgsqlExpressionPB *AllocIndexTargetPB();
-
-  // Allocate column expression.
-  PgsqlExpressionPB *AllocColumnAssignPB(PgColumn *col) override;
-
-  // Delete allocated target for columns that have no bind-values.
-  CHECKED_STATUS DeleteEmptyPrimaryBinds();
-
-  // Load index.
-  CHECKED_STATUS LoadIndex();
-
-  PgObjectId index_id_;
-  PgTableDesc::ScopedRefPtr index_desc_;
-
-  // Protobuf instruction.
-  std::shared_ptr<client::YBPgsqlReadOp> read_op_;
-  PgsqlReadRequestPB *read_req_ = nullptr;
-  PgsqlReadRequestPB *index_req_ = nullptr;
+  virtual bool UseSecondaryIndex() const;
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_SELECT_H_

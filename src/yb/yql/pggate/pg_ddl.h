@@ -12,8 +12,12 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_DDL_H_
-#define YB_YQL_PGGATE_PG_DDL_H_
+#pragma once
+
+#include "yb/common/constants.h"
+#include "yb/common/transaction.h"
+
+#include "yb/tserver/pg_client.messages.h"
 
 #include "yb/yql/pggate/pg_statement.h"
 
@@ -24,10 +28,6 @@ class PgDdl : public PgStatement {
  public:
   explicit PgDdl(PgSession::ScopedRefPtr pg_session) : PgStatement(pg_session) {
   }
-
-  virtual CHECKED_STATUS ClearBinds() {
-    return STATUS(InvalidArgument, "This statement cannot be bound to any values");
-  }
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -36,115 +36,99 @@ class PgDdl : public PgStatement {
 
 class PgCreateDatabase : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgCreateDatabase> ScopedRefPtr;
-  typedef scoped_refptr<const PgCreateDatabase> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgCreateDatabase> UniPtr;
-  typedef std::unique_ptr<const PgCreateDatabase> UniPtrConst;
-
-  // Constructors.
   PgCreateDatabase(PgSession::ScopedRefPtr pg_session,
                    const char *database_name,
                    PgOid database_oid,
                    PgOid source_database_oid,
-                   PgOid next_oid);
+                   const char* source_database_name,
+                   PgOid next_oid,
+                   const int64_t clone_time,
+                   const bool colocated);
   virtual ~PgCreateDatabase();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_DATABASE; }
+  void UseTransaction() {
+    req_.set_use_transaction(true);
+  }
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_DATABASE; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  private:
-  const char *database_name_;
-  const PgOid database_oid_;
-  const PgOid source_database_oid_;
-  const PgOid next_oid_;
+  tserver::PgCreateDatabaseRequestPB req_;
 };
 
 class PgDropDatabase : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDropDatabase> ScopedRefPtr;
-  typedef scoped_refptr<const PgDropDatabase> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgDropDatabase> UniPtr;
-  typedef std::unique_ptr<const PgDropDatabase> UniPtrConst;
-
-  // Constructors.
-  PgDropDatabase(PgSession::ScopedRefPtr pg_session, const char *database_name, bool if_exist);
+  PgDropDatabase(PgSession::ScopedRefPtr pg_session, const char *database_name, PgOid database_oid);
   virtual ~PgDropDatabase();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_DROP_DATABASE; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_DATABASE; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  private:
   const char *database_name_;
-  bool if_exist_;
+  const PgOid database_oid_;
+};
+
+class PgAlterDatabase : public PgDdl {
+ public:
+  PgAlterDatabase(PgSession::ScopedRefPtr pg_session,
+                  const char *database_name,
+                  PgOid database_oid);
+  virtual ~PgAlterDatabase();
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_ALTER_DATABASE; }
+
+  void RenameDatabase(const char *newname);
+
+  // Execute.
+  Status Exec();
+
+ private:
+  tserver::PgAlterDatabaseRequestPB req_;
 };
 
 //--------------------------------------------------------------------------------------------------
-// CREATE SCHEMA
-//
-// TODO(neil) This is not yet supported.  After Mihnea figures out how PostgreSQL implemented it,
-// we can add support for schema.
+// CREATE / DROP TABLEGROUP
 //--------------------------------------------------------------------------------------------------
 
-class PgCreateSchema : public PgDdl {
+class PgCreateTablegroup : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgCreateSchema> ScopedRefPtr;
-  typedef scoped_refptr<const PgCreateSchema> ScopedRefPtrConst;
+  // Assumes we are within a DDL transaction.
+  PgCreateTablegroup(PgSession::ScopedRefPtr pg_session,
+                     const char *database_name,
+                     const PgOid database_oid,
+                     const PgOid tablegroup_oid,
+                     const PgOid tablespace_oid);
+  virtual ~PgCreateTablegroup();
 
-  typedef std::unique_ptr<PgCreateSchema> UniPtr;
-  typedef std::unique_ptr<const PgCreateSchema> UniPtrConst;
-
-  // Constructors.
-  PgCreateSchema(PgSession::ScopedRefPtr pg_session,
-                 const char *database_name,
-                 const char *schema_name,
-                 bool if_not_exist);
-  virtual ~PgCreateSchema();
-
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_SCHEMA; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_TABLEGROUP; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  private:
-  const char *database_name_;
-  const char *schema_name_;
-  bool if_not_exist_;
+  tserver::PgCreateTablegroupRequestPB req_;
 };
 
-class PgDropSchema : public PgDdl {
+class PgDropTablegroup : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDropSchema> ScopedRefPtr;
-  typedef scoped_refptr<const PgDropSchema> ScopedRefPtrConst;
+  PgDropTablegroup(PgSession::ScopedRefPtr pg_session,
+                   PgOid database_oid,
+                   PgOid tablegroup_oid);
+  virtual ~PgDropTablegroup();
 
-  typedef std::unique_ptr<PgDropSchema> UniPtr;
-  typedef std::unique_ptr<const PgDropSchema> UniPtrConst;
-
-  // Constructors.
-  PgDropSchema(PgSession::ScopedRefPtr pg_session,
-               const char *database_name,
-               const char *schema_name,
-               bool if_exist);
-  virtual ~PgDropSchema();
-
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_DROP_SCHEMA; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_TABLEGROUP; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  private:
-  const char *database_name_;
-  const char *schema_name_;
-  bool if_exist_;
+  tserver::PgDropTablegroupRequestPB req_;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -153,66 +137,81 @@ class PgDropSchema : public PgDdl {
 
 class PgCreateTable : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgCreateTable> ScopedRefPtr;
-  typedef scoped_refptr<const PgCreateTable> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgCreateTable> UniPtr;
-  typedef std::unique_ptr<const PgCreateTable> UniPtrConst;
-
-  // Constructors.
   PgCreateTable(PgSession::ScopedRefPtr pg_session,
                 const char *database_name,
                 const char *schema_name,
                 const char *table_name,
                 const PgObjectId& table_id,
                 bool is_shared_table,
+                bool is_sys_catalog_table,
                 bool if_not_exist,
-                bool add_primary_key);
-  virtual ~PgCreateTable();
+                PgYbrowidMode ybrowid_mode,
+                bool is_colocated_via_database,
+                const PgObjectId& tablegroup_oid,
+                const ColocationId colocation_id,
+                const PgObjectId& tablespace_oid,
+                bool is_matview,
+                const PgObjectId& pg_table_oid,
+                const PgObjectId& old_relfilenode_oid,
+                bool is_truncate);
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_TABLE; }
+  void SetupIndex(
+      const PgObjectId& base_table_id, bool is_unique_index, bool skip_index_backfill);
 
-  // For PgCreateIndex: the indexed (base) table id and if this is a unique index.
-  virtual boost::optional<const PgObjectId&> indexed_table_id() const { return boost::none; }
-  virtual bool is_unique_index() const { return false; }
+  StmtOp stmt_op() const override;
 
-  CHECKED_STATUS AddColumn(const char *attr_name, int attr_num, int attr_ybtype,
-                           bool is_hash, bool is_range);
-  CHECKED_STATUS AddColumn(const char *attr_name, int attr_num, const YBCPgTypeEntity *attr_type,
-                           bool is_hash, bool is_range) {
-    return AddColumn(attr_name, attr_num, attr_type->yb_type, is_hash, is_range);
+  Status AddColumn(const char *attr_name,
+                   int attr_num,
+                   int attr_ybtype,
+                   bool is_hash,
+                   bool is_range,
+                   SortingType sorting_type = SortingType::kNotSpecified) {
+    return AddColumnImpl(attr_name, attr_num, attr_ybtype, 20 /*INT8OID*/,
+                         is_hash, is_range, sorting_type);
+  }
+
+  Status AddColumn(const char *attr_name,
+                   int attr_num,
+                   const YBCPgTypeEntity *attr_type,
+                   bool is_hash,
+                   bool is_range,
+                   SortingType sorting_type = SortingType::kNotSpecified) {
+    return AddColumnImpl(attr_name, attr_num, attr_type->yb_type, attr_type->type_oid,
+                         is_hash, is_range, sorting_type);
+  }
+
+  // Specify the number of tablets explicitly.
+  Status SetNumTablets(int32_t num_tablets);
+
+  Status SetVectorOptions(YbPgVectorIdxOptions *options);
+
+  Status AddSplitBoundary(PgExpr **exprs, int expr_count);
+
+  void UseTransaction() {
+    req_.set_use_transaction(true);
   }
 
   // Execute.
-  virtual CHECKED_STATUS Exec();
+  virtual Status Exec();
+
+ protected:
+  virtual Status AddColumnImpl(
+      const char *attr_name, int attr_num, int attr_ybtype, int pg_type_oid, bool is_hash,
+      bool is_range, SortingType sorting_type = SortingType::kNotSpecified);
 
  private:
-  client::YBTableName table_name_;
-  const PgObjectId table_id_;
-  bool is_pg_catalog_table_;
-  bool is_shared_table_;
-  bool if_not_exist_;
-  client::YBSchemaBuilder schema_builder_;
+  tserver::PgCreateTableRequestPB req_;
 };
 
 class PgDropTable : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDropTable> ScopedRefPtr;
-  typedef scoped_refptr<const PgDropTable> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgDropTable> UniPtr;
-  typedef std::unique_ptr<const PgDropTable> UniPtrConst;
-
-  // Constructors.
   PgDropTable(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool if_exist);
   virtual ~PgDropTable();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_DROP_TABLE; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_TABLE; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  protected:
   const PgObjectId table_id_;
@@ -221,86 +220,30 @@ class PgDropTable : public PgDdl {
 
 class PgTruncateTable : public PgDdl {
  public:
-  // Public types.
-  typedef scoped_refptr<PgTruncateTable> ScopedRefPtr;
-  typedef scoped_refptr<const PgTruncateTable> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgTruncateTable> UniPtr;
-  typedef std::unique_ptr<const PgTruncateTable> UniPtrConst;
-
-  // Constructors.
   PgTruncateTable(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
   virtual ~PgTruncateTable();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_TRUNCATE_TABLE; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_TRUNCATE_TABLE; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
 
  private:
-  const PgObjectId table_id_;
-};
-
-//--------------------------------------------------------------------------------------------------
-// CREATE INDEX
-//--------------------------------------------------------------------------------------------------
-
-class PgCreateIndex : public PgCreateTable {
- public:
-  // Public types.
-  typedef scoped_refptr<PgCreateIndex> ScopedRefPtr;
-  typedef scoped_refptr<const PgCreateIndex> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgCreateIndex> UniPtr;
-  typedef std::unique_ptr<const PgCreateIndex> UniPtrConst;
-
-  // Constructors.
-  PgCreateIndex(PgSession::ScopedRefPtr pg_session,
-                const char *database_name,
-                const char *schema_name,
-                const char *index_name,
-                const PgObjectId& index_id,
-                const PgObjectId& base_table_id,
-                bool is_shared_index,
-                bool is_unique_index,
-                bool if_not_exist);
-  virtual ~PgCreateIndex();
-
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_INDEX; }
-
-  virtual boost::optional<const PgObjectId&> indexed_table_id() const override {
-    return base_table_id_;
-  }
-
-  virtual bool is_unique_index() const override {
-    return is_unique_index_;
-  }
-
-  // Execute.
-  virtual CHECKED_STATUS Exec() override;
-
- private:
-  const PgObjectId base_table_id_;
-  bool is_unique_index_;
+  tserver::PgTruncateTableRequestPB req_;
 };
 
 class PgDropIndex : public PgDropTable {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDropIndex> ScopedRefPtr;
-  typedef scoped_refptr<const PgDropIndex> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgDropIndex> UniPtr;
-  typedef std::unique_ptr<const PgDropIndex> UniPtrConst;
-
-  // Constructors.
-  PgDropIndex(PgSession::ScopedRefPtr pg_session, const PgObjectId& index_id, bool if_exist);
+  PgDropIndex(PgSession::ScopedRefPtr pg_session, const PgObjectId& index_id, bool if_exist,
+              bool ddl_rollback_enabled);
   virtual ~PgDropIndex();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_DROP_INDEX; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_INDEX; }
 
   // Execute.
-  CHECKED_STATUS Exec();
+  Status Exec();
+ private:
+  bool ddl_rollback_enabled_;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -309,39 +252,116 @@ class PgDropIndex : public PgDropTable {
 
 class PgAlterTable : public PgDdl {
  public:
-  typedef scoped_refptr<PgAlterTable> ScopedRefPtr;
-  typedef scoped_refptr<const PgAlterTable> ScopedRefPtrConst;
-
-  typedef std::unique_ptr<PgAlterTable> UniPtr;
-  typedef std::unique_ptr<const PgAlterTable> UniPtrConst;
-
-  // Constructors.
   PgAlterTable(PgSession::ScopedRefPtr pg_session,
                const PgObjectId& table_id);
 
-  CHECKED_STATUS AddColumn(const char *name, const YBCPgTypeEntity *attr_type,
-                           int order, bool is_not_null);
+  Status AddColumn(const char *name,
+                   const YBCPgTypeEntity *attr_type,
+                   int order,
+                   YBCPgExpr missing_value);
 
-  CHECKED_STATUS RenameColumn(const char *oldname, const char *newname);
+  Status RenameColumn(const char *oldname, const char *newname);
 
-  CHECKED_STATUS DropColumn(const char *name);
+  Status DropColumn(const char *name);
 
-  CHECKED_STATUS RenameTable(const char *db_name, const char *newname);
+  Status RenameTable(const char *db_name, const char *newname);
 
-  CHECKED_STATUS Exec();
+  Status IncrementSchemaVersion();
+
+  Status SetTableId(const PgObjectId& table_id);
+
+  Status SetReplicaIdentity(const char identity_type);
+
+  Status Exec();
+
+  void InvalidateTableCacheEntry();
 
   virtual ~PgAlterTable();
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_ALTER_TABLE; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_ALTER_TABLE; }
+
+  void UseTransaction() {
+    req_.set_use_transaction(true);
+  }
 
  private:
-  const client::YBTableName table_name_;
-  const PgObjectId table_id_;
-  client::YBTableAlterer* table_alterer;
+  tserver::PgAlterTableRequestPB req_;
+};
 
+//--------------------------------------------------------------------------------------------------
+// DROP SEQUENCE
+//--------------------------------------------------------------------------------------------------
+
+class PgDropSequence : public PgDdl {
+ public:
+  PgDropSequence(PgSession::ScopedRefPtr pg_session,
+                 PgOid database_oid,
+                 PgOid sequence_oid);
+  virtual ~PgDropSequence();
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_SEQUENCE; }
+
+  // Execute.
+  Status Exec();
+
+ private:
+  PgOid database_oid_;
+  PgOid sequence_oid_;
+};
+
+class PgDropDBSequences : public PgDdl {
+ public:
+  PgDropDBSequences(PgSession::ScopedRefPtr pg_session,
+                    PgOid database_oid);
+  virtual ~PgDropDBSequences();
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_DB_SEQUENCES; }
+
+  // Execute.
+  Status Exec();
+
+ private:
+  PgOid database_oid_;
+};
+
+// CREATE REPLICATION SLOT
+//--------------------------------------------------------------------------------------------------
+
+class PgCreateReplicationSlot : public PgDdl {
+ public:
+  PgCreateReplicationSlot(PgSession::ScopedRefPtr pg_session,
+                          const char *slot_name,
+                          const char *plugin_name,
+                          PgOid database_oid,
+                          YBCPgReplicationSlotSnapshotAction snapshot_action);
+
+  Result<tserver::PgCreateReplicationSlotResponsePB> Exec();
+
+  virtual ~PgCreateReplicationSlot();
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_CREATE_REPLICATION_SLOT; }
+
+ private:
+  tserver::PgCreateReplicationSlotRequestPB req_;
+};
+
+// DROP REPLICATION SLOT
+//--------------------------------------------------------------------------------------------------
+
+class PgDropReplicationSlot : public PgDdl {
+ public:
+  PgDropReplicationSlot(PgSession::ScopedRefPtr pg_session,
+                        const char *slot_name);
+
+  Status Exec();
+
+  virtual ~PgDropReplicationSlot();
+
+  StmtOp stmt_op() const override { return StmtOp::STMT_DROP_REPLICATION_SLOT; }
+
+ private:
+  tserver::PgDropReplicationSlotRequestPB req_;
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_DDL_H_

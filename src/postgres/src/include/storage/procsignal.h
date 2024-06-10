@@ -14,7 +14,9 @@
 #ifndef PROCSIGNAL_H
 #define PROCSIGNAL_H
 
+#include "postgres.h"
 #include "storage/backendid.h"
+#include "storage/proc.h"
 
 
 /*
@@ -33,6 +35,7 @@ typedef enum
 	PROCSIG_NOTIFY_INTERRUPT,	/* listen/notify interrupt */
 	PROCSIG_PARALLEL_MESSAGE,	/* message from cooperating parallel backend */
 	PROCSIG_WALSND_INIT_STOPPING,	/* ask walsenders to prepare for shutdown  */
+	PROCSIG_LOG_MEMORY_CONTEXT, /* ask backend to log the memory contexts */
 
 	/* Recovery conflict reasons */
 	PROCSIG_RECOVERY_CONFLICT_DATABASE,
@@ -56,5 +59,8 @@ extern int SendProcSignal(pid_t pid, ProcSignalReason reason,
 			   BackendId backendId);
 
 extern void procsignal_sigusr1_handler(SIGNAL_ARGS);
+
+extern void CleanupProcSignalState(int status, Datum arg);
+extern void CleanupProcSignalStateForProc(PGPROC *proc);
 
 #endif							/* PROCSIGNAL_H */

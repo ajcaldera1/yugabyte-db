@@ -29,26 +29,29 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CONSENSUS_PEER_MANAGER_H
-#define YB_CONSENSUS_PEER_MANAGER_H
+#pragma once
 
 #include <string>
 #include <unordered_map>
 
+#include "yb/util/flags.h"
+
+#include "yb/consensus/log_fwd.h"
 #include "yb/consensus/consensus_util.h"
-#include "yb/gutil/gscoped_ptr.h"
+#include "yb/consensus/multi_raft_batcher.h"
+
+#include "yb/gutil/integral_types.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
+
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
-#include "yb/util/status.h"
+#include "yb/util/shared_lock.h"
 
 namespace yb {
 
+class MemTracker;
 class ThreadPoolToken;
-
-namespace log {
-class Log;
-} // namespace log
 
 namespace consensus {
 
@@ -69,7 +72,7 @@ class PeerManager {
               PeerProxyFactory* peer_proxy_factory,
               PeerMessageQueue* queue,
               ThreadPoolToken* raft_pool_token,
-              const scoped_refptr<log::Log>& log);
+              MultiRaftManager* multi_raft_manager);
 
   virtual ~PeerManager();
 
@@ -87,8 +90,10 @@ class PeerManager {
   // Closes connections to those peers that are not in config.
   virtual void ClosePeersNotInConfig(const RaftConfigPB& config);
 
+  virtual void DumpToHtml(std::ostream& out) const;
+
  private:
-  std::string GetLogPrefix() const;
+  std::string LogPrefix() const;
 
   typedef std::unordered_map<std::string, std::shared_ptr<Peer>> PeersMap;
   const std::string tablet_id_;
@@ -96,7 +101,7 @@ class PeerManager {
   PeerProxyFactory* peer_proxy_factory_;
   PeerMessageQueue* queue_;
   ThreadPoolToken* raft_pool_token_;
-  scoped_refptr<log::Log> log_;
+  MultiRaftManager* multi_raft_manager_;
   PeersMap peers_;
   Consensus* consensus_ = nullptr;
   mutable simple_spinlock lock_;
@@ -106,5 +111,3 @@ class PeerManager {
 
 } // namespace consensus
 } // namespace yb
-
-#endif /* YB_CONSENSUS_PEER_MANAGER_H */

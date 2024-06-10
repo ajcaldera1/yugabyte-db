@@ -30,6 +30,7 @@
 #include "utils/snapmgr.h"
 
 #include "pg_yb_utils.h"
+#include "utils/yb_inheritscache.h"
 
 /*
  * All resource IDs managed by this code are required to fit into a Datum,
@@ -127,8 +128,7 @@ typedef struct ResourceOwnerData
 	ResourceArray filearr;		/* open temporary files */
 	ResourceArray dsmarr;		/* dynamic shmem segments */
 	ResourceArray jitarr;		/* JIT contexts */
-
-	ResourceArray ybstmtarr;    /* YugaByte statement handles */
+	ResourceArray ybinheritsrefarr; /* YbPgInherits cache references */
 
 	/* We can remember up to MAX_RESOWNER_LOCKS references to local locks. */
 	int			nlocks;			/* number of owned locks */
@@ -175,10 +175,7 @@ static void PrintSnapshotLeakWarning(Snapshot snapshot);
 static void PrintFileLeakWarning(File file);
 static void PrintDSMLeakWarning(dsm_segment *seg);
 
-/**
- * YugaByte-specific
- */
-static void PrintYugaByteStmtLeakWarning(YBCPgStatement yb_stmt);
+static void PrintYbPgInheritsCacheLeakWarning(YbPgInheritsCacheEntry entry);
 
 /*****************************************************************************
  *	  INTERNAL ROUTINES														 *
@@ -447,9 +444,7 @@ ResourceOwnerCreate(ResourceOwner parent, const char *name)
 	ResourceArrayInit(&(owner->filearr), FileGetDatum(-1));
 	ResourceArrayInit(&(owner->dsmarr), PointerGetDatum(NULL));
 	ResourceArrayInit(&(owner->jitarr), PointerGetDatum(NULL));
-
-	if (IsYugaByteEnabled())
-		ResourceArrayInit(&(owner->ybstmtarr), PointerGetDatum(NULL));
+	ResourceArrayInit(&(owner->ybinheritsrefarr), PointerGetDatum(NULL));
 
 	return owner;
 }
@@ -555,9 +550,20 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 		/* Ditto for JIT contexts */
 		while (ResourceArrayGetAny(&(owner->jitarr), &foundres))
 		{
-			JitContext *context = (JitContext *) PointerGetDatum(foundres);
+			JitContext *context = (JitContext *) DatumGetPointer(foundres);
 
 			jit_release_context(context);
+		}
+
+		/* Ditto for ybinheritsrefarr */
+		while (ResourceArrayGetAny(&owner->ybinheritsrefarr, &foundres))
+		{
+			YbPgInheritsCacheEntry entry =
+				(YbPgInheritsCacheEntry) DatumGetPointer(foundres);
+
+			if (isCommit)
+				PrintYbPgInheritsCacheLeakWarning(entry);
+			ReleaseYbPgInheritsCacheEntry(entry);
 		}
 	}
 	else if (phase == RESOURCE_RELEASE_LOCKS)
@@ -674,23 +680,6 @@ ResourceOwnerReleaseInternal(ResourceOwner owner,
 				PrintFileLeakWarning(res);
 			FileClose(res);
 		}
-
-		if (IsYugaByteEnabled())
-		{
-			/* Ditto for YugaByte statements */
-			while (ResourceArrayGetAny(&(owner->ybstmtarr), &foundres))
-			{
-				YBCPgStatement	res =
-					(YBCPgStatement) DatumGetPointer(foundres);
-
-				if (isCommit)
-					PrintYugaByteStmtLeakWarning(res);
-
-				HandleYBStatus(YBCPgDeleteStatement(res));
-
-				ResourceOwnerForgetYugaByteStmt(owner, res);
-			}
-		}
 	}
 
 	/* Let add-on modules get a chance too */
@@ -723,7 +712,7 @@ ResourceOwnerDelete(ResourceOwner owner)
 	Assert(owner->filearr.nitems == 0);
 	Assert(owner->dsmarr.nitems == 0);
 	Assert(owner->jitarr.nitems == 0);
-	Assert(owner->ybstmtarr.nitems == 0);
+	Assert(owner->ybinheritsrefarr.nitems == 0);
 	Assert(owner->nlocks == 0 || owner->nlocks == MAX_RESOWNER_LOCKS + 1);
 
 	/*
@@ -751,7 +740,7 @@ ResourceOwnerDelete(ResourceOwner owner)
 	ResourceArrayFree(&(owner->filearr));
 	ResourceArrayFree(&(owner->dsmarr));
 	ResourceArrayFree(&(owner->jitarr));
-	ResourceArrayFree(&(owner->ybstmtarr));
+	ResourceArrayFree(&(owner->ybinheritsrefarr));
 
 	pfree(owner);
 }
@@ -1060,6 +1049,43 @@ ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
 }
 
 /*
+ * Make sure there is room for at least one more entry in a ResourceOwner's
+ * YbPgInherits reference array.
+ *
+ * This is separate from actually inserting an entry because if we run out
+ * of memory, it's critical to do so *before* acquiring the resource.
+ */
+void
+ResourceOwnerEnlargeYbPgInheritsRefs(ResourceOwner owner)
+{
+	ResourceArrayEnlarge(&owner->ybinheritsrefarr);
+}
+
+/*
+ * Remember that a YbPgInherits cache reference is owned by a ResourceOwner
+ *
+ * Caller must have previously done ResourceOwnerEnlargeYbPgInheritsRefs()
+ */
+void
+ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
+									 YbPgInheritsCacheEntry entry)
+{
+	ResourceArrayAdd(&owner->ybinheritsrefarr, PointerGetDatum(entry));
+}
+
+/*
+ * Forget that a YbPgInherits cache reference is owned by a ResourceOwner
+ */
+void
+ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
+								   YbPgInheritsCacheEntry entry)
+{
+	if (!ResourceArrayRemove(&owner->ybinheritsrefarr, PointerGetDatum(entry)))
+		elog(ERROR, "YbPgInheritsCache entry %d is not owned by resource owner %s",
+			 entry->parentOid, owner->name);
+}
+
+/*
  * Debugging subroutine
  */
 static void
@@ -1067,6 +1093,13 @@ PrintRelCacheLeakWarning(Relation rel)
 {
 	elog(WARNING, "relcache reference leak: relation \"%s\" not closed",
 		 RelationGetRelationName(rel));
+}
+
+static void
+PrintYbPgInheritsCacheLeakWarning(YbPgInheritsCacheEntry entry)
+{
+	elog(WARNING, "YbPgInheritsCache reference leak: Entry for oid \"%d\" not "
+ 				  "released", entry->parentOid);
 }
 
 /*
@@ -1328,49 +1361,4 @@ ResourceOwnerForgetJIT(ResourceOwner owner, Datum handle)
 	if (!ResourceArrayRemove(&(owner->jitarr), handle))
 		elog(ERROR, "JIT context %p is not owned by resource owner %s",
 			 DatumGetPointer(handle), owner->name);
-}
-
-/*
- * Make sure there is room for at least one more entry in a ResourceOwner's
- * dynamic shmem segment reference array.
- *
- * This is separate from actually inserting an entry because if we run out
- * of memory, it's critical to do so *before* acquiring the resource.
- */
-void
-ResourceOwnerEnlargeYugaByteStmts(ResourceOwner owner)
-{
-	ResourceArrayEnlarge(&(owner->ybstmtarr));
-}
-
-/*
- * Remember that a YugaByte statement is owned by a ResourceOwner
- *
- * Caller must have previously done ResourceOwnerEnlargeYugaByteStmts()
- */
-void
-ResourceOwnerRememberYugaByteStmt(ResourceOwner owner, YBCPgStatement yb_stmt)
-{
-	ResourceArrayAdd(&(owner->ybstmtarr), PointerGetDatum(yb_stmt));
-}
-
-/*
- * Forget that a YugaByte statement is owned by a ResourceOwner
- */
-void
-ResourceOwnerForgetYugaByteStmt(ResourceOwner owner, YBCPgStatement yb_stmt)
-{
-	if (!ResourceArrayRemove(&(owner->ybstmtarr), PointerGetDatum(yb_stmt)))
-		elog(ERROR, "YugaByte statement %p is not owned by resource owner %s",
-			 yb_stmt, owner->name);
-}
-
-/*
- * Debugging subroutine
- */
-static void
-PrintYugaByteStmtLeakWarning(YBCPgStatement yb_stmt)
-{
-	elog(WARNING, "YugaByte statement leak: statement %p still referenced",
-		 yb_stmt);
 }

@@ -11,22 +11,65 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_DOCDB_FWD_H
-#define YB_DOCDB_DOCDB_FWD_H
+#pragma once
 
-namespace yb {
-namespace docdb {
+#include "yb/common/common_fwd.h"
 
-class DocPath;
+#include "yb/docdb/docdb.fwd.h"
+#include "yb/dockv/dockv_fwd.h"
+
+#include "yb/qlexpr/qlexpr_fwd.h"
+
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+#include "yb/util/strongly_typed_bool.h"
+
+namespace yb::docdb {
+
+class ConsensusFrontier;
+class DeadlineInfo;
+class DocDBCompactionFilterFactory;
+class DocOperation;
+class DocPgsqlScanSpec;
+class DocQLScanSpec;
+class DocRowwiseIterator;
 class DocWriteBatch;
+class HistoryRetentionPolicy;
 class IntentAwareIterator;
-class KeyValueWriteBatchPB;
-class QLWriteOperation;
+class IntentAwareIteratorIf;
+class IntentIterator;
+class ManualHistoryRetentionPolicy;
 class PgsqlWriteOperation;
+class QLWriteOperation;
+class RedisWriteOperation;
+class ScanChoices;
+class SchemaPackingProvider;
+class SharedLockManager;
+class TableInfoProvider;
+class TransactionStatusCache;
+class WaitQueue;
+class YQLRowwiseIteratorIf;
+class YQLStorageIf;
 
+struct ApplyTransactionState;
 struct DocDB;
+struct DocReadContext;
+struct FetchedEntry;
+struct HistoryRetentionDirective;
+struct IntentKeyValueForCDC;
+struct KeyBounds;
+struct LockBatchEntry;
+struct ReadOperationData;
 
-}  // namespace docdb
-}  // namespace yb
+using DocKeyHash = uint16_t;
+using LockBatchEntries = std::vector<LockBatchEntry>;
+using DocReadContextPtr = std::shared_ptr<DocReadContext>;
+using ScanChoicesPtr = std::unique_ptr<ScanChoices>;
 
-#endif // YB_DOCDB_DOCDB_FWD_H
+using IndexRequests = std::vector<std::pair<const qlexpr::IndexInfo*, QLWriteRequestPB>>;
+
+YB_STRONGLY_TYPED_BOOL(SkipFlush);
+YB_STRONGLY_TYPED_BOOL(SkipSeek);
+YB_STRONGLY_TYPED_BOOL(FastBackwardScan);
+
+}  // namespace yb::docdb

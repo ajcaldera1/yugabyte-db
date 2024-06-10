@@ -13,8 +13,15 @@
 
 #include "yb/common/ql_protocol_util.h"
 
-#include "yb/common/ql_rowblock.h"
+#include "yb/common/ql_protocol.pb.h"
+#include "yb/common/ql_type.h"
 #include "yb/common/schema.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+#include "yb/util/write_buffer.h"
 
 namespace yb {
 
@@ -81,15 +88,6 @@ void QLAddColumns(const Schema& schema, const std::vector<ColumnId>& columns,
   }
 }
 
-std::unique_ptr<QLRowBlock> CreateRowBlock(QLClient client, const Schema& schema, Slice data) {
-  auto rowblock = std::make_unique<QLRowBlock>(schema);
-  if (!data.empty()) {
-    // TODO: a better way to handle errors here?
-    CHECK_OK(rowblock->Deserialize(client, &data));
-  }
-  return rowblock;
-}
-
 bool RequireReadForExpressions(const QLWriteRequestPB& request) {
   // A QLWriteOperation requires a read if it contains an IF clause or an UPDATE assignment that
   // involves an expresion with a column reference. If the IF clause contains a condition that
@@ -106,7 +104,8 @@ bool RequireReadForExpressions(const QLWriteRequestPB& request) {
 // Note: If target columns are given this could just be e.g. a delete targeting a static column
 // which can also omit the range portion -- Analyzer will check these restrictions.
 bool IsRangeOperation(const QLWriteRequestPB& request, const Schema& schema) {
-  return request.range_column_values().size() < schema.num_range_key_columns() &&
+  return implicit_cast<size_t>(request.range_column_values().size()) <
+             schema.num_range_key_columns() &&
          request.column_values().empty();
 }
 
@@ -120,6 +119,35 @@ bool RequireRead(const QLWriteRequestPB& request, const Schema& schema) {
   bool is_range_operation = IsRangeOperation(request, schema);
 
   return RequireReadForExpressions(request) || has_user_timestamp || is_range_operation;
+}
+
+Result<int32_t> CQLDecodeLength(Slice* data) {
+  RETURN_NOT_ENOUGH(data, sizeof(int32_t));
+  const auto len = static_cast<int32_t>(NetworkByteOrder::Load32(data->data()));
+  data->remove_prefix(sizeof(int32_t));
+  return len;
+}
+
+void CQLEncodeLength(const ssize_t length, WriteBuffer* buffer) {
+  uint32_t byte_value;
+  NetworkByteOrder::Store32(&byte_value, narrow_cast<int32_t>(length));
+  buffer->Append(pointer_cast<const char*>(&byte_value), sizeof(byte_value));
+}
+
+// Encode a 32-bit length into the buffer without extending the buffer. Caller should ensure the
+// buffer size is at least 4 bytes.
+void CQLEncodeLength(const ssize_t length, void* buffer) {
+  NetworkByteOrder::Store32(buffer, narrow_cast<int32_t>(length));
+}
+
+void CQLFinishCollection(const WriteBufferPos& start_pos, WriteBuffer* buffer) {
+  // computing collection size (in bytes)
+  auto coll_size = static_cast<int32_t>(buffer->BytesAfterPosition(start_pos) - sizeof(uint32_t));
+
+  // writing the collection size in bytes to the length component of the CQL value
+  char encoded_coll_size[sizeof(uint32_t)];
+  NetworkByteOrder::Store32(encoded_coll_size, static_cast<uint32_t>(coll_size));
+  CHECK_OK(buffer->Write(start_pos, encoded_coll_size, sizeof(uint32_t)));
 }
 
 } // namespace yb

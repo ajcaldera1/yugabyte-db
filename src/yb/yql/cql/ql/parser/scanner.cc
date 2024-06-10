@@ -23,6 +23,8 @@
 // #include <algorithm>
 #include <unordered_map>
 
+#include "yb/gutil/casts.h"
+
 #include "yb/yql/cql/ql/parser/parser.h"
 #include "yb/yql/cql/ql/parser/scanner.h"
 #include "yb/yql/cql/ql/parser/scanner_util.h"
@@ -32,6 +34,7 @@ namespace yb {
 namespace ql {
 
 using std::unordered_map;
+using std::string;
 
 //--------------------------------------------------------------------------------------------------
 // Class LexProcessor.
@@ -96,6 +99,7 @@ GramProcessor::symbol_type LexProcessor::Scan() {
 
   // Return the token if it doesn't require lookahead. Otherwise, set the token length.
   switch (cur_token.token()) {
+    case GramProcessor::token::TOK_GROUP_P:
     case GramProcessor::token::TOK_OFFSET:
     case GramProcessor::token::TOK_NOT:
     case GramProcessor::token::TOK_NULLS_P:
@@ -115,6 +119,18 @@ GramProcessor::symbol_type LexProcessor::Scan() {
   // Replace cur_token if needed, based on lookahead.
   GramProcessor::token_type next_token_type = lookahead_.token();
   switch (cur_token.token()) {
+    case GramProcessor::token::TOK_GROUP_P: {
+      // Replace GROUP_P with GROUP_LA to support SELECT ... GROUP BY ...
+      // - Token GROUP_P is accepted when being used as column name (practically all names).
+      // - Token GROUP_LA is accepted when being used in GROUP BY clause.
+      //   group_clause: GROUP_LA BY <group_by_list>
+      int next_tok = static_cast<int>(next_token_type);
+      if (next_tok == GramProcessor::token::TOK_BY) {
+        return GramProcessor::make_GROUP_LA(cursor_);
+      }
+      break;
+    }
+
     case GramProcessor::token::TOK_OFFSET: {
       // Replace OFFSET with OFFSET_LA to support SELECT ... OFFSET ...
       // - Token OFFSET is accepted when being used as column name (practically all names).
@@ -189,15 +205,15 @@ GramProcessor::symbol_type LexProcessor::Scan() {
 //--------------------------------------------------------------------------------------------------
 
 int LexProcessor::LexerInput(char* buf, int max_size) {
-  return parse_context_->Read(buf, max_size);
+  return narrow_cast<int>(parse_context_->Read(buf, max_size));
 }
 
 //--------------------------------------------------------------------------------------------------
 
 void LexProcessor::CountNewlineInToken(const string& token) {
-  const int lines =
+  const auto lines =
     count(token.begin(), token.end(), '\n') + count(token.begin(), token.end(), '\r');
-  cursor_.lines(lines);
+  cursor_.lines(narrow_cast<int>(lines));
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -265,7 +281,7 @@ MCSharedPtr<MCString> LexProcessor::MakeIdentifier(const char *text, int len, bo
 }
 
 void LexProcessor::TruncateIdentifier(const MCSharedPtr<MCString>& ident, bool warn) {
-  int len = ident->length();
+  auto len = ident->length();
   if (len >= NAMEDATALEN) {
     len = pg_encoding_mbcliplen(ident->c_str(), len, NAMEDATALEN - 1);
     if (warn) {
@@ -289,22 +305,25 @@ void LexProcessor::TruncateIdentifier(const MCSharedPtr<MCString>& ident, bool w
 // from '/**/' to '//'.
 //--------------------------------------------------------------------------------------------------
 
-void LexProcessor::EnlargeLiteralBuf(int bytes) {
+inline void LexProcessor::EnlargeLiteralBuf(size_t bytes) {
   // Increase literalbuf by the given number of "bytes".
-  if (literalalloc_ <= 0) {
+  auto prev_literalalloc = literalalloc_;
+  if (prev_literalalloc == 0) {
     literalalloc_ = 4096;
   }
   while (literalalloc_ < literallen_ + bytes) {
-    literalalloc_ *= 2;
+    literalalloc_ <<= 1;
   }
-  literalbuf_ = reinterpret_cast<char *>(realloc(literalbuf_, literalalloc_));
+  if (prev_literalalloc != literalalloc_) {
+    literalbuf_ = reinterpret_cast<char *>(realloc(literalbuf_, literalalloc_));
+  }
 }
 
 void LexProcessor::startlit() {
   literallen_ = 0;
 }
 
-void LexProcessor::addlit(char *ytext, int yleng) {
+void LexProcessor::addlit(char *ytext, size_t yleng) {
   // Enlarge buffer if needed.
   EnlargeLiteralBuf(yleng);
 
@@ -318,8 +337,7 @@ void LexProcessor::addlitchar(unsigned char ychar) {
   EnlargeLiteralBuf(1);
 
   // Append new data.
-  literalbuf_[literallen_] = ychar;
-  literallen_ += 1;
+  literalbuf_[literallen_++] = ychar;
 }
 
 char *LexProcessor::litbuf_udeescape(unsigned char escape) {
@@ -341,7 +359,7 @@ char *LexProcessor::litbuf_udeescape(unsigned char escape) {
     if (in[0] == escape) {
       if (in[1] == escape) {
         if (pair_first) {
-          AdvanceCursor(in - litbuf + 3);                                             // 3 for U&".
+          AdvanceCursor(narrow_cast<int>(in - litbuf + 3)); // 3 for U&".
           ScanError("invalid Unicode surrogate pair");
         }
         *out++ = escape;
@@ -363,7 +381,7 @@ char *LexProcessor::litbuf_udeescape(unsigned char escape) {
             unicode = surrogate_pair_to_codepoint(pair_first, unicode);
             pair_first = 0;
           } else {
-            AdvanceCursor(in - litbuf + 3);   /* 3 for U&" */
+            AdvanceCursor(narrow_cast<int>(in - litbuf + 3));   /* 3 for U&" */
             ScanError("invalid Unicode surrogate pair");
           }
         } else if (is_utf16_surrogate_second(unicode)) {
@@ -399,7 +417,7 @@ char *LexProcessor::litbuf_udeescape(unsigned char escape) {
             unicode = surrogate_pair_to_codepoint(pair_first, unicode);
             pair_first = 0;
           } else {
-            AdvanceCursor(in - litbuf + 3);   /* 3 for U&" */
+            AdvanceCursor(narrow_cast<int>(in - litbuf + 3));   /* 3 for U&" */
             ScanError("invalid Unicode surrogate pair");
           }
         } else if (is_utf16_surrogate_second(unicode)) {
@@ -414,12 +432,12 @@ char *LexProcessor::litbuf_udeescape(unsigned char escape) {
         }
         in += 8;
       } else {
-        AdvanceCursor(in - litbuf + 3);   /* 3 for U&" */
+        AdvanceCursor(narrow_cast<int>(in - litbuf + 3));   /* 3 for U&" */
         ScanError("invalid Unicode escape value");
       }
     } else {
       if (pair_first) {
-        AdvanceCursor(in - litbuf + 3);   /* 3 for U&" */
+        AdvanceCursor(narrow_cast<int>(in - litbuf + 3));   /* 3 for U&" */
         ScanError("invalid Unicode surrogate pair");
       }
       *out++ = *in++;
@@ -519,7 +537,7 @@ const ScanKeyword& LexProcessor::ScanKeywordLookup(const char *text) {
 
   // PostgreQL Note: Apply an ASCII-only downcasing.  We must not use tolower() since it may
   // produce the wrong translation in some locales (eg, Turkish).
-  for (int i = 0; i < word_bytes; i++) {
+  for (size_t i = 0; i < word_bytes; i++) {
     char ch = text[i];
     if (ch >= 'A' && ch <= 'Z') {
       ch += 'a' - 'A';

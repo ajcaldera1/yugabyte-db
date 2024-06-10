@@ -24,10 +24,15 @@
 #include "yb/rocksdb/db/log_writer.h"
 
 #include <stdint.h>
+
+#include <memory>
+
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/crc32c.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 namespace log {
@@ -69,8 +74,8 @@ Status Writer::AddRecord(const Slice& slice) {
         // Fill the trailer (literal below relies on kHeaderSize and
         // kRecyclableHeaderSize being <= 11)
         assert(header_size <= 11);
-        dest_->Append(
-            Slice("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", leftover));
+        RETURN_NOT_OK(dest_->Append(
+            Slice("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00", leftover)));
       }
       block_offset_ = 0;
     }

@@ -19,10 +19,12 @@ import java.net.URL;
 import java.util.Map;
 import java.util.HashMap;
 import java.util.Scanner;
-
+import com.google.gson.JsonArray;
 import com.google.gson.JsonElement;
 import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
+import com.google.gson.JsonPrimitive;
+
 
 /**
  * A class to retrieve metrics from a YB server.
@@ -42,6 +44,26 @@ public class Metrics {
      */
     protected Metric(JsonObject metric) {
       name = metric.get("name").getAsString();
+    }
+    protected Metric(JsonObject metric, String s) {
+      name = metric.get(s).getAsString();
+    }
+  }
+
+  /**
+   * A boolean gauge metric.
+   */
+  public static class BooleanGauge extends Metric {
+    public final boolean value;
+
+    /**
+     * Constructs a {@code BooleanGauge} metric.
+     *
+     * @param metric  the JSON object that contains the metric
+     */
+    BooleanGauge(JsonObject metric) {
+      super(metric);
+      value = metric.get("value").getAsBoolean();
     }
   }
 
@@ -109,6 +131,82 @@ public class Metrics {
     }
   }
 
+  /**
+   * A YSQL Metric.
+   */
+   public static class YSQLMetric extends Metric {
+     public final int count;
+     public final int sum;
+     public final int rows;
+
+     /**
+      * Constructs a {@code YSQLMetric} metric.
+      *
+      * @param metric  the JSON object that contains the metric
+      */
+
+     YSQLMetric(JsonObject metric) {
+      super(metric);
+      count = metric.get("count").getAsInt();
+      sum = metric.get("sum").getAsInt();
+      rows = metric.get("rows").getAsInt();
+     }
+
+   }
+
+  /**
+   * A YSQL Stat.
+   */
+   public static class YSQLStat extends Metric {
+     public final long userid;
+     public final long dbid;
+     public final String query;
+
+     public final long calls;
+     public final double total_time;
+     public final double min_time;
+     public final double max_time;
+     public final double mean_time;
+     public final double stddev_time;
+     public final long rows;
+     public final long local_blks_hit;
+     public final long local_blks_read;
+     public final long local_blks_dirtied;
+     public final long local_blks_written;
+     public final long temp_blks_read;
+     public final long temp_blks_written;
+     public final JsonArray yb_latency_histogram;
+
+     /**
+      * Constructs a {@code YSQLStat} stat.
+      *
+      * @param stat  the JSON object that contains the stat
+      */
+
+     YSQLStat(JsonObject metric) {
+      super(metric, "query");
+
+      userid = metric.get("userid").getAsLong();
+      dbid = metric.get("dbid").getAsLong();
+      query = metric.get("query").getAsString();
+
+      calls = metric.get("calls").getAsLong();
+      total_time = metric.get("total_time").getAsDouble();
+      min_time = metric.get("min_time").getAsDouble();
+      max_time = metric.get("max_time").getAsDouble();
+      mean_time = metric.get("mean_time").getAsDouble();
+      stddev_time = metric.get("stddev_time").getAsDouble();
+      rows = metric.get("rows").getAsLong();
+      local_blks_hit = metric.get("local_blks_hit").getAsLong();
+      local_blks_read = metric.get("local_blks_read").getAsLong();
+      local_blks_dirtied = metric.get("local_blks_dirtied").getAsLong();
+      local_blks_written = metric.get("local_blks_written").getAsLong();
+      temp_blks_read = metric.get("temp_blks_read").getAsLong();
+      temp_blks_written = metric.get("temp_blks_written").getAsLong();
+      yb_latency_histogram = metric.get("yb_latency_histogram").getAsJsonArray();
+     }
+   }
+
   // The metrics map.
   Map<String, Metric> map;
 
@@ -119,6 +217,15 @@ public class Metrics {
    */
   public Metrics(JsonObject obj) {
     readMetrics(obj);
+  }
+
+  /**
+   * Constructs a {@code Metrics} to retrieve the stats.
+   *
+   * @param obj   the metric in JSON
+   */
+  public Metrics(JsonObject obj, boolean is_stat) {
+    readStats(obj);
   }
 
   /**
@@ -152,13 +259,45 @@ public class Metrics {
     for (JsonElement subelem : obj.getAsJsonArray("metrics")) {
       JsonObject metric = subelem.getAsJsonObject();
       if (metric.has("value")) {
-        Counter counter = new Counter(metric);
-        map.put(counter.name, counter);
+        JsonPrimitive value = metric.get("value").getAsJsonPrimitive();
+        if (value.isBoolean()) {
+          BooleanGauge booleangauge = new BooleanGauge(metric);
+          map.put(booleangauge.name, booleangauge);
+        } else {
+          Counter counter = new Counter(metric);
+          map.put(counter.name, counter);
+        }
       } else if (metric.has("total_count")) {
         Histogram histogram = new Histogram(metric);
         map.put(histogram.name, histogram);
+      } else if (metric.has("count") &&
+                 metric.has("sum") &&
+                 metric.has("rows")) {
+        YSQLMetric ysqlmetric = new YSQLMetric(metric);
+        map.put(ysqlmetric.name, ysqlmetric);
       }
     }
+  }
+
+  // Read stats.
+  private void readStats(JsonObject obj) {
+    map = new HashMap<>();
+    for (JsonElement subelem : obj.getAsJsonArray("statements")) {
+      JsonObject metric = subelem.getAsJsonObject();
+      if (metric.has("query")) {
+        YSQLStat ysqlstat = new YSQLStat(metric);
+        map.put(ysqlstat.query, ysqlstat);
+      }
+    }
+  }
+
+  /**
+   * Retrieves a {@code BooleanGauge} metric.
+   *
+   * @param name  the metric name
+   */
+  public BooleanGauge getBooleanGauge(String name) {
+    return (BooleanGauge)map.get(name);
   }
 
   /**
@@ -177,5 +316,23 @@ public class Metrics {
    */
   public Histogram getHistogram(String name) {
     return (Histogram)map.get(name);
+  }
+
+  /**
+   * Retrieves a {@code YSQL} metric.
+   *
+   * @param name  the metric name
+   */
+  public YSQLMetric getYSQLMetric(String name) {
+    return (YSQLMetric)map.get(name);
+  }
+
+  /**
+   * Retrieves a {@code YSQL} stat.
+   *
+   * @param name  the stat name
+   */
+  public YSQLStat getYSQLStat(String name) {
+    return (YSQLStat)map.get(name);
   }
 }

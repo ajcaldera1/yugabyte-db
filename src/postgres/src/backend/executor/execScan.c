@@ -78,8 +78,8 @@ ExecScanFetch(ScanState *node,
 				return ExecClearTuple(slot);
 
 			/* Store test tuple in the plan node's scan slot */
-			ExecStoreTuple(estate->es_epqTuple[scanrelid - 1],
-						   slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(estate->es_epqTuple[scanrelid - 1],
+							   slot, false);
 
 			/* Check if it meets the access-method conditions */
 			if (!(*recheckMtd) (node, slot))
@@ -150,6 +150,15 @@ ExecScan(ScanState *node,
 	 * storage allocated in the previous tuple cycle.
 	 */
 	ResetExprContext(econtext);
+
+	/*
+	 * Use default prefetch limit if there's a qualifier for filtering since YB cannot LIMIT the
+	 * number rows but must feed all rows to NodeSort Operator.
+	 */
+	if (qual)
+	{
+		node->ps.state->yb_exec_params.limit_use_default = true;
+	}
 
 	/*
 	 * get a tuple from the access method.  Loop until we obtain a tuple that

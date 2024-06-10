@@ -30,8 +30,7 @@
 // under the License.
 //
 
-#ifndef YB_SERVER_HYBRID_CLOCK_H_
-#define YB_SERVER_HYBRID_CLOCK_H_
+#pragma once
 
 #include <atomic>
 #include <string>
@@ -39,14 +38,49 @@
 #include <sys/timex.h>
 #endif // !defined(__APPLE__)
 
+#include <boost/atomic.hpp>
+
 #include "yb/gutil/ref_counted.h"
 #include "yb/server/clock.h"
 #include "yb/util/locks.h"
-#include "yb/util/metrics.h"
 #include "yb/util/physical_time.h"
 
 namespace yb {
 namespace server {
+
+struct HybridClockComponents {
+  // The last clock read/update, in microseconds.
+  MicrosTime last_usec = 0;
+
+  // The next logical value to be assigned to a hybrid time.
+  uint64_t logical = 0;
+
+  HybridClockComponents() noexcept {}
+
+  HybridClockComponents(MicrosTime last_usec_, LogicalTimeComponent logical_)
+      : last_usec(last_usec_),
+        logical(logical_) {
+  }
+
+  HybridClockComponents(HybridClockComponents&& other) = default;
+  HybridClockComponents(const HybridClockComponents& other) = default;
+  HybridClockComponents& operator=(const HybridClockComponents& other) = default;
+  HybridClockComponents& operator=(HybridClockComponents&& other) = default;
+
+  bool operator< (const HybridClockComponents& o) const {
+    return last_usec < o.last_usec || (last_usec == o.last_usec && logical < o.logical);
+  }
+
+  bool operator<= (const HybridClockComponents& o) const {
+    return last_usec < o.last_usec || (last_usec == o.last_usec && logical <= o.logical);
+  }
+
+  void HandleLogicalComponentOverflow();
+
+  std::string ToString() const;
+};
+
+std::ostream& operator<<(std::ostream& out, const HybridClockComponents& components);
 
 // The HybridTime clock.
 //
@@ -58,7 +92,7 @@ class HybridClock : public Clock {
   explicit HybridClock(PhysicalClockPtr clock);
   explicit HybridClock(const std::string& time_source);
 
-  CHECKED_STATUS Init() override;
+  Status Init() override;
 
   HybridTimeRange NowRange() override;
 
@@ -76,66 +110,14 @@ class HybridClock : public Clock {
   // Static encoding/decoding methods for hybrid_times. Public mostly
   // for testing/debugging purposes.
 
-  // Returns the logical value embedded in 'hybrid_time'
-  static LogicalTimeComponent GetLogicalValue(const HybridTime& hybrid_time);
-
-  // Returns the physical value embedded in 'hybrid_time', in microseconds.
-  static MicrosTime GetPhysicalValueMicros(const HybridTime& hybrid_time);
-
-  // Returns the physical value embedded in 'hybrid_time', in nanoseconds.
-  static uint64_t GetPhysicalValueNanos(const HybridTime& hybrid_time);
-
-  // Obtains a new HybridTime with the logical value zeroed out.
-  static HybridTime HybridTimeFromMicroseconds(uint64_t micros);
-
-  // Obtains a new HybridTime that embeds both the physical and logical values.
-  static HybridTime HybridTimeFromMicrosecondsAndLogicalValue(
-      MicrosTime micros, LogicalTimeComponent logical_value);
-
-  // Creates a new hybrid_time whose physical time is GetPhysicalValue(original) +
-  // 'micros_to_add' and which retains the same logical value.
-  static HybridTime AddPhysicalTimeToHybridTime(const HybridTime& original,
-                                                const MonoDelta& to_add);
-
-  // Given two hybrid times, determines whether the delta between end and begin them is higher,
-  // lower or equal to the given delta and returns 1, -1 and 0 respectively. Note that if end <
-  // begin we return -1.
-  static int CompareHybridClocksToDelta(const HybridTime& begin, const HybridTime& end,
-                                        const MonoDelta& delta);
-
   static void RegisterProvider(std::string name, PhysicalClockProvider provider);
 
-  const PhysicalClockPtr& TEST_clock() { return clock_; }
+  // Enables check whether clock skew within configured bounds.
+  static void EnableClockSkewControl();
+
+  const PhysicalClockPtr& physical_clock() { return clock_; }
 
  private:
-  struct HybridClockComponents {
-    // The last clock read/update, in microseconds.
-    MicrosTime last_usec = 0;
-
-    // The next logical value to be assigned to a hybrid time.
-    LogicalTimeComponent logical = 0;
-
-    HybridClockComponents() noexcept {}
-
-    HybridClockComponents(MicrosTime last_usec_, LogicalTimeComponent logical_)
-        : last_usec(last_usec_),
-          logical(logical_) {
-    }
-
-    HybridClockComponents(HybridClockComponents&& other) = default;
-    HybridClockComponents(const HybridClockComponents& other) = default;
-
-    bool operator< (const HybridClockComponents& o) const {
-      return last_usec < o.last_usec || (last_usec == o.last_usec && logical < o.logical);
-    }
-
-    bool operator<= (const HybridClockComponents& o) const {
-      return last_usec < o.last_usec || (last_usec == o.last_usec && logical <= o.logical);
-    }
-
-    void HandleLogicalComponentOverflow();
-  };
-
   enum State {
     kNotInitialized,
     kInitialized
@@ -147,17 +129,18 @@ class HybridClock : public Clock {
   // Used to get the current error, for metrics.
   uint64_t ErrorForMetrics();
 
+  // Used to get the current error, for metrics.
+  int64_t SkewForMetrics();
+
   PhysicalClockPtr clock_;
-  std::atomic<HybridClockComponents> components_{HybridClockComponents(0, 0)};
+  boost::atomic<HybridClockComponents> components_{HybridClockComponents(0, 0)};
   State state_ = kNotInitialized;
 
   // Clock metrics are set to detach to their last value. This means
   // that, during our destructor, we'll need to access other class members
   // declared above this. Hence, this member must be declared last.
-  FunctionGaugeDetacher metric_detacher_;
+  std::shared_ptr<void> metric_detacher_;
 };
 
 }  // namespace server
 }  // namespace yb
-
-#endif /* YB_SERVER_HYBRID_CLOCK_H_ */

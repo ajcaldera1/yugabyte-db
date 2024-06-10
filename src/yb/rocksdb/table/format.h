@@ -21,8 +21,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_FORMAT_H
-#define YB_ROCKSDB_TABLE_FORMAT_H
+#pragma once
 
 #include <stdint.h>
 #include <string>
@@ -40,11 +39,16 @@ class MemTracker;
 namespace rocksdb {
 
 class Block;
-class RandomAccessFile;
 struct ReadOptions;
 
 // the length of the magic number in bytes.
 const int kMagicNumberLengthByte = 8;
+
+// Even that we use kKeyDeltaEncodingSharedPrefix format for index blocks, by default every key in
+// index will still have zero shared prefix length and will be stored fully, because
+// index_block_restart_interval default value is 1 (see BlockBasedTableOptions).
+constexpr auto kIndexBlockKeyValueEncodingFormat =
+    KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix;
 
 // BlockHandle is a pointer to the extent of a file that stores a data
 // block or a meta block.
@@ -119,7 +123,7 @@ class Footer {
   // initialized via @ReadFooterFromFile().
   // Use this when you plan to load Footer with DecodeFrom(). Never use this
   // when you plan to AppendEncodedTo.
-  Footer() : Footer(kInvalidTableMagicNumber, 0) {}
+  Footer() : Footer(kInvalidTableMagicNumber, /* version= */ 0) {}
 
   // Use this constructor when you plan to write out the footer using
   // AppendEncodedTo(). Never use this constructor with DecodeFrom().
@@ -190,7 +194,7 @@ class Footer {
   ChecksumType checksum_;
   BlockHandle metaindex_handle_;
   BlockHandle data_index_handle_;
-  uint64_t table_magic_number_ = 0;
+  uint64_t table_magic_number_ = kInvalidTableMagicNumber;
 };
 
 // Read the footer from file
@@ -273,5 +277,3 @@ inline BlockHandle::BlockHandle(uint64_t _offset, uint64_t _size)
     : offset_(_offset), size_(_size) {}
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_TABLE_FORMAT_H

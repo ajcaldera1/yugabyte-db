@@ -14,28 +14,41 @@
 package org.yb.client;
 
 import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
+import org.yb.master.MasterTypes;
+import org.yb.master.MasterTypes.MasterErrorPB;
 
 @InterfaceAudience.Public
 public class GetLoadMovePercentResponse extends YRpcResponse {
   private double percentCompleted;
-  private Master.MasterErrorPB serverError;
+  private long remaining;
+  private long total;
+  private MasterErrorPB serverError;
   private boolean hasRetriableErr = false;
 
   public GetLoadMovePercentResponse(
-      long ellapsedMillis, String masterUUID, double percent,
-      Master.MasterErrorPB error) {
+      long ellapsedMillis, String masterUUID, double percent, long remaining, long total,
+      MasterTypes.MasterErrorPB error) {
     super(ellapsedMillis, masterUUID);
     serverError = error;
     percentCompleted = percent;
+    this.remaining = remaining;
+    this.total = total;
     // This check for a specific string can be centralized for all retriable  errors.
-    if (hasError() && serverError.getCode() == Master.MasterErrorPB.Code.IN_TRANSITION_CAN_RETRY) {
+    if (hasError() && serverError.getCode() == MasterErrorPB.Code.IN_TRANSITION_CAN_RETRY) {
       hasRetriableErr = true;
     }
   }
 
   public double getPercentCompleted() {
     return percentCompleted;
+  }
+
+  public long getRemaining() {
+    return remaining;
+  }
+
+  public long getTotal() {
+    return total;
   }
 
   public boolean hasError() {

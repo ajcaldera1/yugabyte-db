@@ -17,24 +17,24 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
+
 #include "yb/rocksdb/table/adaptive_table_factory.h"
 
-#include "yb/rocksdb/table/table_builder.h"
 #include "yb/rocksdb/table/format.h"
-#include "yb/rocksdb/port/port.h"
+
+#include "yb/rocksdb/table/table_builder.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
 AdaptiveTableFactory::AdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write,
     std::shared_ptr<TableFactory> block_based_table_factory,
-    std::shared_ptr<TableFactory> plain_table_factory,
-    std::shared_ptr<TableFactory> cuckoo_table_factory)
+    std::shared_ptr<TableFactory> plain_table_factory)
     : table_factory_to_write_(table_factory_to_write),
       block_based_table_factory_(block_based_table_factory),
-      plain_table_factory_(plain_table_factory),
-      cuckoo_table_factory_(cuckoo_table_factory) {
+      plain_table_factory_(plain_table_factory) {
   if (!table_factory_to_write_) {
     table_factory_to_write_ = block_based_table_factory_;
   }
@@ -44,16 +44,12 @@ AdaptiveTableFactory::AdaptiveTableFactory(
   if (!block_based_table_factory_) {
     block_based_table_factory_.reset(NewBlockBasedTableFactory());
   }
-  if (!cuckoo_table_factory_) {
-    cuckoo_table_factory_.reset(NewCuckooTableFactory());
-  }
 }
 
 extern const uint64_t kPlainTableMagicNumber;
 extern const uint64_t kLegacyPlainTableMagicNumber;
 extern const uint64_t kBlockBasedTableMagicNumber;
 extern const uint64_t kLegacyBlockBasedTableMagicNumber;
-extern const uint64_t kCuckooTableMagicNumber;
 
 Status AdaptiveTableFactory::NewTableReader(
     const TableReaderOptions& table_reader_options,
@@ -72,19 +68,16 @@ Status AdaptiveTableFactory::NewTableReader(
       footer.table_magic_number() == kLegacyBlockBasedTableMagicNumber) {
     return block_based_table_factory_->NewTableReader(
         table_reader_options, std::move(file), file_size, table);
-  } else if (footer.table_magic_number() == kCuckooTableMagicNumber) {
-    return cuckoo_table_factory_->NewTableReader(
-        table_reader_options, std::move(file), file_size, table);
   } else {
     return STATUS(NotSupported, "Unidentified table format");
   }
 }
 
-TableBuilder* AdaptiveTableFactory::NewTableBuilder(
+std::unique_ptr<TableBuilder> AdaptiveTableFactory::NewTableBuilder(
     const TableBuilderOptions &table_builder_options, uint32_t column_family_id,
     WritableFileWriter* base_file, WritableFileWriter* data_file) const {
-  return table_factory_to_write_->NewTableBuilder(table_builder_options,
-      column_family_id, base_file, data_file);
+  return table_factory_to_write_->NewTableBuilder(
+      table_builder_options, column_family_id, base_file, data_file);
 }
 
 bool AdaptiveTableFactory::IsSplitSstForWriteSupported() const {
@@ -97,28 +90,22 @@ std::string AdaptiveTableFactory::GetPrintableTableOptions() const {
   const int kBufferSize = 200;
   char buffer[kBufferSize];
 
-  if (!table_factory_to_write_) {
+  if (table_factory_to_write_) {
     snprintf(buffer, kBufferSize, "  write factory (%s) options:\n%s\n",
              table_factory_to_write_->Name(),
              table_factory_to_write_->GetPrintableTableOptions().c_str());
     ret.append(buffer);
   }
-  if (!plain_table_factory_) {
+  if (plain_table_factory_) {
     snprintf(buffer, kBufferSize, "  %s options:\n%s\n",
              plain_table_factory_->Name(),
              plain_table_factory_->GetPrintableTableOptions().c_str());
     ret.append(buffer);
   }
-  if (!block_based_table_factory_) {
+  if (block_based_table_factory_) {
     snprintf(buffer, kBufferSize, "  %s options:\n%s\n",
              block_based_table_factory_->Name(),
              block_based_table_factory_->GetPrintableTableOptions().c_str());
-    ret.append(buffer);
-  }
-  if (!cuckoo_table_factory_) {
-    snprintf(buffer, kBufferSize, "  %s options:\n%s\n",
-             cuckoo_table_factory_->Name(),
-             cuckoo_table_factory_->GetPrintableTableOptions().c_str());
     ret.append(buffer);
   }
   return ret;
@@ -127,11 +114,9 @@ std::string AdaptiveTableFactory::GetPrintableTableOptions() const {
 extern TableFactory* NewAdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write,
     std::shared_ptr<TableFactory> block_based_table_factory,
-    std::shared_ptr<TableFactory> plain_table_factory,
-    std::shared_ptr<TableFactory> cuckoo_table_factory) {
+    std::shared_ptr<TableFactory> plain_table_factory) {
   return new AdaptiveTableFactory(table_factory_to_write,
-      block_based_table_factory, plain_table_factory, cuckoo_table_factory);
+      block_based_table_factory, plain_table_factory);
 }
 
 }  // namespace rocksdb
-#endif  // ROCKSDB_LITE

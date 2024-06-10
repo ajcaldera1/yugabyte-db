@@ -13,26 +13,40 @@
 //
 //
 
-#ifndef YB_CLIENT_CLIENT_FWD_H
-#define YB_CLIENT_CLIENT_FWD_H
+#pragma once
 
 #include <functional>
 #include <memory>
+#include <set>
+#include <utility>
 #include <vector>
 
-#include "yb/common/entity_ids.h"
+#include <boost/function/function_fwd.hpp>
 
-#include "yb/util/result.h"
+#include "yb/cdc/cdc_types.h"
+
+#include "yb/common/common_fwd.h"
+#include "yb/common/entity_ids_types.h"
+
+#include "yb/util/status_fwd.h"
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
 #include "yb/util/strongly_typed_bool.h"
 
 template <class T>
 class scoped_refptr;
 
+YB_STRONGLY_TYPED_BOOL(RequireTabletsRunning);
+YB_STRONGLY_TYPED_BOOL(PartitionsOnly);
+
 namespace yb {
 namespace client {
 
+class RejectionScoreSource;
+typedef std::shared_ptr<RejectionScoreSource> RejectionScoreSourcePtr;
+
 class YBClient;
-typedef std::shared_ptr<YBClient> YBClientPtr;
+class YBClientBuilder;
 
 class YBError;
 typedef std::vector<std::unique_ptr<YBError>> CollectedErrors;
@@ -43,9 +57,6 @@ typedef std::shared_ptr<YBTransaction> YBTransactionPtr;
 class YBqlOp;
 class YBqlReadOp;
 class YBqlWriteOp;
-typedef std::shared_ptr<YBqlOp> YBqlOpPtr;
-typedef std::shared_ptr<YBqlReadOp> YBqlReadOpPtr;
-typedef std::shared_ptr<YBqlWriteOp> YBqlWriteOpPtr;
 
 class YBPgsqlOp;
 class YBPgsqlReadOp;
@@ -57,9 +68,17 @@ class YBRedisWriteOp;
 
 class YBSession;
 typedef std::shared_ptr<YBSession> YBSessionPtr;
+struct FlushStatus;
+using FlushCallback = boost::function<void(FlushStatus*)>;
+using CommitCallback = boost::function<void(const Status&)>;
+using CreateCallback = boost::function<void(const Status&)>;
 
 class YBTable;
 typedef std::shared_ptr<YBTable> YBTablePtr;
+typedef std::vector<PartitionKey> TablePartitionList;
+typedef uint32_t PartitionListVersion;
+struct VersionedTablePartitionList;
+struct VersionedPartitionStartKey;
 
 class YBOperation;
 typedef std::shared_ptr<YBOperation> YBOperationPtr;
@@ -70,46 +89,83 @@ class TransactionPool;
 class YBColumnSpec;
 class YBLoggingCallback;
 class YBMetaDataCache;
+class YBNamespaceAlterer;
 class YBSchema;
 class YBTableAlterer;
 class YBTableCreator;
 class YBTableName;
-class YBTabletServer;
+class UniverseKeyClient;
 
+struct ChildTransactionData;
+struct TableSizeInfo;
+struct VersionedTablePartitionList;
 struct YBTableInfo;
+struct YBTabletServer;
+struct YBTabletServerPlacementInfo;
+struct YBqlWriteHashKeyComparator;
+struct YBqlWritePrimaryKeyComparator;
 
-typedef std::function<void(std::vector<const TabletId*>*)> LocalTabletFilter;
+using LocalTabletFilter = std::function<void(std::vector<const TabletId*>*)>;
+using VersionedTablePartitionListPtr = std::shared_ptr<const VersionedTablePartitionList>;
+using TablePartitionListPtr = std::shared_ptr<const TablePartitionList>;
+using TabletServersInfo = std::vector<YBTabletServerPlacementInfo>;
+using YBqlOpPtr = std::shared_ptr<YBqlOp>;
+using YBqlReadOpPtr = std::shared_ptr<YBqlReadOp>;
+using YBqlWriteOpPtr = std::shared_ptr<YBqlWriteOp>;
+using YBPgsqlReadOpPtr = std::shared_ptr<YBPgsqlReadOp>;
+using YBPgsqlWriteOpPtr = std::shared_ptr<YBPgsqlWriteOp>;
 
-YB_STRONGLY_TYPED_BOOL(UseCache);
+enum class YBTableType;
+
+YB_DEFINE_ENUM(GrantRevokeStatementType, (GRANT)(REVOKE));
 YB_STRONGLY_TYPED_BOOL(ForceConsistentRead);
+YB_STRONGLY_TYPED_BOOL(ForceGlobalTransaction);
+YB_STRONGLY_TYPED_BOOL(Initial);
+YB_STRONGLY_TYPED_BOOL(UseCache);
 
 namespace internal {
 
 class AsyncRpc;
+class TxnBatcherIf;
+class GetTableSchemaRpc;
+class GetTablegroupSchemaRpc;
+class GetColocatedTabletSchemaRpc;
+class LookupRpc;
 class MetaCache;
+class PermissionsCache;
+class ReadRpc;
 class TabletInvoker;
+class WriteRpc;
 
 struct InFlightOp;
-typedef std::shared_ptr<InFlightOp> InFlightOpPtr;
-typedef std::vector<InFlightOpPtr> InFlightOps;
+struct InFlightOpsGroupsWithMetadata;
 
 class RemoteTablet;
 typedef scoped_refptr<RemoteTablet> RemoteTabletPtr;
 
 class RemoteTabletServer;
+using RemoteTabletServerPtr = std::shared_ptr<RemoteTabletServer>;
 
 class Batcher;
-typedef scoped_refptr<Batcher> BatcherPtr;
+using BatcherPtr = std::shared_ptr<Batcher>;
 
 struct AsyncRpcMetrics;
 typedef std::shared_ptr<AsyncRpcMetrics> AsyncRpcMetricsPtr;
 
+YB_STRONGLY_TYPED_BOOL(IsWithinTransactionRetry);
+
 } // namespace internal
 
 typedef std::function<void(const Result<internal::RemoteTabletPtr>&)> LookupTabletCallback;
+typedef std::function<void(const Result<std::vector<internal::RemoteTabletPtr>>&)>
+        LookupTabletRangeCallback;
+typedef std::function<void(const Result<xrepl::StreamId>&)> CreateCDCStreamCallback;
+typedef Result<std::tuple<
+    std::vector<TableId> /* table_ids */, std::vector<std::string> /* bootstrap_ids */,
+    HybridTime /* bootstrap_time */>>
+    BootstrapProducerResult;
+typedef std::function<void(BootstrapProducerResult)> BootstrapProducerCallback;
+class AsyncClientInitializer;
 
-class AsyncClientInitialiser;
 } // namespace client
 } // namespace yb
-
-#endif // YB_CLIENT_CLIENT_FWD_H

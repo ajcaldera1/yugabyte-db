@@ -15,14 +15,14 @@ package org.yb.client;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import org.jboss.netty.buffer.ChannelBuffer;
+import io.netty.buffer.ByteBuf;
 
 import org.yb.annotations.InterfaceAudience;
-import org.yb.Common.HostPortPB;
+import org.yb.CommonNet.HostPortPB;
 import org.yb.consensus.Consensus;
 import org.yb.consensus.Metadata;
 import org.yb.consensus.Metadata.RaftPeerPB;
-import org.yb.master.Master;
+import org.yb.master.MasterClusterOuterClass;
 import org.yb.util.Pair;
 
 import java.util.ArrayList;
@@ -35,10 +35,10 @@ class GetMasterClusterConfigRequest extends YRpc<GetMasterClusterConfigResponse>
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
-    final Master.GetMasterClusterConfigRequestPB.Builder builder =
-      Master.GetMasterClusterConfigRequestPB.newBuilder();
+    final MasterClusterOuterClass.GetMasterClusterConfigRequestPB.Builder builder =
+      MasterClusterOuterClass.GetMasterClusterConfigRequestPB.newBuilder();
 
     return toChannelBuffer(header, builder.build());
   }
@@ -53,8 +53,8 @@ class GetMasterClusterConfigRequest extends YRpc<GetMasterClusterConfigResponse>
   Pair<GetMasterClusterConfigResponse, Object> deserialize(
       CallResponse callResponse,
       String masterUUID) throws Exception {
-    final Master.GetMasterClusterConfigResponsePB.Builder respBuilder =
-      Master.GetMasterClusterConfigResponsePB.newBuilder();
+    final MasterClusterOuterClass.GetMasterClusterConfigResponsePB.Builder respBuilder =
+      MasterClusterOuterClass.GetMasterClusterConfigResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     boolean hasErr = respBuilder.hasError();
     GetMasterClusterConfigResponse response =

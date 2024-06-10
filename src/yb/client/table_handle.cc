@@ -15,13 +15,23 @@
 
 #include "yb/client/client.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
 
-#include "yb/master/master.pb.h"
+#include "yb/dockv/partition.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
 
-#include "yb/yql/cql/ql/util/statement_result.h"
+#include "yb/master/master_client.pb.h"
+
+#include "yb/util/format.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+
+using std::string;
 
 using namespace std::literals; // NOLINT
 
@@ -31,28 +41,54 @@ namespace client {
 Status TableHandle::Create(const YBTableName& table_name,
                            int num_tablets,
                            YBClient* client,
-                           YBSchemaBuilder* builder) {
+                           YBSchemaBuilder* builder,
+                           IndexInfoPB* index_info) {
   YBSchema schema;
   RETURN_NOT_OK(builder->Build(&schema));
-  return Create(table_name, num_tablets, schema, client);
+  return Create(table_name, num_tablets, schema, client, index_info);
 }
 
 Status TableHandle::Create(const YBTableName& table_name,
                            int num_tablets,
                            const YBSchema& schema,
-                           YBClient* client) {
+                           YBClient* client,
+                           IndexInfoPB* index_info) {
   std::unique_ptr<YBTableCreator> table_creator(client->NewTableCreator());
-  RETURN_NOT_OK(table_creator->table_name(table_name)
+  table_creator->table_name(table_name)
       .schema(&schema)
-      .num_tablets(num_tablets)
-      .Create());
+      .num_tablets(num_tablets);
 
+  if (schema.num_hash_key_columns() == 0) {
+    // Setup range key columns for range-sharded tables.
+    std::vector<std::string> range_column_names;
+    range_column_names.reserve(schema.num_range_key_columns());
+    auto& columns = schema.columns();
+    for (size_t i = 0; i < schema.num_key_columns(); ++i) {
+      auto& column_schema = columns[i];
+      CHECK(column_schema.is_key());
+      if (!column_schema.is_hash_key()) {
+        range_column_names.push_back(column_schema.name());
+      }
+    }
+    table_creator->set_range_partition_columns(range_column_names);
+  }
+
+  // Setup Index properties.
+  if (index_info) {
+    table_creator->indexed_table_id(index_info->indexed_table_id())
+        .is_local_index(index_info->is_local())
+        .is_unique_index(index_info->is_unique())
+        .mutable_index_info()->CopyFrom(*index_info);
+  }
+
+  RETURN_NOT_OK(table_creator->Create());
   return Open(table_name, client);
 }
 
 Status TableHandle::Open(const YBTableName& table_name, YBClient* client) {
   RETURN_NOT_OK(client->OpenTable(table_name, &table_));
 
+  client_ = client;
   auto schema = table_->schema();
   for (size_t i = 0; i < schema.num_columns(); ++i) {
     yb::ColumnId col_id = yb::ColumnId(schema.ColumnId(i));
@@ -61,6 +97,10 @@ Status TableHandle::Open(const YBTableName& table_name, YBClient* client) {
   }
 
   return Status::OK();
+}
+
+Status TableHandle::Reopen() {
+  return Open(name(), client_);
 }
 
 const YBTableName& TableHandle::name() const {
@@ -89,6 +129,7 @@ auto SetupRequest(const T& op, const YBSchema& schema) {
   req->set_request_id(0);
   req->set_query_id(reinterpret_cast<int64_t>(op.get()));
   req->set_schema_version(schema.version());
+  req->set_is_compatible_with_previous_version(schema.is_compatible_with_previous_version());
   return req;
 }
 
@@ -170,20 +211,27 @@ TableIterator::TableIterator() : table_(nullptr) {}
     if (!status.ok()) { HandleError(MoveStatus(status)); return; } \
   } while (false) \
 
+#define REPORT_AND_RETURN_FALSE_IF_NOT_OK(expr) \
+  do { \
+    auto&& status = (expr); \
+    if (!status.ok()) { HandleError(MoveStatus(status)); return false; } \
+  } while (false) \
+
 TableIterator::TableIterator(const TableHandle* table, const TableIteratorOptions& options)
     : table_(table), error_handler_(options.error_handler) {
-  auto client = (*table)->client();
+  auto client = table->client();
+
+  session_ = client->NewSession(options.timeout);
+
   google::protobuf::RepeatedPtrField<master::TabletLocationsPB> tablets;
-  REPORT_AND_RETURN_IF_NOT_OK(client->GetTablets(table->name(), 0, &tablets));
+  REPORT_AND_RETURN_IF_NOT_OK(client->GetTablets(
+      table->name(), /* max_tablets = */ 0, &tablets, /* partition_list_version =*/nullptr));
   if (tablets.size() == 0) {
     table_ = nullptr;
     return;
   }
   ops_.reserve(tablets.size());
   partition_key_ends_.reserve(tablets.size());
-
-  session_ = client->NewSession();
-  session_->SetTimeout(60s);
 
   for (const auto& tablet : tablets) {
     if (!options.tablet.empty() && options.tablet != tablet.tablet_id()) {
@@ -195,7 +243,7 @@ TableIterator::TableIterator(const TableHandle* table, const TableIteratorOption
 
     const auto& key_start = tablet.partition().partition_key_start();
     if (!key_start.empty()) {
-      req->set_hash_code(PartitionSchema::DecodeMultiColumnHashValue(key_start));
+      req->set_hash_code(dockv::PartitionSchema::DecodeMultiColumnHashValue(key_start));
     }
 
     if (options.filter) {
@@ -212,18 +260,22 @@ TableIterator::TableIterator(const TableHandle* table, const TableIteratorOption
     partition_key_ends_.push_back(tablet.partition().partition_key_end());
   }
 
-  ExecuteOps();
-  Move();
+  if (ExecuteOps()) {
+    Move();
+  }
 }
 
-void TableIterator::ExecuteOps() {
+bool TableIterator::ExecuteOps() {
   constexpr size_t kMaxConcurrentOps = 5;
   const size_t new_executed_ops = std::min(ops_.size(), executed_ops_ + kMaxConcurrentOps);
   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
-    REPORT_AND_RETURN_IF_NOT_OK(session_->Apply(ops_[i]));
+    session_->Apply(ops_[i]);
   }
 
-  REPORT_AND_RETURN_IF_NOT_OK(session_->Flush());
+  // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+  if (!IsFlushStatusOkOrHandleErrors(session_->TEST_FlushAndGetOpsErrors())) {
+    return false;
+  }
 
   for (size_t i = executed_ops_; i != new_executed_ops; ++i) {
     const auto& op = ops_[i];
@@ -233,6 +285,7 @@ void TableIterator::ExecuteOps() {
   }
 
   executed_ops_ = new_executed_ops;
+  return true;
 }
 
 bool TableIterator::Equals(const TableIterator& rhs) const {
@@ -245,7 +298,7 @@ TableIterator& TableIterator::operator++() {
   return *this;
 }
 
-const QLRow& TableIterator::operator*() const {
+const qlexpr::QLRow& TableIterator::operator*() const {
   return current_block_->rows()[row_index_];
 }
 
@@ -255,14 +308,21 @@ void TableIterator::Move() {
       if (paging_state_) {
         auto& op = ops_[ops_index_];
         *op->mutable_request()->mutable_paging_state() = *paging_state_;
-        REPORT_AND_RETURN_IF_NOT_OK(session_->ApplyAndFlush(op));
+        session_->Apply(op);
+        // TODO(async_flush): https://github.com/yugabyte/yugabyte-db/issues/12173
+        if (!IsFlushStatusOkOrHandleErrors(session_->TEST_FlushAndGetOpsErrors())) {
+          return;
+        }
         if (QLResponsePB::YQL_STATUS_OK != op->response().status()) {
           HandleError(STATUS_FORMAT(RuntimeError, "Error for $0: $1", *op, op->response()));
         }
       } else {
         ++ops_index_;
         if (ops_index_ >= executed_ops_ && executed_ops_ < ops_.size()) {
-          ExecuteOps();
+          if (!ExecuteOps()) {
+            // Error occurred. exit out early.
+            return;
+          }
         }
       }
     }
@@ -286,18 +346,28 @@ void TableIterator::Move() {
   }
 }
 
+bool TableIterator::IsFlushStatusOkOrHandleErrors(FlushStatus flush_status) {
+  if (flush_status.status.ok()) {
+    return true;
+  }
+  HandleError(flush_status.status);
+  if (!error_handler_) {
+    for (const auto& error : flush_status.errors) {
+      LOG(ERROR) << "Failed operation: " << error->failed_op().ToString()
+                 << ", status: " << error->status();
+    }
+  }
+  return false;
+}
+
 void TableIterator::HandleError(const Status& status) {
   if (error_handler_) {
     error_handler_(status);
   } else {
-    CollectedErrors errors = session_->GetPendingErrors();
-    for (const auto& error : errors) {
-      LOG(ERROR) << "Failed operation: " << error->failed_op().ToString()
-                 << ", status: " << error->status();
-    }
-
     LOG(FATAL) << "Failed: " << status;
   }
+  // Makes this iterator == end().
+  table_ = nullptr;
 }
 
 template <>
@@ -336,6 +406,41 @@ template <>
 void FilterEqualImpl<std::string>::operator()(
     const TableHandle& table, QLConditionPB* condition) const {
   table.SetBinaryCondition(condition, column_, QL_OP_EQUAL, t_);
+}
+
+void UpdateMapUpsertKeyValue(
+    QLWriteRequestPB* req, const int32_t column_id, const string& entry_key,
+    const string& entry_value) {
+  auto column_value = req->add_column_values();
+  column_value->set_column_id(column_id);
+  QLValuePB* elem = column_value->mutable_expr()->mutable_value();
+  elem->set_string_value(entry_value);
+  auto sub_arg = column_value->add_subscript_args();
+  elem = sub_arg->mutable_value();
+  elem->set_string_value(entry_key);
+}
+
+void UpdateMapRemoveKey(QLWriteRequestPB* req, const int32_t column_id, const string& entry_key) {
+  auto column_value = req->add_column_values();
+  column_value->set_column_id(column_id);
+  auto sub_arg = column_value->add_subscript_args();
+  QLValuePB* elem = sub_arg->mutable_value();
+  elem->set_string_value(entry_key);
+}
+
+QLMapValuePB* AddMapColumn(QLWriteRequestPB* req, const int32_t& column_id) {
+  auto column_value = req->add_column_values();
+  column_value->set_column_id(column_id);
+  QLMapValuePB* map_value = (column_value->mutable_expr()->mutable_value()->mutable_map_value());
+  return map_value;
+}
+
+void AddMapEntryToColumn(
+    QLMapValuePB* map_value_pb, const string& entry_key, const string& entry_value) {
+  QLValuePB* elem = map_value_pb->add_keys();
+  elem->set_string_value(entry_key);
+  elem = map_value_pb->add_values();
+  elem->set_string_value(entry_value);
 }
 
 } // namespace client

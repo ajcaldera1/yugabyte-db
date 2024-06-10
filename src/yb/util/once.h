@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_ONCE_H
-#define YB_UTIL_ONCE_H
+#pragma once
 
 #include <stddef.h>
 
@@ -78,7 +77,7 @@ class YBOnceDynamic {
   //
   // T: the type of the member passed in.
   template<typename T>
-  CHECKED_STATUS Init(Status (T::*member_func)(), T* instance) {
+  Status Init(Status (T::*member_func)(), T* instance) {
     internal::MemberFunc<T> mf = { this, instance, member_func };
 
     // Clang UBSAN doesn't like it when GoogleOnceDynamic handles the cast
@@ -121,5 +120,3 @@ class YBOnceDynamic {
 };
 
 } // namespace yb
-
-#endif

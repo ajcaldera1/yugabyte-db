@@ -18,11 +18,8 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
 #include "yb/rocksdb/utilities/memory_util.h"
-
-#include "yb/rocksdb/db/db_impl.h"
 
 namespace rocksdb {
 
@@ -64,4 +61,3 @@ Status MemoryUtil::GetApproximateMemoryUsageByType(
   return Status::OK();
 }
 }  // namespace rocksdb
-#endif  // !ROCKSDB_LITE

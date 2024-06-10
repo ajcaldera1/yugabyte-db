@@ -29,14 +29,13 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_TRACING_PATH_HANDLERS_H
-#define YB_SERVER_TRACING_PATH_HANDLERS_H
+#pragma once
+
+#include <sstream>
 
 #include "yb/gutil/macros.h"
 #include "yb/server/webserver.h"
-#include "yb/util/status.h"
-
-#include <sstream>
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 namespace server {
@@ -48,9 +47,9 @@ class TracingPathHandlers {
  public:
   static void RegisterHandlers(Webserver* server);
 
+ private:
   DISALLOW_IMPLICIT_CONSTRUCTORS(TracingPathHandlers);
 };
 
 } // namespace server
 } // namespace yb
-#endif /* YB_SERVER_TRACING_PATH_HANDLERS_H */

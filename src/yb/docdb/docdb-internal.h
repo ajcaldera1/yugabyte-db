@@ -11,13 +11,28 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_DOCDB_INTERNAL_H_
-#define YB_DOCDB_DOCDB_INTERNAL_H_
+#pragma once
 
-#include "yb/docdb/docdb.h"
-#include "yb/docdb/value_type.h"
-#include "yb/gutil/strings/substitute.h"
-#include "yb/util/slice.h"
+#include <assert.h>
+#include <inttypes.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+
+#include <iosfwd>
+#include <limits>
+#include <string>
+
+#include "yb/common/doc_hybrid_time.h"
+
+#include "yb/docdb/docdb_types.h"
+
+#include "yb/gutil/endian.h"
+#include "yb/gutil/integral_types.h"
+#include "yb/gutil/strings/substitute.h" // For Substitute
+
+#include "yb/util/status_fwd.h"
 
 // This file should only be included in .cc files of the docdb subsystem. Defines some macros for
 // debugging DocDB functionality.
@@ -55,12 +70,8 @@ constexpr bool IsDocDbDebug() {
 namespace yb {
 namespace docdb {
 
-// Type of keys written by DocDB into RocksDB.
-YB_DEFINE_ENUM(KeyType, (kEmpty)(kIntentKey)(kReverseTxnKey)(kValueKey)(kTransactionMetadata));
-
+// Infer the key type from the given slice, given whether this is regular or intents RocksDB.
 KeyType GetKeyType(const Slice& slice, StorageDbType db_type);
 
 } // namespace docdb
 } // namespace yb
-
-#endif  // YB_DOCDB_DOCDB_INTERNAL_H_

@@ -20,7 +20,7 @@
 #include "access/itup.h"
 #include "access/tupdesc.h"
 #include "storage/spin.h"
-#include "ybcam.h"
+#include "access/yb_scan.h"
 
 /*
  * Shared state for parallel heap scan.
@@ -141,6 +141,41 @@ typedef struct IndexScanDescData
 
 	/* parallel index scan information, in shared memory */
 	ParallelIndexScanDesc parallel_scan;
+
+	/* During execution, Postgres will push down hints to YugaByte for performance purpose.
+	 * (currently, only LIMIT values are being pushed down). All these execution information will
+	 * kept in "yb_exec_params".
+	 *
+	 * - Generally, "yb_exec_params" is kept in execution-state. As Postgres executor traverses and
+	 *   excutes the nodes, it passes along the execution state. Necessary information (such as
+	 *   LIMIT values) will be collected and written to "yb_exec_params" in EState.
+	 *
+	 * - However, IndexScan execution doesn't use Postgres's node execution infrastructure. Neither
+	 *   execution plan nor execution state is passed to IndexScan operators. As a result,
+	 *   "yb_exec_params" is kept in "IndexScanDescData" to avoid passing EState to a lot of
+	 *   IndexScan functions.
+	 *
+	 * - Postgres IndexScan function will call and pass "yb_exec_params" to PgGate to control the
+	 *   index-scan execution in YugaByte.
+	 */
+	YBCPgExecParameters *yb_exec_params;
+
+	/*
+	 * yb_scan_plan stores postgres scan plan for current index scan.
+	 * This information is used to determine target columns that must be read from DocDB
+	 * and columns which can be omitted.
+	 * TODO: Calculate set of required YB targets on plan stage and use it here
+	 *       instead of scan plan. In addition to code speedup this approach will allow to
+	 *       remove scan plan from IndexScanDescData structure. Native postgres code doesn't
+	 *       have plan information in scan state structures.
+	 */
+	Scan *yb_scan_plan;
+	PushdownExprs *yb_rel_pushdown;
+	PushdownExprs *yb_idx_pushdown;
+	List *yb_aggrefs;				/* aggregate information for aggregate pushdown */
+	TupleTableSlot *yb_agg_slot;	/* scan slot used by aggregate pushdown */
+	int yb_distinct_prefixlen; /* prefix length, in columns, of a distinct index scan */
+	bool fetch_ybctids_only;
 }			IndexScanDescData;
 
 /* Generic structure for parallel scans */
@@ -160,7 +195,7 @@ typedef struct SysScanDescData
 	HeapScanDesc scan;			/* only valid in heap-scan case */
 	IndexScanDesc iscan;		/* only valid in index-scan case */
 	Snapshot	snapshot;		/* snapshot to unregister at end of scan */
-	YbScanDesc	ybscan;			/* only valid in yb-scan case */
+	YbSysScanBase	ybscan;			/* only valid in yb-scan case */
 }			SysScanDescData;
 
 #endif							/* RELSCAN_H */

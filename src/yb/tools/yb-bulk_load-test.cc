@@ -13,34 +13,52 @@
 
 #include <string>
 #include <thread>
-#include <gtest/gtest.h>
+
 #include <boost/algorithm/string.hpp>
+#include <gtest/gtest.h>
 
 #include "yb/client/client.h"
 #include "yb/client/schema.h"
+#include "yb/client/table.h"
 #include "yb/client/table_creator.h"
 #include "yb/client/table_handle.h"
+
 #include "yb/common/hybrid_time.h"
-#include "yb/common/partition.h"
+#include "yb/common/jsonb.h"
+#include "yb/dockv/partition.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/ql_value.h"
+#include "yb/common/schema.h"
 #include "yb/common/wire_protocol.h"
-#include "yb/docdb/docdb_test_util.h"
-#include "yb/docdb/ql_rocksdb_storage.h"
+
+#include "yb/gutil/casts.h"
+
 #include "yb/integration-tests/mini_cluster.h"
 #include "yb/integration-tests/yb_mini_cluster_test_base.h"
-#include "yb/master/master.proxy.h"
-#include "yb/master/master_defaults.h"
+
+#include "yb/master/master_client.proxy.h"
 #include "yb/master/mini_master.h"
+
 #include "yb/rpc/messenger.h"
-#include "yb/yql/cql/ql/util/statement_result.h"
-#include "yb/tablet/tablet_peer.h"
+#include "yb/rpc/proxy.h"
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/tools/bulk_load_utils.h"
 #include "yb/tools/yb-generate_partitions.h"
-#include "yb/tserver/tablet_server.h"
-#include "yb/tserver/mini_tablet_server.h"
-#include "yb/util/date_time.h"
+
+#include "yb/tserver/tserver_service.proxy.h"
+
 #include "yb/util/path_util.h"
 #include "yb/util/random.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/subprocess.h"
+#include "yb/util/tsan_util.h"
+
+#include "yb/yql/cql/ql/util/statement_result.h"
+
+using std::string;
+using std::vector;
 
 DECLARE_uint64(initial_seqno);
 DECLARE_uint64(bulk_load_num_files_per_tablet);
@@ -59,6 +77,7 @@ using client::YBSchemaBuilder;
 using client::YBTableCreator;
 using client::YBTableName;
 using client::YBTable;
+using common::Jsonb;
 
 static const char* const kPartitionToolName = "yb-generate_partitions_main";
 static const char* const kBulkLoadToolName = "yb-bulk_load";
@@ -84,38 +103,38 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     opts.num_tablet_servers = kNumTabletServers;
 
     // Use a high enough initial sequence number.
-    FLAGS_initial_seqno = 1 << 20;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_initial_seqno) = 1 << 20;
 
-    cluster_.reset(new MiniCluster(env_.get(), opts));
+    cluster_.reset(new MiniCluster(opts));
     ASSERT_OK(cluster_->Start());
 
-    ASSERT_OK(YBClientBuilder()
-              .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
-              .Build(&client_));
+    client_ = ASSERT_RESULT(YBClientBuilder()
+        .add_master_server_addr(cluster_->mini_master()->bound_rpc_addr_str())
+        .Build());
 
     YBSchemaBuilder b;
-    b.AddColumn("hash_key")->Type(INT64)->NotNull()->HashPrimaryKey();
-    b.AddColumn("hash_key_timestamp")->Type(TIMESTAMP)->NotNull()->HashPrimaryKey();
-    b.AddColumn("hash_key_string")->Type(STRING)->NotNull()->HashPrimaryKey();
-    b.AddColumn("range_key")->Type(TIMESTAMP)->NotNull()->PrimaryKey();
-    b.AddColumn("v1")->Type(STRING)->NotNull();
-    b.AddColumn("v2")->Type(INT32)->NotNull();
-    b.AddColumn("v3")->Type(FLOAT)->NotNull();
-    b.AddColumn("v4")->Type(DOUBLE)->NotNull();
+    b.AddColumn("hash_key")->Type(DataType::INT64)->NotNull()->HashPrimaryKey();
+    b.AddColumn("hash_key_timestamp")->Type(DataType::TIMESTAMP)->NotNull()->HashPrimaryKey();
+    b.AddColumn("hash_key_string")->Type(DataType::STRING)->NotNull()->HashPrimaryKey();
+    b.AddColumn("range_key")->Type(DataType::TIMESTAMP)->NotNull()->PrimaryKey();
+    b.AddColumn("v1")->Type(DataType::STRING)->NotNull();
+    b.AddColumn("v2")->Type(DataType::INT32)->NotNull();
+    b.AddColumn("v3")->Type(DataType::FLOAT)->NotNull();
+    b.AddColumn("v4")->Type(DataType::DOUBLE)->NotNull();
+    b.AddColumn("v5")->Type(DataType::JSONB)->Nullable();
     CHECK_OK(b.Build(&schema_));
 
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
     client_messenger_ = ASSERT_RESULT(rpc::MessengerBuilder("Client").Build());
-    rpc::ProxyCache proxy_cache(client_messenger_);
-    proxy_.reset(new master::MasterServiceProxy(&proxy_cache,
-                                                cluster_->leader_mini_master()->bound_rpc_addr()));
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
+    proxy_ = std::make_unique<master::MasterClientProxy>(
+        &proxy_cache, ASSERT_RESULT(cluster_->GetLeaderMasterBoundRpcAddr()));
 
     // Create the namespace.
     ASSERT_OK(client_->CreateNamespace(kNamespace));
 
     // Create the table.
-    table_name_.reset(new YBTableName(kNamespace, kTableName));
+    table_name_.reset(new YBTableName(YQL_DATABASE_CQL, kNamespace, kTableName));
     std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(*table_name_.get())
           .table_type(client::YBTableType::YQL_TABLE_TYPE)
@@ -126,7 +145,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
 
     ASSERT_OK(client_->OpenTable(*table_name_, &table_));
 
-    for (int i = 0; i < cluster_->num_masters(); i++) {
+    for (size_t i = 0; i < cluster_->num_masters(); i++) {
       const string& master_address = cluster_->mini_master(i)->bound_rpc_addr_str();
       master_addresses_.push_back(master_address);
     }
@@ -137,13 +156,15 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
   void DoTearDown() override {
+    client_messenger_->Shutdown();
+    client_.reset();
     cluster_->Shutdown();
   }
 
-  CHECKED_STATUS StartProcessAndGetStreams(string exe_path, vector<string> argv, FILE** out,
-                                           FILE** in, std::unique_ptr<Subprocess>* process) {
+  Status StartProcessAndGetStreams(string exe_path, vector<string> argv, FILE** out,
+                                   FILE** in, std::unique_ptr<Subprocess>* process) {
     process->reset(new Subprocess(exe_path, argv));
-    (*process)->ShareParentStdout(false);
+    (*process)->PipeParentStdout();
     RETURN_NOT_OK((*process)->Start());
 
     *out = fdopen((*process)->ReleaseChildStdinFd(), "w");
@@ -163,14 +184,14 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_EQ(0, WEXITSTATUS(wait_status));
   }
 
-  CHECKED_STATUS CreateQLReadRequest(const string& row, QLReadRequestPB* req) {
+  Status CreateQLReadRequest(const string& row, QLReadRequestPB* req) {
     req->set_client(YQL_CLIENT_CQL);
     string tablet_id;
     string partition_key;
     CsvTokenizer tokenizer = Tokenize(row);
-    RETURN_NOT_OK(partition_generator_->LookupTabletIdWithTokenizer(tokenizer, &tablet_id,
-                                                                    &partition_key));
-    uint16_t hash_code = PartitionSchema::DecodeMultiColumnHashValue(partition_key);
+    RETURN_NOT_OK(partition_generator_->LookupTabletIdWithTokenizer(
+        tokenizer, {}, &tablet_id, &partition_key));
+    uint16_t hash_code = dockv::PartitionSchema::DecodeMultiColumnHashValue(partition_key);
     req->set_hash_code(hash_code);
     req->set_max_hash_code(hash_code);
 
@@ -199,9 +220,9 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
 
     // Set all column ids.
     QLRSRowDescPB *rsrow_desc = req->mutable_rsrow_desc();
-    for (int i = 0; i < table_->InternalSchema().num_columns(); i++) {
-      req->mutable_column_refs()->add_ids(kFirstColumnId + i);
-      req->add_selected_exprs()->set_column_id(kFirstColumnId + i);
+    for (size_t i = 0; i < table_->InternalSchema().num_columns(); i++) {
+      req->mutable_column_refs()->add_ids(narrow_cast<int32_t>(kFirstColumnId + i));
+      req->add_selected_exprs()->set_column_id(narrow_cast<int32_t>(kFirstColumnId + i));
 
       const ColumnSchema& col = table_->InternalSchema().column(i);
       QLRSColDescPB *rscol_desc = rsrow_desc->add_rscol_descs();
@@ -212,7 +233,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
   }
 
 
-  void ValidateRow(const string& row, const QLRow& ql_row) {
+  void ValidateRow(const string& row, const qlexpr::QLRow& ql_row) {
     // Get individual columns.
     CsvTokenizer tokenizer = Tokenize(row);
     auto it = tokenizer.begin();
@@ -227,6 +248,14 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_EQ(std::stoi(*it++), ql_row.column(5).int32_value());
     ASSERT_FLOAT_EQ(std::stof(*it++), ql_row.column(6).float_value());
     ASSERT_DOUBLE_EQ(std::stold(*it++), ql_row.column(7).double_value());
+    string token_str = *it++;
+    if (IsNull(token_str)) {
+      ASSERT_TRUE(ql_row.column(8).IsNull());
+    } else {
+      Jsonb jsonb_from_token;
+      CHECK_OK(jsonb_from_token.FromString(token_str));
+      ASSERT_EQ(jsonb_from_token.SerializedJsonb(), ql_row.column(8).jsonb_value());
+    }
   }
 
  protected:
@@ -269,6 +298,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
       table_->AddInt32ColumnValue(ql_write, "v2", 0);
       table_->AddFloatColumnValue(ql_write, "v3", 0);
       table_->AddDoubleColumnValue(ql_write, "v4", 0);
+      table_->AddJsonbColumnValue(ql_write, "v5", "{ \"a\" : \"foo\" , \"b\" : \"bar\" }");
 
       auto status = tserver_proxy_->Write(req, &resp, &controller);
       ASSERT_TRUE(status.ok() || status.IsTimedOut()) << "Bad status: " << status;
@@ -287,6 +317,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
   string GenerateRow(int index) {
     // Build the row and lookup table_id
     string timestamp_string;
+    string json;
     if (index % 2 == 0) {
       // Use string format.
       int year = 1970 + random_.Next32() % 2000;
@@ -297,13 +328,15 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
       int second = random_.Next32() % 60;
       timestamp_string = strings::Substitute("$0-$1-$2 $3:$4:$5", year, month, day, hour, minute,
                                              second);
+      json = "\"{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}\"";
     } else {
       timestamp_string = std::to_string(static_cast<int64_t>(random_.Next32()));
+      json = "\\\\n"; // represents null value.
     }
 
     string row = strings::Substitute(
-        "$0,$1,$2,2017-06-17 14:47:00,\"abc,xyz\",$3,3.14,4.1",
-        static_cast<int64_t>(random_.Next32()), timestamp_string, random_.Next32(), kV2Value);
+        "$0,$1,$2,2017-06-17 14:47:00,\"abc,xyz\",$3,3.14,4.1,$4",
+        static_cast<int64_t>(random_.Next32()), timestamp_string, random_.Next32(), kV2Value, json);
     VLOG(1) << "Generated row: " << row;
     return row;
   }
@@ -334,7 +367,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
 
   void PerformRead(const tserver::ReadRequestPB& req,
                    tserver::TabletServerServiceProxy* tserver_proxy,
-                   std::unique_ptr<QLRowBlock>* rowblock) {
+                   std::unique_ptr<qlexpr::QLRowBlock>* rowblock) {
     tserver::ReadResponsePB resp;
     rpc::RpcController controller;
     controller.set_timeout(15s);
@@ -347,21 +380,19 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
     ASSERT_TRUE(ql_resp.has_rows_data_sidecar());
 
     // Retrieve row.
-    Slice rows_data;
     ASSERT_TRUE(controller.finished());
-    ASSERT_OK(controller.GetSidecar(ql_resp.rows_data_sidecar(), &rows_data));
-    std::shared_ptr<std::vector<ColumnSchema>>
-      columns = std::make_shared<std::vector<ColumnSchema>>(schema_.columns());
-    yb::ql::RowsResult rowsResult(*table_name_, columns, rows_data.ToBuffer());
+    auto rows_data = ASSERT_RESULT(controller.ExtractSidecar(ql_resp.rows_data_sidecar()));
+    auto columns = std::make_shared<std::vector<ColumnSchema>>(schema_.columns());
+    ql::RowsResult rowsResult(*table_name_, columns, rows_data);
     *rowblock = rowsResult.GetRowBlock();
   }
 
-  std::shared_ptr<YBClient> client_;
+  std::unique_ptr<YBClient> client_;
   YBSchema schema_;
   std::unique_ptr<YBTableName> table_name_;
   std::shared_ptr<YBTable> table_;
-  std::unique_ptr<master::MasterServiceProxy> proxy_;
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<master::MasterClientProxy> proxy_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
   std::unique_ptr<YBPartitionGenerator> partition_generator_;
   std::vector<std::string> master_addresses_;
   std::string master_addresses_comma_separated_;
@@ -371,7 +402,7 @@ class YBBulkLoadTest : public YBMiniClusterTestBase<MiniCluster> {
 class YBBulkLoadTestWithoutRebalancing : public YBBulkLoadTest {
  public:
   void SetUp() override {
-    FLAGS_enable_load_balancing = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_load_balancing) = false;
     YBBulkLoadTest::SetUp();
   }
 };
@@ -385,6 +416,82 @@ TEST_F(YBBulkLoadTest, VerifyPartitions) {
     VLOG(1) << "Got tablet id: " << tablet_id << ", partition key: " << partition_key;
 
     VerifyTabletIdPartitionKey(tablet_id, partition_key);
+  }
+}
+
+TEST_F(YBBulkLoadTest, VerifyPartitionsWithIgnoredColumns) {
+  const std::set<int> skipped_cols = tools::SkippedColumns("0,9");
+  for (int i = 0; i < kNumIterations; i++) {
+    string tablet_id;
+    string partition_key;
+    string row = GenerateRow(i);
+    ASSERT_OK(partition_generator_->LookupTabletId(row, &tablet_id, &partition_key));
+    VLOG(1) << "Got tablet id: " << tablet_id << ", partition key: " << partition_key;
+
+    VerifyTabletIdPartitionKey(tablet_id, partition_key);
+
+    string tablet_id2;
+    string partition_key2;
+    string row_with_extras = "foo," + row + ",bar";
+    ASSERT_OK(partition_generator_->LookupTabletId(
+        row_with_extras, skipped_cols, &tablet_id2, &partition_key2));
+    ASSERT_EQ(tablet_id, tablet_id2);
+    ASSERT_EQ(partition_key, partition_key2);
+  }
+}
+
+TEST_F(YBBulkLoadTest, TestTokenizer) {
+  {
+    // JSON needs to be enclosed in quotes, so that the internal commas are not treated as different
+    // columns. Need to escape the quotes within to ensure that they are not eaten up.
+    string str ="1,2017-06-17 14:47:00,\"abc,;xyz\","
+                 "\"{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}\"";
+    CsvTokenizer tokenizer = Tokenize(str);
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+
+  {
+    // Separating fields with ';'. No need to enclose JSON in quotes. Internal quotes still need
+    // to be escapted to prevent being consumed.
+    string str ="1;2017-06-17 14:47:00;\"abc,;xyz\";"
+                "{\\\"a\\\":\\\"foo\\\",\\\"b\\\":\\\"bar\\\"}";
+    CsvTokenizer tokenizer = Tokenize(str, ';', '\"');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+
+  {
+    string str ="1,2017-06-17 14:47:00,'abc,;xyz',"
+                 "'{\"a\":\"foo\",\"b\":\"bar\"}'";
+    // No need to escape quotes because the quote character is \'
+    CsvTokenizer tokenizer = Tokenize(str, ',', '\'');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "{\"a\":\"foo\",\"b\":\"bar\"}");
+    ASSERT_EQ(it, tokenizer.end());
+  }
+  {
+    string str ="1,2017-06-17 14:47:00,'abc,;xyz',"
+                "\\\\n";
+    // No need to escape quotes because the quote character is \'
+    CsvTokenizer tokenizer = Tokenize(str, ',', '\'');
+    auto it = tokenizer.begin();
+    ASSERT_EQ(*it++, "1");
+    ASSERT_EQ(*it++, "2017-06-17 14:47:00");
+    ASSERT_EQ(*it++, "abc,;xyz");
+    ASSERT_EQ(*it++, "\\n");
+    ASSERT_EQ(it, tokenizer.end());
   }
 }
 
@@ -436,6 +543,9 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
     boost::split(tokens, buf, boost::is_any_of("\t"));
     ASSERT_EQ(2, tokens.size());
     const string& tablet_id = tokens[0];
+    ASSERT_EQ(generated_rows[i], tokens[1]);
+    ASSERT_EQ(tokens[1][tokens[1].length() -1], '\n');
+    boost::trim_right(tokens[1]); // remove the trailing '\n'
     const string& line = tokens[1];
     auto it = tabletid_to_line.find(tablet_id);
     if (it != tabletid_to_line.end()) {
@@ -447,7 +557,6 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
     // Verify tablet id and original line.
     master::TabletLocationsPB tablet_location;
     VerifyTabletId(tablet_id, &tablet_location);
-    ASSERT_EQ(generated_rows[i], line);
   }
 
   CloseStreamsAndWaitForProcess(out, in, partition_process.get());
@@ -477,14 +586,15 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
       "-initial_seqno", "0",
       "-row_batch_size", std::to_string(kNumIterations/kNumTablets/10),
       "-bulk_load_num_files_per_tablet", std::to_string(kNumFilesPerTablet),
-      "-flush_batch_for_tests"
+      "-flush_batch_for_tests",
+      "-never_fsync", "true"
   };
 
   std::unique_ptr<Subprocess> bulk_load_process;
   ASSERT_OK(StartProcessAndGetStreams(bulk_load_exec, bulk_load_argv, &out, &in,
                 &bulk_load_process));
 
-  for (int i = 0; i < mapper_output.size(); i++) {
+  for (size_t i = 0; i < mapper_output.size(); i++) {
     // Write the input line.
     ASSERT_GT(fprintf(out, "%s", mapper_output[i].c_str()), 0);
     ASSERT_EQ(0, fflush(out));
@@ -524,13 +634,13 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
 
     HostPort leader_tserver;
     for (const master::TabletLocationsPB::ReplicaPB& replica : tablet_location.replicas()) {
-      if (replica.role() == consensus::RaftPeerPB_Role::RaftPeerPB_Role_LEADER) {
+      if (replica.role() == PeerRole::LEADER) {
         leader_tserver = HostPortFromPB(replica.ts_info().private_rpc_addresses(0));
         break;
       }
     }
 
-    rpc::ProxyCache proxy_cache(client_messenger_);
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
     auto tserver_proxy = std::make_unique<tserver::TabletServerServiceProxy>(&proxy_cache,
                                                                              leader_tserver);
 
@@ -556,12 +666,12 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
       QLReadRequestPB* ql_req = req.mutable_ql_batch()->Add();
       ASSERT_OK(CreateQLReadRequest(row, ql_req));
 
-      std::unique_ptr<QLRowBlock> rowblock;
+      std::unique_ptr<qlexpr::QLRowBlock> rowblock;
       PerformRead(req, tserver_proxy.get(), &rowblock);
 
       // Validate row.
       ASSERT_EQ(1, rowblock->row_count());
-      const QLRow& ql_row = rowblock->row(0);
+      const auto& ql_row = rowblock->row(0);
       ASSERT_EQ(schema_.num_columns(), ql_row.column_count());
       ValidateRow(row, ql_row);
     }
@@ -581,9 +691,9 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
 
     // Set all column ids.
     QLRSRowDescPB *rsrow_desc = ql_req->mutable_rsrow_desc();
-    for (int i = 0; i < table_->InternalSchema().num_columns(); i++) {
-      ql_req->mutable_column_refs()->add_ids(kFirstColumnId + i);
-      ql_req->add_selected_exprs()->set_column_id(kFirstColumnId + i);
+    for (size_t i = 0; i < table_->InternalSchema().num_columns(); i++) {
+      ql_req->mutable_column_refs()->add_ids(narrow_cast<int32_t>(kFirstColumnId + i));
+      ql_req->add_selected_exprs()->set_column_id(narrow_cast<int32_t>(kFirstColumnId + i));
 
       const ColumnSchema& col = table_->InternalSchema().column(i);
       QLRSColDescPB *rscol_desc = rsrow_desc->add_rscol_descs();
@@ -591,7 +701,7 @@ TEST_F_EX(YBBulkLoadTest, TestCLITool, YBBulkLoadTestWithoutRebalancing) {
       col.type()->ToQLTypePB(rscol_desc->mutable_ql_type());
     }
 
-    std::unique_ptr<QLRowBlock> rowblock;
+    std::unique_ptr<qlexpr::QLRowBlock> rowblock;
     PerformRead(req, tserver_proxy.get(), &rowblock);
     ASSERT_EQ(tabletid_to_line[tablet_id].size(), rowblock->row_count());
 

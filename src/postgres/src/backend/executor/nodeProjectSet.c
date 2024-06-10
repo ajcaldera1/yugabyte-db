@@ -256,7 +256,7 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 	/*
 	 * tuple table and result type initialization
 	 */
-	ExecInitResultTupleSlotTL(estate, &state->ps);
+	ExecInitResultTupleSlotTL(&state->ps);
 
 	/* Create workspace for per-tlist-entry expr state & SRF-is-done state */
 	state->nelems = list_length(node->plan.targetlist);
@@ -303,7 +303,7 @@ ExecInitProjectSet(ProjectSet *node, EState *estate, int eflags)
 	 * results into the query-lifespan context either.  We use one context for
 	 * the arguments of all tSRFs, as they have roughly equivalent lifetimes.
 	 */
-	state->argcontext = AllocSetContextCreate(CurrentMemoryContext,
+	state->argcontext = AllocSetContextCreate(GetCurrentMemoryContext(),
 											  "tSRF function arguments",
 											  ALLOCSET_DEFAULT_SIZES);
 

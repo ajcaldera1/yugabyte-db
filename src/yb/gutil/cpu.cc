@@ -19,13 +19,10 @@
 
 #include "yb/gutil/cpu.h"
 
-#include <stdlib.h>
 #include <string.h>
 
-#include <algorithm>
 
-#include "yb/gutil/basictypes.h"
-#include "yb/gutil/strings/stringpiece.h"
+#include "yb/gutil/integral_types.h"
 
 #if defined(__x86_64__)
 #if defined(_MSC_VER)
@@ -102,7 +99,7 @@ uint64 _xgetbv(uint32 xcr) {
 #endif  // !_MSC_VER
 #endif  // __x86_64__
 
-#if defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(OS_LINUX))
+#if defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(__linux__))
 class LazyCpuInfoValue {
  public:
   LazyCpuInfoValue() : has_broken_neon_(false) {
@@ -168,7 +165,7 @@ class LazyCpuInfoValue {
           // handle that.
           char* endptr;
           std::string value(value_sp.as_string());
-          unsigned long int result = strtoul(value.c_str(), &endptr, 0);
+          unsigned long int result = strtoul(value.c_str(), &endptr, 0);  // NOLINT
           if (*endptr == 0 && result <= UINT_MAX) {
             *kUnsignedValues[i].result = result;
           }
@@ -197,7 +194,7 @@ base::LazyInstance<LazyCpuInfoValue>::Leaky g_lazy_cpuinfo =
     LAZY_INSTANCE_INITIALIZER;
 
 #endif  // defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) ||
-        // defined(OS_LINUX))
+        // defined(__linux__))
 
 }  // anonymous namespace
 
@@ -281,9 +278,12 @@ void CPU::Initialize() {
     __cpuid(cpu_info, parameter_containing_non_stop_time_stamp_counter);
     has_non_stop_time_stamp_counter_ = (cpu_info[3] & (1 << 8)) != 0;
   }
-#elif defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(OS_LINUX))
+#elif defined(ARCH_CPU_ARM_FAMILY) && (defined(OS_ANDROID) || defined(__linux__))
   cpu_brand_.assign(g_lazy_cpuinfo.Get().brand());
   has_broken_neon_ = g_lazy_cpuinfo.Get().has_broken_neon();
+#elif defined(__aarch64__)
+  cpu_brand_.assign("ARM64");
+  has_broken_neon_ = false;
 #else
   #error unknown architecture
 #endif

@@ -29,25 +29,22 @@
 // Example code is also available
 //   https://github.com/facebook/rocksdb/wiki/A-Tutorial-of-RocksDB-SST-formats#wiki-examples
 
-#ifndef YB_ROCKSDB_TABLE_H
-#define YB_ROCKSDB_TABLE_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 
-#include "yb/rocksdb/env.h"
-#include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/status.h"
+#include "yb/rocksdb/types.h"
+
 #include "yb/util/size_literals.h"
 
 namespace rocksdb {
 
 // -- Block-based Table
 class FlushBlockPolicyFactory;
-class RandomAccessFile;
 struct TableReaderOptions;
 struct TableBuilderOptions;
 class TableBuilder;
@@ -56,7 +53,6 @@ class WritableFileWriter;
 struct EnvOptions;
 struct Options;
 
-using std::unique_ptr;
 using namespace yb::size_literals;
 
 enum ChecksumType : char {
@@ -157,16 +153,28 @@ struct BlockBasedTableOptions {
   // used to avoid too many index levels in case we have large keys.
   size_t min_keys_per_index_block = 64;
 
-  // Use delta encoding to compress keys in blocks.
+  // Use delta encoding to compress keys in data blocks.
   // Iterator::PinData() requires this option to be disabled.
   //
   // Default: true
   bool use_delta_encoding = true;
 
-  // If non-nullptr, use the specified filter policy to reduce disk reads.
+  // Specifies format for encoding entries in data blocks.
+  KeyValueEncodingFormat data_block_key_value_encoding_format =
+      KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix;
+
+  // If non-nullptr, use the specified filter policy for new SST files to reduce disk reads.
   // Many applications will benefit from passing the result of
   // NewBloomFilterPolicy() here.
-  std::shared_ptr<const FilterPolicy> filter_policy = nullptr;
+  typedef std::shared_ptr<const FilterPolicy> FilterPolicyPtr;
+  FilterPolicyPtr filter_policy = nullptr;
+
+  // Other filter policies we support for backward compatibility to be able to use bloom filters
+  // for existing SST files.
+  // Note: wrapped into std::shared_ptr for options_helper to be compilable. Without wrapping there
+  // is an error: offset of on non-standard-layout type 'struct BlockBasedTableOptions'.
+  typedef std::unordered_map<std::string, FilterPolicyPtr> FilterPoliciesMap;
+  std::shared_ptr<FilterPoliciesMap> supported_filter_policies;
 
   // If true, place whole keys in the filter (not just prefixes).
   // This must generally be true for gets to be efficient.
@@ -213,13 +221,14 @@ struct BlockBasedTablePropertyNames {
   static const char kWholeKeyFiltering[];
   // value is "1" for true and "0" for false.
   static const char kPrefixFiltering[];
+  // value is a uint8_t.
+  static const char kDataBlockKeyValueEncodingFormat[];
 };
 
 // Create default block based table factory.
 extern TableFactory* NewBlockBasedTableFactory(
     const BlockBasedTableOptions& table_options = BlockBasedTableOptions());
 
-#ifndef ROCKSDB_LITE
 
 enum EncodingType : char {
   // Always write full keys without any special encoding.
@@ -309,72 +318,6 @@ struct PlainTableOptions {
 extern TableFactory* NewPlainTableFactory(const PlainTableOptions& options =
                                               PlainTableOptions());
 
-struct CuckooTablePropertyNames {
-  // The key that is used to fill empty buckets.
-  static const char kEmptyKey[];
-  // Fixed length of value.
-  static const char kValueLength[];
-  // Number of hash functions used in Cuckoo Hash.
-  static const char kNumHashFunc[];
-  // It denotes the number of buckets in a Cuckoo Block. Given a key and a
-  // particular hash function, a Cuckoo Block is a set of consecutive buckets,
-  // where starting bucket id is given by the hash function on the key. In case
-  // of a collision during inserting the key, the builder tries to insert the
-  // key in other locations of the cuckoo block before using the next hash
-  // function. This reduces cache miss during read operation in case of
-  // collision.
-  static const char kCuckooBlockSize[];
-  // Size of the hash table. Use this number to compute the modulo of hash
-  // function. The actual number of buckets will be kMaxHashTableSize +
-  // kCuckooBlockSize - 1. The last kCuckooBlockSize-1 buckets are used to
-  // accommodate the Cuckoo Block from end of hash table, due to cache friendly
-  // implementation.
-  static const char kHashTableSize[];
-  // Denotes if the key sorted in the file is Internal Key (if false)
-  // or User Key only (if true).
-  static const char kIsLastLevel[];
-  // Indicate if using identity function for the first hash function.
-  static const char kIdentityAsFirstHash[];
-  // Indicate if using module or bit and to calculate hash value
-  static const char kUseModuleHash[];
-  // Fixed user key length
-  static const char kUserKeyLength[];
-};
-
-struct CuckooTableOptions {
-  // Determines the utilization of hash tables. Smaller values
-  // result in larger hash tables with fewer collisions.
-  double hash_table_ratio = 0.9;
-  // A property used by builder to determine the depth to go to
-  // to search for a path to displace elements in case of
-  // collision. See Builder.MakeSpaceForKey method. Higher
-  // values result in more efficient hash tables with fewer
-  // lookups but take more time to build.
-  uint32_t max_search_depth = 100;
-  // In case of collision while inserting, the builder
-  // attempts to insert in the next cuckoo_block_size
-  // locations before skipping over to the next Cuckoo hash
-  // function. This makes lookups more cache friendly in case
-  // of collisions.
-  uint32_t cuckoo_block_size = 5;
-  // If this option is enabled, user key is treated as uint64_t and its value
-  // is used as hash value directly. This option changes builder's behavior.
-  // Reader ignore this option and behave according to what specified in table
-  // property.
-  bool identity_as_first_hash = false;
-  // If this option is set to true, module is used during hash calculation.
-  // This often yields better space efficiency at the cost of performance.
-  // If this optino is set to false, # of entries in table is constrained to be
-  // power of two, and bit and is used to calculate hash, which is faster in
-  // general.
-  bool use_module_hash = true;
-};
-
-// Cuckoo Table Factory for SST table format using Cache Friendly Cuckoo Hashing
-extern TableFactory* NewCuckooTableFactory(
-    const CuckooTableOptions& table_options = CuckooTableOptions());
-
-#endif  // ROCKSDB_LITE
 
 class RandomAccessFileReader;
 
@@ -411,8 +354,8 @@ class TableFactory {
   // table_reader is the output table reader.
   virtual Status NewTableReader(
       const TableReaderOptions& table_reader_options,
-      unique_ptr<RandomAccessFileReader>&& base_file, uint64_t base_file_size,
-      unique_ptr<TableReader>* table_reader) const = 0;
+      std::unique_ptr<RandomAccessFileReader>&& base_file, uint64_t base_file_size,
+      std::unique_ptr<TableReader>* table_reader) const = 0;
 
   // Whether SST split into metadata and data file(s) is supported for writing.
   // There is a AdaptiveTableFactory inheriting common TableFactory interface. AdaptiveTableFactory
@@ -442,7 +385,7 @@ class TableFactory {
   // It is the caller's responsibility to keep the file open and close the file
   // after closing the table builder. compression_type is the compression type
   // to use in this table.
-  virtual TableBuilder* NewTableBuilder(
+  virtual std::unique_ptr<TableBuilder> NewTableBuilder(
       const TableBuilderOptions& table_builder_options,
       uint32_t column_family_id, WritableFileWriter* base_file,
       WritableFileWriter* data_file = nullptr) const = 0;
@@ -474,16 +417,8 @@ class TableFactory {
   // Developers should use DB::SetOption() instead to dynamically change
   // options while the DB is open.
   virtual void* GetOptions() { return nullptr; }
-
-  // Returns SST file filter for pruning out files which doesn't contain some part of user_key.
-  // It should be in sync with FilterPolicy used for bloom filter construction. For example,
-  // file filter should only consider hashed components of the key when using with
-  // DocDbAwareFilterPolicy and HashedComponentsExtractor.
-  virtual std::shared_ptr<TableAwareReadFileFilter> NewTableAwareReadFileFilter(
-      const ReadOptions &read_options, const Slice &user_key) const { return nullptr; }
 };
 
-#ifndef ROCKSDB_LITE
 // Create a special table factory that can open either of the supported
 // table formats, based on setting inside the SST files. It should be used to
 // convert a DB from one table format to another.
@@ -491,15 +426,10 @@ class TableFactory {
 // @block_based_table_factory:  block based table factory to use. If NULL, use
 //                              a default one.
 // @plain_table_factory: plain table factory to use. If NULL, use a default one.
-// @cuckoo_table_factory: cuckoo table factory to use. If NULL, use a default one.
 extern TableFactory* NewAdaptiveTableFactory(
     std::shared_ptr<TableFactory> table_factory_to_write = nullptr,
     std::shared_ptr<TableFactory> block_based_table_factory = nullptr,
-    std::shared_ptr<TableFactory> plain_table_factory = nullptr,
-    std::shared_ptr<TableFactory> cuckoo_table_factory = nullptr);
+    std::shared_ptr<TableFactory> plain_table_factory = nullptr);
 
-#endif  // ROCKSDB_LITE
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_H

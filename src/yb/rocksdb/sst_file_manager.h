@@ -18,13 +18,14 @@
 // under the License.
 //
 
+
 #pragma once
 
 #include <memory>
 #include <string>
 #include <unordered_map>
 
-#include "yb/rocksdb/status.h"
+#include "yb/util/status.h"
 
 namespace rocksdb {
 
@@ -87,9 +88,9 @@ class SstFileManager {
 //    SstFileManager will delete files that already exist in trash_dir.
 // @param status: If not nullptr, status will contain any errors that happened
 //    during creating the missing trash_dir or deleting existing files in trash.
-extern SstFileManager* NewSstFileManager(
+yb::Result<SstFileManager*> NewSstFileManager(
     Env* env, std::shared_ptr<Logger> info_log = nullptr,
     std::string trash_dir = "", int64_t rate_bytes_per_sec = 0,
-    bool delete_exisitng_trash = true, Status* status = nullptr);
+    bool delete_exisitng_trash = true);
 
 }  // namespace rocksdb

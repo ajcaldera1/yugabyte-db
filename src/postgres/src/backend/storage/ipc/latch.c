@@ -296,7 +296,7 @@ OwnLatch(volatile Latch *latch)
 #endif
 
 	if (latch->owner_pid != 0)
-		elog(ERROR, "latch already owned");
+		elog(ERROR, "latch already owned by %d", latch->owner_pid);
 
 	latch->owner_pid = MyProcPid;
 }
@@ -309,6 +309,20 @@ DisownLatch(volatile Latch *latch)
 {
 	Assert(latch->is_shared);
 	Assert(latch->owner_pid == MyProcPid);
+
+	latch->owner_pid = 0;
+}
+
+/*
+ * Disown a shared latch currently owned by the given process.
+ * This is useful in the event that a process was killed
+ * without being able to release its latch (for example, OOM)
+ */
+void
+DisownLatchOnBehalfOfPid(volatile Latch *latch, int owner_pid)
+{
+	Assert(latch->is_shared);
+	Assert(latch->owner_pid == owner_pid);
 
 	latch->owner_pid = 0;
 }
@@ -359,7 +373,7 @@ WaitLatchOrSocket(volatile Latch *latch, int wakeEvents, pgsocket sock,
 	int			ret = 0;
 	int			rc;
 	WaitEvent	event;
-	WaitEventSet *set = CreateWaitEventSet(CurrentMemoryContext, 3);
+	WaitEventSet *set = CreateWaitEventSet(GetCurrentMemoryContext(), 3);
 
 	if (wakeEvents & WL_TIMEOUT)
 		Assert(timeout >= 0);

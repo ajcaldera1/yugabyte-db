@@ -31,13 +31,14 @@
 //
 #include "yb/util/hdr_histogram.h"
 
-#include <algorithm>
-#include <cmath>
+#include <math.h>
+
 #include <limits>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/bits.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/util/status.h"
 
 using base::subtle::Atomic64;
@@ -46,6 +47,7 @@ using base::subtle::NoBarrier_Store;
 using base::subtle::NoBarrier_Load;
 using base::subtle::NoBarrier_CompareAndSwap;
 using strings::Substitute;
+using std::endl;
 
 namespace yb {
 
@@ -60,6 +62,8 @@ HdrHistogram::HdrHistogram(uint64_t highest_trackable_value, int num_significant
     sub_bucket_mask_(0),
     total_count_(0),
     total_sum_(0),
+    current_count_(0),
+    current_sum_(0),
     min_value_(std::numeric_limits<Atomic64>::max()),
     max_value_(0),
     counts_(nullptr) {
@@ -77,6 +81,8 @@ HdrHistogram::HdrHistogram(const HdrHistogram& other)
     sub_bucket_mask_(0),
     total_count_(0),
     total_sum_(0),
+    current_count_(0),
+    current_sum_(0),
     min_value_(std::numeric_limits<Atomic64>::max()),
     max_value_(0),
     counts_(nullptr) {
@@ -85,6 +91,7 @@ HdrHistogram::HdrHistogram(const HdrHistogram& other)
   // Not a consistent snapshot but we try to roughly keep it close.
   // Copy the sum and min first.
   NoBarrier_Store(&total_sum_, NoBarrier_Load(&other.total_sum_));
+  NoBarrier_Store(&current_sum_, NoBarrier_Load(&other.current_sum_));
   NoBarrier_Store(&min_value_, NoBarrier_Load(&other.min_value_));
 
   uint64_t total_copied_count = 0;
@@ -97,7 +104,19 @@ HdrHistogram::HdrHistogram(const HdrHistogram& other)
   // Copy the max observed value last.
   NoBarrier_Store(&max_value_, NoBarrier_Load(&other.max_value_));
   // We must ensure the total is consistent with the copied counts.
-  NoBarrier_Store(&total_count_, total_copied_count);
+  NoBarrier_Store(&total_count_, NoBarrier_Load(&other.total_count_));
+  NoBarrier_Store(&current_count_, total_copied_count);
+}
+
+void HdrHistogram::Reset() {
+  for (int i = 0; i < counts_array_length_; i++) {
+    NoBarrier_Store(&counts_[i], 0);
+  }
+  NoBarrier_Store(&current_count_, 0);
+  NoBarrier_Store(&current_sum_, 0);
+
+  NoBarrier_Store(&min_value_, std::numeric_limits<Atomic64>::max());
+  NoBarrier_Store(&max_value_, 0);
 }
 
 bool HdrHistogram::IsValidHighestTrackableValue(uint64_t highest_trackable_value) {
@@ -171,7 +190,9 @@ void HdrHistogram::IncrementBy(int64_t value, int64_t count) {
   // Increment bucket, total, and sum.
   NoBarrier_AtomicIncrement(&counts_[counts_index], count);
   NoBarrier_AtomicIncrement(&total_count_, count);
+  NoBarrier_AtomicIncrement(&current_count_, count);
   NoBarrier_AtomicIncrement(&total_sum_, value * count);
+  NoBarrier_AtomicIncrement(&current_sum_, value * count);
 
   // Update min, if needed.
   {
@@ -240,7 +261,7 @@ int HdrHistogram::CountsArrayIndex(int bucket_index, int sub_bucket_index) const
 }
 
 uint64_t HdrHistogram::CountAt(int bucket_index, int sub_bucket_index) const {
-  return counts_[CountsArrayIndex(bucket_index, sub_bucket_index)];
+  return NoBarrier_Load(&counts_[CountsArrayIndex(bucket_index, sub_bucket_index)]);
 }
 
 uint64_t HdrHistogram::CountInBucketForValue(uint64_t value) const {
@@ -287,23 +308,27 @@ bool HdrHistogram::ValuesAreEquivalent(uint64_t value1, uint64_t value2) const {
 }
 
 uint64_t HdrHistogram::MinValue() const {
-  if (PREDICT_FALSE(TotalCount() == 0)) return 0;
+  if (PREDICT_FALSE(CurrentCount() == 0)) {
+    return 0;
+  }
   return NoBarrier_Load(&min_value_);
 }
 
 uint64_t HdrHistogram::MaxValue() const {
-  if (PREDICT_FALSE(TotalCount() == 0)) return 0;
+  if (PREDICT_FALSE(CurrentCount() == 0)) {
+    return 0;
+  }
   return NoBarrier_Load(&max_value_);
 }
 
 double HdrHistogram::MeanValue() const {
-  uint64_t count = TotalCount();
+  uint64_t count = CurrentCount();
   if (PREDICT_FALSE(count == 0)) return 0.0;
-  return static_cast<double>(TotalSum()) / count;
+  return static_cast<double>(CurrentSum()) / count;
 }
 
 uint64_t HdrHistogram::ValueAtPercentile(double percentile) const {
-  uint64_t count = TotalCount();
+  uint64_t count = CurrentCount();
   if (PREDICT_FALSE(count == 0)) return 0;
 
   double requested_percentile = std::min(percentile, 100.0); // Truncate down to 100%
@@ -328,6 +353,29 @@ uint64_t HdrHistogram::ValueAtPercentile(double percentile) const {
   return 0;
 }
 
+void HdrHistogram::DumpHumanReadable(std::ostream* out) const {
+  *out << "Total Count: " << TotalCount() << endl;
+  *out << "Mean: " << MeanValue() << endl;
+  *out << "Percentiles:" << endl;
+  *out << "CountInBuckets: " << CurrentCount() << endl;
+  *out << "   0%  (min) = " << MinValue() << endl;
+  *out << "  25%        = " << ValueAtPercentile(25) << endl;
+  *out << "  50%  (med) = " << ValueAtPercentile(50) << endl;
+  *out << "  75%        = " << ValueAtPercentile(75) << endl;
+  *out << "  95%        = " << ValueAtPercentile(95) << endl;
+  *out << "  99%        = " << ValueAtPercentile(99) << endl;
+  *out << "  99.9%      = " << ValueAtPercentile(99.9) << endl;
+  *out << "  99.99%     = " << ValueAtPercentile(99.99) << endl;
+  *out << "  100% (max) = " << MaxValue() << endl;
+  if (MaxValue() >= highest_trackable_value()) {
+    *out << "*NOTE: some values were greater than highest trackable value" << endl;
+  }
+}
+
+size_t HdrHistogram::DynamicMemoryUsage() const {
+  return sizeof(*this) + sizeof(Atomic64) * counts_array_length_;
+}
+
 ///////////////////////////////////////////////////////////////////////
 // AbstractHistogramIterator
 ///////////////////////////////////////////////////////////////////////
@@ -335,7 +383,7 @@ uint64_t HdrHistogram::ValueAtPercentile(double percentile) const {
 AbstractHistogramIterator::AbstractHistogramIterator(const HdrHistogram* histogram)
   : histogram_(CHECK_NOTNULL(histogram)),
     cur_iter_val_(),
-    histogram_total_count_(histogram_->TotalCount()),
+    histogram_total_count_(histogram_->CurrentCount()),
     current_bucket_index_(0),
     current_sub_bucket_index_(0),
     current_value_at_index_(0),
@@ -355,7 +403,7 @@ bool AbstractHistogramIterator::HasNext() const {
 }
 
 Status AbstractHistogramIterator::Next(HistogramIterationValue* value) {
-  if (histogram_->TotalCount() != histogram_total_count_) {
+  if (histogram_->CurrentCount() != histogram_total_count_) {
     return STATUS(IllegalState, "Concurrently modified histogram while traversing it");
   }
 

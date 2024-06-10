@@ -11,23 +11,21 @@
 // under the License.
 //
 
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_empty_vtable.h"
 
 namespace yb {
 namespace master {
 
 YQLEmptyVTable::YQLEmptyVTable(const TableName& table_name,
+                               const NamespaceName& namespace_name,
                                const Master* const master,
                                const Schema& schema)
-    : YQLVirtualTable(table_name, master, schema) {
+    : YQLVirtualTable(table_name, namespace_name, master, schema) {
 }
 
-Status YQLEmptyVTable::RetrieveData(const QLReadRequestPB& request,
-                                    std::unique_ptr<QLRowBlock>* vtable) const {
+Result<VTableDataPtr> YQLEmptyVTable::RetrieveData(const QLReadRequestPB& request) const {
   // Empty rowblock.
-  vtable->reset(new QLRowBlock(schema_));
-  return Status::OK();
+  return std::make_shared<qlexpr::QLRowBlock>(schema());
 }
 
 }  // namespace master

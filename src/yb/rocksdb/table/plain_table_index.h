@@ -18,19 +18,22 @@
 // under the License.
 //
 
+
 #pragma once
 
-#ifndef ROCKSDB_LITE
 
 #include <string>
 #include <vector>
 
 #include "yb/rocksdb/db/dbformat.h"
+#include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/util/murmurhash.h"
 #include "yb/rocksdb/util/hash.h"
 #include "yb/rocksdb/util/arena.h"
 #include "yb/rocksdb/util/histogram.h"
+
+#include "yb/util/status_log.h"
 
 namespace rocksdb {
 
@@ -77,7 +80,7 @@ class PlainTableIndex {
     kSubindex = 2
   };
 
-  explicit PlainTableIndex(Slice data) { InitFromRawData(data); }
+  explicit PlainTableIndex(Slice data) { CHECK_OK(InitFromRawData(data)); }
 
   PlainTableIndex()
       : index_size_(0),
@@ -236,5 +239,3 @@ class PlainTableIndexBuilder {
 };
 
 };  // namespace rocksdb
-
-#endif  // ROCKSDB_LITE

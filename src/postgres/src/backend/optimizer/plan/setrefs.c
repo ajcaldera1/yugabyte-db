@@ -17,12 +17,14 @@
 
 #include "access/transam.h"
 #include "catalog/pg_type.h"
+#include "nodes/execnodes.h"
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "optimizer/pathnode.h"
 #include "optimizer/planmain.h"
 #include "optimizer/planner.h"
 #include "optimizer/tlist.h"
+#include "pg_yb_utils.h"
 #include "tcop/utility.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
@@ -458,6 +460,19 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->plan.qual, rtoffset);
 			}
 			break;
+		case T_YbSeqScan:
+			{
+				YbSeqScan    *splan = (YbSeqScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				splan->yb_pushdown.quals =
+					fix_scan_list(root, splan->yb_pushdown.quals, rtoffset);
+				splan->scan.plan.targetlist =
+					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
+				splan->scan.plan.qual =
+					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+			}
+			break;
 		case T_SampleScan:
 			{
 				SampleScan *splan = (SampleScan *) plan;
@@ -474,12 +489,28 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 		case T_IndexScan:
 			{
 				IndexScan  *splan = (IndexScan *) plan;
+				indexed_tlist *index_itlist;
 
+				index_itlist = build_tlist_index(splan->indextlist);
 				splan->scan.scanrelid += rtoffset;
 				splan->scan.plan.targetlist =
 					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
 				splan->scan.plan.qual =
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+				splan->yb_rel_pushdown.quals =
+					fix_scan_list(root, splan->yb_rel_pushdown.quals, rtoffset);
+				splan->yb_idx_pushdown.quals = (List *)
+					fix_upper_expr(root,
+								   (Node *) splan->yb_idx_pushdown.quals,
+								   index_itlist,
+								   INDEX_VAR,
+								   rtoffset);
+				splan->yb_idx_pushdown.colrefs = (List *)
+					fix_upper_expr(root,
+								   (Node *) splan->yb_idx_pushdown.colrefs,
+								   index_itlist,
+								   INDEX_VAR,
+								   rtoffset);
 				splan->indexqual =
 					fix_scan_list(root, splan->indexqual, rtoffset);
 				splan->indexqualorig =
@@ -511,6 +542,36 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->indexqualorig, rtoffset);
 			}
 			break;
+		case T_YbBitmapIndexScan:
+			{
+				YbBitmapIndexScan *splan = (YbBitmapIndexScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				/* no need to fix targetlist and qual */
+				Assert(splan->scan.plan.targetlist == NIL);
+				Assert(splan->scan.plan.qual == NIL);
+				splan->indexqual =
+					fix_scan_list(root, splan->indexqual, rtoffset);
+				splan->indexqualorig =
+					fix_scan_list(root, splan->indexqualorig, rtoffset);
+
+				indexed_tlist *index_itlist;
+				index_itlist = build_tlist_index(splan->indextlist);
+
+				splan->yb_idx_pushdown.quals = (List *)
+					fix_upper_expr(root,
+								   (Node *) splan->yb_idx_pushdown.quals,
+								   index_itlist,
+								   INDEX_VAR,
+								   rtoffset);
+				splan->yb_idx_pushdown.colrefs = (List *)
+					fix_upper_expr(root,
+								   (Node *) splan->yb_idx_pushdown.colrefs,
+								   index_itlist,
+								   INDEX_VAR,
+								   rtoffset);
+			}
+			break;
 		case T_BitmapHeapScan:
 			{
 				BitmapHeapScan *splan = (BitmapHeapScan *) plan;
@@ -522,6 +583,30 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
 				splan->bitmapqualorig =
 					fix_scan_list(root, splan->bitmapqualorig, rtoffset);
+			}
+			break;
+		case T_YbBitmapTableScan:
+			{
+				YbBitmapTableScan *splan = (YbBitmapTableScan *) plan;
+
+				splan->scan.scanrelid += rtoffset;
+				splan->scan.plan.targetlist =
+					fix_scan_list(root, splan->scan.plan.targetlist, rtoffset);
+				splan->scan.plan.qual =
+					fix_scan_list(root, splan->scan.plan.qual, rtoffset);
+
+				splan->rel_pushdown.quals =
+					fix_scan_list(root, splan->rel_pushdown.quals, rtoffset);
+
+				splan->recheck_pushdown.quals =
+					fix_scan_list(root, splan->recheck_pushdown.quals, rtoffset);
+				splan->recheck_local_quals =
+					fix_scan_list(root, splan->recheck_local_quals, rtoffset);
+
+				splan->fallback_pushdown.quals =
+					fix_scan_list(root, splan->fallback_pushdown.quals, rtoffset);
+				splan->fallback_local_quals =
+					fix_scan_list(root, splan->fallback_local_quals, rtoffset);
 			}
 			break;
 		case T_TidScan:
@@ -622,6 +707,7 @@ set_plan_refs(PlannerInfo *root, Plan *plan, int rtoffset)
 			break;
 
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 		case T_MergeJoin:
 		case T_HashJoin:
 			set_join_references(root, (Join *) plan, rtoffset);
@@ -1032,6 +1118,18 @@ set_indexonlyscan_references(PlannerInfo *root,
 	plan->scan.plan.qual = (List *)
 		fix_upper_expr(root,
 					   (Node *) plan->scan.plan.qual,
+					   index_itlist,
+					   INDEX_VAR,
+					   rtoffset);
+	plan->yb_pushdown.quals = (List *)
+		fix_upper_expr(root,
+					   (Node *) plan->yb_pushdown.quals,
+					   index_itlist,
+					   INDEX_VAR,
+					   rtoffset);
+	plan->yb_pushdown.colrefs = (List *)
+		fix_upper_expr(root,
+					   (Node *) plan->yb_pushdown.colrefs,
 					   index_itlist,
 					   INDEX_VAR,
 					   rtoffset);
@@ -1534,22 +1632,14 @@ fix_scan_expr_mutator(Node *node, fix_scan_expr_context *context)
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
+		Param	   *aggparam;
 
 		/* See if the Aggref should be replaced by a Param */
-		if (context->root->minmax_aggs != NIL &&
-			list_length(aggref->args) == 1)
+		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
+		if (aggparam != NULL)
 		{
-			TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
-			ListCell   *lc;
-
-			foreach(lc, context->root->minmax_aggs)
-			{
-				MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-				if (mminfo->aggfnoid == aggref->aggfnoid &&
-					equal(mminfo->target, curTarget->expr))
-					return (Node *) copyObject(mminfo->param);
-			}
+			/* Make a copy of the Param for paranoia's sake */
+			return (Node *) copyObject(aggparam);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -1586,6 +1676,23 @@ fix_scan_expr_walker(Node *node, fix_scan_expr_context *context)
 								  (void *) context);
 }
 
+static int
+YbBNL_hinfo_cmp_inner_att(const void *arg_1,
+						  const void *arg_2)
+{
+	const YbBNLHashClauseInfo *hinfo_1 = (const YbBNLHashClauseInfo *) arg_1;
+	const YbBNLHashClauseInfo *hinfo_2 = (const YbBNLHashClauseInfo *) arg_2;
+
+	if (!OidIsValid(hinfo_1->hashOp))
+		return -1;
+
+	if (!OidIsValid(hinfo_2->hashOp))
+		return 1;
+
+	return (hinfo_1->innerHashAttNo > hinfo_2->innerHashAttNo) -
+		   (hinfo_1->innerHashAttNo < hinfo_2->innerHashAttNo);
+}
+
 /*
  * set_join_references
  *	  Modify the target list and quals of a join node to reference its
@@ -1620,9 +1727,11 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 								   rtoffset);
 
 	/* Now do join-type-specific stuff */
-	if (IsA(join, NestLoop))
+	if (IsA(join, NestLoop) || IsA(join, YbBatchedNestLoop))
 	{
-		NestLoop   *nl = (NestLoop *) join;
+		NestLoop   *nl = IsA(join, NestLoop)
+						 ? (NestLoop *) join
+						 : &((YbBatchedNestLoop *) join)->nl;
 		ListCell   *lc;
 
 		foreach(lc, nl->nestParams)
@@ -1639,6 +1748,76 @@ set_join_references(PlannerInfo *root, Join *join, int rtoffset)
 				  nlp->paramval->varno == OUTER_VAR))
 				elog(ERROR, "NestLoopParam was not reduced to a simple Var");
 		}
+
+		ListCell *l;
+		if (IsA(join, YbBatchedNestLoop))
+		{
+			YbBatchedNestLoop *batchednl = (YbBatchedNestLoop *) join;
+
+			YbBNLHashClauseInfo *current_hinfo = batchednl->hashClauseInfos;
+
+			foreach(l, join->joinqual)
+			{
+				Expr *clause = (Expr *) lfirst(l);
+				Oid hashOp = current_hinfo->hashOp;
+
+				if (OidIsValid(hashOp))
+				{
+					Assert(IsA(clause, OpExpr));
+					OpExpr *opexpr = (OpExpr *) clause;
+					Assert(list_length(opexpr->args) == 2);
+					Expr *leftArg = linitial(opexpr->args);
+					Expr *rightArg = lsecond(opexpr->args);
+
+					if (IsA(leftArg, RelabelType))
+						leftArg = ((RelabelType *) leftArg)->arg;
+
+					if (IsA(rightArg, RelabelType))
+						rightArg = ((RelabelType *) rightArg)->arg;
+
+					Var *innerArg;
+					Expr *outerArg;
+
+					if (IsA((Expr*) leftArg, Var) &&
+						((Var*) leftArg)->varno == INNER_VAR)
+					{
+						innerArg = (Var *) leftArg;
+						outerArg = rightArg;
+					}
+					else
+					{
+						outerArg = leftArg;
+						innerArg = (Var *) rightArg;
+					}
+
+					Assert(innerArg->varno = INNER_VAR);
+
+					current_hinfo->innerHashAttNo =
+						((Var *) innerArg)->varattno;
+					current_hinfo->outerParamExpr = outerArg;
+					current_hinfo->orig_expr = clause;
+				}
+				current_hinfo++;
+			}
+
+			qsort(batchednl->hashClauseInfos, join->joinqual->length,
+				  sizeof(YbBNLHashClauseInfo), YbBNL_hinfo_cmp_inner_att);
+
+			YbBNLHashClauseInfo *valid_bnl_hinfos = batchednl->hashClauseInfos;
+			int num_invalid = 0;
+			while(num_invalid < batchednl->num_hashClauseInfos &&
+				  !OidIsValid(valid_bnl_hinfos->hashOp))
+			{
+				valid_bnl_hinfos++;
+				num_invalid++;
+			}
+			if (num_invalid == batchednl->num_hashClauseInfos)
+				valid_bnl_hinfos = NULL;
+
+			batchednl->hashClauseInfos = valid_bnl_hinfos;
+			batchednl->num_hashClauseInfos -= num_invalid;
+		}
+
 	}
 	else if (IsA(join, MergeJoin))
 	{
@@ -2431,25 +2610,40 @@ fix_upper_expr_mutator(Node *node, fix_upper_expr_context *context)
 	/* Special cases (apply only AFTER failing to match to lower tlist) */
 	if (IsA(node, Param))
 		return fix_param_node(context->root, (Param *) node);
+	if (IsA(node, YbExprColrefDesc))
+	{
+		YbExprColrefDesc *colref = castNode(YbExprColrefDesc, node);
+		AttrNumber	varattno = colref->attno;
+		tlist_vinfo *vinfo;
+		int			i;
+
+		vinfo = context->subplan_itlist->vars;
+		i = context->subplan_itlist->num_vars;
+		while (i-- > 0)
+		{
+			if (vinfo->varattno == varattno)
+			{
+				/* Found a match */
+				YbExprColrefDesc *newcolref = makeNode(YbExprColrefDesc);
+				*newcolref = *colref;
+				newcolref->attno = vinfo->resno;
+				return (Node *) newcolref;
+			}
+			vinfo++;
+		}
+		elog(ERROR, "column reference not found in subplan target list");
+	}
 	if (IsA(node, Aggref))
 	{
 		Aggref	   *aggref = (Aggref *) node;
+		Param	   *aggparam;
 
 		/* See if the Aggref should be replaced by a Param */
-		if (context->root->minmax_aggs != NIL &&
-			list_length(aggref->args) == 1)
+		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
+		if (aggparam != NULL)
 		{
-			TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
-			ListCell   *lc;
-
-			foreach(lc, context->root->minmax_aggs)
-			{
-				MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
-
-				if (mminfo->aggfnoid == aggref->aggfnoid &&
-					equal(mminfo->target, curTarget->expr))
-					return (Node *) copyObject(mminfo->param);
-			}
+			/* Make a copy of the Param for paranoia's sake */
+			return (Node *) copyObject(aggparam);
 		}
 		/* If no match, just fall through to process it normally */
 	}
@@ -2522,6 +2716,38 @@ set_returning_clause_references(PlannerInfo *root,
 	pfree(itlist);
 
 	return rlist;
+}
+
+
+/*
+ * find_minmax_agg_replacement_param
+ *		If the given Aggref is one that we are optimizing into a subquery
+ *		(cf. planagg.c), then return the Param that should replace it.
+ *		Else return NULL.
+ *
+ * This is exported so that SS_finalize_plan can use it before setrefs.c runs.
+ * Note that it will not find anything until we have built a Plan from a
+ * MinMaxAggPath, as root->minmax_aggs will never be filled otherwise.
+ */
+Param *
+find_minmax_agg_replacement_param(PlannerInfo *root, Aggref *aggref)
+{
+	if (root->minmax_aggs != NIL &&
+		list_length(aggref->args) == 1)
+	{
+		TargetEntry *curTarget = (TargetEntry *) linitial(aggref->args);
+		ListCell   *lc;
+
+		foreach(lc, root->minmax_aggs)
+		{
+			MinMaxAggInfo *mminfo = (MinMaxAggInfo *) lfirst(lc);
+
+			if (mminfo->aggfnoid == aggref->aggfnoid &&
+				equal(mminfo->target, curTarget->expr))
+				return mminfo->param;
+		}
+	}
+	return NULL;
 }
 
 

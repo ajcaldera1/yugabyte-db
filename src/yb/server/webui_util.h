@@ -29,23 +29,22 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_WEBUI_UTIL_H
-#define YB_SERVER_WEBUI_UTIL_H
+#pragma once
 
 #include <string>
-#include <sstream>
-#include <vector>
 #include <unordered_set>
 
-#include "yb/gutil/ref_counted.h"
+#include "yb/common/common_fwd.h"
+
+#include "yb/server/server_fwd.h"
 
 namespace yb {
-
-class Schema;
-class MonitoredTask;
+namespace server {
 
 void HtmlOutputSchemaTable(const Schema& schema,
                            std::stringstream* output);
+void HtmlOutputTask(const std::shared_ptr<MonitoredTask>& task,
+                    std::stringstream* output);
 void HtmlOutputTasks(const std::unordered_set<std::shared_ptr<MonitoredTask> >& tasks,
                      std::stringstream* output);
 
@@ -54,6 +53,5 @@ inline std::string TableLongName(const std::string& keyspace_name,
   return keyspace_name + (keyspace_name.empty() ? "" : ".") + table_name;
 }
 
+} // namespace server
 } // namespace yb
-
-#endif // YB_SERVER_WEBUI_UTIL_H

@@ -31,7 +31,7 @@
 #include "commands/dbcommands.h"
 #include "catalog/pg_database.h"
 #include "commands/ybccmds.h"
-#include "catalog/ybctype.h"
+#include "catalog/yb_type.h"
 
 #include "catalog/catalog.h"
 #include "access/htup_details.h"
@@ -56,7 +56,7 @@ static void YBCAddSysCatalogColumn(YBCPgStatement yb_stmt,
 
 	ListCell      *lc;
 	bool          is_key    = false;
-	const YBCPgTypeEntity *col_type  = YBCDataTypeFromOidMod(attnum, type_id);
+	const YBCPgTypeEntity *col_type  = YbDataTypeFromOidMod(attnum, type_id);
 
 	if (pkey_idx)
 	{
@@ -76,12 +76,14 @@ static void YBCAddSysCatalogColumn(YBCPgStatement yb_stmt,
 	 */
 	if (key == is_key)
 	{
-		HandleYBStmtStatus(YBCPgCreateTableAddColumn(yb_stmt,
-		                                             attname,
-		                                             attnum,
-		                                             col_type,
-		                                             false /* is_hash */,
-		                                             is_key), yb_stmt);
+		HandleYBStatus(YBCPgCreateTableAddColumn(yb_stmt,
+																						 attname,
+																						 attnum,
+																						 col_type,
+																						 false /* is_hash */,
+																						 is_key,
+																						 false /* is_desc */,
+																						 false /* is_nulls_first */));
 	}
 }
 
@@ -127,16 +129,27 @@ void YBCCreateSysCatalogTable(const char *table_name,
 	char           *db_name     = "template1";
 	char           *schema_name = "pg_catalog";
 	YBCPgStatement yb_stmt      = NULL;
+	YBCPgYbrowidMode ybrowid_mode = (pkey_idx == NULL
+									 ? PG_YBROWID_MODE_RANGE
+									 : PG_YBROWID_MODE_NONE);
 
-	HandleYBStatus(YBCPgNewCreateTable(ybc_pg_session,
-	                                   db_name,
+	HandleYBStatus(YBCPgNewCreateTable(db_name,
 	                                   schema_name,
 	                                   table_name,
 	                                   TemplateDbOid,
 	                                   table_oid,
 	                                   is_shared_relation,
+	                                   true /* is_sys_catalog_table */,
 	                                   false, /* if_not_exists */
-									   pkey_idx == NULL, /* add_primary_key */
+	                                   ybrowid_mode,
+	                                   true, /* is_colocated_via_database */
+	                                   InvalidOid /* tablegroup_oid */,
+	                                   InvalidOid /* colocation_id */,
+	                                   InvalidOid /* tablespace_oid */,
+	                                   false /* is_matview */,
+	                                   InvalidOid /* pg_table_oid */,
+	                                   InvalidOid /* old_relfilenode_oid */,
+	                                   false /* is_truncate */,
 	                                   &yb_stmt));
 
 	/* Add all key columns first, then the regular columns */
@@ -146,6 +159,5 @@ void YBCCreateSysCatalogTable(const char *table_name,
 	}
 	YBCAddSysCatalogColumns(yb_stmt, tupdesc, pkey_idx, /* key */ false);
 
-	HandleYBStmtStatus(YBCPgExecCreateTable(yb_stmt), yb_stmt);
-	HandleYBStatus(YBCPgDeleteStatement(yb_stmt));
+	HandleYBStatus(YBCPgExecCreateTable(yb_stmt));
 }

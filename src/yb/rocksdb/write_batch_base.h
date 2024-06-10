@@ -20,12 +20,10 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_WRITE_BATCH_BASE_H
-#define ROCKSDB_INCLUDE_ROCKSDB_WRITE_BATCH_BASE_H
 
 #pragma once
 
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/slice.h"
 #include "yb/rocksdb/status.h"
 
@@ -115,5 +113,3 @@ class WriteBatchBase {
 };
 
 }  // namespace rocksdb
-
-#endif // ROCKSDB_INCLUDE_ROCKSDB_WRITE_BATCH_BASE_H

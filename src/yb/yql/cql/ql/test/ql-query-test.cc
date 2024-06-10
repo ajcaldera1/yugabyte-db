@@ -13,32 +13,47 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include <thread>
 #include <cmath>
+#include <thread>
 
+#include "yb/client/client.h"
 #include "yb/client/table.h"
+
 #include "yb/common/jsonb.h"
+#include "yb/dockv/partition.h"
+#include "yb/common/ql_protocol_util.h"
+#include "yb/qlexpr/ql_serialization.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/ql_value.h"
+
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/master/master.h"
 #include "yb/master/ts_manager.h"
+
+#include "yb/util/decimal.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/yb_partition.h"
-#include "yb/util/crypt.h"
+
 #include "yb/yql/cql/ql/test/ql-test-base.h"
 
 using std::string;
-using std::unique_ptr;
 using std::shared_ptr;
 using strings::Substitute;
 
 namespace yb {
 namespace ql {
 
+using qlexpr::QLRow;
+
 class TestQLQuery : public QLTestBase {
  public:
   TestQLQuery() : QLTestBase() {
   }
 
-  std::shared_ptr<QLRowBlock> ExecSelect(TestQLProcessor *processor, int expected_rows = 1) {
+  std::shared_ptr<qlexpr::QLRowBlock> ExecSelect(
+      TestQLProcessor *processor, int expected_rows = 1) {
     auto select = "SELECT c1, c2, c3 FROM test_table WHERE c1 = 1";
     Status s = processor->Run(select);
     CHECK(s.ok());
@@ -71,7 +86,7 @@ class TestQLQuery : public QLTestBase {
 
     // Verify row is present.
     auto row_block = ExecSelect(processor);
-    QLRow& row = row_block->row(0);
+    auto& row = row_block->row(0);
 
     EXPECT_EQ(1, row.column(0).int32_value());
     EXPECT_EQ(2, row.column(1).int32_value());
@@ -95,8 +110,8 @@ class TestQLQuery : public QLTestBase {
     auto row_block = processor->row_block();
     // checking result
     ASSERT_EQ(test_rows.size(), row_block->row_count());
-    for (int i = 0; i < test_rows.size(); i++) {
-      QLRow &row = row_block->row(i);
+    for (size_t i = 0; i < test_rows.size(); i++) {
+      auto& row = row_block->row(i);
       EXPECT_EQ(std::get<1>(test_rows[i]), row.column(0).int32_value());
       EXPECT_EQ(std::get<2>(test_rows[i]), row.column(1).string_value());
       EXPECT_EQ(std::get<3>(test_rows[i]), row.column(2).int32_value());
@@ -143,8 +158,15 @@ class TestQLQuery : public QLTestBase {
     // Create test table.
     CHECK_OK(processor->Run("CREATE TABLE scan_bounds_test (h1 int, h2 text, r1 int, v1 int,"
                                 " PRIMARY KEY((h1, h2), r1));"));
+    CHECK_INVALID_STMT("SELECT * FROM scan_bounds_test WHERE h1 in (1, 3) ORDER BY r1 DESC");
 
-    client::YBTableName name(kDefaultKeyspaceName, "scan_bounds_test");
+    string createTableStmt = "CREATE TABLE tab (i int, j int, k int, primary key(i, j)) ";
+    CHECK_OK(processor->Run(createTableStmt + "WITH transactions = {'enabled': 'false'};"));
+    string createIdxStmt = "CREATE INDEX tab_index ON tab (j, k) WITH transactions = {'enabled':";
+    CHECK_OK(processor->Run(createIdxStmt + " 'false', 'consistency_level': 'user_enforced'};"));
+    CHECK_INVALID_STMT("SELECT * from tab where j in (1, 2) order by k");
+
+    client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "scan_bounds_test");
     shared_ptr<client::YBTable> table;
 
     ASSERT_OK(client_->OpenTable(name, &table));
@@ -163,7 +185,7 @@ class TestQLQuery : public QLTestBase {
 
       std::string part_key;
       CHECK_OK(table->partition_schema().EncodeKey(row, &part_key));
-      uint16_t hash_code = PartitionSchema::DecodeMultiColumnHashValue(part_key);
+      uint16_t hash_code = dockv::PartitionSchema::DecodeMultiColumnHashValue(part_key);
 
       int64_t cql_hash = func_name == "token" ? YBPartition::YBToCqlHashCode(hash_code) : hash_code;
       std::tuple<int64_t, int, string, int, int> values(cql_hash, i, i_str, i, i);
@@ -445,10 +467,32 @@ class TestQLQuery : public QLTestBase {
     ASSERT_EQ(1, row_block->row_count());
 
     //----------------------------------------------------------------------------------------------
-    // Testing parametric types (i.e. with frozen)
+    // Testing separate UDT type.
     //----------------------------------------------------------------------------------------------
     CHECK_OK(processor->Run("CREATE TYPE udt_partition_hash_test(a int, b text)"));
 
+    CHECK_OK(processor->Run(
+        "CREATE TABLE partition_hash_bcall_udt_test("
+        " h frozen<udt_partition_hash_test>, r int, v int, PRIMARY KEY ((h), r))"));
+
+    // Sample values to check hash value computation
+    key_values = "{a : 1, b : 'foo'}";
+
+    insert_stmt = Substitute("INSERT INTO partition_hash_bcall_udt_test "
+                             "(h, r, v) VALUES ($0, 1, 1);", key_values);
+    CHECK_OK(processor->Run(insert_stmt));
+
+    select_stmt = Substitute("SELECT * FROM partition_hash_bcall_udt_test WHERE "
+                                 "$0(h) = $1($2)", func_name, func_name, key_values);
+    CHECK_OK(processor->Run(select_stmt));
+
+    // Checking result.
+    row_block = processor->row_block();
+    ASSERT_EQ(1, row_block->row_count());
+
+    //----------------------------------------------------------------------------------------------
+    // Testing parametric types (i.e. with frozen)
+    //----------------------------------------------------------------------------------------------
     CHECK_OK(processor->Run(
         "CREATE TABLE partition_hash_bcall_frozen_test("
         " h1 frozen<map<int,text>>, h2 frozen<set<text>>, h3 frozen<list<int>>, "
@@ -502,7 +546,7 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
 
   // Test NOTFOUND. Select from empty table.
   CHECK_VALID_STMT("SELECT * FROM test_table");
-  std::shared_ptr<QLRowBlock> empty_row_block = processor->row_block();
+  auto empty_row_block = processor->row_block();
   CHECK_EQ(empty_row_block->row_count(), 0);
   CHECK_VALID_STMT("SELECT * FROM test_table WHERE h1 = 0 AND h2 = ''");
   empty_row_block = processor->row_block();
@@ -539,9 +583,9 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
   CHECK_VALID_STMT("SELECT h1, h2, r1, r2, v1, v2 FROM test_table "
                    "  WHERE h1 = 7 AND h2 = 'h7' AND r1 = 107;");
 
-  std::shared_ptr<QLRowBlock> row_block = processor->row_block();
+  auto row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& ordered_row = row_block->row(0);
+  const auto& ordered_row = row_block->row(0);
   CHECK_EQ(ordered_row.column(0).int32_value(), 7);
   CHECK_EQ(ordered_row.column(1).string_value(), "h7");
   CHECK_EQ(ordered_row.column(2).int32_value(), 107);
@@ -555,7 +599,7 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
 
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& unordered_row = row_block->row(0);
+  const auto& unordered_row = row_block->row(0);
   CHECK_EQ(unordered_row.column(0).int32_value(), 1007);
   CHECK_EQ(unordered_row.column(1).string_value(), "v1007");
   CHECK_EQ(unordered_row.column(2).int32_value(), 7);
@@ -573,7 +617,7 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
 
     row_block = processor->row_block();
     CHECK_EQ(row_block->row_count(), 1);
-    const QLRow& row = row_block->row(0);
+    const auto& row = row_block->row(0);
     CHECK_EQ(row.column(0).int32_value(), idx);
     CHECK_EQ(row.column(1).string_value(), Substitute("h$0", idx));
     CHECK_EQ(row.column(2).int32_value(), idx + 100);
@@ -605,7 +649,7 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
   // Check the result set.
   CHECK_EQ(row_block->row_count(), kHashNumRows);
   for (int idx = 0; idx < kHashNumRows; idx++) {
-    const QLRow& row = row_block->row(idx);
+    const auto& row = row_block->row(idx);
     CHECK_EQ(row.column(0).int32_value(), h1_shared);
     CHECK_EQ(row.column(1).string_value(), h2_shared);
     CHECK_EQ(row.column(2).int32_value(), idx + 100);
@@ -627,7 +671,7 @@ TEST_F(TestQLQuery, TestQLQuerySimple) {
   int32_t prev_r1 = 0;
   string prev_r2;
   for (int idx = 0; idx < limit; idx++) {
-    const QLRow& row = row_block->row(idx);
+    const auto& row = row_block->row(idx);
     CHECK_EQ(row.column(0).int32_value(), h1_shared);
     CHECK_EQ(row.column(1).string_value(), h2_shared);
     CHECK_EQ(row.column(2).int32_value(), idx + 100);
@@ -674,9 +718,9 @@ TEST_F(TestQLQuery, TestPagingState) {
 
   // Read a single row. Verify row and that the paging state is empty.
   CHECK_VALID_STMT("SELECT h, r, v FROM t WHERE h = 1 AND r = 1;");
-  std::shared_ptr<QLRowBlock> row_block = processor->row_block();
+  auto row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& row = row_block->row(0);
+  const auto& row = row_block->row(0);
   CHECK_EQ(row.column(0).int32_value(), 1);
   CHECK_EQ(row.column(1).int32_value(), 1);
   CHECK_EQ(row.column(2).int32_value(), 101);
@@ -691,10 +735,10 @@ TEST_F(TestQLQuery, TestPagingState) {
     int i = 0;
     do {
       CHECK_OK(processor->Run("SELECT h, r, v FROM t WHERE h = 1;", params));
-      std::shared_ptr<QLRowBlock> row_block = processor->row_block();
+      auto row_block = processor->row_block();
       CHECK_EQ(row_block->row_count(), kPageSize);
       for (int j = 0; j < kPageSize; j++) {
-        const QLRow& row = row_block->row(j);
+        const auto& row = row_block->row(j);
         i++;
         CHECK_EQ(row.column(0).int32_value(), 1);
         CHECK_EQ(row.column(1).int32_value(), i);
@@ -704,7 +748,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(page_count, kNumRows / kPageSize);
   }
@@ -720,9 +764,9 @@ TEST_F(TestQLQuery, TestPagingState) {
     string select_stmt = Substitute("SELECT h, r, v FROM t WHERE h = 1 LIMIT $0;", kLimit);
     do {
       CHECK_OK(processor->Run(select_stmt, params));
-      std::shared_ptr<QLRowBlock> row_block = processor->row_block();
-      for (int j = 0; j < row_block->row_count(); j++) {
-        const QLRow& row = row_block->row(j);
+      auto row_block = processor->row_block();
+      for (size_t j = 0; j < row_block->row_count(); j++) {
+        const auto& row = row_block->row(j);
         i++;
         CHECK_EQ(row.column(0).int32_value(), 1);
         CHECK_EQ(row.column(1).int32_value(), i);
@@ -733,7 +777,7 @@ TEST_F(TestQLQuery, TestPagingState) {
         break;
       }
       CHECK_EQ(row_block->row_count(), kPageSize);
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(i, kLimit);
     CHECK_EQ(page_count, static_cast<int>(ceil(static_cast<double>(kLimit) /
@@ -762,9 +806,9 @@ TEST_F(TestQLQuery, TestPagingState) {
     int sum = 0;
     do {
       CHECK_OK(processor->Run("SELECT h, r, v FROM t WHERE r > 100;", params));
-      std::shared_ptr<QLRowBlock> row_block = processor->row_block();
-      for (int j = 0; j < row_block->row_count(); j++) {
-        const QLRow& row = row_block->row(j);
+      auto row_block = processor->row_block();
+      for (size_t j = 0; j < row_block->row_count(); j++) {
+        const auto& row = row_block->row(j);
         CHECK_EQ(row.column(0).int32_value() + 100, row.column(1).int32_value());
         sum += row.column(0).int32_value();
         row_count++;
@@ -773,7 +817,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(row_count, kNumRows);
     // Page count should be at least "kNumRows / kPageSize". Can be more because some pages may not
@@ -794,9 +838,9 @@ TEST_F(TestQLQuery, TestPagingState) {
     string select_stmt = Substitute("SELECT h, r, v FROM t WHERE r > 100 LIMIT $0;", kLimit);
     do {
       CHECK_OK(processor->Run(select_stmt, params));
-      std::shared_ptr<QLRowBlock> row_block = processor->row_block();
-      for (int j = 0; j < row_block->row_count(); j++) {
-        const QLRow& row = row_block->row(j);
+      auto row_block = processor->row_block();
+      for (size_t j = 0; j < row_block->row_count(); j++) {
+        const auto& row = row_block->row(j);
         CHECK_EQ(row.column(0).int32_value() + 100, row.column(1).int32_value());
         sum += row.column(0).int32_value();
         row_count++;
@@ -805,7 +849,7 @@ TEST_F(TestQLQuery, TestPagingState) {
       if (processor->rows_result()->paging_state().empty()) {
         break;
       }
-      CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));
+      CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
     } while (true);
     CHECK_EQ(row_count, kLimit);
     // Page count should be at least "kLimit / kPageSize". Can be more because some pages may not
@@ -841,48 +885,49 @@ TEST_F(TestQLQuery, TestPagingState) {
   }
 }
 
-#define RUN_PAGINATION_WITH_DESC_TEST(processor, type, values, rows)                               \
-do {                                                                                               \
-  /* Creating the table. */                                                                        \
-  string create_stmt = Substitute("CREATE TABLE t_$0 (h int, r1 $1, r2 $2, v int, "                \
-      "primary key((h), r1, r2)) WITH CLUSTERING ORDER BY (r1 DESC, r2 ASC);", type, type, type);  \
-  CHECK_VALID_STMT(create_stmt);                                                                   \
-                                                                                                   \
-  /* Inserting the values. */                                                                      \
-  for (auto& value : values) {                                                                     \
-    string stmt = Substitute("INSERT INTO t_$0 (h, r1, r2, v) VALUES (1, $1, $2, $3);",            \
-        type, value, value, 0);                                                                  \
-    CHECK_VALID_STMT(stmt);                                                                        \
-  }                                                                                                \
-  /* Seting up low page size for reading to test paging. */                                        \
-  StatementParameters params;                                                                      \
-  int kPageSize = 5;                                                                               \
-  params.set_page_size(kPageSize);                                                                 \
-  /* Setting up range query, will include all values except minimum and maximum */                 \
-  int num_rows = values.size();                                                                    \
-  auto min_val = values[0];                                                                        \
-  auto max_val = values[num_rows - 1];                                                             \
-  int page_count = 0;                                                                              \
-  string select_stmt = Substitute("SELECT h, r1, r2, v FROM t_$0 WHERE h = 1 AND "                 \
-    "r1 > $1 AND r2 > $2 AND r1 < $3 AND r2 < $4;", type, min_val, min_val, max_val, max_val );    \
-  /* Reading rows, loading the rows vector to be checked later for each case */                    \
-  do {                                                                                             \
-    CHECK_OK(processor->Run(select_stmt, params));                                                 \
-    std::shared_ptr<QLRowBlock> row_block = processor->row_block();                               \
-    for (int j = 0; j < row_block->row_count(); j++) {                                             \
-    const QLRow& row = row_block->row(j);                                                         \
-      rows->push_back(row);                                                                        \
-    }                                                                                              \
-    page_count++;                                                                                  \
-    if (processor->rows_result()->paging_state().empty()) {                                        \
-      break;                                                                                       \
-    }                                                                                              \
-    CHECK_OK(params.set_paging_state(processor->rows_result()->paging_state()));                   \
-  } while (true);                                                                                  \
-  /* Page count should be at least "<nrRowsRead> / kPageSize". */                                  \
-  /* Can be more since some pages may not be fully filled depending on hash key distribution. */   \
-  CHECK_GE(page_count, (num_rows - 2) / kPageSize);                                                \
-} while(0)
+template <class T>
+void RunPaginationWithDescTest(
+    TestQLProcessor *processor, const char* type, const std::vector<T>& values,
+    std::vector<QLRow>* rows) {
+  /* Creating the table. */
+  string create_stmt = Substitute("CREATE TABLE t_$0 (h int, r1 $1, r2 $2, v int, "
+      "primary key((h), r1, r2)) WITH CLUSTERING ORDER BY (r1 DESC, r2 ASC);", type, type, type);
+  CHECK_VALID_STMT(create_stmt);
+
+  /* Inserting the values. */
+  for (auto& value : values) {
+    string stmt = Substitute("INSERT INTO t_$0 (h, r1, r2, v) VALUES (1, $1, $2, $3);",
+        type, value, value, 0);
+    CHECK_VALID_STMT(stmt);
+  }
+  /* Seting up low page size for reading to test paging. */
+  StatementParameters params;
+  int kPageSize = 5;
+  params.set_page_size(kPageSize);
+  /* Setting up range query, will include all values except minimum and maximum */
+  auto min_val = values.front();
+  auto max_val = values.back();
+  int page_count = 0;
+  string select_stmt = Substitute("SELECT h, r1, r2, v FROM t_$0 WHERE h = 1 AND "
+    "r1 > $1 AND r2 > $2 AND r1 < $3 AND r2 < $4;", type, min_val, min_val, max_val, max_val );
+  /* Reading rows, loading the rows vector to be checked later for each case */
+  do {
+    CHECK_OK(processor->Run(select_stmt, params));
+    auto row_block = processor->row_block();
+    for (size_t j = 0; j < row_block->row_count(); j++) {
+      const auto& row = row_block->row(j);
+      rows->push_back(row);
+    }
+    page_count++;
+    if (processor->rows_result()->paging_state().empty()) {
+      break;
+    }
+    CHECK_OK(params.SetPagingState(processor->rows_result()->paging_state()));
+  } while (true);
+  /* Page count should be at least "<nrRowsRead> / kPageSize". */
+  /* Can be more since some pages may not be fully filled depending on hash key distribution. */
+  CHECK_GE(page_count, (values.size() - 2) / kPageSize);
+}
 
 TEST_F(TestQLQuery, TestPaginationWithDescSort) {
 
@@ -904,7 +949,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "int", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "int", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -929,7 +974,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "timestamp", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "timestamp", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -960,7 +1005,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "inet", input_values, rows_ptr);
+    RunPaginationWithDescTest(processor, "inet", input_values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -988,7 +1033,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "uuid", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "uuid", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -1014,7 +1059,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "decimal", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "decimal", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -1043,7 +1088,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "float", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "float", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -1069,7 +1114,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "double", values, rows_ptr);
+    RunPaginationWithDescTest(processor, "double", values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -1097,7 +1142,7 @@ TEST_F(TestQLQuery, TestPaginationWithDescSort) {
     }
     std::vector<QLRow> rows;
     auto rows_ptr = &rows;
-    RUN_PAGINATION_WITH_DESC_TEST(processor, "varchar", input_values, rows_ptr);
+    RunPaginationWithDescTest(processor, "varchar", input_values, rows_ptr);
     // Checking rows values -- expecting results in descending order except for min and max values.
     CHECK_EQ(rows.size(), values.size() - 2);
     // Results should start from second-largest value.
@@ -1132,7 +1177,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
 
   // Test NOTFOUND. Select from empty table.
   CHECK_VALID_STMT("SELECT * FROM test_table");
-  std::shared_ptr<QLRowBlock> empty_row_block = processor->row_block();
+  auto empty_row_block = processor->row_block();
   CHECK_EQ(empty_row_block->row_count(), 0);
   CHECK_VALID_STMT("SELECT * FROM test_table WHERE h1 = 0 AND h2 = ''");
   empty_row_block = processor->row_block();
@@ -1161,9 +1206,9 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
   LOG(INFO) << "Testing 3 out of 4 keys";
   CHECK_VALID_STMT("SELECT h1, h2, h3, h4, r1, r2, v1, v2 FROM test_table "
                    "  WHERE h1 = 7 AND h2 = 'h7' AND h3 = 107;");
-  std::shared_ptr<QLRowBlock> row_block = processor->row_block();
+  auto row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& no_hash_row1 = row_block->row(0);
+  const auto& no_hash_row1 = row_block->row(0);
   CHECK_EQ(no_hash_row1.column(0).int32_value(), 7);
   CHECK_EQ(no_hash_row1.column(1).string_value(), "h7");
   CHECK_EQ(no_hash_row1.column(2).int64_value(), 107);
@@ -1178,7 +1223,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "  WHERE h1 = 7 AND h2 = 'h7';");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& no_hash_row2 = row_block->row(0);
+  const auto& no_hash_row2 = row_block->row(0);
   CHECK_EQ(no_hash_row2.column(0).int32_value(), 7);
   CHECK_EQ(no_hash_row2.column(1).string_value(), "h7");
   CHECK_EQ(no_hash_row2.column(2).int64_value(), 107);
@@ -1193,7 +1238,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "  WHERE h1 = 7;");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& no_hash_row3 = row_block->row(0);
+  const auto& no_hash_row3 = row_block->row(0);
   CHECK_EQ(no_hash_row3.column(0).int32_value(), 7);
   CHECK_EQ(no_hash_row3.column(1).string_value(), "h7");
   CHECK_EQ(no_hash_row3.column(2).int64_value(), 107);
@@ -1209,7 +1254,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "WHERE r1 = 1007;");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& no_hash_row4 = row_block->row(0);
+  const auto& no_hash_row4 = row_block->row(0);
   CHECK_EQ(no_hash_row4.column(0).int32_value(), 7);
   CHECK_EQ(no_hash_row4.column(1).string_value(), "h7");
   CHECK_EQ(no_hash_row4.column(2).int64_value(), 107);
@@ -1225,7 +1270,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "WHERE h1 = 7;");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& h1_hash_row = row_block->row(0);
+  const auto& h1_hash_row = row_block->row(0);
   CHECK_EQ(h1_hash_row.column(0).int32_value(), 7);
   CHECK_EQ(h1_hash_row.column(1).string_value(), "h7");
   CHECK_EQ(h1_hash_row.column(2).int64_value(), 107);
@@ -1239,7 +1284,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "  WHERE h2 = 'h7';");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& h2_hash_row = row_block->row(0);
+  const auto& h2_hash_row = row_block->row(0);
   CHECK_EQ(h2_hash_row.column(0).int32_value(), 7);
   CHECK_EQ(h2_hash_row.column(1).string_value(), "h7");
   CHECK_EQ(h2_hash_row.column(2).int64_value(), 107);
@@ -1253,7 +1298,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "  WHERE h3 = 107;");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& h3_hash_row = row_block->row(0);
+  const auto& h3_hash_row = row_block->row(0);
   CHECK_EQ(h3_hash_row.column(0).int32_value(), 7);
   CHECK_EQ(h3_hash_row.column(1).string_value(), "h7");
   CHECK_EQ(h3_hash_row.column(2).int64_value(), 107);
@@ -1267,7 +1312,7 @@ TEST_F(TestQLQuery, TestQLQueryPartialHash) {
                    "  WHERE h4 = 'h107';");
   row_block = processor->row_block();
   CHECK_EQ(row_block->row_count(), 1);
-  const QLRow& h4_hash_row = row_block->row(0);
+  const auto& h4_hash_row = row_block->row(0);
   CHECK_EQ(h4_hash_row.column(0).int32_value(), 7);
   CHECK_EQ(h4_hash_row.column(1).string_value(), "h7");
   CHECK_EQ(h4_hash_row.column(2).int64_value(), 107);
@@ -1342,7 +1387,7 @@ TEST_F(TestQLQuery, TestUpdateWithTTL) {
 
   // c1 = 1 should still exist.
   auto row_block = ExecSelect(processor);
-  QLRow& row = row_block->row(0);
+  auto& row = row_block->row(0);
 
   EXPECT_EQ(1, row.column(0).int32_value());
   EXPECT_TRUE(row.column(1).IsNull());
@@ -1394,7 +1439,7 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, map_row.column(1).int32_value());
   EXPECT_EQ("x", map_row.column(3).string_value());
   // check map
-  EXPECT_EQ(QLValue::InternalType::kMapValue, map_row.column(2).type());
+  EXPECT_EQ(InternalType::kMapValue, map_row.column(2).type());
   QLMapValuePB map_value = map_row.column(2).map_value();
   // check keys
   EXPECT_EQ(3, map_value.keys_size());
@@ -1436,7 +1481,7 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, set_row.column(1).int32_value());
   EXPECT_EQ("x", set_row.column(3).string_value());
   // check set
-  EXPECT_EQ(QLValue::InternalType::kSetValue, set_row.column(2).type());
+  EXPECT_EQ(InternalType::kSetValue, set_row.column(2).type());
   QLSeqValuePB set_value = set_row.column(2).set_value();
   // check elems
   // returned set should have no duplicates
@@ -1453,13 +1498,14 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
 
   // Create table.
   const char *list_create_stmt =
-      "CREATE TABLE list_test (id int PRIMARY KEY, v int, ls list<varchar>, c varchar);";
+      "CREATE TABLE list_test"
+      "  (id int PRIMARY KEY, v int, ls list<varchar>, c varchar, lb list<blob>);";
   s = processor->Run(list_create_stmt);
   CHECK(s.ok());
 
   // Insert Values
-  std::string list_insert_stmt("INSERT INTO list_test (id, v, ls, c) values "
-      "(1, 3, ['c', 'd', 'a', 'b', 'd', 'b'], 'x');");
+  std::string list_insert_stmt("INSERT INTO list_test (id, v, ls, c, lb) values "
+      "(1, 3, ['c', 'd', 'a', 'b', 'd', 'b'], 'x', [0x01, 0X02, 0x33, 0x04]);");
   s = processor->Run(list_insert_stmt);
   CHECK_OK(s);
 
@@ -1476,11 +1522,15 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ(3, list_row.column(1).int32_value());
   EXPECT_EQ("x", list_row.column(3).string_value());
   // check set
-  EXPECT_EQ(QLValue::InternalType::kListValue, list_row.column(2).type());
-  QLSeqValuePB list_value = list_row.column(2).list_value();
+  EXPECT_EQ(InternalType::kListValue, list_row.column(2).type());
+  EXPECT_EQ(InternalType::kListValue, list_row.column(4).type());
+
   // check elems
   // lists should preserve input length (keep duplicates if any)
+  QLSeqValuePB list_value = list_row.column(2).list_value();
   EXPECT_EQ(6, list_value.elems_size());
+  QLSeqValuePB blist_value = list_row.column(4).list_value();
+  EXPECT_EQ(4, blist_value.elems_size());
   // list elements should preserve input order
   EXPECT_EQ("c", list_value.elems(0).string_value());
   EXPECT_EQ("d", list_value.elems(1).string_value());
@@ -1488,6 +1538,11 @@ TEST_F(TestQLQuery, TestCollectionTypes) {
   EXPECT_EQ("b", list_value.elems(3).string_value());
   EXPECT_EQ("d", list_value.elems(4).string_value());
   EXPECT_EQ("b", list_value.elems(5).string_value());
+
+  EXPECT_EQ("\x1", blist_value.elems(0).binary_value());
+  EXPECT_EQ("\x2", blist_value.elems(1).binary_value());
+  EXPECT_EQ("\x33", blist_value.elems(2).binary_value());
+  EXPECT_EQ("\x4", blist_value.elems(3).binary_value());
 }
 
 TEST_F(TestQLQuery, TestSystemLocal) {
@@ -1503,7 +1558,7 @@ TEST_F(TestQLQuery, TestSystemLocal) {
   // Validate rows.
   auto row_block = processor->row_block();
   EXPECT_EQ(1, row_block->row_count());
-  QLRow& row = row_block->row(0);
+  auto& row = row_block->row(0);
   EXPECT_EQ("127.0.0.3", row.column(2).inetaddress_value().ToString()); // broadcast address.
 }
 
@@ -1533,10 +1588,10 @@ TEST_F(TestQLQuery, TestInvalidPeerTableEntries) {
   // Verify system peers table.
   TestQLProcessor* processor = GetQLProcessor();
   ASSERT_OK(processor->Run("SELECT * FROM system.peers"));
-  std::shared_ptr<QLRowBlock> row_block = processor->row_block();
+  auto row_block = processor->row_block();
   ASSERT_EQ(num_tservers - 1, row_block->row_count()) << row_block->ToString();
 
-  auto ts_manager = cluster_->leader_mini_master()->master()->ts_manager();
+  auto ts_manager = ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->master()->ts_manager();
   NodeInstancePB instance;
   instance.set_permanent_uuid("test");
   instance.set_instance_seqno(0);
@@ -1581,7 +1636,7 @@ TEST_F(TestQLQuery, TestPagination) {
   auto row_block = processor->row_block();
   EXPECT_EQ(10, row_block->row_count());
   int sum = 0;
-  for (int i = 0; i < row_block->row_count(); i++) {
+  for (size_t i = 0; i < row_block->row_count(); i++) {
     sum += row_block->row(i).column(0).int32_value();
   }
   EXPECT_EQ(55, sum);
@@ -1655,7 +1710,7 @@ TEST_F(TestQLQuery, TestDeleteColumn) {
   CHECK_OK(processor->Run("CREATE TABLE delete_column (h int, v1 int, v2 int,"
                             " PRIMARY KEY(h));"));
 
-  client::YBTableName name(kDefaultKeyspaceName, "delete_column");
+  client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "delete_column");
 
   for (int i = 0; i < 2; i++) {
     string stmt = Substitute("INSERT INTO delete_column (h, v1, v2) VALUES "
@@ -1696,7 +1751,7 @@ TEST_F(TestQLQuery, TestTtlWritetimeInWhereClauseOfSelectStatements) {
   CHECK_OK(
       processor->Run("CREATE TABLE ttl_writetime_test (h int, v1 int, v2 int, PRIMARY KEY(h))"));
 
-  client::YBTableName name(kDefaultKeyspaceName, "ttl_writetime_test");
+  client::YBTableName name(YQL_DATABASE_CQL, kDefaultKeyspaceName, "ttl_writetime_test");
 
   shared_ptr<client::YBTable> table;
 
@@ -1706,7 +1761,7 @@ TEST_F(TestQLQuery, TestTtlWritetimeInWhereClauseOfSelectStatements) {
   std::vector<std::tuple<int, int, int>> rows;
   for (int i = 0; i < 5; i++) {
     std::string i_str = std::to_string(i);
-    YBPartialRow row(&table->InternalSchema());
+    dockv::YBPartialRow row(&table->InternalSchema());
     CHECK_OK(row.SetInt32(0, i));
     CHECK_OK(row.SetInt32(1, i));
     CHECK_OK(row.SetInt32(2, i));
@@ -1719,7 +1774,7 @@ TEST_F(TestQLQuery, TestTtlWritetimeInWhereClauseOfSelectStatements) {
 
   for (int i = 5; i < 10; i++) {
     std::string i_str = std::to_string(i);
-    YBPartialRow row(&table->InternalSchema());
+    dockv::YBPartialRow row(&table->InternalSchema());
     CHECK_OK(row.SetInt32(0, i));
     CHECK_OK(row.SetInt32(1, i));
     CHECK_OK(row.SetInt32(2, i));
@@ -1855,7 +1910,7 @@ TEST_F(TestQLQuery, TestDoublePrimaryKey) {
 }
 
 
-void verifyJson(std::shared_ptr<QLRowBlock> row_block) {
+void verifyJson(std::shared_ptr<qlexpr::QLRowBlock> row_block) {
   // Verify.
   ASSERT_EQ(1, row_block->row_count());
   std::vector<QLRow> &returned_rows = row_block->rows();
@@ -1865,10 +1920,12 @@ void verifyJson(std::shared_ptr<QLRowBlock> row_block) {
   common::Jsonb jsonb(row.column(1).jsonb_value());
   ASSERT_OK(jsonb.ToJsonString(&json));
   EXPECT_EQ("{\"a\":1,\"b\":2}", json);
-  faststring buffer;
-  row.column(1).Serialize(QLType::Create(DataType::JSONB), YQL_CLIENT_CQL, &buffer);
+  WriteBuffer buffer(1024);
+  qlexpr::SerializeValue(
+      QLType::Create(DataType::JSONB), YQL_CLIENT_CQL, row.column(1).value(), &buffer);
   int32_t len = 0;
-  Slice data(buffer);
+  auto data_str = buffer.ToBuffer();
+  Slice data(data_str);
   ASSERT_OK(CQLDecodeNum(sizeof(len), NetworkByteOrder::Load32, &data, &len));
   string val;
   ASSERT_OK(CQLDecodeBytes(len, &data, &val));
@@ -1924,7 +1981,6 @@ TEST_F(TestQLQuery, TestJsonUpdate) {
   ASSERT_OK(processor->Run("UPDATE test_json SET data->'new-field' = '100' WHERE k1 = 1"));
 
   ASSERT_OK(processor->Run("UPDATE test_json SET data =  '{ \"a\": 2, \"b\": 4 }' WHERE k1 = 2"));
-  ASSERT_NOK(processor->Run("UPDATE test_json SET data->'a' = '3' WHERE k1 = 3"));
 
   // Setting primitive value in JSON column should work
   ASSERT_OK(processor->Run("UPDATE test_json SET data='true' WHERE k1 = 1"));

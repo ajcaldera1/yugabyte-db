@@ -11,20 +11,36 @@
 // under the License.
 //
 
-#ifndef YB_CLIENT_CLIENT_UTILS_H
-#define YB_CLIENT_CLIENT_UTILS_H
+#pragma once
 
 #include <future>
 
 #include "yb/client/client_fwd.h"
 
+#include "yb/rpc/rpc_fwd.h"
+
 namespace yb {
+
+class MemTracker;
+class MetricEntity;
+
 namespace client {
 
 // Lookup first tablet of specified table.
-std::future<Result<internal::RemoteTabletPtr>> LookupFirstTabletFuture(const YBTable* table);
+std::future<Result<internal::RemoteTabletPtr>> LookupFirstTabletFuture(
+    YBClient* client, const YBTablePtr& table);
 
-}
-}
+Result<std::unique_ptr<rpc::Messenger>> CreateClientMessenger(
+    const std::string &client_name,
+    int32_t num_reactors,
+    const scoped_refptr<MetricEntity> &metric_entity,
+    const std::shared_ptr<MemTracker> &parent_mem_tracker,
+    rpc::SecureContext *secure_context = nullptr);
 
-#endif // YB_CLIENT_CLIENT_UTILS_H
+std::vector<internal::RemoteTabletPtr> FilterTabletsByKeyRange(
+    const std::vector<internal::RemoteTabletPtr>& all_tablets,
+    const std::string& partition_key_start,
+    const std::string& partition_key_end);
+
+} // namespace client
+} // namespace yb

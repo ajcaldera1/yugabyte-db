@@ -29,17 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CLIENT_CALLBACKS_H_
-#define YB_CLIENT_CALLBACKS_H_
+#pragma once
 
-#ifdef YB_HEADERS_NO_STUBS
 #include "yb/gutil/macros.h"
 #include "yb/gutil/port.h"
 #include "yb/gutil/walltime.h"
-#else
-#include "yb/client/stubs.h"
-#endif
-
 
 namespace yb {
 
@@ -215,5 +209,3 @@ YBStatusFunctorCallback<Functor>* MakeYBStatusFunctorCallback(const Functor& fun
 
 }  // namespace client
 }  // namespace yb
-
-#endif  // YB_CLIENT_CALLBACKS_H_

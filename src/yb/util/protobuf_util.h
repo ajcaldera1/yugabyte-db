@@ -32,29 +32,25 @@
 
 // Portions Copyright (c) YugaByte, Inc.
 
-#ifndef YB_UTIL_PROTOBUF_UTIL_H
-#define YB_UTIL_PROTOBUF_UTIL_H
+#pragma once
 
+#include <float.h>
+
+#include <chrono>
+#include <sstream>
+#include <string>
+#include <type_traits>
+
+#include <boost/mpl/and.hpp>
+#include <google/protobuf/stubs/port.h>
+#include <google/protobuf/generated_enum_reflection.h>
 #include <google/protobuf/message_lite.h>
 
 #include "yb/util/enums.h"
-
-namespace yb {
-
-inline bool AppendPBToString(const google::protobuf::MessageLite &msg, faststring *output) {
-  int old_size = output->size();
-  int byte_size = msg.ByteSize();
-  output->resize(old_size + byte_size);
-  uint8* start = reinterpret_cast<uint8*>(output->data() + old_size);
-  uint8* end = msg.SerializeWithCachedSizesToArray(start);
-  CHECK(end - start == byte_size)
-    << "Error in serialization. byte_size=" << byte_size
-    << " new ByteSize()=" << msg.ByteSize()
-    << " end-start=" << (end-start);
-  return true;
-}
-
-} // namespace yb
+#include "yb/util/format.h"
+#include "yb/util/math_util.h"
+#include "yb/util/tostring.h"
+#include "yb/util/type_traits.h"
 
 #define PB_ENUM_FORMATTERS(EnumType) \
   inline std::string PBEnumToString(EnumType value) { \
@@ -68,8 +64,29 @@ inline bool AppendPBToString(const google::protobuf::MessageLite &msg, faststrin
   inline std::string ToString(EnumType value) { \
     return PBEnumToString(value); \
   } \
-  inline std::ostream& operator << (std::ostream& out, EnumType value) { \
+  __attribute__((unused)) inline std::ostream& operator << (std::ostream& out, EnumType value) { \
     return out << PBEnumToString(value); \
   }
 
-#endif  // YB_UTIL_PROTOBUF_UTIL_H
+namespace yb {
+
+template<typename T>
+std::vector<T> GetAllPbEnumValues() {
+  const auto* desc = google::protobuf::GetEnumDescriptor<T>();
+  std::vector<T> result;
+  result.reserve(desc->value_count());
+  for (int i = 0; i < desc->value_count(); ++i) {
+    result.push_back(T(desc->value(i)->number()));
+  }
+  return result;
+}
+
+template <class Source, class Dest>
+void AppendToRepeated(const Source& source, Dest* dest) {
+  dest->Reserve(dest->size() + source.size());
+  for (const auto& elem : source) {
+    dest->Add(elem);
+  }
+}
+
+} // namespace yb

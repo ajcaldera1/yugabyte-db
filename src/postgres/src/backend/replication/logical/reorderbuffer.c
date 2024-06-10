@@ -80,6 +80,9 @@
 #include "utils/relfilenodemap.h"
 #include "utils/tqual.h"
 
+/* YB includes. */
+#include "pg_yb_utils.h"
+#include "replication/walsender_private.h"
 
 /* entry for a hash table we use to map from xid to our transaction state */
 typedef struct ReorderBufferTXNByIdEnt
@@ -232,7 +235,7 @@ ReorderBufferAllocate(void)
 	Assert(MyReplicationSlot != NULL);
 
 	/* allocate memory in own context, to have better accountability */
-	new_ctx = AllocSetContextCreate(CurrentMemoryContext,
+	new_ctx = AllocSetContextCreate(GetCurrentMemoryContext(),
 									"ReorderBuffer",
 									ALLOCSET_DEFAULT_SIZES);
 
@@ -435,6 +438,8 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 	ReorderBufferTupleBuf *tuple;
 	Size		alloc_len;
 
+	TimestampTz yb_start_time = GetCurrentTimestamp();
+
 	alloc_len = tuple_len + SizeofHeapTupleHeader;
 
 	tuple = (ReorderBufferTupleBuf *)
@@ -443,6 +448,14 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 						   MAXIMUM_ALIGNOF + alloc_len);
 	tuple->alloc_tuple_size = alloc_len;
 	tuple->tuple.t_data = ReorderBufferTupleBufData(tuple);
+
+	if (IsYugaByteEnabled())
+	{
+		tuple->yb_is_omitted = NULL;
+		tuple->yb_is_omitted_size = 0;
+		YbWalSndTotalTimeInReorderBufferMicros +=
+			YbCalculateTimeDifferenceInMicros(yb_start_time);
+	}
 
 	return tuple;
 }
@@ -453,6 +466,9 @@ ReorderBufferGetTupleBuf(ReorderBuffer *rb, Size tuple_len)
 void
 ReorderBufferReturnTupleBuf(ReorderBuffer *rb, ReorderBufferTupleBuf *tuple)
 {
+	if (IsYugaByteEnabled() && tuple->yb_is_omitted)
+		pfree(tuple->yb_is_omitted);
+
 	pfree(tuple);
 }
 
@@ -582,6 +598,8 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 {
 	ReorderBufferTXN *txn;
 
+	TimestampTz yb_start_time = GetCurrentTimestamp();
+
 	txn = ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
 
 	change->lsn = lsn;
@@ -591,6 +609,10 @@ ReorderBufferQueueChange(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn,
 	txn->nentries_mem++;
 
 	ReorderBufferCheckSerializeTXN(rb, txn);
+
+	if (IsYugaByteEnabled())
+		YbWalSndTotalTimeInReorderBufferMicros +=
+			YbCalculateTimeDifferenceInMicros(yb_start_time);
 }
 
 /*
@@ -1438,6 +1460,8 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 	bool		using_subtxn;
 	ReorderBufferIterTXNState *volatile iterstate = NULL;
 
+	TimestampTz yb_start_time = GetCurrentTimestamp();
+
 	txn = ReorderBufferTXNByXid(rb, xid, false, NULL, InvalidXLogRecPtr,
 								false);
 
@@ -1452,25 +1476,33 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 	txn->origin_lsn = origin_lsn;
 
 	/*
-	 * If this transaction has no snapshot, it didn't make any changes to the
-	 * database, so there's nothing to decode.  Note that
-	 * ReorderBufferCommitChild will have transferred any snapshots from
-	 * subtransactions if there were any.
+	 * YB note: Snapshot is used to read the catalog table entries at the time of
+	 * transaction start. This mechanism is not yet applicable to YB. So we
+	 * disable the snapshot related code here.
 	 */
-	if (txn->base_snapshot == NULL)
+	if (!IsYugaByteEnabled())
 	{
-		Assert(txn->ninvalidations == 0);
-		ReorderBufferCleanupTXN(rb, txn);
-		return;
+		/*
+		 * If this transaction has no snapshot, it didn't make any changes to the
+		 * database, so there's nothing to decode.  Note that
+		 * ReorderBufferCommitChild will have transferred any snapshots from
+		 * subtransactions if there were any.
+		 */
+		if (txn->base_snapshot == NULL)
+		{
+			Assert(txn->ninvalidations == 0);
+			ReorderBufferCleanupTXN(rb, txn);
+			return;
+		}
+
+		snapshot_now = txn->base_snapshot;
+
+		/* build data to be able to lookup the CommandIds of catalog tuples */
+		ReorderBufferBuildTupleCidHash(rb, txn);
+
+		/* setup the initial snapshot */
+		SetupHistoricSnapshot(snapshot_now, txn->tuplecid_hash);
 	}
-
-	snapshot_now = txn->base_snapshot;
-
-	/* build data to be able to lookup the CommandIds of catalog tuples */
-	ReorderBufferBuildTupleCidHash(rb, txn);
-
-	/* setup the initial snapshot */
-	SetupHistoricSnapshot(snapshot_now, txn->tuplecid_hash);
 
 	/*
 	 * Decoding needs access to syscaches et al., which in turn use
@@ -1518,13 +1550,19 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 					change->action = REORDER_BUFFER_CHANGE_INSERT;
 
 					/* intentionally fall through */
+					switch_fallthrough();
 				case REORDER_BUFFER_CHANGE_INSERT:
 				case REORDER_BUFFER_CHANGE_UPDATE:
 				case REORDER_BUFFER_CHANGE_DELETE:
-					Assert(snapshot_now);
+					if (IsYugaByteEnabled())
+						reloid = change->data.tp.yb_table_oid;
+					else
+					{
+						Assert(snapshot_now);
 
-					reloid = RelidByRelfilenode(change->data.tp.relnode.spcNode,
-												change->data.tp.relnode.relNode);
+						reloid = RelidByRelfilenode(change->data.tp.relnode.spcNode,
+													change->data.tp.relnode.relNode);
+					}
 
 					/*
 					 * Mapped catalog tuple without data, emitted while
@@ -1547,15 +1585,37 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 							 relpathperm(change->data.tp.relnode,
 										 MAIN_FORKNUM));
 
-					relation = RelationIdGetRelation(reloid);
+					if (IsYugaByteEnabled())
+					{
+						/*
+						 * In YB, the replica identity used for streaming is the
+						 * one that existed at the time of slot (stream)
+						 * creation. So we overwrite the replica identity of the
+						 * relation to what it existed at that time.
+						 */
+						relation = YbGetRelationWithOverwrittenReplicaIdentity(
+							reloid, YBCGetReplicaIdentityForRelation(reloid));
+					}
+					else
+					{
+						relation = RelationIdGetRelation(reloid);
 
-					if (relation == NULL)
-						elog(ERROR, "could not open relation with OID %u (for filenode \"%s\")",
-							 reloid,
-							 relpathperm(change->data.tp.relnode,
-										 MAIN_FORKNUM));
+						if (relation == NULL)
+							elog(ERROR, "could not open relation with OID %u (for filenode \"%s\")",
+								 reloid,
+								 relpathperm(change->data.tp.relnode,
+											 MAIN_FORKNUM));
+					}
 
-					if (!RelationIsLogicallyLogged(relation))
+					/*
+					 * YB note: We disable this check here since:
+					 * 1. WAL levels are not applicable to YSQL as we have
+					 * a separate WAL.
+					 * 2. We are guaranteed to not get entries for catalog
+					 * tables here since the slot creation itself skips
+					 * catalog tables.
+					 */
+					if (!IsYugaByteEnabled() && !RelationIsLogicallyLogged(relation))
 						goto change_done;
 
 					/*
@@ -1799,7 +1859,7 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 		if (using_subtxn)
 			RollbackAndReleaseCurrentSubTransaction();
 
-		if (snapshot_now->copied)
+		if (!IsYugaByteEnabled() && snapshot_now->copied)
 			ReorderBufferFreeSnap(rb, snapshot_now);
 
 		/* remove potential on-disk data, and deallocate */
@@ -1825,7 +1885,7 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 		if (using_subtxn)
 			RollbackAndReleaseCurrentSubTransaction();
 
-		if (snapshot_now->copied)
+		if (!IsYugaByteEnabled() && snapshot_now->copied)
 			ReorderBufferFreeSnap(rb, snapshot_now);
 
 		/* remove potential on-disk data, and deallocate */
@@ -1834,6 +1894,10 @@ ReorderBufferCommit(ReorderBuffer *rb, TransactionId xid,
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+	if (IsYugaByteEnabled())
+		YbWalSndTotalTimeInReorderBufferMicros +=
+			YbCalculateTimeDifferenceInMicros(yb_start_time);
 }
 
 /*
@@ -1937,6 +2001,8 @@ ReorderBufferForget(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
 {
 	ReorderBufferTXN *txn;
 
+	TimestampTz yb_start_time = GetCurrentTimestamp();
+
 	txn = ReorderBufferTXNByXid(rb, xid, false, NULL, InvalidXLogRecPtr,
 								false);
 
@@ -1960,6 +2026,10 @@ ReorderBufferForget(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
 
 	/* remove potential on-disk data, and deallocate */
 	ReorderBufferCleanupTXN(rb, txn);
+
+	if (IsYugaByteEnabled())
+		YbWalSndTotalTimeInReorderBufferMicros +=
+			YbCalculateTimeDifferenceInMicros(yb_start_time);
 }
 
 /*
@@ -2007,9 +2077,15 @@ ReorderBufferImmediateInvalidation(ReorderBuffer *rb, uint32 ninvalidations,
 void
 ReorderBufferProcessXid(ReorderBuffer *rb, TransactionId xid, XLogRecPtr lsn)
 {
+	TimestampTz yb_start_time = GetCurrentTimestamp();
+
 	/* many records won't have an xid assigned, centralize check here */
 	if (xid != InvalidTransactionId)
 		ReorderBufferTXNByXid(rb, xid, true, NULL, lsn, true);
+
+	if (IsYugaByteEnabled())
+		YbWalSndTotalTimeInReorderBufferMicros +=
+			YbCalculateTimeDifferenceInMicros(yb_start_time);
 }
 
 /*
@@ -2237,6 +2313,9 @@ ReorderBufferCheckSerializeTXN(ReorderBuffer *rb, ReorderBufferTXN *txn)
 	 */
 	if (txn->nentries_mem >= max_changes_in_memory)
 	{
+		if (IsYugaByteEnabled())
+			elog(DEBUG1, "Serializing txn %d to disk.", txn->xid);
+
 		ReorderBufferSerializeTXN(rb, txn);
 		Assert(txn->nentries_mem == 0);
 	}
@@ -2349,6 +2428,10 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				Size		oldlen = 0;
 				Size		newlen = 0;
 
+				/* is_omitted is only applicable to UPDATE. */
+				bool yb_handle_is_omitted = change->action ==
+											REORDER_BUFFER_CHANGE_UPDATE;
+
 				oldtup = change->data.tp.oldtuple;
 				newtup = change->data.tp.newtuple;
 
@@ -2357,6 +2440,11 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					sz += sizeof(HeapTupleData);
 					oldlen = oldtup->tuple.t_len;
 					sz += oldlen;
+
+					/* account for the size of the is_omitted array. */
+					if (IsYugaByteEnabled() && yb_handle_is_omitted)
+						sz += (sizeof(int) +
+							   oldtup->yb_is_omitted_size * sizeof(bool));
 				}
 
 				if (newtup)
@@ -2364,6 +2452,11 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 					sz += sizeof(HeapTupleData);
 					newlen = newtup->tuple.t_len;
 					sz += newlen;
+
+					/* account for the size of the is_omitted array. */
+					if (IsYugaByteEnabled() && yb_handle_is_omitted)
+						sz += (sizeof(int) +
+							   newtup->yb_is_omitted_size * sizeof(bool));
 				}
 
 				/* make sure we have enough space */
@@ -2380,6 +2473,19 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 					memcpy(data, oldtup->tuple.t_data, oldlen);
 					data += oldlen;
+
+					/* write the yb_is_omitted array. */
+					if (IsYugaByteEnabled() && yb_handle_is_omitted) {
+						memcpy(data, &oldtup->yb_is_omitted_size, sizeof(int));
+						data += sizeof(int);
+
+						if (oldtup->yb_is_omitted_size > 0)
+						{
+							memcpy(data, oldtup->yb_is_omitted,
+								   oldtup->yb_is_omitted_size * sizeof(bool));
+							data += oldtup->yb_is_omitted_size * sizeof(bool);
+						}
+					}
 				}
 
 				if (newlen)
@@ -2389,6 +2495,19 @@ ReorderBufferSerializeChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 
 					memcpy(data, newtup->tuple.t_data, newlen);
 					data += newlen;
+
+					/* write the yb_is_omitted array. */
+					if (IsYugaByteEnabled() && yb_handle_is_omitted) {
+						memcpy(data, &newtup->yb_is_omitted_size, sizeof(int));
+						data += sizeof(int);
+
+						if (newtup->yb_is_omitted_size > 0)
+						{
+							memcpy(data, newtup->yb_is_omitted,
+								   newtup->yb_is_omitted_size * sizeof(bool));
+							data += newtup->yb_is_omitted_size * sizeof(bool);
+						}
+					}
 				}
 				break;
 			}
@@ -2669,6 +2788,8 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 			if (change->data.tp.oldtuple)
 			{
 				uint32		tuplelen = ((HeapTuple) data)->t_len;
+				bool yb_handle_is_omitted =
+					(change->action == REORDER_BUFFER_CHANGE_UPDATE);
 
 				change->data.tp.oldtuple =
 					ReorderBufferGetTupleBuf(rb, tuplelen - SizeofHeapTupleHeader);
@@ -2685,12 +2806,36 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				/* restore tuple data itself */
 				memcpy(change->data.tp.oldtuple->tuple.t_data, data, tuplelen);
 				data += tuplelen;
+
+				if (IsYugaByteEnabled() && yb_handle_is_omitted) {
+					int is_omitted_size;
+
+					/* restore yb_is_omitted_size */
+					memcpy(&change->data.tp.oldtuple->yb_is_omitted_size, data,
+						   sizeof(int));
+					data += sizeof(int);
+					is_omitted_size =
+						change->data.tp.oldtuple->yb_is_omitted_size;
+
+					/* restore yb_is_omitted */
+					if (is_omitted_size > 0)
+					{
+						change->data.tp.oldtuple->yb_is_omitted =
+							YBAllocateIsOmittedArray(rb, is_omitted_size);
+
+						memcpy(change->data.tp.oldtuple->yb_is_omitted, data,
+							   is_omitted_size * sizeof(bool));
+						data += is_omitted_size * sizeof(bool);
+					}
+				}
 			}
 
 			if (change->data.tp.newtuple)
 			{
 				/* here, data might not be suitably aligned! */
 				uint32		tuplelen;
+				bool yb_handle_is_omitted =
+					(change->action == REORDER_BUFFER_CHANGE_UPDATE);
 
 				memcpy(&tuplelen, data + offsetof(HeapTupleData, t_len),
 					   sizeof(uint32));
@@ -2710,6 +2855,28 @@ ReorderBufferRestoreChange(ReorderBuffer *rb, ReorderBufferTXN *txn,
 				/* restore tuple data itself */
 				memcpy(change->data.tp.newtuple->tuple.t_data, data, tuplelen);
 				data += tuplelen;
+
+				if (IsYugaByteEnabled() && yb_handle_is_omitted) {
+					int is_omitted_size;
+
+					/* restore yb_is_omitted_size */
+					memcpy(&change->data.tp.newtuple->yb_is_omitted_size, data,
+						   sizeof(int));
+					data += sizeof(int);
+					is_omitted_size =
+						change->data.tp.newtuple->yb_is_omitted_size;
+
+					/* restore yb_is_omitted */
+					if (is_omitted_size > 0)
+					{
+						change->data.tp.newtuple->yb_is_omitted =
+							YBAllocateIsOmittedArray(rb, is_omitted_size);
+
+						memcpy(change->data.tp.newtuple->yb_is_omitted, data,
+							   is_omitted_size * sizeof(bool));
+						data += is_omitted_size * sizeof(bool);
+					}
+				}
 			}
 
 			break;
@@ -3537,4 +3704,16 @@ restart:
 	if (cmax)
 		*cmax = ent->cmax;
 	return true;
+}
+
+bool *
+YBAllocateIsOmittedArray(ReorderBuffer *rb, int nattrs)
+{
+	return (bool *) MemoryContextAlloc(rb->tup_context,
+									   MAXIMUM_ALIGNOF + sizeof(bool) * nattrs);
+}
+
+void YBReorderBufferSchemaChange(ReorderBuffer *rb, Oid relid)
+{
+	rb->yb_schema_change(rb, relid);
 }

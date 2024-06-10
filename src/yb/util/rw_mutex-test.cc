@@ -30,10 +30,12 @@
 // under the License.
 //
 
-#include <gtest/gtest.h>
 #include <mutex>
+#include <shared_mutex>
 #include <thread>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "yb/gutil/integral_types.h"
 #include "yb/util/atomic.h"
@@ -41,6 +43,7 @@
 #include "yb/util/monotime.h"
 #include "yb/util/rw_mutex.h"
 #include "yb/util/test_util.h"
+#include "yb/util/shared_lock.h"
 
 using std::lock_guard;
 using std::thread;
@@ -66,7 +69,7 @@ INSTANTIATE_TEST_CASE_P(Priorities, RWMutexTest,
                                           RWMutex::Priority::PREFER_WRITING));
 
 // Multi-threaded test that tries to find deadlocks in the RWMutex wrapper.
-TEST_P(RWMutexTest, TestDeadlocks) {
+TEST_P(RWMutexTest, TestDeadlocks) NO_THREAD_SAFETY_ANALYSIS {
   uint64_t number_of_writes = 0;
   AtomicInt<uint64_t> number_of_reads(0);
 
@@ -95,13 +98,13 @@ TEST_P(RWMutexTest, TestDeadlocks) {
   for (int i = 0; i < 2; i++) {
     threads.emplace_back([&](){
       while (!done.Load()) {
-        shared_lock<RWMutex> l(lock_);
+        SharedLock l(lock_);
         number_of_reads.Increment();
       }
     });
     threads.emplace_back([&](){
       while (!done.Load()) {
-        shared_lock<RWMutex> l(lock_, try_to_lock);
+        std::shared_lock l(lock_, try_to_lock);
         if (l.owns_lock()) {
           number_of_reads.Increment();
         }
@@ -115,7 +118,7 @@ TEST_P(RWMutexTest, TestDeadlocks) {
     t.join();
   }
 
-  shared_lock<RWMutex> l(lock_);
+  SharedLock l(lock_);
   LOG(INFO) << "Number of writes: " << number_of_writes;
   LOG(INFO) << "Number of reads: " << number_of_reads.Load();
 }
@@ -123,46 +126,46 @@ TEST_P(RWMutexTest, TestDeadlocks) {
 #ifndef NDEBUG
 // Tests that the RWMutex wrapper catches basic usage errors. This checking is
 // only enabled in debug builds.
-TEST_P(RWMutexTest, TestLockChecking) {
+TEST_P(RWMutexTest, TestLockChecking) NO_THREAD_SAFETY_ANALYSIS {
   EXPECT_DEATH({
     lock_.ReadLock();
     lock_.ReadLock();
   }, "already holding lock for reading");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryReadLock());
     CHECK(lock_.TryReadLock());
-  }, "already holding lock for reading");
+  }), "already holding lock for reading");
 
   EXPECT_DEATH({
     lock_.ReadLock();
     lock_.WriteLock();
   }, "already holding lock for reading");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryReadLock());
     CHECK(lock_.TryWriteLock());
-  }, "already holding lock for reading");
+  }), "already holding lock for reading");
 
   EXPECT_DEATH({
     lock_.WriteLock();
     lock_.ReadLock();
   }, "already holding lock for writing");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryWriteLock());
     CHECK(lock_.TryReadLock());
-  }, "already holding lock for writing");
+  }), "already holding lock for writing");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     lock_.WriteLock();
     lock_.WriteLock();
-  }, "already holding lock for writing");
+  }), "already holding lock for writing");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryWriteLock());
     CHECK(lock_.TryWriteLock());
-  }, "already holding lock for writing");
+  }), "already holding lock for writing");
 
   EXPECT_DEATH({
     lock_.ReadUnlock();
@@ -177,20 +180,20 @@ TEST_P(RWMutexTest, TestLockChecking) {
     lock_.WriteUnlock();
   }, "already holding lock for reading");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryReadLock());
     lock_.WriteUnlock();
-  }, "already holding lock for reading");
+  }), "already holding lock for reading");
 
   EXPECT_DEATH({
     lock_.WriteLock();
     lock_.ReadUnlock();
   }, "already holding lock for writing");
 
-  EXPECT_DEATH({
+  EXPECT_DEATH(({
     CHECK(lock_.TryWriteLock());
     lock_.ReadUnlock();
-  }, "already holding lock for writing");
+  }), "already holding lock for writing");
 }
 #endif
 

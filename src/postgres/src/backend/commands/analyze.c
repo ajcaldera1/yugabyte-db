@@ -23,6 +23,7 @@
 #include "access/tuptoaster.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "access/yb_scan.h"
 #include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -98,6 +99,9 @@ static int	compare_rows(const void *a, const void *b);
 static int acquire_inherited_sample_rows(Relation onerel, int elevel,
 							  HeapTuple *rows, int targrows,
 							  double *totalrows, double *totaldeadrows);
+static int yb_acquire_sample_rows(Relation onerel, int elevel,
+					   HeapTuple *rows, int targrows,
+					   double *totalrows, double *totaldeadrows);
 static void update_attstats(Oid relid, bool inh,
 				int natts, VacAttrStats **vacattrstats);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
@@ -245,8 +249,13 @@ analyze_rel(Oid relid, RangeVar *relation, int options,
 	/*
 	 * Check that it's of an analyzable relkind, and set up appropriately.
 	 */
-	if (onerel->rd_rel->relkind == RELKIND_RELATION ||
-		onerel->rd_rel->relkind == RELKIND_MATVIEW)
+	if (IsYBRelation(onerel))
+	{
+		acquirefunc = yb_acquire_sample_rows;
+		relpages = 0;
+	}
+	else if (onerel->rd_rel->relkind == RELKIND_RELATION ||
+			 onerel->rd_rel->relkind == RELKIND_MATVIEW)
 	{
 		/* Regular table, so we'll use the regular row acquisition function */
 		acquirefunc = acquire_sample_rows;
@@ -383,7 +392,7 @@ do_analyze_rel(Relation onerel, int options, VacuumParams *params,
 	 * Set up a working context so that we can easily free whatever junk gets
 	 * created.
 	 */
-	anl_context = AllocSetContextCreate(CurrentMemoryContext,
+	anl_context = AllocSetContextCreate(GetCurrentMemoryContext(),
 										"Analyze",
 										ALLOCSET_DEFAULT_SIZES);
 	caller_context = MemoryContextSwitchTo(anl_context);
@@ -609,7 +618,7 @@ do_analyze_rel(Relation onerel, int options, VacuumParams *params,
 
 		/*
 		 * Emit the completed stats rows into pg_statistic, replacing any
-		 * previous statistics for the target columns.  (If there are stats in
+		 * previous statistics for the target columns. (If there are stats in
 		 * pg_statistic for columns we didn't process, we leave them alone.)
 		 */
 		update_attstats(RelationGetRelid(onerel), inh,
@@ -809,7 +818,7 @@ compute_index_stats(Relation onerel, double totalrows,
 			ResetExprContext(econtext);
 
 			/* Set up for predicate or expression evaluation */
-			ExecStoreTuple(heapTuple, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(heapTuple, slot, false);
 
 			/* If index is partial, check predicate */
 			if (predicate != NULL)
@@ -1118,6 +1127,7 @@ acquire_sample_rows(Relation onerel, int elevel,
 			targtuple.t_tableOid = RelationGetRelid(onerel);
 			targtuple.t_data = (HeapTupleHeader) PageGetItem(targpage, itemid);
 			targtuple.t_len = ItemIdGetLength(itemid);
+			targtuple.t_ybctid = (Datum) NULL;
 
 			switch (HeapTupleSatisfiesVacuum(&targtuple,
 											 OldestXmin,
@@ -1520,7 +1530,7 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 						{
 							HeapTuple	newtup;
 
-							newtup = do_convert_tuple(rows[numrows + j], map);
+							newtup = execute_attr_map_tuple(rows[numrows + j], map);
 							heap_freetuple(rows[numrows + j]);
 							rows[numrows + j] = newtup;
 						}
@@ -1545,6 +1555,44 @@ acquire_inherited_sample_rows(Relation onerel, int elevel,
 	return numrows;
 }
 
+/*
+ * yb_acquire_sample_rows -- acquire a random sample of rows from the YB table
+ *
+ * This has the same API as acquire_sample_rows, and uses similar approach.
+ */
+static int
+yb_acquire_sample_rows(Relation onerel, int elevel,
+					   HeapTuple *rows, int targrows,
+					   double *totalrows, double *totaldeadrows)
+{
+	YbSample	ybSample;
+	int			numrows = 0;
+
+	Assert(targrows > 0);
+
+	/* Prepare to take sample */
+	ybSample = ybBeginSample(onerel, targrows);
+
+	/* Loop over the table blocks until sample is selected */
+	while (ybSampleNextBlock(ybSample)) {
+		vacuum_delay_point();
+	}
+
+	/* Fetch selected rows */
+	numrows = ybFetchSample(ybSample, rows);
+
+	/* Get row counters */
+	*totalrows = ybSample->liverows + ybSample->deadrows;
+	*totaldeadrows = ybSample->deadrows;
+
+	ereport(elevel,
+			(errmsg("\"%s\": scanned, "
+					"%d rows in sample, %.0f estimated total rows",
+					RelationGetRelationName(onerel),
+					numrows, *totalrows)));
+
+	return numrows;
+}
 
 /*
  *	update_attstats() -- update attribute statistics for one relation
@@ -2339,7 +2387,7 @@ compute_scalar_stats(VacAttrStatsP stats,
 	track = (ScalarMCVItem *) palloc(num_mcv * sizeof(ScalarMCVItem));
 
 	memset(&ssup, 0, sizeof(ssup));
-	ssup.ssup_cxt = CurrentMemoryContext;
+	ssup.ssup_cxt = GetCurrentMemoryContext();
 	/* We always use the default collation for statistics */
 	ssup.ssup_collation = DEFAULT_COLLATION_OID;
 	ssup.ssup_nulls_first = false;

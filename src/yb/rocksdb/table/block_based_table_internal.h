@@ -11,11 +11,14 @@
 // under the License.
 //
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_INTERNAL_H
-#define YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_INTERNAL_H
+#pragma once
 
 #include "yb/rocksdb/table/block.h"
 #include "yb/rocksdb/table/format.h"
+
+#include "yb/ash/wait_state.h"
+
+#include "yb/util/file_system.h"
 #include "yb/util/logging.h"
 
 namespace rocksdb {
@@ -30,11 +33,12 @@ constexpr char kFixedSizeFilterBlockPrefix[] = "fixedsizefilter.";
 // The only relevant option is options.verify_checksums for now.
 // On failure return non-OK.
 // On success fill *result and return OK - caller owns *result
-inline CHECKED_STATUS ReadBlockFromFile(
+inline Status ReadBlockFromFile(
     RandomAccessFileReader* file, const Footer& footer, const ReadOptions& options,
     const BlockHandle& handle, std::unique_ptr<Block>* result, Env* env,
     const std::shared_ptr<yb::MemTracker>& mem_tracker,
     bool do_uncompress = true) {
+  SCOPED_WAIT_STATUS(RocksDB_ReadBlockFromFile);
   BlockContents contents;
   Status s = ReadBlockContents(file, footer, options, handle, &contents, env,
                                mem_tracker, do_uncompress);
@@ -46,16 +50,18 @@ inline CHECKED_STATUS ReadBlockFromFile(
 }
 
 // The longest prefix of the cache key used to identify blocks.
-// We are using the fact that we know for Posix files the unique ID is three
-// varints.
-static constexpr size_t kMaxCacheKeyPrefixSize = kMaxVarint64Length * 3 + 1;
+// We are using the fact that we know the size of the unique ID for Posix files.
+static constexpr size_t kMaxCacheKeyPrefixSize =
+    yb::FileWithUniqueId::kPosixFileUniqueIdMaxSize + 1;
+static constexpr size_t kCacheKeyBufferSize =
+    block_based_table::kMaxCacheKeyPrefixSize + yb::kMaxVarint64Length;
 
-struct CacheKeyBuffer {
+struct CacheKeyPrefixBuffer {
   char data[kMaxCacheKeyPrefixSize];
-  size_t size;
+  size_t size = 0;
 };
 
-inline Slice GetCacheKey(const CacheKeyBuffer& cache_key_prefix, const BlockHandle& handle,
+inline Slice GetCacheKey(const CacheKeyPrefixBuffer& cache_key_prefix, const BlockHandle& handle,
     char* cache_key) {
   DCHECK_ONLY_NOTNULL(cache_key);
   DCHECK_NE(cache_key_prefix.size, 0);
@@ -66,10 +72,10 @@ inline Slice GetCacheKey(const CacheKeyBuffer& cache_key_prefix, const BlockHand
 }
 
 // Generate a cache key prefix from the file. Used for both data and metadata files.
-inline void GenerateCachePrefix(Cache* cc, File* file,
-    CacheKeyBuffer* prefix) {
+inline void GenerateCachePrefix(
+    Cache* cc, yb::FileWithUniqueId* file, CacheKeyPrefixBuffer* prefix) {
   // generate an id from the file
-  prefix->size = file->GetUniqueId(prefix->data, kMaxCacheKeyPrefixSize);
+  prefix->size = file->GetUniqueId(prefix->data);
 
   // If the prefix wasn't generated or was too long,
   // create one from the cache.
@@ -82,5 +88,3 @@ inline void GenerateCachePrefix(Cache* cc, File* file,
 } // namespace block_based_table
 
 } // namespace rocksdb
-
-#endif // YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_INTERNAL_H

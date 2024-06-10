@@ -11,31 +11,43 @@
 // under the License.
 //
 
-#include "yb/client/txn-test-base.h"
-
+#include "yb/client/error.h"
 #include "yb/client/session.h"
 #include "yb/client/transaction.h"
+#include "yb/client/txn-test-base.h"
+#include "yb/client/yb_op.h"
 
-#include "yb/util/bfql/gen_opcodes.h"
+#include "yb/gutil/casts.h"
+
+#include "yb/util/async_util.h"
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/random_util.h"
-
-#include "yb/yql/cql/ql/util/statement_result.h"
+#include "yb/util/thread.h"
+#include "yb/util/tsan_util.h"
 
 using namespace std::literals;
 
 DECLARE_int64(transaction_rpc_timeout_ms);
+DECLARE_int32(txn_max_apply_batch_records);
+DECLARE_bool(enable_wait_queues);
 
 namespace yb {
 namespace client {
 
-class SerializableTxnTest : public TransactionTestBase {
+class SerializableTxnTest
+    : public TransactionCustomLogSegmentSizeTest<0, TransactionTestBase<MiniCluster>> {
  protected:
-  IsolationLevel GetIsolationLevel() override {
-    return IsolationLevel::SERIALIZABLE_ISOLATION;
+  void SetUp() override {
+    // This test depends on fail-on-conflict concurrency control to perform its validation.
+    // TODO(wait-queues): https://github.com/yugabyte/yugabyte-db/issues/17871
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_wait_queues) = false;
+    SetIsolationLevel(IsolationLevel::SERIALIZABLE_ISOLATION);
+    TransactionTestBase::SetUp();
   }
 
   void TestIncrements(bool transactional);
   void TestIncrement(int key, bool transactional);
+  void TestColoring();
 };
 
 TEST_F(SerializableTxnTest, NonConflictingWrites) {
@@ -45,7 +57,7 @@ TEST_F(SerializableTxnTest, NonConflictingWrites) {
   struct Entry {
     YBTransactionPtr txn;
     YBqlWriteOpPtr op;
-    std::future<Status> flush_future;
+    std::future<FlushStatus> flush_future;
     std::future<Status> commit_future;
     bool done = false;
   };
@@ -62,17 +74,15 @@ TEST_F(SerializableTxnTest, NonConflictingWrites) {
 
   ASSERT_OK(WaitFor([&entries]() -> Result<bool> {
     for (auto& entry : entries) {
-      if (entry.flush_future.valid() &&
-          entry.flush_future.wait_for(0s) == std::future_status::ready) {
+      if (entry.flush_future.valid() && IsReady(entry.flush_future)) {
         LOG(INFO) << "Flush done";
-        RETURN_NOT_OK(entry.flush_future.get());
+        RETURN_NOT_OK(entry.flush_future.get().status);
         entry.commit_future = entry.txn->CommitFuture();
       }
     }
 
     for (auto& entry : entries) {
-      if (entry.commit_future.valid() &&
-          entry.commit_future.wait_for(0s) == std::future_status::ready) {
+      if (entry.commit_future.valid() && IsReady(entry.commit_future)) {
         LOG(INFO) << "Commit done";
         RETURN_NOT_OK(entry.commit_future.get());
         entry.done = true;
@@ -101,7 +111,7 @@ TEST_F(SerializableTxnTest, ReadWriteConflict) {
     auto read_txn = CreateTransaction();
     auto read_session = CreateSession(read_txn);
     auto read = ReadRow(read_session, i);
-    ASSERT_OK(read_session->Flush());
+    ASSERT_OK(read_session->TEST_Flush());
 
     auto write_txn = CreateTransaction();
     auto write_session = CreateSession(write_txn);
@@ -146,18 +156,17 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
     YBqlWriteOpPtr op;
     YBTransactionPtr txn;
     YBSessionPtr session;
-    std::shared_future<Status> write_future;
+    std::shared_future<FlushStatus> write_future;
     std::shared_future<Status> commit_future;
   };
 
   std::vector<Entry> entries;
 
-  auto value_column_id = table_.ColumnId(kValueColumn);
   for (int i = 0; i != kIncrements; ++i) {
     Entry entry;
     entry.txn = transactional ? CreateTransaction() : nullptr;
     entry.session = CreateSession(entry.txn, clock_);
-    entry.session->SetReadPoint(Restart::kFalse);
+    entry.session->RestartNonTxnReadPoint(Restart::kFalse);
     entries.push_back(entry);
   }
 
@@ -174,32 +183,17 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
       bool entry_complete = false;
       if (!entry.op) {
         // Execute UPDATE table SET value = value + 1 WHERE key = kKey
-        entry.op = table_.NewWriteOp(QLWriteRequestPB::QL_STMT_UPDATE);
-        auto* const req = entry.op->mutable_request();
-        QLAddInt32HashValue(req, key);
-        req->mutable_column_refs()->add_ids(value_column_id);
-        auto* column_value = req->add_column_values();
-        column_value->set_column_id(value_column_id);
-        auto* bfcall = column_value->mutable_expr()->mutable_bfcall();
-        bfcall->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_ConvertI64ToI32_18));
-        bfcall = bfcall->add_operands()->mutable_bfcall();
-
-        bfcall->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_AddI64I64_80));
-        auto column_op = bfcall->add_operands()->mutable_bfcall();
-        column_op->set_opcode(to_underlying(bfql::BFOpcode::OPCODE_ConvertI32ToI64_13));
-        column_op->add_operands()->set_column_id(value_column_id);
-        bfcall->add_operands()->mutable_value()->set_int64_value(1);
-
         entry.session->SetTransaction(entry.txn);
-        ASSERT_OK(entry.session->Apply(entry.op));
+        entry.op = ASSERT_RESULT(kv_table_test::Increment(&table_, entry.session, key));
         entry.write_future = entry.session->FlushFuture();
       } else if (entry.write_future.valid()) {
-        if (entry.write_future.wait_for(0s) == std::future_status::ready) {
-          auto write_status = entry.write_future.get();
-          entry.write_future = std::shared_future<Status>();
+        if (IsReady(entry.write_future)) {
+          auto write_status = entry.write_future.get().status;
+          entry.write_future = std::shared_future<FlushStatus>();
           if (!write_status.ok()) {
             ASSERT_TRUE(write_status.IsTryAgain() ||
-                        (write_status.IsTimedOut() && transactional)) << write_status;
+                        ((write_status.IsTimedOut() || write_status.IsServiceUnavailable())
+                            && transactional)) << write_status;
             entry.txn = transactional ? CreateTransaction() : nullptr;
             entry.op = nullptr;
           } else {
@@ -208,7 +202,7 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
               if (transactional) {
                 entry.txn = ASSERT_RESULT(entry.txn->CreateRestartedTransaction());
               } else {
-                entry.session->SetReadPoint(Restart::kTrue);
+                entry.session->RestartNonTxnReadPoint(Restart::kTrue);
               }
               entry.op = nullptr;
             } else {
@@ -220,7 +214,7 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
           }
         }
       } else if (entry.commit_future.valid()) {
-        if (entry.commit_future.wait_for(0s) == std::future_status::ready) {
+        if (IsReady(entry.commit_future)) {
           auto status = entry.commit_future.get();
           if (status.IsExpired()) {
             entry.txn = transactional ? CreateTransaction() : nullptr;
@@ -248,14 +242,15 @@ void SerializableTxnTest::TestIncrement(int key, bool transactional) {
 // serializable isolation.
 // With retries the resulting value should be equal to number of increments.
 void SerializableTxnTest::TestIncrements(bool transactional) {
-  FLAGS_transaction_rpc_timeout_ms = MonoDelta(1min).ToMicroseconds();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_rpc_timeout_ms) = MonoDelta(1min).ToMilliseconds();
 
   const auto kThreads = RegularBuildVsSanitizers(3, 2);
 
   std::vector<std::thread> threads;
   while (threads.size() != kThreads) {
-    int key = threads.size();
+    int key = narrow_cast<int>(threads.size());
     threads.emplace_back([this, key, transactional] {
+      CDSAttacher attacher;
       TestIncrement(key, transactional);
     });
   }
@@ -284,7 +279,7 @@ TEST_F(SerializableTxnTest, IncrementNonTransactional) {
 //
 // The described prodecure is repeated multiple times to increase probability of catching bug,
 // w/o running test multiple times.
-TEST_F(SerializableTxnTest, Coloring) {
+void SerializableTxnTest::TestColoring() {
   constexpr auto kKeys = 20;
   constexpr auto kColors = 2;
   constexpr auto kIterations = 20;
@@ -298,16 +293,16 @@ TEST_F(SerializableTxnTest, Coloring) {
 
     {
       std::vector<YBqlWriteOpPtr> ops;
-      for (int i = 0; i != kKeys; ++i) {
+      for (int j = 0; j != kKeys; ++j) {
         auto color = RandomUniformInt(0, kColors - 1);
         ops.push_back(ASSERT_RESULT(WriteRow(session,
-            i,
+            j,
             color,
             WriteOpType::INSERT,
             Flush::kFalse)));
       }
 
-      ASSERT_OK(session->Flush());
+      ASSERT_OK(session->TEST_Flush());
 
       for (const auto& op : ops) {
         ASSERT_OK(CheckOp(op.get()));
@@ -318,8 +313,9 @@ TEST_F(SerializableTxnTest, Coloring) {
     std::atomic<size_t> successes(0);
 
     while (threads.size() != kColors) {
-      int32_t color = threads.size();
+      int32_t color = narrow_cast<int32_t>(threads.size());
       threads.emplace_back([this, color, &successes, kKeys] {
+        CDSAttacher attacher;
         for (;;) {
           auto txn = CreateTransaction();
           LOG(INFO) << "Start: " << txn->id() << ", color: " << color;
@@ -345,7 +341,7 @@ TEST_F(SerializableTxnTest, Coloring) {
             break;
           }
 
-          auto flush_status = session->Flush();
+          auto flush_status = session->TEST_Flush();
           if (!flush_status.ok()) {
             ASSERT_TRUE(flush_status.IsTryAgain()) << flush_status;
             break;
@@ -376,7 +372,7 @@ TEST_F(SerializableTxnTest, Coloring) {
       continue;
     }
 
-    session->SetReadPoint(Restart::kFalse);
+    session->RestartNonTxnReadPoint(Restart::kFalse);
     auto values = ASSERT_RESULT(SelectAllRows(session));
     ASSERT_EQ(values.size(), kKeys);
     LOG(INFO) << "Values: " << yb::ToString(values);
@@ -390,6 +386,15 @@ TEST_F(SerializableTxnTest, Coloring) {
     }
     --iterations_left;
   }
+}
+
+TEST_F(SerializableTxnTest, Coloring) {
+  TestColoring();
+}
+
+TEST_F(SerializableTxnTest, ColoringWithLongApply) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_txn_max_apply_batch_records) = 3;
+  TestColoring();
 }
 
 } // namespace client

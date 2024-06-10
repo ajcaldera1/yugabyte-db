@@ -12,7 +12,11 @@
 
 #include "yb/util/async_util.h"
 
-#include "yb/util/logging.h"
+#include "yb/gutil/bind.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/logging.h" // Required in NDEBUG mode
+#include "yb/util/status_log.h"
 
 namespace yb {
 
@@ -32,11 +36,11 @@ Synchronizer::~Synchronizer() {
 }
 
 void Synchronizer::StatusCB(const Status& status) {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   if (!assigned_) {
     assigned_ = true;
     status_ = status;
-    cond_.notify_all();
+    YB_PROFILE(cond_.notify_all());
   } else {
     LOG(DFATAL) << "Status already assigned, existing: " << status_ << ", new: " << status;
   }
@@ -83,7 +87,7 @@ Status Synchronizer::WaitUntil(const std::chrono::steady_clock::time_point& time
 }
 
 void Synchronizer::Reset() {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard lock(mutex_);
   EnsureWaitDone();
   assigned_ = false;
   status_ = Status::OK();

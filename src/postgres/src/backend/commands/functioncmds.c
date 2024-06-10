@@ -72,6 +72,10 @@
 #include "utils/typcache.h"
 #include "utils/tqual.h"
 
+/* YB includes. */
+#include "commands/extension.h"
+#include "pg_yb_utils.h"
+
 /*
  *	 Examine the RETURNS clause of the CREATE FUNCTION statement
  *	 and return information about it as *prorettype_p and *returnsSet.
@@ -905,7 +909,7 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 
 	/* Check we have creation rights in target namespace */
 	aclresult = pg_namespace_aclcheck(namespaceId, GetUserId(), ACL_CREATE);
-	if (aclresult != ACLCHECK_OK)
+	if (aclresult != ACLCHECK_OK && !IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(aclresult, OBJECT_SCHEMA,
 					   get_namespace_name(namespaceId));
 
@@ -947,14 +951,18 @@ CreateFunction(ParseState *pstate, CreateFunctionStmt *stmt)
 		AclResult	aclresult;
 
 		aclresult = pg_language_aclcheck(languageOid, GetUserId(), ACL_USAGE);
-		if (aclresult != ACLCHECK_OK)
+		if (aclresult != ACLCHECK_OK && !IsYbDbAdminUser(GetUserId()))
 			aclcheck_error(aclresult, OBJECT_LANGUAGE,
 						   NameStr(languageStruct->lanname));
 	}
 	else
 	{
-		/* if untrusted language, must be superuser */
-		if (!superuser())
+		/* 
+		 * If untrusted language, must be superuser, or someone with the
+		 * yb_extension role in the midst of creating an extension.
+		 */
+		if (!(IsYbExtensionUser(GetUserId()) && creating_extension) &&
+			!superuser())
 			aclcheck_error(ACLCHECK_NO_PRIV, OBJECT_LANGUAGE,
 						   NameStr(languageStruct->lanname));
 	}
@@ -1202,7 +1210,8 @@ AlterFunction(ParseState *pstate, AlterFunctionStmt *stmt)
 	procForm = (Form_pg_proc) GETSTRUCT(tup);
 
 	/* Permission check: must own function */
-	if (!pg_proc_ownercheck(funcOid, GetUserId()))
+	if (!pg_proc_ownercheck(funcOid, GetUserId()) &&
+		!IsYbDbAdminUser(GetUserId()))
 		aclcheck_error(ACLCHECK_NOT_OWNER, stmt->objtype,
 					   NameListToString(stmt->func->objname));
 
@@ -1558,7 +1567,7 @@ CreateCast(CreateCastStmt *stmt)
 		 * Must be superuser to create binary-compatible casts, since
 		 * erroneous casts can easily crash the backend.
 		 */
-		if (!superuser())
+		if (!superuser() && !(IsYbExtensionUser(GetUserId()) && creating_extension))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to create a cast WITHOUT FUNCTION")));
@@ -2353,8 +2362,9 @@ ExecuteCallStmt(CallStmt *stmt, ParamListInfo params, bool atomic, DestReceiver 
 		ItemPointerSetInvalid(&(rettupdata.t_self));
 		rettupdata.t_tableOid = InvalidOid;
 		rettupdata.t_data = td;
+		rettupdata.t_ybctid = PointerGetDatum(NULL);
 
-		slot = ExecStoreTuple(&rettupdata, tstate->slot, InvalidBuffer, false);
+		slot = ExecStoreHeapTuple(&rettupdata, tstate->slot, false);
 		tstate->dest->receiveSlot(slot, tstate->dest);
 
 		end_tup_output(tstate);
@@ -2389,4 +2399,151 @@ CallStmtResultDesc(CallStmt *stmt)
 	ReleaseSysCache(tuple);
 
 	return tupdesc;
+}
+
+/*
+ * Change function owner
+ */
+ObjectAddress
+AlterFunctionOwner(AlterOwnerStmt *stmt, Oid newOwnerId)
+{
+	Oid			procId;
+	Relation	relation;
+	ObjectAddress address;
+	HeapTuple	tup;
+
+	/* Find the function's OID. */
+	address = get_object_address(stmt->objectType,
+								 stmt->object,
+								 &relation,
+								 AccessExclusiveLock,
+								 false);
+	relation = heap_open(ProcedureRelationId, RowExclusiveLock);
+
+	tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(address.objectId));
+
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("function with OID %u does not exist", address.objectId)));
+	
+	procId = HeapTupleGetOid(tup);
+
+	AlterFunctionOwner_internal(relation, tup, newOwnerId);
+
+	ObjectAddressSet(address, ProcedureRelationId, procId);
+
+	heap_freetuple(tup);
+
+	heap_close(relation, RowExclusiveLock);
+
+	return address;
+}
+
+/*
+ * Internal workhorse for changing a function's owner
+ */
+void
+AlterFunctionOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
+{
+	Form_pg_proc proc;
+	Oid namespaceId;
+
+	proc = (Form_pg_proc) GETSTRUCT(tup);
+	
+	/* Assigning a function to the same owner is a no-op */
+	if (proc->proowner == newOwnerId)
+		return;
+
+	/* Superusers and yb_db_admin role can bypass permission checks */
+	if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+	{
+		/* Must be owner */
+		if(!has_privs_of_role(GetUserId(), proc->proowner))
+		{
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION, NameStr(proc->proname));
+		}
+
+		/* Must be able to become new owner */
+		check_is_member_of_role(GetUserId(), newOwnerId);
+
+		/* New owner must have CREATE privilege on function's schema */
+		namespaceId = proc->pronamespace;
+		if (OidIsValid(namespaceId))
+		{
+			AclResult	aclresult;
+
+			aclresult = pg_namespace_aclcheck(namespaceId, newOwnerId,
+												  ACL_CREATE);
+			if (aclresult != ACLCHECK_OK)
+				aclcheck_error(aclresult, OBJECT_SCHEMA,
+								get_namespace_name(namespaceId));
+		}
+	}
+
+	proc->proowner = newOwnerId;
+	CatalogTupleUpdate(rel, &tup->t_self, tup);
+
+	/* Update owner dependency reference */
+	changeDependencyOnOwner(ProcedureRelationId,
+							HeapTupleGetOid(tup),
+							newOwnerId);
+
+	InvokeObjectPostAlterHook(ProcedureRelationId,
+							  HeapTupleGetOid(tup), 0);
+}
+
+/*
+ * Change function name
+ */
+ObjectAddress
+RenameFunction(RenameStmt *stmt, const char *newname)
+{
+	Relation	relation;
+	ObjectAddress address;
+	HeapTuple	tup;
+
+	/* Find the function's OID */
+	address = get_object_address(stmt->renameType,
+								 stmt->object,
+								 &relation,
+								 AccessExclusiveLock,
+								 false);
+	relation = heap_open(ProcedureRelationId, RowExclusiveLock);
+
+	tup = SearchSysCacheCopy1(PROCOID, ObjectIdGetDatum(address.objectId));
+
+	if (!HeapTupleIsValid(tup))
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("function with OID %u does not exist", address.objectId)));
+	
+	Form_pg_proc proc;
+
+	proc = (Form_pg_proc) GETSTRUCT(tup);
+	
+	/* Superusers and yb_db_admin role can bypass permission checks */
+	if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+	{
+		/* Must be owner of the existing object */
+		if (!has_privs_of_role(GetUserId(),proc->proowner))
+			aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_FUNCTION,  NameStr(proc->proname));
+	}
+	
+	/* Make sure function with new name doesn't exist */
+	IsThereFunctionInNamespace(newname, proc->pronargs,
+								   &proc->proargtypes, proc->pronamespace);
+	
+	/* Rename */
+	namestrcpy(&(((Form_pg_proc) GETSTRUCT(tup))->proname), newname);
+	CatalogTupleUpdate(relation, &tup->t_self, tup);
+	
+
+	InvokeObjectPostAlterHook(ProcedureRelationId,
+							  HeapTupleGetOid(tup), 0);
+
+	heap_freetuple(tup);
+
+	heap_close(relation, RowExclusiveLock);
+	return address;
 }

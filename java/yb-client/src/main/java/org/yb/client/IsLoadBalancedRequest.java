@@ -13,16 +13,11 @@
 
 package org.yb.client;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import org.jboss.netty.buffer.ChannelBuffer;
-
+import io.netty.buffer.ByteBuf;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
+import org.yb.master.MasterClusterOuterClass;
 import org.yb.util.Pair;
-
-import java.util.ArrayList;
-import java.util.List;
 
 @InterfaceAudience.Public
 class IsLoadBalancedRequest extends YRpc<IsLoadBalancedResponse> {
@@ -35,10 +30,10 @@ class IsLoadBalancedRequest extends YRpc<IsLoadBalancedResponse> {
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
-    final Master.IsLoadBalancedRequestPB.Builder builder =
-      Master.IsLoadBalancedRequestPB.newBuilder();
+    final MasterClusterOuterClass.IsLoadBalancedRequestPB.Builder builder =
+      MasterClusterOuterClass.IsLoadBalancedRequestPB.newBuilder();
     builder.setExpectedNumServers(expectedServers);
     return toChannelBuffer(header, builder.build());
   }
@@ -53,8 +48,8 @@ class IsLoadBalancedRequest extends YRpc<IsLoadBalancedResponse> {
   Pair<IsLoadBalancedResponse, Object> deserialize(
       CallResponse callResponse,
       String masterUUID) throws Exception {
-    final Master.IsLoadBalancedResponsePB.Builder respBuilder =
-      Master.IsLoadBalancedResponsePB.newBuilder();
+    final MasterClusterOuterClass.IsLoadBalancedResponsePB.Builder respBuilder =
+      MasterClusterOuterClass.IsLoadBalancedResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     boolean hasErr = respBuilder.hasError();
     IsLoadBalancedResponse response =

@@ -12,8 +12,12 @@
 //
 package org.yb.cql;
 
+import com.datastax.driver.core.DataType;
+import com.datastax.driver.core.PreparedStatement;
 import com.datastax.driver.core.ResultSet;
 import com.datastax.driver.core.Row;
+import com.datastax.driver.core.schemabuilder.SchemaBuilder;
+
 import org.junit.Test;
 import org.json.*;
 
@@ -22,6 +26,8 @@ import java.util.List;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertTrue;
 
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
@@ -29,6 +35,7 @@ import org.junit.runner.RunWith;
 @RunWith(value=YBTestRunner.class)
 public class TestJson extends BaseCQLTest {
 
+  private static final Logger LOG = LoggerFactory.getLogger(TestJson.class);
   private void verifyEmptyRows(ResultSet rs, int expected_rows) {
     List<Row> rows = rs.all();
     assertEquals(expected_rows, rows.size());
@@ -54,6 +61,105 @@ public class TestJson extends BaseCQLTest {
     Row row = session.execute(String.format("SELECT * FROM test_json WHERE c2 = '%s'", json)).one();
     assertEquals(c1, row.getInt("c1"));
     assertEquals(json, row.getJson("c2"));
+  }
+
+  @Test
+  public void testUpsert() throws Exception {
+    session.execute("CREATE TABLE cdr ( Imsi text, Call_date timestamp, Json_metrics jsonb, " +
+      "PRIMARY KEY ((imsi), call_date)) with CLUSTERING ORDER BY (call_date DESC)");
+    session.execute("INSERT INTO cdr (imsi,call_date,json_metrics) VALUES " +
+      "('1111',totimestamp(now()),'{\"a\":43,\"b\":656}') IF NOT EXISTS;");
+    String updateStmt = "UPDATE cdr SET json_metrics->'c'=?,json_metrics->'d'=? " +
+    "WHERE imsi=? and call_date=totimestamp(now());";
+    PreparedStatement stmt = session.prepare(updateStmt);
+    session.execute(stmt.bind("54333", "{\"x\":\"y\"}", "33"));
+    ResultSet rs = session.execute("select * from cdr where imsi='33'");
+    List<Row> rows = rs.all();
+    assertEquals(1, rows.size());
+    Row row = rows.get(0);
+    LOG.info("json is " + row);
+    JSONObject jsonObject = new JSONObject(row.getJson("json_metrics"));
+    assertEquals(54333, jsonObject.getInt("c"));
+    assertEquals("y", jsonObject.getJSONObject("d").getString("x"));
+    runInvalidStmt("UPDATE cdr SET json_metrics->'c'->'e'='5433' " +
+      "WHERE imsi='34' and call_date=totimestamp(now());");
+  }
+
+  private void testUpsertWithNestedJson() throws Exception {
+    session.execute("CREATE TABLE t(a text, b int, j jsonb, PRIMARY KEY (a, b)) with CLUSTERING "
+        + "ORDER BY (b DESC)");
+
+    session.execute(
+        "update t set j = '{\"l1\" : {\"l2\" : {\"l3\" : \"A\"}}}' where a = '1' and b = 1");
+
+    session.execute("update t set j -> 'l1' -> 'l2' -> 'l3_sibling' = '\"10\"', "
+        + "j -> 'l1' -> 'l2' -> 'l3_sibling_2' = '\"20\"', "
+        + "j -> 'l1' -> 'l2' -> 'l3_sibling_3' = '\"30\"', "
+        + "j -> 'l1' -> 'l2_sibling_1' = '\"1000\"', "
+        + "j -> 'l1_sibling_1' = '\"test_value\"', "
+        + "j -> 'l1_sibling_2' = '\"test_value2\"' "
+        + "where a = '1' and b = 1");
+    assertQuery("SELECT * FROM t WHERE a = '1' and b = 1",
+        "Row[1, 1, {\"l1\":{\"l2\":{\"l3\":\"A\",\"l3_sibling\":\"10\",\"l3_sibling_2\":\"20\","
+            + "\"l3_sibling_3\":\"30\"},\"l2_sibling_1\":\"1000\"},\"l1_sibling_1\":\"test_value\""
+            + ",\"l1_sibling_2\":\"test_value2\"}]");
+
+    // Upsert disallowed if intermediate level does not exist.
+    runInvalidStmt(
+        "update t set j -> 'l1' -> 'l2_sibling' -> 'l3_child_l2_sibling' = '\"40\"' where a = '1'"
+            + " and b = 1",
+        "Could not find member");
+
+    // Attributes added within the same statement.
+    session.execute("update t set "
+        + "j -> 'non_existent' = '{}', "
+        + "j -> 'non_existent' -> 'age' = '\"test_value_2\"' "
+        + "where a = '2' and b = 2");
+    assertQuery("SELECT * FROM t WHERE a = '2' and b = 2",
+        "Row[2, 2, {\"non_existent\":{\"age\":\"test_value_2\"}}]");
+
+    // Attributes added & overwritten within the same statement.
+    session.execute("update t set "
+        + "j -> 'non_existent' = '\"10\"', "
+        + "j -> 'non_existent' = '\"20\"' "
+        + "where a = '3' and b = 3");
+    assertQuery("SELECT * FROM t WHERE a = '3' and b = 3", "Row[3, 3, {\"non_existent\":\"20\"}]");
+
+    // Overwrite an existing attribute.
+    session.execute(
+        "update t set j = '{\"l1\" : {\"l2\" : {\"l3\" : \"A\"}}}' where a = '4' and b = 4");
+    session.execute("update t set "
+        + "j -> 'l1' = '\"10\"'"
+        + "where a = '4' and b = 4");
+    assertQuery("SELECT * FROM t WHERE a = '4' and b = 4", "Row[4, 4, {\"l1\":\"10\"}]");
+
+    // Nested objects inside an array.
+    session.execute(
+        "update t set j = '{\"l1\" : {\"l2\" : {\"l3\" : \"A\"}}}' where a = '5' and b = 5");
+    session.execute("update t set "
+        + "j -> 'l1_sibling' = '[1, 2, 3.4, false, { \"k1\" : 1, \"k2\" : [100, 200]}]',"
+        + "j -> 'l1' -> 'l2' -> 'l3_sibling' = '[1, false, { \"k1\" : false, \"k2\" : [100, 200]}]'"
+        + "where a = '5' and b = 5");
+    assertQuery("SELECT * FROM t WHERE a = '5' and b = 5",
+        "Row[5, 5, {\"l1\":{\"l2\":{\"l3\":\"A\",\"l3_sibling\":[1,false,{\"k1\":false,"
+            + "\"k2\":[100,200]}]}},\"l1_sibling\":[1,2,3.4000000953674318,false,{\"k1\":1,\"k2\":"
+            + "[100,200]}]}]");
+  }
+
+  @Test
+  public void testUpsertWithNestedJsonWithMemberCache() throws Exception {
+    testUpsertWithNestedJson();
+  }
+
+  @Test
+  public void testUpsertWithNestedJsonWithoutMemberCache() throws Exception {
+    try {
+      // By default: ycql_jsonb_use_member_cache=true.
+      restartClusterWithFlag("ycql_jsonb_use_member_cache", "false");
+      testUpsertWithNestedJson();
+    } finally {
+      destroyMiniCluster(); // Destroy the recreated cluster when done.
+    }
   }
 
   @Test
@@ -94,7 +200,10 @@ public class TestJson extends BaseCQLTest {
     session.execute("INSERT INTO test_json(c1, c2) values (6, 'null');");
     session.execute("INSERT INTO test_json(c1, c2) values (7, '2.0');");
     session.execute("INSERT INTO test_json(c1, c2) values (8, '{\"b\" : 1}');");
-    verifyResultSet(session.execute("SELECT * FROM test_json WHERE c1 = 1"));
+    // SELECT and verify JSONB column content.
+    verifyResultSet(session.execute("SELECT * FROM test_json WHERE c1 = 1;"));
+    // Apply JSONB operators to NULL and singular objects.
+    verifyEmptyRows(session.execute("SELECT c2->>'non_existing_value' FROM test_json;"), 8);
 
     // Invalid inserts.
     runInvalidStmt("INSERT INTO test_json(c1, c2) values (123, abc);");
@@ -242,10 +351,12 @@ public class TestJson extends BaseCQLTest {
             "SELECT c2->'a'->'q' FROM test_json WHERE c2->'a1'->5->'k3' = 'true'").one()
             .getString(0));
 
+    // JSON expression is now named as its content instead of "expr".
+    // If users actually rely on "expr", we have to change it back.
     assertEquals("{\"p\":4294967295,\"r\":-2147483648,\"s\":2147483647}",
         session.execute(
             "SELECT c2->'a'->'q' FROM test_json WHERE c2->'a1'->5->'k3' = 'true'").one()
-            .getJson("expr"));
+            .getJson("c2->'a'->'q'"));
 
     // Test select with invalid operators, which should result in empty rows.
     verifyEmptyRows(session.execute("SELECT c2->'b'->'c' FROM test_json WHERE c1 = 1"), 1);
@@ -406,5 +517,34 @@ public class TestJson extends BaseCQLTest {
         "c2->'a'->'q'->'s' = '2147483647' AND c2->'a'->'q'->'r' = '200'");
     assertEquals(0, session.execute("SELECT * FROM test_json WHERE c2->'a'->'q'->'p' = " +
         "'\"100\"'").all().size());
+  }
+
+  @Test
+  public void testSchemaBuilderWithJsonColumnType() throws Exception {
+
+
+    String json = "{ " + "\"b\" : 1," + "\"a2\" : {}," + "\"a3\" : \"\","
+                + "\"a1\" : [1, 2, 3.0, false, true, { \"k1\" : 1, \"k2\" : [100, 200, 300], "
+                + "\"k3\" : true}]," + "\"a\" :" + "{" + "\"d\" : true," + "\"q\" :"
+                + "{" + "\"p\" : 4294967295," + "\"r\" : -2147483648," + "\"s\" : 2147483647"
+                + "}," + "\"g\" : -100," + "\"c\" : false," + "\"f\" : \"hello\","
+                + "\"x\" : 2.0," + "\"y\" : 9223372036854775807," + "\"z\" : -9223372036854775808,"
+                + "\"u\" : 18446744073709551615," + "\"l\" : 2147483647.123123e+75,"
+                + "\"e\" : null" + "}" + "}";
+
+
+    session.execute(SchemaBuilder.createTable("test_json")
+      .addPartitionKey("c1", DataType.cint())
+      .addColumn("c2", DataType.json()));
+
+    session.execute(String.format("INSERT INTO test_json(c1, c2) values (1, '%s');", json));
+    session.execute("INSERT INTO test_json(c1, c2) values (2, '\"abc\"');");
+    session.execute("INSERT INTO test_json(c1, c2) values (3, '3');");
+    session.execute("INSERT INTO test_json(c1, c2) values (4, 'true');");
+    session.execute("INSERT INTO test_json(c1, c2) values (5, 'false');");
+    session.execute("INSERT INTO test_json(c1, c2) values (6, 'null');");
+    session.execute("INSERT INTO test_json(c1, c2) values (7, '2.0');");
+    session.execute("INSERT INTO test_json(c1, c2) values (8, '{\"b\" : 1}');");
+    verifyResultSet(session.execute("SELECT * FROM test_json WHERE c1 = 1"));
   }
 }

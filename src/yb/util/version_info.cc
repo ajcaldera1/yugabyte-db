@@ -32,21 +32,21 @@
 
 #include "yb/util/version_info.h"
 
-#include <atomic>
 #include <fstream>
 #include <string>
 
 #include <rapidjson/document.h>
 #include <rapidjson/error/en.h>
 #include <rapidjson/istreamwrapper.h>
-#include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
 
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/env_util.h"
 #include "yb/util/path_util.h"
+#include "yb/util/status.h"
+#include "yb/util/status_log.h"
+#include "yb/util/flags.h"
 
-DEFINE_string(version_file_json_path, "",
+DEFINE_NON_RUNTIME_string(version_file_json_path, "",
               "Path to directory containing JSON file with version info.");
 
 using std::string;
@@ -126,8 +126,9 @@ Status VersionInfo::ReadVersionDataFromFile() {
 
   std::string config_file_path = JoinPathSegments(version_file_path, kVersionJsonFileName);
   std::ifstream json_file(config_file_path);
-  SCHECK(!json_file.fail(),
-          IllegalState, strings::Substitute("Could not open JSON file $0", config_file_path));
+  SCHECK(
+      !json_file.fail(), IllegalState,
+      strings::Substitute("Could not open JSON file $0: $1", config_file_path, strerror(errno)));
 
   rapidjson::IStreamWrapper isw(json_file);
   rapidjson::Document d;

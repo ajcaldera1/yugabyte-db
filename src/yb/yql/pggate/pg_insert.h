@@ -12,8 +12,7 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_INSERT_H_
-#define YB_YQL_PGGATE_PG_INSERT_H_
+#pragma once
 
 #include "yb/yql/pggate/pg_dml_write.h"
 
@@ -26,29 +25,28 @@ namespace pggate {
 
 class PgInsert : public PgDmlWrite {
  public:
-  // Public types.
-  typedef scoped_refptr<PgInsert> ScopedRefPtr;
-  typedef scoped_refptr<const PgInsert> ScopedRefPtrConst;
+  PgInsert(PgSession::ScopedRefPtr pg_session,
+           const PgObjectId& table_id,
+           bool is_region_local,
+           YBCPgTransactionSetting transaction_setting,
+           bool packed)
+      : PgDmlWrite(std::move(pg_session), table_id, is_region_local, transaction_setting, packed) {}
 
-  typedef std::unique_ptr<PgInsert> UniPtr;
-  typedef std::unique_ptr<const PgInsert> UniPtrConst;
+  StmtOp stmt_op() const override { return StmtOp::STMT_INSERT; }
 
-  // Constructors.
-  PgInsert(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id, bool is_single_op_txn);
-  virtual ~PgInsert();
+  void SetUpsertMode() {
+    write_req_->set_stmt_type(PgsqlWriteRequestPB::PGSQL_UPSERT);
+  }
 
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_INSERT; }
-
-  // Prepare write operations.
-  virtual CHECKED_STATUS Prepare() override;
+  void SetIsBackfill(const bool is_backfill) {
+    write_req_->set_is_backfill(is_backfill);
+  }
 
  private:
-  virtual void AllocWriteRequest() override;
-
-  std::unique_ptr<PgGenerateRowId> generate_rowid_;
+  PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
+    return PgsqlWriteRequestPB::PGSQL_INSERT;
+  }
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_INSERT_H_

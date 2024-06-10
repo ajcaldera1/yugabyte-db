@@ -101,7 +101,7 @@ PMSignalShmemInit(void)
 
 	if (!found)
 	{
-		MemSet(PMSignalState, 0, PMSignalShmemSize());
+		MemSet(unvolatize(PMSignalData *, PMSignalState), 0, PMSignalShmemSize());
 		PMSignalState->num_child_flags = MaxLivePostmasterChildren();
 	}
 }
@@ -255,7 +255,7 @@ MarkPostmasterChildWalSender(void)
 void
 MarkPostmasterChildInactive(void)
 {
-	int			slot = MyPMChildSlot;
+	int      slot = MyPMChildSlot;
 
 	Assert(slot > 0 && slot <= PMSignalState->num_child_flags);
 	slot--;

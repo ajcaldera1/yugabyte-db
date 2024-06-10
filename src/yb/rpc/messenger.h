@@ -29,14 +29,13 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_RPC_MESSENGER_H_
-#define YB_RPC_MESSENGER_H_
+#pragma once
 
 #include <stdint.h>
 
 #include <atomic>
-#include <memory>
 #include <list>
+#include <memory>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -44,29 +43,29 @@
 
 #include <gtest/gtest_prod.h>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/io_thread_pool.h"
-#include "yb/rpc/proxy.h"
-#include "yb/rpc/reactor.h"
-#include "yb/rpc/response_callback.h"
+#include "yb/rpc/local_call.h"
+#include "yb/rpc/proxy_context.h"
 #include "yb/rpc/scheduler.h"
 
-#include "yb/util/concurrent_value.h"
+#include "yb/util/metrics_fwd.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/async_util.h"
+#include "yb/util/atomic.h"
 #include "yb/util/locks.h"
-#include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/sockaddr.h"
-#include "yb/util/status.h"
-#include "yb/util/debug-util.h"
+#include "yb/util/operation_counter.h"
+#include "yb/util/stack_trace.h"
 
 namespace yb {
 
 class MemTracker;
 class Socket;
-class ThreadPool;
+struct SourceLocation;
 
 namespace rpc {
 
@@ -81,6 +80,9 @@ class MessengerBuilder {
   friend class Messenger;
 
   explicit MessengerBuilder(std::string name);
+  ~MessengerBuilder();
+
+  MessengerBuilder(const MessengerBuilder&);
 
   // Set the length of time we will keep a TCP connection will alive with no traffic.
   MessengerBuilder &set_connection_keepalive_time(CoarseMonoClock::Duration keepalive);
@@ -122,7 +124,7 @@ class MessengerBuilder {
     return *this;
   }
 
-  Result<std::shared_ptr<Messenger>> Build();
+  Result<std::unique_ptr<Messenger>> Build();
 
   CoarseMonoClock::Duration connection_keepalive_time() const {
     return connection_keepalive_time_;
@@ -136,8 +138,7 @@ class MessengerBuilder {
     return connection_context_factory_;
   }
 
-  MessengerBuilder& set_thread_pool_options(size_t queue_limit, size_t workers_limit) {
-    queue_limit_ = queue_limit;
+  MessengerBuilder& set_thread_pool_options(size_t workers_limit) {
     workers_limit_ = workers_limit;
     return *this;
   }
@@ -164,7 +165,6 @@ class MessengerBuilder {
   ConnectionContextFactoryPtr connection_context_factory_;
   StreamFactories stream_factories_;
   const Protocol* listen_protocol_;
-  size_t queue_limit_;
   size_t workers_limit_;
   int num_connections_to_server_;
   std::shared_ptr<MemTracker> last_used_parent_mem_tracker_;
@@ -184,16 +184,15 @@ class Messenger : public ProxyContext {
   friend class MessengerBuilder;
   friend class Proxy;
   friend class Reactor;
-  typedef std::unordered_map<std::string, scoped_refptr<RpcService> > RpcServicesMap;
+  typedef std::unordered_map<std::string, scoped_refptr<RpcService>> RpcServicesMap;
 
   ~Messenger();
 
-  // Stop all communication and prevent further use.  It's not required to call this -- dropping the
-  // shared_ptr provided from MessengerBuilder::Build will automatically call this method.
+  // Stop all communication and prevent further use. Should be called explicitly by messenger owner.
   void Shutdown();
 
   // Setup messenger to listen connections on given address.
-  CHECKED_STATUS ListenAddress(
+  Status ListenAddress(
       ConnectionContextFactoryPtr factory, const Endpoint& accept_endpoint,
       Endpoint* bound_endpoint = nullptr);
 
@@ -201,16 +200,12 @@ class Messenger : public ProxyContext {
   void ShutdownAcceptor();
 
   // Start accepting connections.
-  CHECKED_STATUS StartAcceptor();
+  Status StartAcceptor();
 
   // Register a new RpcService to handle inbound requests.
-  CHECKED_STATUS RegisterService(const std::string& service_name,
-                         const scoped_refptr<RpcService>& service);
+  Status RegisterService(const std::string& service_name, const RpcServicePtr& service);
 
-  // Unregister currently-registered RpcService.
-  CHECKED_STATUS UnregisterService(const std::string& service_name);
-
-  CHECKED_STATUS UnregisterAllServices();
+  void UnregisterAllServices();
 
   void ShutdownThreadPools();
 
@@ -218,20 +213,25 @@ class Messenger : public ProxyContext {
   // that reactor to assign and send the call.
   void QueueOutboundCall(OutboundCallPtr call) override;
 
-  // Enqueue a call for processing on the server.
-  void QueueInboundCall(InboundCallPtr call) override;
-
   // Invoke the RpcService to handle a call directly.
-  void Handle(InboundCallPtr call) override;
+  void Handle(InboundCallPtr call, Queue queue) override;
 
   const Protocol* DefaultProtocol() override { return listen_protocol_; }
 
-  CHECKED_STATUS QueueEventOnAllReactors(
+  rpc::ThreadPool& CallbackThreadPool(ServicePriority priority) override {
+    return ThreadPool(priority);
+  }
+
+  Status QueueEventOnAllReactors(
       ServerEventListPtr server_event, const SourceLocation& source_location);
 
+  Status QueueEventOnFilteredConnections(
+      ServerEventListPtr server_event, const SourceLocation& source_location,
+      ConnectionFilter connection_filter);
+
   // Dump the current RPCs into the given protobuf.
-  CHECKED_STATUS DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
-                                 DumpRunningRpcsResponsePB* resp);
+  Status DumpRunningRpcs(const DumpRunningRpcsRequestPB& req,
+                         DumpRunningRpcsResponsePB* resp);
 
   void RemoveScheduledTask(ScheduledTaskId task_id);
 
@@ -243,18 +243,16 @@ class Messenger : public ProxyContext {
   //
   // The status argument conveys whether 'func' was run correctly (i.e. after the elapsed time) or
   // not.
-  MUST_USE_RESULT ScheduledTaskId ScheduleOnReactor(
-      StatusFunctor func, MonoDelta when,
-      const SourceLocation& source_location,
-      const std::shared_ptr<Messenger>& msgr);
+  Result<ScheduledTaskId> ScheduleOnReactor(
+      StatusFunctor func, MonoDelta when, const SourceLocation& source_location);
 
   std::string name() const {
     return name_;
   }
 
-  scoped_refptr<MetricEntity> metric_entity() const override { return metric_entity_; }
+  scoped_refptr<MetricEntity> metric_entity() const override;
 
-  scoped_refptr<RpcService> rpc_service(const std::string& service_name) const;
+  RpcServicePtr TEST_rpc_service(const std::string& service_name) const;
 
   size_t max_concurrent_requests() const;
 
@@ -276,10 +274,14 @@ class Messenger : public ProxyContext {
     return io_thread_pool_.io_service();
   }
 
+  DnsResolver& resolver() override {
+    return *resolver_;
+  }
+
   rpc::ThreadPool& ThreadPool(ServicePriority priority = ServicePriority::kNormal);
 
-  RpcMetrics& rpc_metrics() override {
-    return *rpc_metrics_;
+  const std::shared_ptr<RpcMetrics>& rpc_metrics() override {
+    return rpc_metrics_;
   }
 
   const std::shared_ptr<MemTracker>& parent_mem_tracker() override;
@@ -288,26 +290,31 @@ class Messenger : public ProxyContext {
     return num_connections_to_server_;
   }
 
+  size_t num_reactors() const {
+    return reactors_.size();
+  }
+
   // Use specified IP address as base address for outbound connections from messenger.
   void TEST_SetOutboundIpBase(const IpAddress& value) {
     test_outbound_ip_base_ = value;
+    has_outbound_ip_base_.store(true, std::memory_order_release);
   }
 
   bool TEST_ShouldArtificiallyRejectIncomingCallsFrom(const IpAddress &remote);
 
+  Status TEST_GetReactorMetrics(size_t reactor_idx, ReactorMetrics* metrics);
+
+  ScheduledTaskId TEST_next_task_id() const {
+    return next_task_id_.load(std::memory_order_acquire);
+  }
+
  private:
-  FRIEND_TEST(TestRpc, TestConnectionKeepalive);
   friend class DelayedTask;
 
   explicit Messenger(const MessengerBuilder &bld);
 
   Reactor* RemoteToReactor(const Endpoint& remote, uint32_t idx = 0);
-  CHECKED_STATUS Init();
-  void UpdateServicesCache(std::lock_guard<percpu_rwlock>* guard);
-
-  // Called by external-facing shared_ptr when the user no longer holds any references. See
-  // 'retain_self_' for more info.
-  void AllExternalReferencesDropped();
+  Status Init(const MessengerBuilder &bld);
 
   void BreakConnectivity(const IpAddress& address, bool incoming, bool outgoing);
   void RestoreConnectivity(const IpAddress& address, bool incoming, bool outgoing);
@@ -326,65 +333,26 @@ class Messenger : public ProxyContext {
 
   const Protocol* const listen_protocol_;
 
-  // Protects closing_, acceptor_pools_, rpc_services_.
-  mutable percpu_rwlock lock_;
+  mutable PerCpuRwMutex lock_;
 
-  bool closing_ = false;
+  std::atomic_bool closing_ = false;
 
   // RPC services that handle inbound requests.
-  RpcServicesMap rpc_services_;
-  mutable ConcurrentValue<RpcServicesMap> rpc_services_cache_;
+  mutable RWOperationCounter rpc_services_counter_;
+  std::atomic_bool rpc_services_counter_stopped_ = false;
+  std::unordered_multimap<std::string, RpcServicePtr> rpc_services_;
+  RpcEndpointMap rpc_endpoints_;
 
-  std::vector<Reactor*> reactors_;
+  std::vector<std::unique_ptr<Reactor>> reactors_;
+  LocalYBInboundCallTracker local_call_tracker_;
 
   const scoped_refptr<MetricEntity> metric_entity_;
   const scoped_refptr<Histogram> outgoing_queue_time_;
 
   // Acceptor which is listening on behalf of this messenger.
-  std::unique_ptr<Acceptor> acceptor_;
+  std::unique_ptr<Acceptor> acceptor_ GUARDED_BY(lock_);
   IpAddress outbound_address_v4_;
   IpAddress outbound_address_v6_;
-
-  // The ownership of the Messenger object is somewhat subtle. The pointer graph looks like this:
-  //
-  //    [User Code ]             |      [ Internal code ]
-  //                             |
-  //     shared_ptr[1]           |
-  //         |                   |
-  //         v
-  //      Messenger    <------------ shared_ptr[2] --- Reactor
-  //       ^    |       ----------- bare pointer --> Reactor
-  //        \__/
-  //     shared_ptr[2]
-  //     (retain_self_)
-  //
-  // shared_ptr[1] instances use Messenger::AllExternalReferencesDropped() as a deleter.
-  // shared_ptr[2] are "traditional" shared_ptrs which call 'delete' on the object.
-  //
-  // The teardown sequence is as follows:
-  //
-  // Option 1): User calls "Shutdown()" explicitly:
-  //  - Messenger::Shutdown tells Reactors to shut down.
-  //  - When each reactor thread finishes, it drops its shared_ptr[2].
-  //  - The Messenger::retain_self instance remains, keeping the Messenger alive.
-  //  - The user eventually drops its shared_ptr[1], which calls
-  //    Messenger::AllExternalReferencesDropped. This drops retain_self_ and results in object
-  //    destruction.
-  //
-  // Option 2): User drops all of its shared_ptr[1] references
-  //  - Though the Reactors still reference the Messenger, AllExternalReferencesDropped will get
-  //    called, which triggers Messenger::Shutdown.
-  //  - AllExternalReferencesDropped drops retain_self_, so the only remaining references are from
-  //    Reactor threads. But the reactor threads are shutting down.
-  //  - When the last Reactor thread dies, there will be no more shared_ptr[1] references and the
-  //    Messenger will be destroyed.
-  //
-  // The main goal of all of this confusion is that the reactor threads need to be able to shut down
-  // asynchronously, and we need to keep the Messenger alive until they do so. So, handing out a
-  // normal shared_ptr to users would force the Messenger destructor to Join() the reactor threads,
-  // which causes a problem if the user tries to destruct the Messenger from within a Reactor thread
-  // itself.
-  std::shared_ptr<Messenger> retain_self_;
 
   // Id that will be assigned to the next task that is scheduled on the reactor.
   std::atomic<ScheduledTaskId> next_task_id_ = {1};
@@ -392,14 +360,15 @@ class Messenger : public ProxyContext {
 
   std::mutex mutex_scheduled_tasks_;
 
-  std::unordered_map<ScheduledTaskId, std::shared_ptr<DelayedTask>> scheduled_tasks_;
+  std::unordered_map<ScheduledTaskId, std::shared_ptr<DelayedTask>> scheduled_tasks_
+      GUARDED_BY(mutex_scheduled_tasks_);
 
   // Flag that we have at least on address with artificially broken connectivity.
   std::atomic<bool> has_broken_connectivity_ = {false};
 
   // Set of addresses with artificially broken connectivity.
-  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_from_;
-  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_to_;
+  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_from_ GUARDED_BY(lock_);
+  std::unordered_set<IpAddress, IpAddressHash> broken_connectivity_to_ GUARDED_BY(lock_);
 
   IoThreadPool io_thread_pool_;
   Scheduler scheduler_;
@@ -412,10 +381,13 @@ class Messenger : public ProxyContext {
   // This could be used for high-priority services such as Consensus.
   AtomicUniquePtr<rpc::ThreadPool> high_priority_thread_pool_;
 
-  std::unique_ptr<RpcMetrics> rpc_metrics_;
+  std::unique_ptr<DnsResolver> resolver_;
+
+  std::shared_ptr<RpcMetrics> rpc_metrics_;
 
   // Use this IP address as base address for outbound connections from messenger.
   IpAddress test_outbound_ip_base_;
+  std::atomic<bool> has_outbound_ip_base_{false};
 
   // Number of outbound connections to create per each destination server address.
   int num_connections_to_server_;
@@ -430,5 +402,3 @@ class Messenger : public ProxyContext {
 
 }  // namespace rpc
 }  // namespace yb
-
-#endif  // YB_RPC_MESSENGER_H_

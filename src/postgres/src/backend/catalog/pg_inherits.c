@@ -27,10 +27,13 @@
 #include "parser/parse_type.h"
 #include "storage/lmgr.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 #include "utils/tqual.h"
+
+#include "pg_yb_utils.h"
 
 /*
  * Entry of a hash table used in find_all_inheritors. See below.
@@ -76,9 +79,10 @@ find_inheritance_children(Oid parentrelId, LOCKMODE lockmode)
 	/*
 	 * Scan pg_inherits and build a working array of subclass OIDs.
 	 */
+	oidarr = NULL;
+	numoids = 0;
 	maxoids = 32;
 	oidarr = (Oid *) palloc(maxoids * sizeof(Oid));
-	numoids = 0;
 
 	relation = heap_open(InheritsRelationId, AccessShareLock);
 
@@ -175,7 +179,7 @@ find_all_inheritors(Oid parentrelId, LOCKMODE lockmode, List **numparents)
 	memset(&ctl, 0, sizeof(ctl));
 	ctl.keysize = sizeof(Oid);
 	ctl.entrysize = sizeof(SeenRelsEntry);
-	ctl.hcxt = CurrentMemoryContext;
+	ctl.hcxt = GetCurrentMemoryContext();
 
 	seen_rels = hash_create("find_all_inheritors temporary table",
 							32, /* start small and extend */

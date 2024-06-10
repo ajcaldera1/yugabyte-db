@@ -10,23 +10,20 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_YQL_REDIS_REDISSERVER_REDIS_PARSER_H_
-#define YB_YQL_REDIS_REDISSERVER_REDIS_PARSER_H_
+#pragma once
 
 #include <memory>
 #include <string>
 
 #include <boost/container/small_vector.hpp>
 
-#include "yb/client/async_rpc.h"
-#include "yb/client/callbacks.h"
-#include "yb/client/client_builder-internal.h"
+#include "yb/client/client_fwd.h"
+
+#include "yb/util/status_fwd.h"
+#include "yb/util/net/socket.h"
+#include "yb/util/size_literals.h"
 
 #include "yb/yql/redis/redisserver/redis_fwd.h"
-
-#include "yb/util/slice.h"
-#include "yb/util/status.h"
-#include "yb/util/size_literals.h"
 
 namespace yb {
 namespace redisserver {
@@ -34,8 +31,8 @@ namespace redisserver {
 constexpr size_t kMaxRedisValueSize = 512_MB;
 constexpr int64_t kNoneTtl = -1;
 
-CHECKED_STATUS ParseSet(client::YBRedisWriteOp *op, const RedisClientCommand& args);
-CHECKED_STATUS ParseGet(client::YBRedisReadOp* op, const RedisClientCommand& args);
+Status ParseSet(client::YBRedisWriteOp *op, const RedisClientCommand& args);
+Status ParseGet(client::YBRedisReadOp* op, const RedisClientCommand& args);
 
 // TODO: make additional command support here
 
@@ -48,10 +45,7 @@ class RedisParser {
       : source_(source), full_size_(IoVecsFullSize(source)) {
   }
 
-  void SetArgs(boost::container::small_vector_base<Slice>* args) {
-    DCHECK_EQ(source_.size(), 1);
-    args_ = args;
-  }
+  void SetArgs(boost::container::small_vector_base<Slice>* args);
 
   // Begin of input is going to be consumed, so we should adjust our pointers.
   // Since the beginning of input is being consumed by shifting the remaining bytes to the
@@ -89,13 +83,13 @@ class RedisParser {
     FINISHED,
   };
 
-  CHECKED_STATUS AdvanceToNextToken();
-  CHECKED_STATUS Initial();
-  CHECKED_STATUS SingleLine();
-  CHECKED_STATUS BulkHeader();
-  CHECKED_STATUS BulkArgumentSize();
-  CHECKED_STATUS BulkArgumentBody();
-  CHECKED_STATUS FindEndOfLine();
+  Status AdvanceToNextToken();
+  Status Initial();
+  Status SingleLine();
+  Status BulkHeader();
+  Status BulkArgumentSize();
+  Status BulkArgumentBody();
+  Status FindEndOfLine();
 
   // Parses number with specified bounds.
   // Number is located in separate line, and contain prefix before actual number.
@@ -148,5 +142,3 @@ class RedisParser {
 
 }  // namespace redisserver
 }  // namespace yb
-
-#endif  // YB_YQL_REDIS_REDISSERVER_REDIS_PARSER_H_

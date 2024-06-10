@@ -17,27 +17,29 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include <sys/stat.h>
-#include <errno.h>
 
+#include <fstream>
 #include <string>
 #include <thread>
 #include <vector>
-#include <cmath>
-#include <iostream>
-#include <fstream>
-#include <iterator>
-#include <algorithm>
 
+#include <gtest/gtest.h>
+
+#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/auto_roll_logger.h"
 #include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
-#include "yb/rocksdb/db.h"
+#include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/sync_point.h"
+#include "yb/util/test_macros.h"
+
+using std::string;
+using std::shared_ptr;
 
 namespace rocksdb {
 
-class AutoRollLoggerTest : public testing::Test {
+class AutoRollLoggerTest : public RocksDBTest {
  public:
   static void InitTestDb() {
 #ifdef OS_WIN
@@ -51,7 +53,7 @@ class AutoRollLoggerTest : public testing::Test {
     std::string deleteCmd = "rm -rf " + kTestDir;
 #endif
     ASSERT_EQ(system(deleteCmd.c_str()), 0);
-    Env::Default()->CreateDir(kTestDir);
+    ASSERT_OK(Env::Default()->CreateDir(kTestDir));
   }
 
   void RollLogFileBySizeTest(AutoRollLogger* logger,
@@ -304,7 +306,7 @@ TEST_F(AutoRollLoggerTest, LogFlushWhileRolling) {
   ASSERT_TRUE(auto_roll_logger);
   std::thread flush_thread;
 
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
+  yb::SyncPoint::GetInstance()->LoadDependency({
       // Need to pin the old logger before beginning the roll, as rolling grabs
       // the mutex, which would prevent us from accessing the old logger.
       {"AutoRollLogger::Flush:PinnedLogger",
@@ -322,7 +324,7 @@ TEST_F(AutoRollLoggerTest, LogFlushWhileRolling) {
       {"AutoRollLogger::ResetLogger:AfterNewLogger",
        "AutoRollLoggerTest::LogFlushWhileRolling:FlushCallback2"},
   });
-  rocksdb::SyncPoint::GetInstance()->SetCallBack(
+  yb::SyncPoint::GetInstance()->SetCallBack(
       "PosixLogger::Flush:BeginCallback", [&](void* arg) {
         TEST_SYNC_POINT(
             "AutoRollLoggerTest::LogFlushWhileRolling:FlushCallbackBegin");
@@ -333,7 +335,7 @@ TEST_F(AutoRollLoggerTest, LogFlushWhileRolling) {
               "AutoRollLoggerTest::LogFlushWhileRolling:FlushCallback2");
         }
       });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
 
   flush_thread = std::thread([&]() { auto_roll_logger->Flush(); });
   TEST_SYNC_POINT(
@@ -341,7 +343,7 @@ TEST_F(AutoRollLoggerTest, LogFlushWhileRolling) {
   RollLogFileBySizeTest(auto_roll_logger, options.max_log_file_size,
                         kSampleMessage + ":LogFlushWhileRolling");
   flush_thread.join();
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
 }
 
 #endif  // OS_WIN
@@ -396,7 +398,7 @@ static std::vector<string> GetOldFileNames(const string& path) {
   const string fname = path.substr(path.find_last_of("/") + 1);
 
   std::vector<string> children;
-  Env::Default()->GetChildren(dirname, &children);
+  CHECK_OK(Env::Default()->GetChildren(dirname, &children));
 
   // We know that the old log files are named [path]<something>
   // Return all entities that match the pattern

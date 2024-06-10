@@ -22,8 +22,7 @@
 // for it.  However, the rest of the backend is only expected to use the
 // higher-level API provided by parser.h.
 //--------------------------------------------------------------------------------------------------
-#ifndef YB_YQL_CQL_QL_PARSER_SCANNER_H_
-#define YB_YQL_CQL_QL_PARSER_SCANNER_H_
+#pragma once
 
 #include <cstddef>
 #include <cstdint>
@@ -223,9 +222,9 @@ class LexProcessor : public yyFlexLexer {
   // style from '/**/' to '//', and post-fix data members with "_".
   //------------------------------------------------------------------------------------------------
   // Operations on literal buffers.
-  void EnlargeLiteralBuf(int bytes);
+  void EnlargeLiteralBuf(size_t bytes);
   void startlit();
-  void addlit(char *ytext, int yleng);
+  void addlit(char *ytext, size_t yleng);
   void addlitchar(unsigned char ychar);
   char *litbuf_udeescape(unsigned char escape);
 
@@ -250,8 +249,8 @@ class LexProcessor : public yyFlexLexer {
   // NOTE: The string in literalbuf is NOT necessarily null-terminated, but there always IS room to
   // add a trailing null at offset literallen.  We store a null only when we need it.
   char *literalbuf_;  // Temporary buffer for literal.
-  int literallen_;  // Temporary buffer length.
-  int literalalloc_;  // Temporary buffer size.
+  size_t literallen_;  // Temporary buffer length.
+  size_t literalalloc_;  // Temporary buffer size.
   int xcdepth_;  // Depth of nesting in slash-star comments.
   char *dolqstart_;  // Current $foo$ quote start string.
   int32_t utf16_first_part_;  // First of UTF16 surrogate unicode escape pair.
@@ -268,5 +267,3 @@ class LexProcessor : public yyFlexLexer {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PARSER_SCANNER_H_

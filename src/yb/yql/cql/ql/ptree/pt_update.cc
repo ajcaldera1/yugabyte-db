@@ -16,7 +16,25 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/pt_update.h"
+
+#include "yb/common/common.pb.h"
+#include "yb/common/ql_type.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/yql/cql/ql/ptree/column_arg.h"
+#include "yb/yql/cql/ql/ptree/column_desc.h"
+#include "yb/yql/cql/ql/ptree/pt_dml_using_clause.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
+
+using std::string;
+using std::max;
+
+DEFINE_RUNTIME_bool(
+    ycql_bind_collection_assignment_using_column_name, false,
+    "Enable using column name for binding the value of subscripted collection column");
 
 namespace yb {
 namespace ql {
@@ -24,9 +42,9 @@ namespace ql {
 //--------------------------------------------------------------------------------------------------
 
 PTAssign::PTAssign(MemoryContext *memctx,
-                   YBLocation::SharedPtr loc,
+                   YBLocationPtr loc,
                    const PTQualifiedName::SharedPtr& lhs,
-                   const PTExpr::SharedPtr& rhs,
+                   const PTExprPtr& rhs,
                    const PTExprListNode::SharedPtr& subscript_args,
                    const PTExprListNode::SharedPtr& json_ops)
     : TreeNode(memctx, loc),
@@ -40,7 +58,7 @@ PTAssign::PTAssign(MemoryContext *memctx,
 PTAssign::~PTAssign() {
 }
 
-CHECKED_STATUS PTAssign::Analyze(SemContext *sem_context) {
+Status PTAssign::Analyze(SemContext *sem_context) {
   SemState sem_state(sem_context);
 
   sem_state.set_processing_assignee(true);
@@ -68,6 +86,19 @@ CHECKED_STATUS PTAssign::Analyze(SemContext *sem_context) {
 
       sem_state.SetExprState(curr_ytype->keys_type(),
                              client::YBColumnSchema::ToInternalDataType(curr_ytype->keys_type()));
+      string subscripted_column_bindvar_name;
+      switch (col_desc_->ql_type()->main()) {
+        case DataType::MAP:
+          subscripted_column_bindvar_name = PTBindVar::coll_map_key_bindvar_name(col_desc_->name());
+          break;
+        case DataType::LIST:
+          subscripted_column_bindvar_name =
+              PTBindVar::coll_list_index_bindvar_name(col_desc_->name());
+          break;
+        default:
+          subscripted_column_bindvar_name = PTBindVar::default_bindvar_name();
+      }
+      sem_state.set_bindvar_name(subscripted_column_bindvar_name);
       RETURN_NOT_OK(arg->Analyze(sem_context));
 
       curr_ytype = curr_ytype->values_type();
@@ -93,8 +124,28 @@ CHECKED_STATUS PTAssign::Analyze(SemContext *sem_context) {
 
   sem_state.set_processing_assignee(false);
 
+  auto rhs_bindvar_name = lhs_->bindvar_name();
+  if (has_subscripted_column()) {
+    // For "UPDATE ... SET map[x] = ? ..." or "UPDATE ... SET list[x] = ? ..." when GFlag
+    // ycql_bind_collection_assignment_using_column_name is enabled where x is an integer:
+    // 1. allow both "column_name" and "value(column_name)" as the bindvar name.
+    // 2. "column_name" is the primary bindvar name since PreparedStatements can only support a
+    // single name.
+    //
+    // Note that nested maps and lists are only allowed if they are frozen. A frozen collection
+    // can't be updated, hence only checking the first node in the node_list is sufficient here.
+    auto subscripted_bindvar_name = PTBindVar::coll_value_bindvar_name(col_desc_->name());
+    if (subscript_args_->node_list().front()->expr_op() == ExprOperator::kConst &&
+        FLAGS_ycql_bind_collection_assignment_using_column_name) {
+      sem_state.add_alternate_bindvar_name(subscripted_bindvar_name);
+    } else {
+      rhs_bindvar_name = MCMakeShared<MCString>(
+          sem_context->PSemMem(), subscripted_bindvar_name.data(), subscripted_bindvar_name.size());
+    }
+  }
+
   // Setup the expected datatypes, and analyze the rhs value.
-  sem_state.SetExprState(curr_ytype, curr_itype, lhs_->bindvar_name(), col_desc_);
+  sem_state.SetExprState(curr_ytype, curr_itype, rhs_bindvar_name, col_desc_);
   RETURN_NOT_OK(rhs_->Analyze(sem_context));
   RETURN_NOT_OK(rhs_->CheckRhsExpr(sem_context));
 
@@ -115,16 +166,18 @@ PTUpdateStmt::PTUpdateStmt(MemoryContext *memctx,
                            PTExpr::SharedPtr if_clause,
                            const bool else_error,
                            PTDmlUsingClause::SharedPtr using_clause,
-                           const bool return_status)
+                           const bool return_status,
+                           PTDmlWritePropertyListNode::SharedPtr update_properties)
     : PTDmlStmt(memctx, loc, where_clause, if_clause, else_error, using_clause, return_status),
       relation_(relation),
-      set_clause_(set_clause) {
+      set_clause_(set_clause),
+      update_properties_(update_properties) {
 }
 
 PTUpdateStmt::~PTUpdateStmt() {
 }
 
-CHECKED_STATUS PTUpdateStmt::Analyze(SemContext *sem_context) {
+Status PTUpdateStmt::Analyze(SemContext *sem_context) {
   // If use_cassandra_authentication is set, permissions are checked in PTDmlStmt::Analyze.
   RETURN_NOT_OK(PTDmlStmt::Analyze(sem_context));
 
@@ -151,8 +204,8 @@ CHECKED_STATUS PTUpdateStmt::Analyze(SemContext *sem_context) {
   sem_state.ResetContextState();
 
   // Set clause can't have primary keys.
-  int num_keys = num_key_columns();
-  for (int idx = 0; idx < num_keys; idx++) {
+  auto num_keys = num_key_columns();
+  for (size_t idx = 0; idx < num_keys; idx++) {
     if (column_args_->at(idx).IsInitialized()) {
       return sem_context->Error(set_clause_, ErrorCode::INVALID_ARGUMENTS);
     }
@@ -170,6 +223,9 @@ CHECKED_STATUS PTUpdateStmt::Analyze(SemContext *sem_context) {
   // Analyze indexes for write operations.
   RETURN_NOT_OK(AnalyzeIndexesForWrites(sem_context));
 
+  if (update_properties_ != nullptr) {
+    RETURN_NOT_OK(update_properties_->Analyze(sem_context));
+  }
   // If returning a status we always return back the whole row.
   if (returns_status_) {
     AddRefForAllColumns();
@@ -180,9 +236,9 @@ CHECKED_STATUS PTUpdateStmt::Analyze(SemContext *sem_context) {
 
 namespace {
 
-CHECKED_STATUS MultipleColumnSetError(const ColumnDesc* const col_desc,
-                                      const PTAssign* const assign_expr,
-                                      SemContext* sem_context) {
+Status MultipleColumnSetError(const ColumnDesc* const col_desc,
+                              const PTAssign* const assign_expr,
+                              SemContext* sem_context) {
   return sem_context->Error(
       assign_expr,
       strings::Substitute("Multiple incompatible setting of column $0.",
@@ -192,7 +248,7 @@ CHECKED_STATUS MultipleColumnSetError(const ColumnDesc* const col_desc,
 
 } // anonymous namespace
 
-CHECKED_STATUS PTUpdateStmt::AnalyzeSetExpr(PTAssign *assign_expr, SemContext *sem_context) {
+Status PTUpdateStmt::AnalyzeSetExpr(PTAssign *assign_expr, SemContext *sem_context) {
   // Analyze the expression.
   RETURN_NOT_OK(assign_expr->Analyze(sem_context));
 
@@ -256,13 +312,13 @@ ExplainPlanPB PTUpdateStmt::AnalysisResultToPB() {
   update_plan->set_update_type("Update on " + table_name().ToString());
   update_plan->set_scan_type("  ->  Primary Key Lookup on " + table_name().ToString());
   string key_conditions = "        Key Conditions: " +
-      conditionsToString<MCVector<ColumnOp>>(key_where_ops());
+      ConditionsToString<MCVector<ColumnOp>>(key_where_ops());
   update_plan->set_key_conditions(key_conditions);
-  update_plan->set_output_width(max({
+  update_plan->set_output_width(narrow_cast<int32_t>(max({
     update_plan->update_type().length(),
     update_plan->scan_type().length(),
     update_plan->key_conditions().length()
-  }));
+  })));
   return explain_plan;
 }
 

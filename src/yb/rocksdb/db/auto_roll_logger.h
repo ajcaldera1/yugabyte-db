@@ -20,15 +20,26 @@
 // Logger implementation that can be shared by all environments
 // where enough posix functionality is available.
 
+
 #pragma once
+
+#include <assert.h>
+
+#include <cstdint>
+#include <functional>
 #include <list>
+#include <mutex>
+#include <stack>
 #include <string>
+#include <type_traits>
 
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/port/util_logger.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/mutexlock.h"
+
+#include "yb/util/cache_metrics.h"
+#include "yb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -38,24 +49,7 @@ class AutoRollLogger : public Logger {
   AutoRollLogger(Env* env, const std::string& dbname,
                  const std::string& db_log_dir, size_t log_max_size,
                  size_t log_file_time_to_roll,
-                 const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL)
-      : Logger(log_level),
-        dbname_(dbname),
-        db_log_dir_(db_log_dir),
-        env_(env),
-        status_(Status::OK()),
-        kMaxLogFileSize(log_max_size),
-        kLogFileTimeToRoll(log_file_time_to_roll),
-        cached_now(static_cast<uint64_t>(env_->NowMicros() * 1e-6)),
-        ctime_(cached_now),
-        cached_now_access_count(0),
-        call_NowMicros_every_N_records_(100),
-        mutex_() {
-    env->GetAbsolutePath(dbname, &db_absolute_path_);
-    log_fname_ = InfoLogFileName(dbname_, db_absolute_path_, db_log_dir_);
-    RollLogFile();
-    ResetLogger();
-  }
+                 const InfoLogLevel log_level = InfoLogLevel::INFO_LEVEL);
 
   using Logger::Logv;
   void Logv(const char* format, va_list ap) override;
@@ -87,7 +81,7 @@ class AutoRollLogger : public Logger {
       // pin down the current logger_ instance before releasing the mutex.
       logger = logger_;
     }
-    TEST_SYNC_POINT("AutoRollLogger::Flush:PinnedLogger");
+    DEBUG_ONLY_TEST_SYNC_POINT("AutoRollLogger::Flush:PinnedLogger");
     if (logger) {
       logger->Flush();
     }

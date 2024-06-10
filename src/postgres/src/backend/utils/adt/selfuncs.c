@@ -110,6 +110,7 @@
 #include "catalog/pg_collation.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_statistic.h"
 #include "catalog/pg_statistic_ext.h"
 #include "catalog/pg_type.h"
@@ -150,6 +151,8 @@
 #include "utils/typcache.h"
 #include "utils/varlena.h"
 
+// YB includes
+#include "pg_yb_utils.h"
 
 /* Hooks for plugins to get control when we ask for stats */
 get_relation_stats_hook_type get_relation_stats_hook = NULL;
@@ -281,8 +284,18 @@ eqsel_internal(PG_FUNCTION_ARGS, bool negate)
 							 ((Const *) other)->constisnull,
 							 varonleft, negate);
 	else
+	{
+		bool yb_is_batched = IsYugaByteEnabled() && IsA(other, YbBatchedExpr);
+
 		selec = var_eq_non_const(&vardata, operator, other,
 								 varonleft, negate);
+
+		if (yb_is_batched)
+		{
+			selec *= yb_batch_expr_size(root, varRelid, other);
+			CLAMP_PROBABILITY(selec);
+		}
+	}
 
 	ReleaseVariableStats(vardata);
 
@@ -1280,16 +1293,16 @@ patternsel(PG_FUNCTION_ARGS, Pattern_Type ptype, bool negate)
 	switch (vartype)
 	{
 		case TEXTOID:
-			opfamily = TEXT_BTREE_FAM_OID;
+			opfamily = IsYugaByteEnabled() ? TEXT_LSM_FAM_OID : TEXT_BTREE_FAM_OID;
 			break;
 		case BPCHAROID:
-			opfamily = BPCHAR_BTREE_FAM_OID;
+			opfamily = IsYugaByteEnabled() ? BPCHAR_LSM_FAM_OID : BPCHAR_BTREE_FAM_OID;
 			break;
 		case NAMEOID:
-			opfamily = NAME_BTREE_FAM_OID;
+			opfamily = IsYugaByteEnabled() ? NAME_LSM_FAM_OID : NAME_BTREE_FAM_OID;
 			break;
 		case BYTEAOID:
-			opfamily = BYTEA_BTREE_FAM_OID;
+			opfamily = IsYugaByteEnabled() ? BYTEA_LSM_FAM_OID : BYTEA_BTREE_FAM_OID;
 			break;
 		default:
 			ReleaseVariableStats(vardata);
@@ -2225,7 +2238,8 @@ rowcomparesel(PlannerInfo *root,
 	bool		is_join_clause;
 
 	/* Build equivalent arg list for single operator */
-	opargs = list_make2(linitial(clause->largs), linitial(clause->rargs));
+	opargs = list_make2(linitial(clause->largs),
+		linitial(castNode(List, clause->rargs)));
 
 	/*
 	 * Decide if it's a join clause.  This should match clausesel.c's
@@ -4950,9 +4964,13 @@ examine_variable(PlannerInfo *root, Node *node, int varRelid,
 								 * For simplicity, we insist on the whole
 								 * table being selectable, rather than trying
 								 * to identify which column(s) the index
-								 * depends on.
+								 * depends on.  Also require all rows to be
+								 * selectable --- there must be no
+								 * securityQuals from security barrier views
+								 * or RLS policies.
 								 */
 								vardata->acl_ok =
+									rte->securityQuals == NIL &&
 									(pg_class_aclcheck(rte->relid, GetUserId(),
 													   ACL_SELECT) == ACLCHECK_OK);
 							}
@@ -5016,12 +5034,17 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 
 		if (HeapTupleIsValid(vardata->statsTuple))
 		{
-			/* check if user has permission to read this column */
+			/*
+			 * Check if user has permission to read this column.  We require
+			 * all rows to be accessible, so there must be no securityQuals
+			 * from security barrier views or RLS policies.
+			 */
 			vardata->acl_ok =
-				(pg_class_aclcheck(rte->relid, GetUserId(),
-								   ACL_SELECT) == ACLCHECK_OK) ||
-				(pg_attribute_aclcheck(rte->relid, var->varattno, GetUserId(),
-									   ACL_SELECT) == ACLCHECK_OK);
+				rte->securityQuals == NIL &&
+				((pg_class_aclcheck(rte->relid, GetUserId(),
+									ACL_SELECT) == ACLCHECK_OK) ||
+				 (pg_attribute_aclcheck(rte->relid, var->varattno, GetUserId(),
+										ACL_SELECT) == ACLCHECK_OK));
 		}
 		else
 		{
@@ -5053,7 +5076,8 @@ examine_simple_variable(PlannerInfo *root, Var *var,
 		 * of learning something even with it.
 		 */
 		if (subquery->setOperations ||
-			subquery->groupClause)
+			subquery->groupClause ||
+			subquery->groupingSets)
 			return;
 
 		/*
@@ -5463,6 +5487,13 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 	rte = root->simple_rte_array[rel->relid];
 	Assert(rte->rtekind == RTE_RELATION);
 
+	/*
+	 * In case of a YB relation attempt to peek at an index means RPC request,
+	 * that is unaffordable at planning time.
+	 */
+	if (IsYBRelationById(rte->relid))
+		return false;
+
 	/* Search through the indexes to see if any match our problem */
 	foreach(lc, rel->indexlist)
 	{
@@ -5470,7 +5501,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 		ScanDirection indexscandir;
 
 		/* Ignore non-btree indexes */
-		if (index->relam != BTREE_AM_OID)
+		if (index->relam != BTREE_AM_OID && index->relam != LSM_AM_OID)
 			continue;
 
 		/*
@@ -5608,7 +5639,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 										 indexscandir)) != NULL)
 				{
 					/* Extract the index column values from the heap tuple */
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+					ExecStoreHeapTuple(tup, slot, false);
 					FormIndexDatum(indexInfo, slot, estate,
 								   values, isnull);
 
@@ -5641,7 +5672,7 @@ get_actual_variable_range(PlannerInfo *root, VariableStatData *vardata,
 										 -indexscandir)) != NULL)
 				{
 					/* Extract the index column values from the heap tuple */
-					ExecStoreTuple(tup, slot, InvalidBuffer, false);
+					ExecStoreHeapTuple(tup, slot, false);
 					FormIndexDatum(indexInfo, slot, estate,
 								   values, isnull);
 
@@ -6258,9 +6289,18 @@ regex_selectivity(const char *patt, int pattlen, bool case_insensitive,
 		sel *= FULL_WILDCARD_SEL;
 	}
 
-	/* If there's a fixed prefix, discount its selectivity */
+	/*
+	 * If there's a fixed prefix, discount its selectivity.  We have to be
+	 * careful here since a very long prefix could result in pow's result
+	 * underflowing to zero (in which case "sel" probably has as well).
+	 */
 	if (fixed_prefix_len > 0)
-		sel /= pow(FIXED_CHAR_SEL, fixed_prefix_len);
+	{
+		double		prefixsel = pow(FIXED_CHAR_SEL, fixed_prefix_len);
+
+		if (prefixsel > 0.0)
+			sel /= prefixsel;
+	}
 
 	/* Make sure result stays in range */
 	CLAMP_PROBABILITY(sel);
@@ -6565,11 +6605,23 @@ deconstruct_indexquals(IndexPath *path)
 				   *rightop;
 		IndexQualInfo *qinfo;
 
+		if (IsYugaByteEnabled() && path->path.param_info &&
+			 yb_enable_base_scans_cost_model)
+		{
+			Relids batched = YB_PATH_REQ_OUTER_BATCHED(&path->path);
+			RestrictInfo *batched_rinfo =
+				yb_get_batched_restrictinfo(rinfo,
+					batched, path->path.parent->relids);
+			if (batched_rinfo)
+				rinfo = batched_rinfo;
+		}
+
 		clause = rinfo->clause;
 
 		qinfo = (IndexQualInfo *) palloc(sizeof(IndexQualInfo));
 		qinfo->rinfo = rinfo;
 		qinfo->indexcol = indexcol;
+		qinfo->is_hashed = false;
 
 		if (IsA(clause, OpExpr))
 		{
@@ -6580,12 +6632,57 @@ deconstruct_indexquals(IndexPath *path)
 			{
 				qinfo->varonleft = true;
 				qinfo->other_operand = rightop;
+
+				if (IsYugaByteEnabled() && IsA(leftop, FuncExpr))
+				{
+					qinfo->is_hashed =
+						(((FuncExpr*) leftop)->funcid == YB_HASH_CODE_OID);
+					ListCell   *ls;
+					if (qinfo->is_hashed)
+					{
+						/*
+						 * YB: We aren't going to push down a yb_hash_code call
+						 * if we matched the call against an expression
+						 */
+						foreach(ls, index->indexprs)
+						{
+							Node *indexpr = (Node*) lfirst(ls);
+							if (indexpr && IsA(indexpr, RelabelType))
+								indexpr = (Node *) ((RelabelType *) indexpr)->arg;
+							if (equal(indexpr, leftop)) {
+								qinfo->is_hashed = false;
+								break;
+							}
+						}
+					}
+				}
 			}
 			else
 			{
 				Assert(match_index_to_operand(rightop, indexcol, index));
 				qinfo->varonleft = false;
 				qinfo->other_operand = leftop;
+				if (IsA(rightop, FuncExpr))
+				{
+					qinfo->is_hashed =
+						(((FuncExpr*) rightop)->funcid == YB_HASH_CODE_OID);
+					ListCell   *ls;
+					if (qinfo->is_hashed)
+					{
+						/* YB: We aren't going to push down a yb_hash_code call
+						 * if we matched the call against an expression */
+						foreach(ls, index->indexprs)
+						{
+							Node *indexpr = (Node*) lfirst(ls);
+							if (indexpr && IsA(indexpr, RelabelType))
+								indexpr = (Node *) ((RelabelType *) indexpr)->arg;
+							if (equal(indexpr, rightop)) {
+								qinfo->is_hashed = false;
+								break;
+							}
+						}
+					}
+				}
 			}
 		}
 		else if (IsA(clause, RowCompareExpr))
@@ -6602,8 +6699,9 @@ deconstruct_indexquals(IndexPath *path)
 			}
 			else
 			{
-				Assert(match_index_to_operand((Node *) linitial(rc->rargs),
-											  indexcol, index));
+				Assert(match_index_to_operand(
+					(Node *) linitial(castNode(List, rc->rargs)),
+						indexcol, index));
 				qinfo->varonleft = false;
 				qinfo->other_operand = (Node *) rc->largs;
 			}
@@ -6636,6 +6734,27 @@ deconstruct_indexquals(IndexPath *path)
 		result = lappend(result, qinfo);
 	}
 	return result;
+}
+
+int
+yb_batch_expr_size(PlannerInfo *root, Index path_relid, Node *batched_expr)
+{
+	Assert(IsA(batched_expr, YbBatchedExpr));
+	Node *batched_operand =
+		(Node *) castNode(YbBatchedExpr, batched_expr)->orig_expr;
+	Relids other_varnos = pull_varnos(batched_operand);
+	Relids batched_relids = root->yb_cur_batched_relids;
+	root->yb_cur_batched_relids = NULL;
+
+	int num_outer_tuples =
+		get_loop_count(root, path_relid, other_varnos);
+
+	root->yb_cur_batched_relids = batched_relids;
+	int batch_size = yb_bnl_batch_size;
+	if (batch_size > num_outer_tuples)
+		batch_size = num_outer_tuples;
+
+	return batch_size;
 }
 
 /*
@@ -6936,7 +7055,6 @@ add_predicate_to_quals(IndexOptInfo *index, List *indexQuals)
 	/* list_concat avoids modifying the passed-in indexQuals list */
 	return list_concat(predExtraQuals, indexQuals);
 }
-
 
 void
 btcostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
@@ -7490,6 +7608,20 @@ gincost_pattern(IndexOptInfo *index, int indexcol,
 		return false;
 	}
 
+	if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID &&
+		searchMode != GIN_SEARCH_MODE_DEFAULT)
+	{
+		/*
+		 * TODO(#7850): for ybgin, non-default search mode queries aren't
+		 * supported yet.
+		 *
+		 * Piggyback on haveFullScan, which the caller translates to
+		 * disable_cost.
+		 */
+		counts->haveFullScan = true;
+		return true;
+	}
+
 	for (i = 0; i < nentries; i++)
 	{
 		/*
@@ -7729,11 +7861,23 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 	/* Do preliminary analysis of indexquals */
 	qinfos = deconstruct_indexquals(path);
 
+	if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID &&
+		list_length(qinfos) > 1)
+	{
+		/*
+		 * TODO(#7850): for ybgin, queries using multiple scan keys aren't
+		 * supported yet.
+		 */
+		*indexStartupCost = *indexTotalCost =
+			yb_test_ybgin_disable_cost_factor * disable_cost;
+		return;
+	}
+
 	/*
 	 * Obtain statistical information from the meta page, if possible.  Else
 	 * set ginStats to zeroes, and we'll cope below.
 	 */
-	if (!index->hypothetical)
+	if (!index->hypothetical && !IsYBRelationById(index->indexoid))
 	{
 		indexRel = index_open(index->indexoid, AccessShareLock);
 		ginGetStats(indexRel, &ginStats);
@@ -7892,6 +8036,16 @@ gincostestimate(PlannerInfo *root, IndexPath *path, double loop_count,
 
 	if (counts.haveFullScan || indexQuals == NIL)
 	{
+		if (IsYugaByteEnabled() && index->relam == YBGIN_AM_OID)
+		{
+			/*
+			 * TODO(#7850): for ybgin, full scan is not supported.
+			 */
+			*indexStartupCost = *indexTotalCost =
+				yb_test_ybgin_disable_cost_factor * disable_cost;
+			return;
+		}
+
 		/*
 		 * Full index scan will be required.  We treat this as if every key in
 		 * the index had been listed in the query; is that reasonable?

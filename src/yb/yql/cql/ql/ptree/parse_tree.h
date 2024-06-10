@@ -18,11 +18,18 @@
 // parser_gram.y will link the tree nodes together to form this parse tree.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PARSE_TREE_H_
-#define YB_YQL_CQL_QL_PTREE_PARSE_TREE_H_
+#pragma once
+
+#include <functional>
+#include <memory>
 
 #include "yb/client/yb_table_name.h"
+
+#include "yb/rpc/rpc_fwd.h"
+
 #include "yb/util/mem_tracker.h"
+#include "yb/util/memory/arena.h"
+
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 #include "yb/yql/cql/ql/util/ql_env.h"
 
@@ -46,7 +53,7 @@ class ParseTree {
   ~ParseTree();
 
   // Run semantics analysis.
-  CHECKED_STATUS Analyze(SemContext *sem_context);
+  Status Analyze(SemContext *sem_context);
 
   // Access function for stmt_.
   const std::string& stmt() const {
@@ -92,6 +99,12 @@ class ParseTree {
     return internal_;
   }
 
+  // Get schema version this statement used.
+  Result<SchemaVersion> GetYBTableSchemaVersion() const;
+
+  // Check if the used schema version is not in sync with the Master.
+  Result<bool> IsYBTableAltered(QLEnv *ql_env, bool use_cache) const;
+
   // Add table to the set of tables used during semantic analysis.
   void AddAnalyzedTable(const client::YBTableName& table_name);
 
@@ -105,6 +118,8 @@ class ParseTree {
   void ClearAnalyzedUDTypeCache(QLEnv *ql_env) const;
 
  private:
+  static std::shared_ptr<const client::YBTable> GetYBTableFromTreeNode(const TreeNode *tnode);
+
   // The SQL statement.
   const std::string& stmt_;
 
@@ -117,8 +132,8 @@ class ParseTree {
   std::unordered_set<client::YBTableName, boost::hash<client::YBTableName>> analyzed_tables_;
 
   // Set of types used during semantic analysis.
-  std::unordered_set<std::pair<string, string>,
-                     boost::hash<std::pair<string, string>>> analyzed_types_;
+  std::unordered_set<std::pair<std::string, std::string>,
+                     boost::hash<std::pair<std::string, std::string>>> analyzed_types_;
 
   // Parse tree memory pool. This pool is used to allocate parse tree and its nodes. This pool
   // should be part of the generated parse tree that is stored within parse_context. Once the
@@ -136,7 +151,7 @@ class ParseTree {
   TreeNode::SharedPtr root_;
 
   // Is this parse tree stale?
-  mutable bool stale_ = false;
+  mutable std::atomic<bool> stale_ = {false};
 
   // Was this generated internally? Used to to bypass authorization enforcement.
   bool internal_ = false;
@@ -144,5 +159,3 @@ class ParseTree {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PARSE_TREE_H_

@@ -13,8 +13,15 @@
 //
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/common/constants.h"
+
+#include "yb/util/status_log.h"
+
 #include "yb/yql/pggate/test/pggate_test.h"
-#include "yb/util/ybc-internal.h"
+#include "yb/yql/pggate/util/ybc-internal.h"
+#include "yb/yql/pggate/ybc_pggate.h"
+
+using std::string;
 
 namespace yb {
 namespace pggate {
@@ -31,31 +38,41 @@ TEST_F(PggateTestDelete, TestDelete) {
 
   // Create table in the connected database.
   int col_count = 0;
-  CHECK_YBC_STATUS(YBCPgNewCreateTable(pg_session_, kDefaultDatabase, kDefaultSchema, tabname,
+  CHECK_YBC_STATUS(YBCPgNewCreateTable(kDefaultDatabase, kDefaultSchema, tabname,
                                        kDefaultDatabaseOid, tab_oid,
-                                       false /* is_shared_table */, true /* if_not_exist */,
-                                       false /* add_primary_key */, &pg_stmt));
+                                       false /* is_shared_table */,
+                                       false /* is_sys_catalog_table */,
+                                       true /* if_not_exist */,
+                                       PG_YBROWID_MODE_NONE,
+                                       true /* is_colocated_via_database */,
+                                       kInvalidOid /* tablegroup_id */,
+                                       kColocationIdNotSet /* colocation_id */,
+                                       kInvalidOid /* tablespace_id */,
+                                       false /* is_matview */,
+                                       kInvalidOid /* pg_table_oid */,
+                                       kInvalidOid /* old_relfilenode_oid */,
+                                       false /* is_truncate */,
+                                       &pg_stmt));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "hash_key", ++col_count,
-                                             DataType::INT64, true, true));
+                                               DataType::INT64, true, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "id", ++col_count,
-                                             DataType::INT32, false, true));
+                                               DataType::INT32, false, true));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "dependent_count", ++col_count,
-                                             DataType::INT16, false, false));
+                                               DataType::INT16, false, false));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "project_count", ++col_count,
-                                             DataType::INT32, false, false));
+                                               DataType::INT32, false, false));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "salary", ++col_count,
-                                             DataType::FLOAT, false, false));
+                                               DataType::FLOAT, false, false));
   CHECK_YBC_STATUS(YBCTestCreateTableAddColumn(pg_stmt, "job", ++col_count,
-                                             DataType::STRING, false, false));
-  CHECK_YBC_STATUS(YBCPgExecCreateTable(pg_stmt));
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
-  CommitTransaction();
+                                               DataType::STRING, false, false));
+  ExecCreateTableTransaction(pg_stmt);
   pg_stmt = nullptr;
 
   // INSERT ----------------------------------------------------------------------------------------
   // Allocate new insert.
-  CHECK_YBC_STATUS(YBCPgNewInsert(pg_session_, kDefaultDatabaseOid, tab_oid,
-                                  false /* is_single_row_txn */, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewInsert(
+      kDefaultDatabaseOid, tab_oid, false /* is_region_local */, &pg_stmt,
+      YBCPgTransactionSetting::YB_TRANSACTIONAL));
 
   // Allocate constant expressions.
   // TODO(neil) We can also allocate expression with bind.
@@ -88,28 +105,28 @@ TEST_F(PggateTestDelete, TestDelete) {
   const int insert_row_count = 7;
   for (int i = 0; i < insert_row_count; i++) {
     // Insert the row with the original seed.
+    BeginTransaction();
     CHECK_YBC_STATUS(YBCPgExecInsert(pg_stmt));
     CommitTransaction();
 
     // Update the constant expresions to insert the next row.
     // TODO(neil) When we support binds, we can also call UpdateBind here.
     seed++;
-    YBCPgUpdateConstInt8(expr_hash, seed, false);
-    YBCPgUpdateConstInt4(expr_id, seed, false);
-    YBCPgUpdateConstInt2(expr_depcnt, seed, false);
-    YBCPgUpdateConstInt4(expr_projcnt, 100 + seed, false);
-    YBCPgUpdateConstFloat4(expr_salary, seed + 1.0*seed/10.0, false);
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt8(expr_hash, seed, false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt4(expr_id, seed, false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt2(expr_depcnt, seed, false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt4(expr_projcnt, 100 + seed, false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstFloat4(expr_salary, seed + 1.0*seed/10.0, false));
     job = strings::Substitute("Job_title_$0", seed);
-    YBCPgUpdateConstChar(expr_job, job.c_str(), job.size(), false);
+    CHECK_YBC_STATUS(YBCPgUpdateConstText(expr_job, job.c_str(), false));
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
-  CommitTransaction();
   pg_stmt = nullptr;
 
   // DELETE ----------------------------------------------------------------------------------------
   // Allocate new delete.
-  CHECK_YBC_STATUS(YBCPgNewDelete(pg_session_, kDefaultDatabaseOid, tab_oid, &pg_stmt));
+  CHECK_YBC_STATUS(YBCPgNewDelete(
+      kDefaultDatabaseOid, tab_oid, false /* is_region_local */, &pg_stmt, YB_TRANSACTIONAL));
 
   // Allocate constant expressions.
   // TODO(neil) We can also allocate expression with bind.
@@ -125,42 +142,42 @@ TEST_F(PggateTestDelete, TestDelete) {
   const int delete_row_count = (insert_row_count + 1)/ 2;
   for (int i = 0; i < delete_row_count; i++) {
     // Delete the row with the original seed.
+    BeginTransaction();
     CHECK_YBC_STATUS(YBCPgExecDelete(pg_stmt));
     CommitTransaction();
 
     // Update the constant expresions to delete the next row.
     // TODO(neil) When we support binds, we can also call UpdateBind here.
     seed = seed + 2;
-    YBCPgUpdateConstInt8(expr_hash, seed, false);
-    YBCPgUpdateConstInt4(expr_id, seed, false);
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt8(expr_hash, seed, false));
+    CHECK_YBC_STATUS(YBCPgUpdateConstInt4(expr_id, seed, false));
   }
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
-  CommitTransaction();
   pg_stmt = nullptr;
 
   // SELECT ----------------------------------------------------------------------------------------
   LOG(INFO) << "Test SELECTing from non-partitioned table";
-  CHECK_YBC_STATUS(YBCPgNewSelect(pg_session_, kDefaultDatabaseOid, tab_oid, kInvalidOid, &pg_stmt,
-                                  nullptr /* read_time */));
+  CHECK_YBC_STATUS(YBCPgNewSelect(kDefaultDatabaseOid, tab_oid, NULL /* prepare_params */,
+                                  false /* is_region_local */, &pg_stmt));
 
   // Specify the selected expressions.
   YBCPgExpr colref;
-  YBCTestNewColumnRef(pg_stmt, 1, DataType::INT64, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 1, DataType::INT64, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
-  YBCTestNewColumnRef(pg_stmt, 2, DataType::INT32, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 2, DataType::INT32, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
-  YBCTestNewColumnRef(pg_stmt, 3, DataType::INT16, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 3, DataType::INT16, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
-  YBCTestNewColumnRef(pg_stmt, 4, DataType::INT32, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 4, DataType::INT32, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
-  YBCTestNewColumnRef(pg_stmt, 5, DataType::FLOAT, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 5, DataType::FLOAT, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
-  YBCTestNewColumnRef(pg_stmt, 6, DataType::STRING, &colref);
+  CHECK_YBC_STATUS(YBCTestNewColumnRef(pg_stmt, 6, DataType::STRING, &colref));
   CHECK_YBC_STATUS(YBCPgDmlAppendTarget(pg_stmt, colref));
 
   // Execute select statement.
-  YBCPgExecSelect(pg_stmt);
+  BeginTransaction();
+  CHECK_YBC_STATUS(YBCPgExecSelect(pg_stmt, nullptr /* exec_params */));
 
   // Fetching rows and check their contents.
   uint64_t *values = static_cast<uint64_t*>(YBCPAlloc(col_count * sizeof(uint64_t)));
@@ -168,7 +185,7 @@ TEST_F(PggateTestDelete, TestDelete) {
   int select_row_count = 0;
   for (int i = 0; i < insert_row_count; i++) {
     bool has_data = false;
-    YBCPgDmlFetch(pg_stmt, col_count, values, isnulls, nullptr, &has_data);
+    CHECK_YBC_STATUS(YBCPgDmlFetch(pg_stmt, col_count, values, isnulls, nullptr, &has_data));
     if (!has_data) {
       break;
     }
@@ -185,8 +202,8 @@ TEST_F(PggateTestDelete, TestDelete) {
 
     // Check result.
     int col_index = 0;
-    int32_t hash_id = values[col_index++];  // id : int32
-    int32_t id = values[col_index++];  // id : int32
+    auto hash_id = values[col_index++];  // id : int32
+    auto id = values[col_index++];  // id : int32
     CHECK_EQ(hash_id, id) << "Expect hash and range key share the same value";
     CHECK(id%2 == 0) << "Odd rows should have been deleted";
     CHECK_EQ(values[col_index++], id);  // dependent_count : int16
@@ -199,8 +216,8 @@ TEST_F(PggateTestDelete, TestDelete) {
     CHECK_EQ(selected_job_name, expected_job_name);
   }
   CHECK_EQ(select_row_count, insert_row_count - delete_row_count) << "Unexpected row count";
+  CommitTransaction();
 
-  CHECK_YBC_STATUS(YBCPgDeleteStatement(pg_stmt));
   pg_stmt = nullptr;
 }
 

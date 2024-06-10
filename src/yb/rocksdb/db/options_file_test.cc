@@ -18,7 +18,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 #include <string>
 
 #include "yb/rocksdb/db/db_impl.h"
@@ -27,8 +26,10 @@
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/util/testharness.h"
 
+#include "yb/rocksdb/util/testutil.h"
+
 namespace rocksdb {
-class OptionsFileTest : public testing::Test {
+class OptionsFileTest : public RocksDBTest {
  public:
   OptionsFileTest() : dbname_(test::TmpDir() + "/options_file_test") {}
 
@@ -40,7 +41,7 @@ void UpdateOptionsFiles(DB* db,
                         std::unordered_set<std::string>* filename_history,
                         int* options_files_count) {
   std::vector<std::string> filenames;
-  db->GetEnv()->GetChildren(db->GetName(), &filenames);
+  ASSERT_OK(db->GetEnv()->GetChildren(db->GetName(), &filenames));
   uint64_t number;
   FileType type;
   *options_files_count = 0;
@@ -57,7 +58,7 @@ void VerifyOptionsFileName(
     DB* db, const std::unordered_set<std::string>& past_filenames) {
   std::vector<std::string> filenames;
   std::unordered_set<std::string> current_filenames;
-  db->GetEnv()->GetChildren(db->GetName(), &filenames);
+  ASSERT_OK(db->GetEnv()->GetChildren(db->GetName(), &filenames));
   uint64_t number;
   FileType type;
   for (auto filename : filenames) {
@@ -80,7 +81,7 @@ TEST_F(OptionsFileTest, NumberOfOptionsFiles) {
   const int kReopenCount = 20;
   Options opt;
   opt.create_if_missing = true;
-  DestroyDB(dbname_, opt);
+  ASSERT_OK(DestroyDB(dbname_, opt));
   std::unordered_set<std::string> filename_history;
   DB* db;
   for (int i = 0; i < kReopenCount; ++i) {
@@ -123,12 +124,3 @@ int main(int argc, char** argv) {
   return 0;
 #endif  // !(defined NDEBUG) || !defined(OS_WIN)
 }
-#else
-
-#include <cstdio>
-
-int main(int argc, char** argv) {
-  printf("Skipped as Options file is not supported in RocksDBLite.\n");
-  return 0;
-}
-#endif  // !ROCKSDB_LITE

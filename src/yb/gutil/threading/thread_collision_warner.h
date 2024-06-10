@@ -17,14 +17,11 @@
 // under the License.
 //
 
-#ifndef BASE_THREADING_THREAD_COLLISION_WARNER_H_
-#define BASE_THREADING_THREAD_COLLISION_WARNER_H_
-
-#include <memory>
+#pragma once
 
 #include "yb/gutil/atomicops.h"
-#include "yb/gutil/port.h"
 #include "yb/gutil/macros.h"
+#include "yb/gutil/port.h"
 
 #ifndef BASE_EXPORT
 #define BASE_EXPORT
@@ -259,5 +256,3 @@ class BASE_EXPORT ThreadCollisionWarner {
 };
 
 }  // namespace base
-
-#endif  // BASE_THREADING_THREAD_COLLISION_WARNER_H_

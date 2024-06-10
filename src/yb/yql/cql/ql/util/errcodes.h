@@ -18,14 +18,9 @@
 //   Compilation and execution should continue after a warning is raised.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_UTIL_ERRCODES_H_
-#define YB_YQL_CQL_QL_UTIL_ERRCODES_H_
+#pragma once
 
-#include <cstdint>
-
-#include "yb/common/ql_protocol.pb.h"
-
-#include "yb/util/status.h"
+#include "yb/util/status_ec.h"
 
 // Return an unauthorized error if authentication is not enabled through the flag
 // use_cassandra_authentication.
@@ -107,9 +102,12 @@ enum class ErrorCode : int64_t {
   DUPLICATE_TYPE = -218,
   DUPLICATE_TYPE_FIELD = -219,
   ALTER_KEY_COLUMN = -220,
-  INCOMPATIBLE_COPARTITION_SCHEMA = -221,
+  // reserved code: INCOMPATIBLE_COPARTITION_SCHEMA = -221
   INVALID_ROLE_DEFINITION = -222,
   DUPLICATE_ROLE = -223,
+  NULL_IN_COLLECTIONS = -224,
+  DUPLICATE_UPDATE_PROPERTY = -225,
+  INVALID_UPDATE_PROPERTY = -226,
 
   //------------------------------------------------------------------------------------------------
   // Execution errors [-300, x).
@@ -131,6 +129,7 @@ enum class ErrorCode : int64_t {
   RESOURCE_NOT_FOUND = -315,
   INVALID_REQUEST = -316,
   PERMISSION_NOT_FOUND = -317,
+  CONDITION_NOT_SATISFIED = -318,
 
 };
 
@@ -148,9 +147,17 @@ constexpr const char *kErrorFontStart = "\033[31m";
 constexpr const char *kErrorFontEnd = "\033[0m";
 
 std::string FormatForComparisonFailureMessage(ErrorCode op, ErrorCode other);
-ErrorCode QLStatusToErrorCode(QLResponsePB::QLStatus status);
+
+struct QLErrorTag : IntegralErrorTag<ErrorCode> {
+  // This category id is part of the wire protocol and should not be changed once released.
+  static constexpr uint8_t kCategory = 4;
+
+  static std::string ToMessage(Value code) {
+    return ErrorText(code);
+  }
+};
+
+typedef StatusErrorCodeImpl<QLErrorTag> QLError;
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_UTIL_ERRCODES_H_

@@ -11,11 +11,9 @@
 // under the License.
 //
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_ELEMENT_H
-#define YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_ELEMENT_H
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/tree_node.h"
-#include "yb/yql/cql/ql/ptree/pt_expr.h"
 
 namespace yb {
 namespace ql {
@@ -31,9 +29,9 @@ class PTDmlUsingClauseElement : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructors and destructor.
   PTDmlUsingClauseElement(MemoryContext *memctx,
-                          YBLocation::SharedPtr loc,
+                          YBLocationPtr loc,
                           const MCSharedPtr<MCString>& name,
-                          const PTExpr::SharedPtr& value);
+                          const PTExprPtr& value);
 
   virtual ~PTDmlUsingClauseElement();
 
@@ -49,29 +47,20 @@ class PTDmlUsingClauseElement : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
-  const PTExpr::SharedPtr value() {
+  const PTExprPtr value() {
     return value_;
   }
 
-  bool IsTTL() const {
-    return strcmp(name_->c_str(), kTtl) == 0;
-  }
+  bool IsTTL() const;
 
-  bool IsTimestamp() const {
-    return strcmp(name_->c_str(), kTimestamp) == 0;
-  }
+  bool IsTimestamp() const;
 
  private:
-  constexpr static const char* const kTtl = "ttl";
-  constexpr static const char* const kTimestamp = "timestamp";
-
   const MCSharedPtr<MCString> name_;
-  const PTExpr::SharedPtr value_;
+  const PTExprPtr value_;
 };
 
 } // namespace ql
 } // namespace yb
-
-#endif // YB_YQL_CQL_QL_PTREE_PT_DML_USING_CLAUSE_ELEMENT_H

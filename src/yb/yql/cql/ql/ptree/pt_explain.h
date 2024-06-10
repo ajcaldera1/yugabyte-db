@@ -15,14 +15,10 @@
 // Tree node definitions for EXPLAIN statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_EXPLAIN_H_
-#define YB_YQL_CQL_QL_PTREE_PT_EXPLAIN_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/list_node.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
-#include "yb/yql/cql/ql/ptree/pt_select.h"
-#include "yb/yql/cql/ql/ptree/column_desc.h"
-#include "yb/yql/cql/ql/ptree/pt_dml.h"
 
 namespace yb {
 namespace ql {
@@ -39,7 +35,7 @@ class PTExplainStmt : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTExplainStmt(MemoryContext *memctx,
-                YBLocation::SharedPtr loc,
+                YBLocationPtr loc,
                 TreeNode::SharedPtr stmt);
   virtual ~PTExplainStmt();
 
@@ -50,7 +46,7 @@ class PTExplainStmt : public TreeNode {
   }
 
 //  // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   // Node type.
@@ -72,5 +68,3 @@ class PTExplainStmt : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_EXPLAIN_H_

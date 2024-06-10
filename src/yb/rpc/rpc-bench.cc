@@ -35,29 +35,32 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/rpc/proxy.h"
 #include "yb/rpc/rpc-test-base.h"
+#include "yb/rpc/rpc_controller.h"
 #include "yb/rpc/rtest.proxy.h"
+
 #include "yb/util/countdown_latch.h"
+#include "yb/util/net/net_util.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals; // NOLINT
 
 using std::string;
-using std::shared_ptr;
 
 namespace yb {
 namespace rpc {
 
 class RpcBench : public RpcTestBase {
  public:
-  RpcBench()
-  {}
+  RpcBench() {}
 
  protected:
   friend class ClientThread;
 
   HostPort server_hostport_;
-  shared_ptr<Messenger> client_messenger_;
   std::atomic<bool> should_run_{true};
 };
 
@@ -69,16 +72,18 @@ class ClientThread {
   }
 
   void Start() {
-    thread_.reset(new std::thread(&ClientThread::Run, this));
+    CHECK_OK(Thread::Create("rpc_bench", "client", &ClientThread::Run, this, &thread_));
   }
 
   void Join() {
-    thread_->join();
+    if (thread_) {
+      thread_->Join();
+    }
   }
 
   void Run() {
-    shared_ptr<Messenger> client_messenger = bench_->CreateMessenger("Client");
-    ProxyCache proxy_cache(client_messenger);
+    auto client_messenger = CreateAutoShutdownMessengerHolder(bench_->CreateMessenger("Client"));
+    ProxyCache proxy_cache(client_messenger.get());
 
     rpc_test::CalculatorServiceProxy p(&proxy_cache, HostPort(bench_->server_hostport_));
 
@@ -95,7 +100,7 @@ class ClientThread {
     }
   }
 
-  std::unique_ptr<std::thread> thread_;
+  scoped_refptr<Thread> thread_;
   RpcBench *bench_;
   int request_count_;
 };
@@ -113,7 +118,7 @@ TEST_F(RpcBench, BenchmarkCalls) {
   LOG(INFO) << "Connecting to " << server_hostport_;
   MessengerOptions client_options = kDefaultClientMessengerOptions;
   client_options.n_reactors = 2;
-  client_messenger_ = CreateMessenger("Client", client_options);
+  auto client_messenger = CreateAutoShutdownMessengerHolder("Client", client_options);
 
   Stopwatch sw(Stopwatch::ALL_THREADS);
   sw.start();
@@ -152,4 +157,3 @@ TEST_F(RpcBench, BenchmarkCalls) {
 
 } // namespace rpc
 } // namespace yb
-

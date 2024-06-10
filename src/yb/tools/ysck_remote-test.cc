@@ -33,17 +33,25 @@
 #include <gtest/gtest.h>
 
 #include "yb/client/client.h"
-#include "yb/client/table_creator.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/yb_op.h"
+
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/integration-tests/mini_cluster.h"
-#include "yb/master/mini_master.h"
+
 #include "yb/tools/data_gen_util.h"
 #include "yb/tools/ysck_remote.h"
+
 #include "yb/util/monotime.h"
+#include "yb/util/promise.h"
 #include "yb/util/random.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
+#include "yb/util/thread.h"
 
 using namespace std::literals;
 
@@ -52,27 +60,25 @@ DECLARE_int32(heartbeat_interval_ms);
 namespace yb {
 namespace tools {
 
-using client::YBColumnSchema;
 using client::YBSchemaBuilder;
 using client::YBSession;
 using client::YBTable;
 using client::YBTableCreator;
 using client::YBTableName;
 using std::shared_ptr;
-using std::static_pointer_cast;
 using std::string;
 using std::vector;
 using strings::Substitute;
 
-static const YBTableName kTableName("my_keyspace", "ysck-test-table");
+static const YBTableName kTableName(YQL_DATABASE_CQL, "my_keyspace", "ysck-test-table");
 
 class RemoteYsckTest : public YBTest {
  public:
   RemoteYsckTest()
     : random_(SeedRandom()) {
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->HashPrimaryKey();
-    b.AddColumn("int_val")->Type(INT32)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->NotNull()->HashPrimaryKey();
+    b.AddColumn("int_val")->Type(DataType::INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
   }
 
@@ -80,23 +86,22 @@ class RemoteYsckTest : public YBTest {
     YBTest::SetUp();
 
     // Speed up testing, saves about 700ms per TEST_F.
-    FLAGS_heartbeat_interval_ms = 10;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_interval_ms) = 10;
 
     MiniClusterOptions opts;
     opts.num_tablet_servers = 3;
-    mini_cluster_.reset(new MiniCluster(env_.get(), opts));
+    mini_cluster_.reset(new MiniCluster(opts));
     ASSERT_OK(mini_cluster_->Start());
 
-    master_rpc_addr_ = mini_cluster_->mini_master()->bound_rpc_addr();
+    master_rpc_addr_ = ASSERT_RESULT(mini_cluster_->GetLeaderMasterBoundRpcAddr());
 
     // Connect to the cluster.
-    ASSERT_OK(client::YBClientBuilder()
-                     .add_master_server_addr(ToString(master_rpc_addr_))
-                     .Build(&client_));
+    client_ = ASSERT_RESULT(mini_cluster_->CreateClient());
 
     // Create one table.
-    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name()));
-    gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
+    ASSERT_OK(client_->CreateNamespaceIfNotExists(kTableName.namespace_name(),
+                                                  kTableName.namespace_type()));
+    std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
     ASSERT_OK(table_creator->table_name(kTableName)
                      .schema(&schema_)
                      .num_tablets(3)
@@ -110,6 +115,7 @@ class RemoteYsckTest : public YBTest {
   }
 
   void TearDown() override {
+    client_.reset();
     if (mini_cluster_) {
       mini_cluster_->Shutdown();
       mini_cluster_.reset();
@@ -129,13 +135,12 @@ class RemoteYsckTest : public YBTest {
       promise->Set(status);
       return;
     }
-    shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeout(10s);
+    auto session = client_->NewSession(10s);
 
     for (uint64_t i = 0; continue_writing.Load(); i++) {
       std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
       GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
-      status = session->ApplyAndFlush(insert);
+      status = session->TEST_ApplyAndFlush(insert);
       if (!status.ok()) {
         promise->Set(status);
         return;
@@ -150,24 +155,23 @@ class RemoteYsckTest : public YBTest {
   Status GenerateRowWrites(uint64_t num_rows) {
     shared_ptr<YBTable> table;
     RETURN_NOT_OK(client_->OpenTable(kTableName, &table));
-    shared_ptr<YBSession> session(client_->NewSession());
-    session->SetTimeout(10s);
+    auto session = client_->NewSession(10s);
     for (uint64_t i = 0; i < num_rows; i++) {
       VLOG(1) << "Generating write for row id " << i;
       std::shared_ptr<client::YBqlWriteOp> insert(table->NewQLInsert());
       GenerateDataForRow(table->schema(), i, &random_, insert->mutable_request());
-      RETURN_NOT_OK(session->Apply(insert));
+      session->Apply(insert);
 
       if (i > 0 && i % 1000 == 0) {
-        RETURN_NOT_OK(session->Flush());
+        RETURN_NOT_OK(session->TEST_Flush());
       }
     }
-    RETURN_NOT_OK(session->Flush());
+    RETURN_NOT_OK(session->TEST_Flush());
     return Status::OK();
   }
 
   std::shared_ptr<Ysck> ysck_;
-  shared_ptr<client::YBClient> client_;
+  std::unique_ptr<client::YBClient> client_;
 
  private:
   HostPort master_rpc_addr_;

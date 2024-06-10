@@ -21,12 +21,13 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_TABLE_TABLE_READER_H
-#define ROCKSDB_TABLE_TABLE_READER_H
+#pragma once
 
 #include <memory>
 
-#include "yb/util/slice.h"
+#include "yb/rocksdb/status.h"
+
+#include "yb/util/result.h"
 
 namespace rocksdb {
 
@@ -37,6 +38,8 @@ struct ReadOptions;
 struct TableProperties;
 class GetContext;
 class InternalIterator;
+class RandomAccessFileReader;
+class WritableFile;
 
 // A Table is a sorted map from strings to strings.  Tables are
 // immutable and persistent.  A Table may be safely accessed from
@@ -49,7 +52,7 @@ class TableReader {
   virtual bool IsSplitSst() const = 0;
 
   // Set data file reader for SST split into data and metadata files.
-  virtual void SetDataFileReader(unique_ptr<RandomAccessFileReader>&& data_file) = 0;
+  virtual void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) = 0;
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
@@ -63,6 +66,10 @@ class TableReader {
   virtual InternalIterator* NewIterator(const ReadOptions&,
                                         Arena* arena = nullptr,
                                         bool skip_filters = false) = 0;
+
+  // TODO(index_iter): consider allocating index iterator on arena, try and measure potential
+  // performance improvements.
+  virtual InternalIterator* NewIndexIterator(const ReadOptions& read_options) = 0;
 
   // Given a key, return an approximate byte offset in the file where
   // the data for that key begins (or would begin if the key were
@@ -114,8 +121,12 @@ class TableReader {
   virtual Status DumpTable(WritableFile* out_file) {
     return STATUS(NotSupported, "DumpTable() not supported");
   }
+
+  // Returns approximate middle key which divides SST file into two parts containing roughly the
+  // same amount of keys.
+  virtual yb::Result<std::string> GetMiddleKey() {
+    return STATUS(NotSupported, "GetMiddleKey() not supported");
+  }
 };
 
 }  // namespace rocksdb
-
-#endif  // ROCKSDB_TABLE_TABLE_READER_H

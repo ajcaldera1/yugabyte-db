@@ -36,21 +36,23 @@ int main() {
 #include <memory>
 #include <thread>
 #include <vector>
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
-#include "dynamic_bloom.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/util/arena.h"
+#include "yb/rocksdb/util/dynamic_bloom.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/util/stop_watch.h"
 
+#include "yb/util/test_util.h"
+
 using GFLAGS::ParseCommandLineFlags;
 
-DEFINE_int32(bits_per_key, 10, "");
-DEFINE_int32(num_probes, 6, "");
-DEFINE_bool(enable_perf, false, "");
+DEFINE_NON_RUNTIME_int32(bits_per_key, 10, "");
+DEFINE_NON_RUNTIME_int32(num_probes, 6, "");
+DEFINE_NON_RUNTIME_bool(enable_perf, false, "");
 
 namespace rocksdb {
 
@@ -59,7 +61,7 @@ static Slice Key(uint64_t i, char* buffer) {
   return Slice(buffer, sizeof(i));
 }
 
-class DynamicBloomTest : public testing::Test {};
+class DynamicBloomTest : public RocksDBTest {};
 
 TEST_F(DynamicBloomTest, EmptyFilter) {
   Arena arena;

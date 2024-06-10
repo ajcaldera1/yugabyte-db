@@ -16,19 +16,17 @@
 #include <future>
 #include <thread>
 
-#include <boost/optional/optional.hpp>
-
 #include "yb/rpc/io_thread_pool.h"
 #include "yb/rpc/rpc-test-base.h"
 #include "yb/rpc/scheduler.h"
 
 #include "yb/util/countdown_latch.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
 namespace rpc {
 
-using std::shared_ptr;
 using namespace std::placeholders;
 using namespace std::literals;
 

@@ -15,6 +15,8 @@
 
 #include "yb/server/hybrid_clock.h"
 
+#include "yb/util/stol_utils.h"
+
 namespace yb {
 namespace server {
 
@@ -27,14 +29,18 @@ SkewedClock::DeltaTime SkewedClock::SetDelta(DeltaTime new_delta) {
 }
 
 void SkewedClock::Register() {
-  HybridClock::RegisterProvider(kName, [] {
-    return std::make_shared<SkewedClock>(WallClock());
+  HybridClock::RegisterProvider(kName, [](const std::string& options) {
+    auto result = std::make_shared<SkewedClock>(WallClock());
+    if (!options.empty()) {
+      result->SetDelta(std::chrono::milliseconds(CHECK_RESULT(CheckedStoll(options))));
+    }
+    return result;
   });
 }
 
 Result<PhysicalTime> SkewedClock::Now() {
   auto result = VERIFY_RESULT(impl_->Now());
-  result.time_point += delta_.load(std::memory_order_acquire);
+  result.time_point += delta_.load(std::memory_order_acquire).count();
   return result;
 }
 

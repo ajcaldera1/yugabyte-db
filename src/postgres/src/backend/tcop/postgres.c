@@ -1,4 +1,4 @@
-/*-------------------------------------------------------------------------
+ /*-------------------------------------------------------------------------
  *
  * postgres.c
  *	  POSTGRES C Backend Interface
@@ -19,6 +19,7 @@
 
 #include "postgres.h"
 
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
@@ -40,10 +41,14 @@
 #include "access/printtup.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
+#include "catalog/yb_catalog_version.h"
 #include "commands/async.h"
+#include "commands/portalcmds.h"
 #include "commands/prepare.h"
 #include "executor/spi.h"
 #include "jit/jit.h"
+
+#include "libpq/auth.h"
 #include "libpq/libpq.h"
 #include "libpq/pqformat.h"
 #include "libpq/pqsignal.h"
@@ -71,6 +76,7 @@
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/inval.h"
 #include "utils/relcache.h"
 #include "utils/catcache.h"
 #include "utils/syscache.h"
@@ -82,6 +88,12 @@
 #include "utils/timestamp.h"
 #include "mb/pg_wchar.h"
 #include "pg_yb_utils.h"
+#include "libpq/yb_pqcomm_extensions.h"
+#include "utils/builtins.h"
+#include "utils/rel.h"
+
+/* YB includes */
+#include "replication/walsender_private.h"
 
 /* ----------------
  *		global variables
@@ -174,6 +186,19 @@ static StringInfoData row_description_buf;
 
 /* Flag to mark cache as invalid if discovered within a txn block. */
 static bool yb_need_cache_refresh = false;
+
+/* whether or not we are executing a multi-statement query received via simple query protocol */
+static bool yb_is_multi_statement_query = false;
+
+/* whether ASH metadata is set or not */
+static bool yb_is_ash_metadata_set = false;
+
+/*
+ * String constants used for redacting text after the password token in
+ * CREATE/ALTER ROLE commands.
+ */
+#define TOKEN_PASSWORD "password"
+#define TOKEN_REDACTED "<REDACTED>"
 
 /* ----------------------------------------------------------------
  *		decls for routines only used in this file
@@ -472,6 +497,22 @@ SocketBackend(StringInfo inBuf)
 						 errmsg("invalid frontend message type %d", qtype)));
 			break;
 
+		case 'A': /* Auth Passthrough Request */
+
+			if (!YbIsClientYsqlConnMgr())
+				ereport(FATAL,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("invalid frontend message type %d", qtype)));
+			break;
+
+		case 's': /* SET SESSION PARAMETER */
+
+			if (!YbIsClientYsqlConnMgr())
+				ereport(FATAL,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("invalid frontend message type %d", qtype)));
+			break;
+
 		default:
 
 			/*
@@ -494,6 +535,31 @@ SocketBackend(StringInfo inBuf)
 	{
 		if (pq_getmessage(inBuf, 0))
 			return EOF;			/* suitable message already logged */
+		if (IsYugaByteEnabled())
+		{
+			switch(qtype)
+			{
+				case 'E':
+					switch (yb_pg_batch_detection_mechanism)
+					{
+						case ASSUME_ALL_BATCH_EXECUTIONS:
+							YbSetIsBatchedExecution(true);
+							break;
+						case DETECT_BY_PEEKING:
+							if (!YbIsBatchedExecution() &&
+								yb_pq_peekbyte_no_msg_reading_status_check() !=
+									'S')
+								YbSetIsBatchedExecution(true);
+							break;
+					}
+					break;
+				case 'S':
+					YbSetIsBatchedExecution(false);
+					break;
+				default:
+					break;
+			}
+		}
 	}
 	else
 		pq_endmsgread();
@@ -517,7 +583,9 @@ ReadCommand(StringInfo inBuf)
 	if (whereToSendOutput == DestRemote)
 		result = SocketBackend(inBuf);
 	else
+	{
 		result = InteractiveBackend(inBuf);
+	}
 	return result;
 }
 
@@ -739,6 +807,13 @@ pg_analyze_and_rewrite_params(RawStmt *parsetree,
 
 	query = transformTopLevelStmt(pstate, parsetree);
 
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		SetTxnWithPGRel();
+	}
+
 	if (post_parse_analyze_hook)
 		(*post_parse_analyze_hook) (pstate, query);
 
@@ -925,13 +1000,15 @@ exec_simple_query(const char *query_string)
 	bool		was_logged = false;
 	bool		use_implicit_block;
 	char		msec_str[32];
+	const char *redacted_query_string;
 
 	/*
 	 * Report query to various monitoring facilities.
 	 */
 	debug_query_string = query_string;
 
-	pgstat_report_activity(STATE_RUNNING, query_string);
+	redacted_query_string = RedactPasswordIfExists(query_string);
+	pgstat_report_activity(STATE_RUNNING, redacted_query_string);
 
 	TRACE_POSTGRESQL_QUERY_START(query_string);
 
@@ -970,11 +1047,11 @@ exec_simple_query(const char *query_string)
 	 */
 	parsetree_list = pg_parse_query(query_string);
 
-	/* Log immediately if dictated by log_statement */
+	/* Log the redacted query immediately if dictated by log_statement */
 	if (check_log_statement(parsetree_list))
 	{
 		ereport(LOG,
-				(errmsg("statement: %s", query_string),
+				(errmsg("statement: %s", redacted_query_string),
 				 errhidestmt(true),
 				 errdetail_execute(parsetree_list)));
 		was_logged = true;
@@ -994,6 +1071,7 @@ exec_simple_query(const char *query_string)
 	 * transaction block.
 	 */
 	use_implicit_block = (list_length(parsetree_list) > 1);
+	yb_is_multi_statement_query = use_implicit_block;
 
 	/*
 	 * Run through the raw parsetree(s) and process each one.
@@ -1225,7 +1303,7 @@ exec_simple_query(const char *query_string)
 		case 2:
 			ereport(LOG,
 					(errmsg("duration: %s ms  statement: %s",
-							msec_str, query_string),
+							msec_str, redacted_query_string),
 					 errhidestmt(true),
 					 errdetail_execute(parsetree_list)));
 			break;
@@ -1261,13 +1339,15 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	bool		is_named;
 	bool		save_log_statement_stats = log_statement_stats;
 	char		msec_str[32];
+	const char *redacted_query_string;
 
 	/*
 	 * Report query to various monitoring facilities.
 	 */
 	debug_query_string = query_string;
 
-	pgstat_report_activity(STATE_RUNNING, query_string);
+	redacted_query_string = RedactPasswordIfExists(query_string);
+	pgstat_report_activity(STATE_RUNNING, redacted_query_string);
 
 	set_ps_display("PARSE", false);
 
@@ -1277,7 +1357,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 	ereport(DEBUG2,
 			(errmsg("parse %s: %s",
 					*stmt_name ? stmt_name : "<unnamed>",
-					query_string)));
+					redacted_query_string)));
 
 	/*
 	 * Start up a transaction command so we can run parse analysis etc. (Note
@@ -1492,7 +1572,7 @@ exec_parse_message(const char *query_string,	/* string to execute */
 					(errmsg("duration: %s ms  parse %s: %s",
 							msec_str,
 							*stmt_name ? stmt_name : "<unnamed>",
-							query_string),
+							redacted_query_string),
 					 errhidestmt(true)));
 			break;
 	}
@@ -1522,6 +1602,7 @@ exec_bind_message(StringInfo input_message)
 	CachedPlan *cplan;
 	Portal		portal;
 	char	   *query_string;
+	const char *redacted_query_string;
 	char	   *saved_stmt_name;
 	ParamListInfo params;
 	MemoryContext oldContext;
@@ -1561,7 +1642,8 @@ exec_bind_message(StringInfo input_message)
 	 */
 	debug_query_string = psrc->query_string;
 
-	pgstat_report_activity(STATE_RUNNING, psrc->query_string);
+	redacted_query_string = RedactPasswordIfExists(psrc->query_string);
+	pgstat_report_activity(STATE_RUNNING, redacted_query_string);
 
 	set_ps_display("BIND", false);
 
@@ -1876,7 +1958,7 @@ exec_bind_message(StringInfo input_message)
 							*stmt_name ? stmt_name : "<unnamed>",
 							*portal_name ? "/" : "",
 							*portal_name ? portal_name : "",
-							psrc->query_string),
+							redacted_query_string),
 					 errhidestmt(true),
 					 errdetail_params(params)));
 			break;
@@ -2144,6 +2226,8 @@ check_log_statement(List *stmt_list)
 /*
  * check_log_duration
  *		Determine whether current command's duration should be logged
+ *		We also check if this statement in this transaction must be logged
+ *		(regardless of its duration).
  *
  * Returns:
  *		0 if no logging is needed
@@ -2159,12 +2243,15 @@ check_log_statement(List *stmt_list)
 int
 check_log_duration(char *msec_str, bool was_logged)
 {
-	if (log_duration || log_min_duration_statement >= 0)
+	if (log_duration || log_min_duration_sample >= 0 ||
+		log_min_duration_statement >= 0 || xact_is_sampled)
 	{
 		long		secs;
 		int			usecs;
 		int			msecs;
-		bool		exceeded;
+		bool		exceeded_duration;
+		bool		exceeded_sample_duration;
+		bool		in_sample = false;
 
 		TimestampDifference(GetCurrentStatementStartTimestamp(),
 							GetCurrentTimestamp(),
@@ -2172,20 +2259,35 @@ check_log_duration(char *msec_str, bool was_logged)
 		msecs = usecs / 1000;
 
 		/*
-		 * This odd-looking test for log_min_duration_statement being exceeded
-		 * is designed to avoid integer overflow with very long durations:
-		 * don't compute secs * 1000 until we've verified it will fit in int.
+		 * This odd-looking test for log_min_duration_* being exceeded is
+		 * designed to avoid integer overflow with very long durations: don't
+		 * compute secs * 1000 until we've verified it will fit in int.
 		 */
-		exceeded = (log_min_duration_statement == 0 ||
-					(log_min_duration_statement > 0 &&
-					 (secs > log_min_duration_statement / 1000 ||
-					  secs * 1000 + msecs >= log_min_duration_statement)));
+		exceeded_duration = (log_min_duration_statement == 0 ||
+							 (log_min_duration_statement > 0 &&
+							  (secs > log_min_duration_statement / 1000 ||
+							   secs * 1000 + msecs >= log_min_duration_statement)));
 
-		if (exceeded || log_duration)
+		exceeded_sample_duration = (log_min_duration_sample == 0 ||
+									(log_min_duration_sample > 0 &&
+									 (secs > log_min_duration_sample / 1000 ||
+									  secs * 1000 + msecs >= log_min_duration_sample)));
+
+		/*
+		 * Do not log if log_statement_sample_rate = 0. Log a sample if
+		 * log_statement_sample_rate <= 1 and avoid unecessary random() call
+		 * if log_statement_sample_rate = 1.
+		 */
+		if (exceeded_sample_duration)
+			in_sample = log_statement_sample_rate != 0 &&
+				(log_statement_sample_rate == 1 ||
+				 random() <= log_statement_sample_rate * MAX_RANDOM_VALUE);
+
+		if (exceeded_duration || in_sample || log_duration || xact_is_sampled)
 		{
 			snprintf(msec_str, 32, "%ld.%03d",
 					 secs * 1000 + msecs, usecs % 1000);
-			if (exceeded && !was_logged)
+			if ((exceeded_duration || in_sample || xact_is_sampled) && !was_logged)
 				return 2;
 			else
 				return 1;
@@ -2539,10 +2641,6 @@ finish_xact_command(void)
 #endif
 
 		xact_started = false;
-
-		if (YBTransactionsEnabled()) {
-			YBCHandleCommitError();
-		}
 	}
 }
 
@@ -2661,6 +2759,8 @@ quickdie(SIGNAL_ARGS)
 	 * Ideally this should be ereport(FATAL), but then we'd not get control
 	 * back...
 	 */
+
+#ifndef THREAD_SANITIZER
 	ereport(WARNING,
 			(errcode(ERRCODE_CRASH_SHUTDOWN),
 			 errmsg("terminating connection because of crash of another server process"),
@@ -2670,10 +2770,7 @@ quickdie(SIGNAL_ARGS)
 					   " shared memory."),
 			 errhint("In a moment you should be able to reconnect to the"
 					 " database and repeat your command.")));
-
-	if (IsYugaByteEnabled()) {
-		YBOnPostgresBackendShutdown();
-	}
+#endif
 
 	/*
 	 * We DO NOT want to run proc_exit() or atexit() callbacks -- we're here
@@ -2708,6 +2805,9 @@ die(SIGNAL_ARGS)
 		ProcDiePending = true;
 	}
 
+	if (IsYugaByteEnabled())
+		YBCInterruptPgGate();
+
 	/* If we're still here, waken anything waiting on the process latch */
 	SetLatch(MyLatch);
 
@@ -2721,10 +2821,6 @@ die(SIGNAL_ARGS)
 		ProcessInterrupts();
 
 	errno = save_errno;
-
-	if (IsYugaByteEnabled()) {
-		YBOnPostgresBackendShutdown();
-	}
 }
 
 /*
@@ -2810,7 +2906,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 					return;
 
 				/* Intentional fall through to check wait for pin */
-				/* FALLTHROUGH */
+				switch_fallthrough();
 
 			case PROCSIG_RECOVERY_CONFLICT_BUFFERPIN:
 
@@ -2824,7 +2920,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 				MyProc->recoveryConflictPending = true;
 
 				/* Intentional fall through to error handling */
-				/* FALLTHROUGH */
+				switch_fallthrough();
 
 			case PROCSIG_RECOVERY_CONFLICT_LOCK:
 			case PROCSIG_RECOVERY_CONFLICT_TABLESPACE:
@@ -2869,7 +2965,7 @@ RecoveryConflictInterrupt(ProcSignalReason reason)
 				}
 
 				/* Intentional fall through to session cancel */
-				/* FALLTHROUGH */
+				switch_fallthrough();
 
 			case PROCSIG_RECOVERY_CONFLICT_DATABASE:
 				RecoveryConflictPending = true;
@@ -3102,6 +3198,9 @@ ProcessInterrupts(void)
 
 	if (ParallelMessagePending)
 		HandleParallelMessages();
+
+	if (LogMemoryContextPending)
+		ProcessLogMemoryContextInterrupt();
 }
 
 
@@ -3162,7 +3261,14 @@ set_stack_base(void)
 #endif
 
 	/* Set up reference point for stack depth checking */
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdangling-pointer"
+#endif
 	stack_base_ptr = &stack_base;
+#if !defined(__clang__) && defined(__GNUC__) && __GNUC__ >= 12
+#pragma GCC diagnostic pop
+#endif
 #if defined(__ia64__) || defined(__ia64)
 	register_stack_base_ptr = ia64_get_bsp();
 #endif
@@ -3660,11 +3766,12 @@ process_postgres_switches(int argc, char *argv[], GucContext ctx,
  * version it is unfortunate but ok. The master version will have
  * changed too (making our version number obsolete) so we will just end
  * up needing to do another cache refresh later.
- * See the comment for yb_catalog_cache_version in 'pg_yb_utils.c' for
+ * See the comment for yb_catalog_cache_version in 'pg_yb_utils.h' for
  * more details.
  */
 static void YBRefreshCache()
 {
+	Assert(OidIsValid(MyDatabaseId));
 
 	/*
 	 * Check that we are not already inside a transaction or we might end up
@@ -3680,33 +3787,64 @@ static void YBRefreshCache()
 				        errmsg("Cannot refresh cache within a transaction")));
 	}
 
-	/* Get the latest syscatalog version from the master */
-	uint64 catalog_master_version = 0;
-	YBCPgGetCatalogMasterVersion(ybc_pg_session,
-	                             (uint64_t *) &catalog_master_version);
+	if (yb_debug_log_catcache_events)
+	{
+		ereport(LOG,(errmsg("Refreshing catalog cache.")));
+	}
+
+	/*
+	 * Get the latest syscatalog version from the master.
+	 * Reset the cached version type if needed to force reading catalog version
+	 * from the catalog table first.
+	 */
+	if (yb_catalog_version_type != CATALOG_VERSION_CATALOG_TABLE)
+		yb_catalog_version_type = CATALOG_VERSION_UNSET;
 
 	/* Need to execute some (read) queries internally so start a local txn. */
 	start_xact_command();
 
-	/* Clear and reload system catalog caches. */
+	/* Clear and reload system catalog caches, including all callbacks. */
 	ResetCatalogCaches();
+	YbRelationCacheInvalidate();
+	CallSystemCacheCallbacks();
+
 	YBPreloadRelCache();
 
 	/* Also invalidate the pggate cache. */
-	YBCPgInvalidateCache(ybc_pg_session);
+	HandleYBStatus(YBCPgInvalidateCache());
 
-	/* Set the new ysql cache version. */
-	yb_catalog_cache_version = catalog_master_version;
 	yb_need_cache_refresh = false;
 
 	finish_xact_command();
 }
 
-static void YBPrepareCacheRefreshIfNeeded(MemoryContext oldcontext,
-                                          bool consider_retry,
-                                          bool *need_retry)
+static bool YBTableSchemaVersionMismatchError(ErrorData *edata, char **table_id)
 {
-	bool need_cache_refresh = false;
+	if (!IsYugaByteEnabled())
+		return false;
+
+	const char *table_cache_refresh_search_str = "schema version mismatch for table ";
+	char *table_to_refresh = strstr(edata->message, table_cache_refresh_search_str);
+	if (table_to_refresh)
+	{
+		table_to_refresh += strlen(table_cache_refresh_search_str);
+		const int size_of_uuid = 16; /* boost::uuids::uuid::static_size() */
+		const int size_of_hex_uuid = size_of_uuid * 2;
+		if (strlen(table_to_refresh) >= size_of_hex_uuid)
+		{
+			if (table_id)
+				*table_id = pnstrdup(table_to_refresh, size_of_hex_uuid);
+			return true;
+		}
+	}
+	return false;
+}
+
+static void YBPrepareCacheRefreshIfNeeded(ErrorData *edata,
+										  bool consider_retry,
+										  bool is_dml,
+										  bool *need_retry)
+{
 	*need_retry = false;
 
 	/*
@@ -3715,80 +3853,1025 @@ static void YBPrepareCacheRefreshIfNeeded(MemoryContext oldcontext,
 	if (!IsYugaByteEnabled())
 		return;
 
-	/* Get error data */
-	ErrorData *edata;
-	MemoryContextSwitchTo(oldcontext);
-	edata = CopyErrorData();
-	bool is_retryable_err = YBNeedRetryAfterCacheRefresh(edata);
+	/*
+	 * A non-DDL statement that failed due to transaction conflict does not
+	 * require cache refresh.
+	*/
+	bool is_read_restart_error = YBCIsRestartReadError(edata->yb_txn_errcode);
+	bool is_conflict_error     = YBCIsTxnConflictError(edata->yb_txn_errcode);
+	bool is_deadlock_error	   = YBCIsTxnDeadlockError(edata->yb_txn_errcode);
+	/*
+	 * Note that 'is_dml' could be set for a Select operation on a pg_catalog
+	 * table. Even if it fails due to conflict, a retry is expected to succeed
+	 * without refreshing the cache (as the schema of a PG catalog table cannot
+	 * change).
+	 */
+	if (is_dml && (is_read_restart_error || is_conflict_error || is_deadlock_error))
+	{
+		return;
+	}
+	char *table_to_refresh = NULL;
+	const bool need_table_cache_refresh =
+	    YBTableSchemaVersionMismatchError(edata, &table_to_refresh);
 
 	/*
 	 * Get the latest syscatalog version from the master to check if we need
 	 * to refresh the cache.
 	 */
-	uint64 catalog_master_version = 0;
-	YBCPgGetCatalogMasterVersion(ybc_pg_session,
-	                             (uint64_t *) &catalog_master_version);
-	need_cache_refresh = yb_catalog_cache_version != catalog_master_version;
-	if (!need_cache_refresh)
+	bool need_global_cache_refresh = false;
+	/*
+	 * If an operation on the PG catalog has failed at this point, the
+	 * below YbGetMasterCatalogVersion() is not expected to succeed either as it
+	 * would be using the same transaction as the failed operation.
+	*/
+	if (!yb_non_ddl_txn_for_sys_tables_allowed)
+	{
+		YBCPgResetCatalogReadTime();
+		const uint64_t catalog_master_version = YbGetMasterCatalogVersion();
+		if (YbGetCatalogCacheVersion() != catalog_master_version) {
+			need_global_cache_refresh = true;
+			YbUpdateLastKnownCatalogCacheVersion(catalog_master_version);
+		}
+		if (*YBCGetGFlags()->log_ysql_catalog_versions)
+		{
+			int elevel = need_global_cache_refresh ? LOG : DEBUG1;
+			ereport(elevel,
+					(errmsg("%s: got master catalog version: %" PRIu64,
+							__func__, catalog_master_version)));
+		}
+	}
+	if (!(need_global_cache_refresh || need_table_cache_refresh))
 		return;
 
 	/*
 	 * Reset catalog version so that the cache gets marked as invalid and
 	 * will be refreshed after the txn ends.
 	 */
-	yb_need_cache_refresh = true;
+	if (need_global_cache_refresh)
+		yb_need_cache_refresh = true;
+	else if (need_table_cache_refresh)
+	{
+		ereport(LOG,
+				(errmsg("invalidating table cache entry %s",
+						table_to_refresh)));
+		HandleYBStatus(YBCPgInvalidateTableCacheByTableId(table_to_refresh));
+	}
 
 	/*
-	 * Prepare to retry the query if possible.
+	 * For single-query transactions we abort the current
+	 * transaction to undo any already-applied operations
+	 * and retry the query.
+	 *
+	 * For transaction blocks we would have to re-apply
+	 * all previous queries and also continue the
+	 * transaction for future queries (before commit).
+	 * So we just re-throw the error in that case.
+	 *
 	 */
-	if (is_retryable_err)
+	if (consider_retry &&
+			!IsTransactionBlock() &&
+			!YBCGetDisableTransparentCacheRefreshRetry())
 	{
+		/* Clear error state */
+		FlushErrorState();
+
 		/*
-		 * For single-query transactions we abort the current
-		 * transaction to undo any already-applied operations
-		 * and retry the query.
-		 *
-		 * For transaction blocks we would have to re-apply
-		 * all previous queries and also continue the
-		 * transaction for future queries (before commit).
-		 * So we just re-throw the error in that case.
-		 *
+		 * Make sure debug_query_string gets reset before we possibly clobber
+		 * the storage it points at.
 		 */
-		if (consider_retry && !IsTransactionBlock())
-		{
-			/* Clear error state */
-			FlushErrorState();
-			FreeErrorData(edata);
+		debug_query_string = NULL;
 
-			/* Abort the transaction and clean up. */
-			AbortCurrentTransaction();
-			if (am_walsender)
-				WalSndErrorCleanup();
+		/* Abort the transaction and clean up. */
+		AbortCurrentTransaction();
+		if (am_walsender)
+			WalSndErrorCleanup();
 
-			if (MyReplicationSlot != NULL)
-				ReplicationSlotRelease();
+		if (MyReplicationSlot != NULL)
+			ReplicationSlotRelease();
 
-			ReplicationSlotCleanup();
+		ReplicationSlotCleanup();
 
-			if (doing_extended_query_message)
-				ignore_till_sync = true;
+		if (doing_extended_query_message)
+			ignore_till_sync = true;
 
-			xact_started = false;
+		xact_started = false;
 
-			/* Refresh cache now so that the retry uses latest version. */
+		/* Refresh cache now so that the retry uses latest version. */
+		if (need_global_cache_refresh)
 			YBRefreshCache();
 
-			*need_retry = true;
+		*need_retry = true;
+	}
+	else
+	{
+		if (need_global_cache_refresh)
+		{
+			int error_code = edata->sqlerrcode;
+
+			/*
+			 * TODO: This error occurs in tablet service when snapshot is outdated.
+			 * We should eventually translate this type of error as a retryable error
+			 * in the upper layer such as in YBCStatusPgsqlError().
+			 */
+			bool isInvalidCatalogSnapshotError = strstr(edata->message,
+					"catalog snapshot used for this transaction has been invalidated") != NULL;
+
+			/*
+			 * If we got a schema-version-mismatch error while a DDL happened,
+			 * this is likely caused by a conflict between the current
+			 * transaction and the DDL transaction.
+			 * So we map it to the retryable serialization failure error code.
+			 * TODO: consider if we should
+			 * 1. map this case to a different (retryable) error code
+			 * 2. always map schema-version-mismatch to a retryable error.
+			 */
+			if (need_table_cache_refresh || isInvalidCatalogSnapshotError)
+			{
+				error_code = ERRCODE_T_R_SERIALIZATION_FAILURE;
+			}
+
+			/*
+			 * Report the original error, but add a context mentioning that a
+			 * possibly-conflicting, concurrent DDL transaction happened.
+			 */
+			ereport(edata->elevel,
+					(yb_txn_errcode(edata->yb_txn_errcode),
+					 errcode(error_code),
+					 errmsg("%s", edata->message),
+					 edata->detail ? errdetail("%s", edata->detail) : 0,
+					 edata->hint ? errhint("%s", edata->hint) : 0,
+					 errcontext("Catalog Version Mismatch: A DDL occurred "
+								"while processing this query. Try again.")));
 		}
 		else
 		{
+			Assert(need_table_cache_refresh);
 			ereport(ERROR,
-			        (errcode(ERRCODE_INTERNAL_ERROR),
-					        errmsg("Catalog Version Mismatch: A DDL occurred "
-					               "while processing this query. Try Again.")));
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("%s", edata->message)));
 		}
-
 	}
+}
+
+/*
+ * Parse query tree via pg_parse_query, suppressing log messages below ERROR level.
+ * This is useful e.g. for avoiding "not supported yet and will be ignored" warnings.
+ */
+static List* yb_parse_query_silently(const char *query_string)
+{
+	List* parsetree_list;
+
+	int prev_log_min_messages    = log_min_messages;
+	int prev_client_min_messages = client_min_messages;
+	PG_TRY();
+	{
+		log_min_messages    = ERROR;
+		client_min_messages = ERROR;
+		parsetree_list      = pg_parse_query(query_string);
+		log_min_messages    = prev_log_min_messages;
+		client_min_messages = prev_client_min_messages;
+	}
+	PG_CATCH();
+	{
+		log_min_messages    = prev_log_min_messages;
+		client_min_messages = prev_client_min_messages;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	return parsetree_list;
+}
+
+static const char* yb_parse_command_tag(const char *query_string)
+{
+	List* parsetree_list = yb_parse_query_silently(query_string);
+
+	if (list_length(parsetree_list) > 0) {
+		RawStmt* raw_parse_tree = linitial_node(RawStmt, parsetree_list);
+		return CreateCommandTag(raw_parse_tree->stmt);
+	} else {
+		return NULL;
+	}
+}
+
+static bool yb_is_begin_transaction(const char *command_tag)
+{
+	if (!command_tag)
+		return false;
+
+	return (strncmp(command_tag, "BEGIN", 5) == 0 ||
+	        strncmp(command_tag, "START TRANSACTION", 17) == 0);
+}
+
+/*
+ * Find whether the statement is a SELECT/UPDATE/INSERT/DELETE
+ * with minimum parsing.
+ * Note: This function will always return false if
+ * yb_non_ddl_txn_for_sys_tables_allowed is set to true.
+ */
+static bool yb_is_dml_command(const char *query_string)
+{
+	if (yb_non_ddl_txn_for_sys_tables_allowed)
+	{
+		/*
+		 * This guc variable is typically used to update the system catalog
+		 * directly. Therefore we can assume that the user is running a non-
+		 * DML statement.
+		*/
+		return false;
+	}
+	if (!query_string)
+		return false;
+
+	/*
+	 * Detect and return false for replication commands since they are never a
+	 * DML. This is needed to avoid calling yb_parse_command_tag for replication
+	 * commands which have a different grammar (repl_gram.y) and will always
+	 * lead to a syntax error.
+	 */
+	replication_scanner_init(query_string);
+	if (replication_scanner_is_replication_command())
+	{
+		replication_scanner_finish();
+		return false;
+	}
+
+	const char* command_tag = yb_parse_command_tag(query_string);
+	if (!command_tag)
+		return false;
+
+	return (strncmp(command_tag, "DELETE", 6) == 0 ||
+	        strncmp(command_tag, "INSERT", 6) == 0 ||
+	        strncmp(command_tag, "SELECT", 6) == 0 ||
+	        strncmp(command_tag, "UPDATE", 6) == 0);
+}
+
+/*
+ * Only retry supported commands.
+ */
+static bool yb_check_retry_allowed(const char *query_string)
+{
+	return yb_is_dml_command(query_string);
+}
+
+static void YBCheckSharedCatalogCacheVersion() {
+	/*
+	 * We cannot refresh the cache if we are already inside a transaction, so don't
+	 * bother checking shared memory.
+	 */
+	if (IsTransactionOrTransactionBlock())
+		return;
+
+	/*
+	 * Don't check shared memory if we are in initdb. E.g. during initial system
+	 * catalog snapshot creation, tablet servers may not be running.
+	 */
+	if (YBCIsInitDbModeEnvVarSet())
+		return;
+
+	const uint64_t shared_catalog_version = YbGetSharedCatalogVersion();
+	const bool need_global_cache_refresh =
+		YbGetCatalogCacheVersion() < shared_catalog_version;
+	if (*YBCGetGFlags()->log_ysql_catalog_versions)
+	{
+		int elevel = need_global_cache_refresh ? LOG : DEBUG1;
+		ereport(elevel,
+				(errmsg("%s: got tserver catalog version: %" PRIu64,
+						__func__, shared_catalog_version)));
+	}
+	if (need_global_cache_refresh)
+	{
+		YbUpdateLastKnownCatalogCacheVersion(shared_catalog_version);
+		YBRefreshCache();
+	}
+}
+
+/*
+ * Data needed to restart a query (plaintext or portal) after its execution failed.
+ *
+ * Note that in case of a portal query, it refers to values from portal's memory context,
+ * so it's only valid as long as the portal exists.
+ */
+typedef struct YBQueryRetryData
+{
+	const char *portal_name;	/* '\0' for unnamed portal, NULL if not a portal */
+	const char *query_string;
+	const char *command_tag;
+} YBQueryRetryData;
+
+static bool
+YBIsDmlCommandTag(const char *command_tag)
+{
+	return strncmp(command_tag, "UPDATE", 6) == 0 ||
+	       strncmp(command_tag, "INSERT", 6) == 0 ||
+	       strncmp(command_tag, "DELETE", 6) == 0;
+}
+
+/* Whether we are allowed to restart current query/txn. */
+static bool
+yb_is_retry_possible(
+	ErrorData *edata, int attempt, const YBQueryRetryData *retry_data)
+{
+	if (yb_debug_log_internal_restarts)
+		elog(LOG, "Error details: edata->message=%s, edata->filename=%s, edata->lineno=%d",
+				 edata->message, edata->filename, edata->lineno);
+
+	if (!IsYugaByteEnabled())
+	{
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "query layer retry isn't possible, YB is not enabled");
+		return false;
+	}
+
+	bool is_read_restart_error = YBCIsRestartReadError(edata->yb_txn_errcode);
+	bool is_conflict_error = YBCIsTxnConflictError(edata->yb_txn_errcode);
+	bool is_deadlock_error = YBCIsTxnDeadlockError(edata->yb_txn_errcode);
+
+	if (!is_read_restart_error && !is_conflict_error && !is_deadlock_error)
+	{
+		if (yb_debug_log_internal_restarts)
+			elog(
+					LOG, "query layer retry isn't possible, txn error %s isn't one of "
+					"kConflict/kReadRestart/kDeadlock", YBCTxnErrCodeToString(edata->yb_txn_errcode));
+		return false;
+	}
+
+	if (yb_is_multi_statement_query)
+	{
+		const char* retry_err = "query layer retries aren't supported for multi-statement queries "
+				"issued via the simple query protocol, upvote github issue #21833 if you want this";
+		edata->message = psprintf("%s (%s)", edata->message, retry_err);
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "%s", retry_err);
+		return false;
+	}
+
+	/*
+	 * TODO (#18616): Retry read committed transactions with best-effort in case of deadlock errors in
+	 * Wait on Conflict concurrency control mode.
+	 *
+	 * Note that we can't rollback and retry just the current statement as we do in read committed for
+	 * kReadRestart and kConflict errors (see yb_attempt_to_restart_on_error()). There are 2 reasons
+	 * for this:
+	 *
+	 * 1) The txn has already been aborted for breaking the deadlock.
+	 * 2) Even if we were to somehow ensure in docdb that the transaction is not aborted but just
+	 *    removed from the wait queue to avoid (1), we can't differentiate if locks acquired by this
+	 *    transaction that are part of the deadlock cycle were acquired in a previous statement or the
+	 *    current statement. If acquired in a previous statement, restarting the current statement is
+	 *    of no use. If acquired in the current statement, a restart could help in resolving the
+	 *    deadlock since the acquired locks would be released in the retry.
+	 *
+	 * When addressing this TODO, we should restart the whole transaction only if YBIsDataSent() is
+	 * false. YBIsDataSent() == false is needed because we can't retry the transaction if some data
+	 * has already been sent to the external client as part of this transaction. Plus, we can't just
+	 * use YBIsDataSentForCurrQuery() == false because we also want to ensure that we retry only if no
+	 * previous statement had executed.
+	 */
+	if (IsYBReadCommitted() && is_deadlock_error) {
+		const char* retry_err = "query layer retries are not supported for deadlock errors in "
+				"READ COMMITTED isolation, upvote github issue #18616 if you want this";
+		edata->message = psprintf("%s (%s)", edata->message, retry_err);
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "%s", retry_err);
+		return false;
+	}
+
+	/*
+	 * In REPEATABLE READ and SERIALIZABLE isolation levels, retrying involves restarting the whole
+	 * transaction. So, we can only retry if no data has been sent to the external client as part of
+	 * the current transaction.
+	 *
+	 * In READ COMMITTED, we can perform retries even if data has been sent as part of the txn, but
+	 * not if data has been sent as part of the current query. This is because in RC, we just have
+	 * to retry the query, and not the whole transaction.
+	 */
+	if ((!IsYBReadCommitted() && YBIsDataSent()) ||
+			(IsYBReadCommitted() && YBIsDataSentForCurrQuery()))
+	{
+		const char* retry_err = "query layer retry isn't possible because data was already sent, "
+				"if this is the read committed isolation (or) the first statement in repeatable read/ "
+				"serializable isolation transaction, consider increasing the tserver gflag "
+				"ysql_output_buffer_size";
+		edata->message = psprintf("%s (%s)", edata->message, retry_err);
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "%s", retry_err);
+		return false;
+	}
+
+	/*
+	 * In batch processing using the extended query protocol, YBIsDataSent() /
+	 * YBIsDataSentForCurrQuery() can be false even if earlier mutation statements have been
+	 * processed. Unless it's the first statement of the batch, we cannot retry the current
+	 * statement. If we do, we will lose the mutations from earlier statements (this is true
+	 * irrespective of whether the retry is done by restarting the whole transaaction in RR/SR
+	 * isolation, or by rolling back to the previous internal savepoint in RC).
+	 */
+	if (YbIsBatchedExecution() && (GetCurrentCommandId(false) > FirstCommandId))
+	{
+		const char* retry_err = "query layer retries aren't supported when executing non-first "
+				"statement in batch, will be unable to replay earlier commands";
+		edata->message = psprintf("%s (%s)", edata->message, retry_err);
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "%s", retry_err);
+		return false;
+	}
+
+	if (attempt >= yb_max_query_layer_retries)
+	{
+		const char* retry_err = psprintf(
+				"yb_max_query_layer_retries set to %d are exhausted", yb_max_query_layer_retries);
+		edata->message = psprintf("%s (%s)", edata->message, retry_err);
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "%s", retry_err);
+		return false;
+	}
+
+	if (!retry_data)
+	{
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "query layer retry isn't possible, retry data is missing");
+		return false;
+	}
+
+	/* can only restart SELECT queries */
+	if (!retry_data->query_string)
+	{
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "query layer retry isn't possible, query string is missing");
+		return false;
+	}
+
+	const char* command_tag = retry_data->command_tag;
+
+	/*
+	 * If we're executing a prepared statement, we're interested in the command
+	 * tag of the underlying statement.
+	 */
+	if (strncmp(command_tag, "EXECUTE", 7) == 0)
+	{
+		List* parsetree_list =
+			yb_parse_query_silently(retry_data->query_string);
+		if (list_length(parsetree_list) == 0)
+			return false;
+		ExecuteStmt* execute_stmt =
+			(ExecuteStmt*) linitial_node(RawStmt, parsetree_list)->stmt;
+		PreparedStatement* prepared_stmt =
+			FetchPreparedStatement(execute_stmt->name, false /* throwError */);
+		if (prepared_stmt == NULL)
+			return false;
+		command_tag = prepared_stmt->plansource->commandTag;
+	}
+
+	bool is_read = strncmp(command_tag, "SELECT", 6) == 0;
+	bool is_dml  = YBIsDmlCommandTag(command_tag);
+
+	if (IsYBReadCommitted())
+	{
+		if (YBGetDdlNestingLevel() != 0) {
+			const char* retry_err = "query layer retries aren't supported for DDLs inside a "
+					"read committed isolation transaction block";
+			edata->message = psprintf("%s (%s)", edata->message, retry_err);
+			if (yb_debug_log_internal_restarts)
+				elog(LOG, "%s", retry_err);
+			return false;
+		}
+	}
+	else if (!(is_read || is_dml))
+	{
+		// if !read committed, we only support retries with SELECT/UPDATE/INSERT/DELETE. There are other
+		// statements that might result in a kReadRestart/kConflict like CREATE INDEX. We don't retry
+		// those as of now.
+		if (yb_debug_log_internal_restarts)
+			elog(LOG, "query layer retries not possible because statement isn't one of "
+					 "SELECT/UPDATE/INSERT/DELETE");
+		return false;
+	}
+
+	return true;
+}
+
+/*
+ * Collect data necessary for yb_attempt_to_restart_on_error invocation.
+ */
+static YBQueryRetryData *
+yb_collect_portal_restart_data(const char *portal_name)
+{
+	Portal portal = GetPortalByName(portal_name);
+	Assert(portal);
+	Assert(!strcmp(portal->name, portal_name));
+
+	YBQueryRetryData *result = palloc(sizeof(YBQueryRetryData));
+	result->portal_name  = portal->name;
+	result->query_string = portal->sourceText;
+	result->command_tag  = portal->commandTag;
+	return result;
+}
+
+/*
+ * The next two functions yb_clear_portal_before_restart and
+ * yb_restart_portal_after_clear performs portal restart and prepares it for
+ * re-execution.
+ *
+ * This allows us to reuse portal's MemoryContext, which contains,
+ * among other things, bound variables.
+ * Some of them might be pointers to a memory within the same context
+ * (e.g. arrays), so it's important to preserve the context as-is instead of
+ * e.g. copying it into a fresh portal.
+ *
+ * Our goal is to emulate what would PortalDrop + CreatePortal do,
+ * but instead of actually destroying/creating a portal, we're going to
+ * reuse an existing one.
+ *
+ * The yb_clear_portal_before_restart function is a selective copy-paste from
+ * PortalDrop routine.
+ * Original comments are preserved, even though some of the described use cases
+ * are not applicable here.
+ */
+static void
+yb_clear_portal_before_restart(Portal portal)
+{
+	Assert(PointerIsValid(portal));
+	Assert(portal->status == PORTAL_FAILED);
+	if (yb_debug_log_internal_restarts)
+		elog(LOG, "Restarting portal %s for retry", portal->name);
+
+	/*
+	 * Allow portalcmds.c to clean up the state it knows about, in particular
+	 * shutting down the executor if still active.  This step potentially runs
+	 * user-defined code so failure has to be expected.  It's the cleanup
+	 * hook's responsibility to not try to do that more than once, in the case
+	 * that failure occurs and then we come back to drop the portal again
+	 * during transaction abort.
+	 *
+	 * Note: in most paths of control, this will have been done already in
+	 * MarkPortalDone or MarkPortalFailed.  We're just making sure.
+	 */
+	if (PointerIsValid(portal->cleanup))
+	{
+		portal->cleanup(portal);
+		portal->cleanup = NULL;
+	}
+
+	/*
+	 * If portal has a snapshot protecting its data, release that.  This needs
+	 * a little care since the registration will be attached to the portal's
+	 * resowner; if the portal failed, we will already have released the
+	 * resowner (and the snapshot) during transaction abort.
+	 */
+	if (portal->holdSnapshot)
+	{
+		if (portal->resowner)
+			UnregisterSnapshotFromOwner(portal->holdSnapshot,
+										portal->resowner);
+		portal->holdSnapshot = NULL;
+	}
+
+	/*
+	 * Release any resources still attached to the portal.  There are several
+	 * cases being covered here:
+	 *
+	 * Top transaction commit (indicated by isTopCommit): normally we should
+	 * do nothing here and let the regular end-of-transaction resource
+	 * releasing mechanism handle these resources too.  However, if we have a
+	 * FAILED portal (eg, a cursor that got an error), we'd better clean up
+	 * its resources to avoid resource-leakage warning messages.
+	 *
+	 * Sub transaction commit: never comes here at all, since we don't kill
+	 * any portals in AtSubCommit_Portals().
+	 *
+	 * Main or sub transaction abort: we will do nothing here because
+	 * portal->resowner was already set NULL; the resources were already
+	 * cleaned up in transaction abort.
+	 *
+	 * Ordinary portal drop: must release resources.  However, if the portal
+	 * is not FAILED then we do not release its locks.  The locks become the
+	 * responsibility of the transaction's ResourceOwner (since it is the
+	 * parent of the portal's owner) and will be released when the transaction
+	 * eventually ends.
+	 */
+	if (portal->resowner)
+	{
+		bool		isCommit = (portal->status != PORTAL_FAILED);
+
+		ResourceOwnerRelease(portal->resowner,
+							 RESOURCE_RELEASE_BEFORE_LOCKS,
+							 isCommit, false);
+		ResourceOwnerRelease(portal->resowner,
+							 RESOURCE_RELEASE_LOCKS,
+							 isCommit, false);
+		ResourceOwnerRelease(portal->resowner,
+							 RESOURCE_RELEASE_AFTER_LOCKS,
+							 isCommit, false);
+		ResourceOwnerDelete(portal->resowner);
+	}
+	portal->resowner = NULL;
+
+	/*
+	 * Delete tuplestore if present.  We should do this even under error
+	 * conditions; since the tuplestore would have been using cross-
+	 * transaction storage, its temp files need to be explicitly deleted.
+	 */
+	if (portal->holdStore)
+	{
+		MemoryContext oldcontext;
+
+		oldcontext = MemoryContextSwitchTo(portal->holdContext);
+		tuplestore_end(portal->holdStore);
+		MemoryContextSwitchTo(oldcontext);
+		portal->holdStore = NULL;
+	}
+
+	/* delete tuplestore storage, if any */
+	if (portal->holdContext)
+	{
+		MemoryContextDelete(portal->holdContext);
+		portal->holdContext = NULL;
+	}
+
+	/* the portal run context might not have been reset, so do it now */
+	MemoryContextReset(portal->ybRunContext);
+
+	/*
+	 * Fully detach portal from transaction to keep it alive in case of
+	 * transaction restart
+	 */
+	portal->createSubid = InvalidSubTransactionId;
+	portal->activeSubid = InvalidSubTransactionId;
+}
+
+/*
+ * The yb_restart_portal_after_clear is a selective copy-paste from CreatePortal
+ * routine.
+ */
+static void
+yb_restart_portal_after_clear(Portal portal)
+{
+	Assert(PointerIsValid(portal));
+
+	/* create a resource owner for the portal */
+	portal->resowner = ResourceOwnerCreate(CurTransactionResourceOwner,
+										   "Portal");
+
+	/* initialize portal fields that don't start off zero */
+	portal->status = PORTAL_NEW;
+	portal->cleanup = PortalCleanup;
+	portal->createSubid = GetCurrentSubTransactionId();
+	portal->activeSubid = portal->createSubid;
+	portal->strategy = PORTAL_MULTI_QUERY;
+	portal->cursorOptions = CURSOR_OPT_NO_SCROLL;
+	portal->atStart = true;
+	portal->atEnd = true;		/* disallow fetches until query is set */
+	portal->visible = true;
+	portal->creation_time = GetCurrentStatementStartTimestamp();
+
+	/* -------------------------------------------------------------------------
+	 * YB NOTE:
+	 *
+	 * Now that our portal looks like a fresh one, time to prepare and start it.
+	 */
+
+	/*
+	 * No need for GetCachedPlan + PortalDefineQuery routine, everything is in
+	 * place already.
+	 */
+	portal->status = PORTAL_DEFINED;
+	PortalStart(portal, portal->portalParams, 0 /* eflags */, InvalidSnapshot);
+
+	/* no need to call PortalSetResultFormat either - formats array is already set */
+}
+
+static long
+yb_get_sleep_usecs_on_txn_conflict(int attempt) {
+	/* Use exponential backoff to calculate the sleep duration. */
+	if (!*YBCGetGFlags()->ysql_sleep_before_retry_on_txn_conflict)
+		return 0;
+
+	/*
+	 * While the guc variables are being changed, RetryMaxBackoffMsecs can be
+	 * smaller than RetryMinBackoffMsecs. Return RetryMaxBackoffMsecs in this
+	 * case.
+	 */
+	if (RetryMaxBackoffMsecs <= RetryMinBackoffMsecs)
+		return RetryMaxBackoffMsecs;
+
+	if (RetryMaxBackoffMsecs == 0 || RetryMinBackoffMsecs == 0)
+		return 0;
+
+	return (long) (PowerWithUpperLimit(RetryBackoffMultiplier, attempt,
+				1.0 * RetryMaxBackoffMsecs / RetryMinBackoffMsecs) *
+			RetryMinBackoffMsecs * 1000);
+}
+
+static void
+yb_maybe_sleep_on_txn_conflict(int attempt)
+{
+	if (YBIsWaitQueueEnabled())
+		return;
+
+	/*
+	 * If transactions are leveraging the wait queue based infrastructure for
+	 * blocking semantics on conflicts, they need not sleep with exponential
+	 * backoff between retries. The wait queues ensure that the transaction's
+	 * read/ write rpc which faced a kConflict error is unblocked only when all
+	 * conflicting transactions have ended (either committed or aborted).
+	 */
+	pgstat_report_wait_start(WAIT_EVENT_YB_TXN_CONFLICT_BACKOFF);
+	pg_usleep(yb_get_sleep_usecs_on_txn_conflict(attempt));
+	pgstat_report_wait_end();
+}
+
+static void
+yb_restart_current_stmt(int attempt, bool is_read_restart)
+{
+	if (yb_debug_log_internal_restarts)
+		elog(LOG, "Rolling back and retrying current statement");
+
+	// TODO(Piyush): Perform pg_session_->InvalidateForeignKeyReferenceCache()
+	// and create tests that would fail without this.
+
+	/*
+	 * Rollback to the savepoint that was started in StartTransactionCommand()
+	 * for READ COMMITTED isolation.
+	 */
+
+	// TODO(read committed): remove this once the feature is GA
+	Assert(!strcmp(
+		GetCurrentTransactionName(), YB_READ_COMMITTED_INTERNAL_SUB_TXN_NAME));
+	RollbackAndReleaseCurrentSubTransaction();
+	BeginInternalSubTransactionForReadCommittedStatement();
+
+	if (is_read_restart)
+	{
+		HandleYBStatus(YBCPgRestartReadPoint());
+	}
+	else
+	{
+		HandleYBStatus(YBCPgResetTransactionReadPoint());
+		yb_maybe_sleep_on_txn_conflict(attempt);
+	}
+}
+
+static void
+yb_restart_transaction(int attempt, bool is_read_restart)
+{
+	if (yb_debug_log_internal_restarts)
+		elog(LOG, "Restarting transaction");
+
+	/*
+	 * The txn might or might not have performed writes. Reset the state in
+	 * either case to avoid checking/tracking if a write could have been
+	 * performed.
+	 */
+	YBCRestartWriteTransaction();
+
+	if (is_read_restart)
+	{
+		YBCRestartTransaction();
+	}
+	else
+	{
+		/*
+		 * Recreate the YB state for the transaction. This call preserves
+		 * the priority of the current YB transaction so that when we retry,
+		 * we re-use the same priority.
+		 */
+		YBCRecreateTransaction();
+		yb_maybe_sleep_on_txn_conflict(attempt);
+	}
+}
+
+static void
+yb_prepare_transaction_for_retry(int attempt, bool is_read_restart)
+{
+	if (IsYBReadCommitted() && IsInTransactionBlock(true /* isTopLevel */))
+	{
+		/*
+		 * In this case the txn is not retried, just the statement is retried
+		 * after rolling back to the internal savepoint registered at start of
+		 * the statement.
+		 */
+		yb_restart_current_stmt(attempt, is_read_restart);
+	}
+	else
+	{
+		/*
+		 * In this case the txn is restarted, which can be done since we haven't
+		 * executed even the first statement fully and no data has been sent to
+		 * the client.
+		 */
+		yb_restart_transaction(attempt, is_read_restart);
+	}
+}
+
+static void
+yb_perform_retry_on_error(
+	int attempt, uint16_t txn_errcode, const char *portal_name)
+{
+	if (yb_debug_log_internal_restarts)
+		ereport(LOG, (errmsg("Performing query layer retry with attempt number: %d", attempt)));
+
+
+	const bool is_read_restart = YBCIsRestartReadError(txn_errcode);
+	if (!(is_read_restart ||
+		  YBCIsTxnConflictError(txn_errcode) ||
+		  YBCIsTxnDeadlockError(txn_errcode)))
+	{
+		Assert(false);
+		elog(ERROR, "unexpected txn error code: %d", txn_errcode);
+	}
+
+	Portal portal = portal_name ? GetPortalByName(portal_name) : NULL;
+	if (portal)
+	{
+		yb_clear_portal_before_restart(portal);
+		/*
+		 * Portal is fully detached from current transaction now. It is
+		 * necessary to manually drop it in case of error happening prior to
+		 * the call of the yb_restart_portal_after_clear function.
+		 */
+	}
+
+	PG_TRY();
+	{
+		yb_prepare_transaction_for_retry(attempt, is_read_restart);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * Paranoid check that portal was not removed by the transaction
+		 * restart routines.
+		 */
+		Assert(!portal || GetPortalByName(portal_name) == portal);
+
+		if (portal && !portal->autoHeld && !portal->portalPinned)
+			PortalDrop(portal, /* isTopCommit */ false);
+
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (portal)
+	{
+		/*
+		 * Paranoid check that portal was not removed by the transaction
+		 * restart routines.
+		 */
+		Assert(GetPortalByName(portal_name) == portal);
+		yb_restart_portal_after_clear(portal);
+	}
+	YBRestoreOutputBufferPosition();
+	/* Presence of triggers pushes additional snapshots. Pop all of them. */
+	PopAllActiveSnapshots();
+}
+
+/*
+ * Process an error that happened during execution with expected expected
+ * retriable errors. Prepares the re-execution if an error is restartable,
+ * otherwise - rethrows the error.
+ */
+static void
+yb_attempt_to_retry_on_error(
+	int attempt, const YBQueryRetryData *retry_data, MemoryContext exec_context)
+{
+	/*
+	 * Switch the context back to the original one when server started
+	 * processing user request.
+	 */
+	MemoryContextSwitchTo(exec_context);
+	ErrorData *edata = CopyErrorData();
+
+	if (yb_is_retry_possible(edata, attempt, retry_data))
+	{
+		FlushErrorState();
+		yb_perform_retry_on_error(
+			attempt, edata->yb_txn_errcode, retry_data->portal_name);
+	} else {
+		/* if we shouldn't restart - propagate the error */
+		ReThrowError(edata);
+	}
+}
+
+typedef void(*YBFunctor)(const void*);
+
+static void
+yb_exec_query_wrapper_one_attempt(
+	MemoryContext exec_context,
+	const YBQueryRetryData *retry_data,
+	YBFunctor functor,
+	const void *functor_context,
+	int attempt,
+	bool *retry)
+{
+	elog(DEBUG2, "yb_exec_query_wrapper attempt %d for %s", attempt, retry_data->query_string);
+	YBSaveOutputBufferPosition(
+		!yb_is_begin_transaction(retry_data->command_tag));
+	PG_TRY();
+	{
+		(*functor)(functor_context);
+		/*
+			* Stop retrying if successful. Note, break or return could not be
+			* used here, they would prevent PG_END_TRY();
+			*/
+		*retry = false;
+	}
+	PG_CATCH();
+	{
+		YBResetOperationsBuffering();
+		yb_attempt_to_retry_on_error(attempt, retry_data, exec_context);
+	}
+	PG_END_TRY();
+}
+
+static void
+yb_exec_query_wrapper(MemoryContext exec_context,
+					  const YBQueryRetryData *retry_data,
+					  YBFunctor functor,
+					  const void *functor_context)
+{
+	bool retry = true;
+	for (int attempt = 0; retry; ++attempt)
+	{
+		yb_exec_query_wrapper_one_attempt(
+			exec_context, retry_data, functor, functor_context, attempt, &retry);
+	}
+}
+
+static void
+yb_exec_simple_query_impl(const void *query_string)
+{
+	exec_simple_query((const char *)query_string);
+}
+
+/*
+ * Wraps exec_simple_query, attempting to transparently do restarts when possible.
+ * Accepts execution memory context to revert to in case of an error.
+ */
+static void
+yb_exec_simple_query(const char *query_string, MemoryContext exec_context)
+{
+	YBQueryRetryData retry_data  = {
+		.portal_name  = NULL,
+		.query_string = query_string,
+		.command_tag  = yb_parse_command_tag(query_string)
+	};
+	yb_exec_query_wrapper(
+		exec_context, &retry_data, &yb_exec_simple_query_impl, query_string);
+
+	/*
+	 * Fetch the updated session execution stats at the end of each query, so
+	 * that stats don't accumulate across queries. The stats collected here
+	 * typically correspond to completed flushes, reads associated with triggers
+	 * etc.
+	 */
+	YbRefreshSessionStatsDuringExecution();
+}
+
+typedef struct YBExecuteMessageFunctorContext
+{
+	const char *portal_name;
+	long max_rows;
+} YBExecuteMessageFunctorContext;
+
+static void
+yb_exec_execute_message_impl(const void* raw_ctx)
+{
+	const YBExecuteMessageFunctorContext* ctx = (const YBExecuteMessageFunctorContext*)(raw_ctx);
+	exec_execute_message(ctx->portal_name, ctx->max_rows);
+}
+
+/*
+ * Wraps exec_execute_message, attempting to transparently do restarts when possible.
+ * Accepts execution memory context to revert to in case of an error.
+ */
+static void
+yb_exec_execute_message(long max_rows,
+                        const YBQueryRetryData *restart_data,
+                        MemoryContext exec_context)
+{
+	YBExecuteMessageFunctorContext ctx = {
+		.portal_name = restart_data->portal_name,
+		.max_rows = max_rows
+	};
+	yb_exec_query_wrapper(
+		exec_context, restart_data, &yb_exec_execute_message_impl, &ctx);
+
+	/*
+	 * Fetch the updated session execution stats at the end of each query, so
+	 * that stats don't accumulate across queries. The stats collected here
+	 * typically correspond to completed flushes, reads associated with triggers
+	 * etc.
+	 */
+	YbRefreshSessionStatsDuringExecution();
+}
+
+static void yb_report_cache_version_restart(const char* query, ErrorData *edata)
+{
+	ereport(LOG,
+	        (errmsg("Restarting statement due to catalog version mismatch:"
+	                "\nQuery: %s\nError: %s",
+	                query,
+	                edata->message)));
 }
 
 /* ----------------------------------------------------------------
@@ -3807,23 +4890,6 @@ PostgresMain(int argc, char *argv[],
 			 const char *dbname,
 			 const char *username)
 {
-	// TODO(neil) Once we have our system DB, remove the following code.
-	// It is a hack to help us getting by for now.
-	for (int i = 0; i < argc; i++) {
-		if (strcmp(argv[i], "template0") == 0 || strcmp(argv[i], "template1") == 0) {
-			YBSetPreparingTemplates();
-		}
-	}
-	if (dbname) {
-		if (strcmp(dbname, "template0") == 0 || strcmp(dbname, "template1") == 0) {
-			YBSetPreparingTemplates();
-		}
-	} else if (username) {
-		if (strcmp(username, "template0") == 0 || strcmp(username, "template1") == 0) {
-			YBSetPreparingTemplates();
-		}
-	}
-
 	int			firstchar;
 	StringInfoData input_message;
 	sigjmp_buf	local_sigjmp_buf;
@@ -3857,6 +4923,11 @@ PostgresMain(int argc, char *argv[],
 					 errmsg("%s: no database nor user name specified",
 							progname)));
 	}
+
+	// TODO(neil) Once we have our system DB, remove the following code.
+	// It is a hack to help us getting by for now.
+	if (strcmp(dbname, "template0") == 0 || strcmp(dbname, "template1") == 0)
+		YbSetConnectedToTemplateDb();
 
 	/* Acquire configuration parameters, unless inherited from postmaster */
 	if (!IsUnderPostmaster)
@@ -3977,7 +5048,7 @@ PostgresMain(int argc, char *argv[],
 	 * it inside InitPostgres() instead.  In particular, anything that
 	 * involves database access should be there, not here.
 	 */
-	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, false);
+	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, NULL, false);
 
 	/*
 	 * If the PostmasterContext is still around, recycle the space; we don't
@@ -3985,8 +5056,11 @@ PostgresMain(int argc, char *argv[],
 	 * *MyProcPort, because ConnCreate() allocated that space with malloc()
 	 * ... else we'd need to copy the Port data first.  Also, subsidiary data
 	 * such as the username isn't lost either; see ProcessStartupPacket().
+	 * YB note: PostmasterContext is required in case of connections created by
+	 * Ysql Connection Manager for `Authentication Passthrough`, so it shouldn't
+	 * be deleted in this case.
 	 */
-	if (PostmasterContext)
+	if (PostmasterContext && !YbIsClientYsqlConnMgr())
 	{
 		MemoryContextDelete(PostmasterContext);
 		PostmasterContext = NULL;
@@ -4279,6 +5353,21 @@ PostgresMain(int argc, char *argv[],
 
 				set_ps_display("idle", false);
 				pgstat_report_activity(STATE_IDLE, NULL);
+
+				if (IsYugaByteEnabled())
+					yb_pgstat_set_has_catalog_version(false);
+			}
+
+			/*
+			 * YB: The server must respond with a ReadyForQuery message when it's
+			 * ready to accept new queries. This is a good place to unset
+			 * ASH metadata because here we are sure that the previous request
+			 * has been completely processed by the server.
+			 */
+			if (IsYugaByteEnabled() && yb_enable_ash && yb_is_ash_metadata_set)
+			{
+				YbAshUnsetMetadata();
+				yb_is_ash_metadata_set = false;
 			}
 
 			ReadyForQuery(whereToSendOutput);
@@ -4311,6 +5400,17 @@ PostgresMain(int argc, char *argv[],
 		DoingCommandRead = false;
 
 		/*
+		 * YB: A single TCP packet from the client might contain a series of messages -
+		 * parse, bind, describe, execute and sync. We only want to set the metadata
+		 * once during this process.
+		 */
+		if (IsYugaByteEnabled() && yb_enable_ash && !yb_is_ash_metadata_set)
+		{
+			YbAshSetMetadata();
+			yb_is_ash_metadata_set = true;
+		}
+
+		/*
 		 * (5) turn off the idle-in-transaction timeout
 		 */
 		if (disable_idle_in_transaction_timeout)
@@ -4336,6 +5436,18 @@ PostgresMain(int argc, char *argv[],
 		if (ignore_till_sync && firstchar != EOF)
 			continue;
 
+		if (IsYugaByteEnabled())
+		{
+			yb_pgstat_set_has_catalog_version(true);
+			YBCPgResetCatalogReadTime();
+			YBCheckSharedCatalogCacheVersion();
+			yb_run_with_explain_analyze = false;
+			if (IsYsqlUpgrade &&
+				yb_catalog_version_type != CATALOG_VERSION_CATALOG_TABLE)
+				yb_catalog_version_type = CATALOG_VERSION_UNSET;
+			yb_is_multi_statement_query = false;
+		}
+
 		switch (firstchar)
 		{
 			case 'Q':			/* simple query */
@@ -4347,34 +5459,46 @@ PostgresMain(int argc, char *argv[],
 
 				query_string = pq_getmsgstring(&input_message);
 				pq_getmsgend(&input_message);
-
-				MemoryContext oldcontext = CurrentMemoryContext;
+				MemoryContext oldcontext = GetCurrentMemoryContext();
 
 				PG_TRY();
 				{
-					if (am_walsender)
-					{
-						if (!exec_replication_command(query_string))
-							exec_simple_query(query_string);
-					} else
-						exec_simple_query(query_string);
+					if (!am_walsender || !exec_replication_command(query_string))
+                      yb_exec_simple_query(query_string, oldcontext);
 				}
 				PG_CATCH();
 				{
+					/* Get error data */
+					ErrorData *edata;
+					MemoryContext errorcontext = MemoryContextSwitchTo(oldcontext);
+					edata = CopyErrorData();
+
 					bool need_retry = false;
-					YBPrepareCacheRefreshIfNeeded(oldcontext,
-					                              true /* consider_retry */,
-					                              &need_retry);
+					YBPrepareCacheRefreshIfNeeded(
+							edata,
+							yb_check_retry_allowed(query_string),
+							yb_is_dml_command(query_string),
+							&need_retry);
+
 					if (need_retry)
 					{
-						if (am_walsender)
+						if (!am_walsender || !exec_replication_command(query_string))
 						{
-							if (!exec_replication_command(query_string))
-								exec_simple_query(query_string);
-						} else
-							exec_simple_query(query_string);
-					} else
+							if (yb_debug_log_internal_restarts)
+							{
+								yb_report_cache_version_restart(query_string, edata);
+							}
+							/*
+							 * Free edata before restarting, in other branches
+							 * the memory context will get reset after anyway.
+							 */
+							FreeErrorData(edata);
+							yb_exec_simple_query(query_string, oldcontext);
+						}
+					}
+					else
 					{
+						MemoryContextSwitchTo(errorcontext);
 						PG_RE_THROW();
 					}
 				}
@@ -4409,7 +5533,7 @@ PostgresMain(int argc, char *argv[],
 					}
 					pq_getmsgend(&input_message);
 
-					MemoryContext oldcontext = CurrentMemoryContext;
+					MemoryContext oldcontext = GetCurrentMemoryContext();
 
 					PG_TRY();
 					{
@@ -4421,14 +5545,22 @@ PostgresMain(int argc, char *argv[],
 					}
 					PG_CATCH();
 					{
+						/* Get error data */
+						ErrorData *edata;
+						MemoryContext errorcontext = MemoryContextSwitchTo(oldcontext);
+						edata = CopyErrorData();
+
 						/*
 						 * TODO Cannot retry parse statements yet (without
 						 * aborting the followup bind/execute.
 						 */
 						bool need_retry = false;
-						YBPrepareCacheRefreshIfNeeded(oldcontext,
-						                              false /* consider_retry */,
-						                              &need_retry);
+						YBPrepareCacheRefreshIfNeeded(
+								edata,
+								false /* consider_retry */,
+								yb_is_dml_command(query_string),
+								&need_retry);
+						MemoryContextSwitchTo(errorcontext);
 						PG_RE_THROW();
 
 					}
@@ -4452,41 +5584,55 @@ PostgresMain(int argc, char *argv[],
 
 			case 'E':			/* execute */
 				{
-					const char *portal_name;
-					int			max_rows;
-
 					forbidden_in_wal_sender(firstchar);
 
 					/* Set statement_timestamp() */
 					SetCurrentStatementStartTimestamp();
 
-					portal_name = pq_getmsgstring(&input_message);
-					max_rows = pq_getmsgint(&input_message, 4);
+					const char *portal_name = pq_getmsgstring(&input_message);
+					const int max_rows = pq_getmsgint(&input_message, 4);
 					pq_getmsgend(&input_message);
 
-					MemoryContext oldcontext = CurrentMemoryContext;
+					MemoryContext oldcontext = GetCurrentMemoryContext();
+					const YBQueryRetryData *retry_data =
+						yb_collect_portal_restart_data(portal_name);
 
 					PG_TRY();
 					{
-						exec_execute_message(portal_name, max_rows);
+						yb_exec_execute_message(
+							max_rows, retry_data, oldcontext);
 					}
 					PG_CATCH();
 					{
+						/*
+						 * Get error data. Original error will be thrown in 2 cases:
+						 * - query can't be restarted transparently
+						 * - original error is "schema version mismatch for table"
+						 *   and restarting will raise an error (workaround for #6982)
+						 */
+						MemoryContext errorcontext = MemoryContextSwitchTo(oldcontext);
+						ErrorData *edata = CopyErrorData();
+
+						/*
+						 * The portal recreation logic is restored to the pre-#2216 state
+						 * (it was reworked in #4254).
+						 */
 						Portal old_portal = GetPortalByName(portal_name);
 
 						/*
 						 * TODO Do not support retrying for prepared statements
 						 * yet. (i.e. if portal is named or has params).
 						 */
-						bool can_retry = IsYugaByteEnabled() &&
-						                 old_portal &&
-						                 portal_name[0] == '\0' &&
-						                 !old_portal->portalParams;
+						bool can_retry =
+						    IsYugaByteEnabled() &&
+						    old_portal &&
+						    portal_name[0] == '\0' &&
+						    !old_portal->portalParams &&
+						    yb_check_retry_allowed(retry_data->query_string);
+
 
 						/* Stuff we might need for retrying below */
-						char *query_string = NULL;
-						int num_params = 0;
-						Oid *param_types = NULL;
+						char* query_string = NULL;
 						int   nformats = 0;
 						int16 *formats = NULL;
 
@@ -4496,15 +5642,7 @@ PostgresMain(int argc, char *argv[],
 							 * Copy the data needed to retry before transaction
 							 * abort cleans it up.
 							 */
-							query_string = pstrdup(unnamed_stmt_psrc->query_string);
-							num_params   = unnamed_stmt_psrc->num_params;
-							if (unnamed_stmt_psrc->param_types)
-							{
-								param_types = (Oid *) palloc(num_params * sizeof(Oid));
-								memcpy(param_types,
-								       unnamed_stmt_psrc->param_types,
-								       num_params * sizeof(Oid));
-							}
+							query_string = pstrdup(retry_data->query_string);
 
 							if (old_portal->formats)
 							{
@@ -4517,70 +5655,87 @@ PostgresMain(int argc, char *argv[],
 						}
 
 						bool need_retry = false;
+
 						/*
 						 * Execute may have been partially applied so need to
 						 * cleanup (and restart) the transaction.
 						 */
-						YBPrepareCacheRefreshIfNeeded(oldcontext,
-						                              true /* consider_retry */,
-						                              &need_retry);
+						YBPrepareCacheRefreshIfNeeded(
+								edata,
+								can_retry,
+								yb_is_dml_command(query_string),
+								&need_retry);
 
 						if (need_retry && can_retry)
 						{
+							PG_TRY();
+							{
+								if (yb_debug_log_internal_restarts)
+								{
+									yb_report_cache_version_restart(query_string, edata);
+								}
 
-							/* 1. Redo Parse: Create Cached stmt (no output) */
-							exec_parse_message(query_string,
-							                   portal_name,
-							                   param_types,
-							                   num_params,
-							                   DestNone);
+								/* 1. Redo Parse: Create Cached stmt (no output) */
+								exec_parse_message(query_string,
+								                   portal_name,
+								                   NULL /* param_types*/,
+								                   0 /* num_params */,
+								                   DestNone);
 
-							/* 2. Redo the Bind step */
-							Portal portal;
-							/* Create portal */
-							if (portal_name[0] == '\0')
+								/* 2. Redo the Bind step */
+								Portal portal;
+								/* Create portal */
 								portal = CreatePortal(portal_name, true, true);
-							else
-								portal = CreatePortal(portal_name,
-								                      false,
-								                      false);
 
-							/* Set portal data */
-							MemoryContext oldContext = MemoryContextSwitchTo(
-									portal->portalContext);
-							char          *stmt_name;
-							if (portal_name[0])
-								stmt_name = pstrdup(portal_name);
-							else
-								stmt_name = NULL;
+								/* Set portal data */
+								MemoryContext oldContext = MemoryContextSwitchTo(
+										portal->portalContext);
+								char          *stmt_name;
+								if (portal_name[0])
+									stmt_name = pstrdup(portal_name);
+								else
+									stmt_name = NULL;
+								query_string = pstrdup(query_string);
 
-							/* TODO params are none for now (see above) */
-							ParamListInfo params = NULL;
+								/* TODO params are none for now (see above) */
+								ParamListInfo params = NULL;
 
-							MemoryContextSwitchTo(oldContext);
+								MemoryContextSwitchTo(oldContext);
 
-							CachedPlan *cplan = GetCachedPlan(unnamed_stmt_psrc,
-							                                  params,
-							                                  false,
-							                                  NULL);
+								CachedPlan *cplan = GetCachedPlan(unnamed_stmt_psrc,
+								                                  params,
+								                                  false,
+								                                  NULL);
 
-							PortalDefineQuery(portal,
-							                  stmt_name,
-							                  query_string,
-							                  unnamed_stmt_psrc->commandTag,
-							                  cplan->stmt_list,
-							                  cplan);
+								PortalDefineQuery(portal,
+								                  stmt_name,
+								                  query_string,
+								                  unnamed_stmt_psrc->commandTag,
+								                  cplan->stmt_list,
+								                  cplan);
 
-							/* Start portal */
-							PortalStart(portal, params, 0, InvalidSnapshot);
-							/* Set the output format */
-							PortalSetResultFormat(portal, nformats, formats);
+								/* Start portal */
+								PortalStart(portal, params, 0, InvalidSnapshot);
+								/* Set the output format */
+								PortalSetResultFormat(portal, nformats, formats);
 
-							/* 3. Now ready to retry the execute step. */
-							exec_execute_message(portal_name, max_rows);
+								/* Now ready to retry the execute step. */
+								yb_exec_execute_message(max_rows,
+														retry_data,
+														GetCurrentMemoryContext());
+							}
+							PG_CATCH();
+							{
+								if (YBTableSchemaVersionMismatchError(edata, NULL /* table_id */))
+									ReThrowError(edata);
+								else
+									PG_RE_THROW();
+							}
+							PG_END_TRY();
 						}
 						else
 						{
+							MemoryContextSwitchTo(errorcontext);
 							PG_RE_THROW();
 						}
 
@@ -4743,6 +5898,95 @@ PostgresMain(int argc, char *argv[],
 				 * probably got here because a COPY failed, and the frontend
 				 * is still sending data.
 				 */
+				break;
+
+			case 'A': /* Auth Passthrough Request */
+				if (YbIsClientYsqlConnMgr())
+				{
+					/*
+					 * Do not rely on cache during authentication passthrough.
+					 * "ALTER ROLE" does not change the catalog version due to this
+					 * local cache may have an invalid cache.
+					 *
+					 * TODO (GH #21998): Invalidate cache specific to the role credentials and
+					 * logic permissions.
+					 */
+					ResetCatalogCaches();
+
+					/* Store a copy of the old context */
+					char *db_name = MyProcPort->database_name;
+					char *user_name = MyProcPort->user_name;
+					char *host = MyProcPort->remote_host;
+					sa_family_t conn_type = MyProcPort->raddr.addr.ss_family;
+
+					/* Update the Port details with the new context. */
+					MyProcPort->user_name =
+						(char *) pq_getmsgstring(&input_message);
+					MyProcPort->database_name =
+						(char *) pq_getmsgstring(&input_message);
+					MyProcPort->remote_host =
+						(char *) pq_getmsgstring(&input_message);
+					// HARD Code connection type between client and ysql_conn_mgr to AF_INET (only supported)
+					// for authentication
+					MyProcPort->raddr.addr.ss_family = AF_INET;
+					MyProcPort->yb_is_ssl_enabled_in_logical_conn =
+						pq_getmsgbyte(&input_message) == 'E' ? true : false;
+
+					/* Update the `remote_host` */
+					struct sockaddr_in *ip_address_1;
+					ip_address_1 =
+						(struct sockaddr_in *) (&MyProcPort->raddr.addr);
+					inet_pton(AF_INET, MyProcPort->remote_host,
+							  &(ip_address_1->sin_addr));
+					MyProcPort->yb_is_auth_passthrough_req = true;
+
+					/* Start authentication */
+					start_xact_command();
+					ClientAuthentication(MyProcPort);
+					finish_xact_command();
+
+					/* Place back the old context */
+					MyProcPort->yb_is_auth_passthrough_req = false;
+					MyProcPort->yb_is_ssl_enabled_in_logical_conn = false;
+					MyProcPort->user_name = user_name;
+					MyProcPort->database_name = db_name;
+					MyProcPort->remote_host = host;
+					MyProcPort->raddr.addr.ss_family = conn_type;
+					inet_pton(AF_INET, MyProcPort->remote_host,
+							  &(ip_address_1->sin_addr));
+
+					send_ready_for_query = true;
+				}
+				else
+				{
+					ereport(FATAL,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							 errmsg("invalid frontend message type %d",
+									firstchar)));
+				}
+				break;
+
+			case 's': /* SET SESSION PARAMETER */
+				if (YbIsClientYsqlConnMgr())
+				{
+					start_xact_command();
+					YbHandleSetSessionParam(pq_getmsgint(&input_message, 4));
+					int new_shmem_key = yb_logical_client_shmem_key;
+					finish_xact_command();
+
+					// finish_xact_command() resets the yb_logical_client_shmem_key value.
+					if (new_shmem_key > 0)
+						yb_logical_client_shmem_key = new_shmem_key;
+
+					send_ready_for_query = true;
+				}
+				else
+				{
+					ereport(FATAL,
+							(errcode(ERRCODE_PROTOCOL_VIOLATION),
+							 errmsg("invalid frontend message type %d",
+								firstchar)));
+				}
 				break;
 
 			default:
@@ -4994,4 +6238,53 @@ disable_statement_timeout(void)
 
 		stmt_timeout_active = false;
 	}
+}
+
+/*
+ * Redact password, if exists in the query text.
+ */
+const char* RedactPasswordIfExists(const char* queryStr) {
+	char *redactedStr;
+	char *passwordToken;
+	int i;
+	int passwordPos;
+	const char *commandTag;
+
+	/*
+	* Parse and check the type of the query. We only redact password
+	* for the CREATE USER / CREATE ROLE / ALTER USER / ALTER ROLE queries.
+	* Use yb_parse_command_tag to suppress error warnings.
+	*/
+	commandTag = yb_parse_command_tag(queryStr);
+	if (commandTag == NULL || (strcmp(commandTag, "CREATE ROLE") != 0 &&
+					strcmp(commandTag, "ALTER ROLE") != 0))
+		return queryStr;
+
+	/* Copy the query string and convert to lower case. */
+  	redactedStr = pstrdup(queryStr);
+
+  	for (i = 0; redactedStr[i]; i++)
+    	redactedStr[i] = (char)pg_tolower((unsigned char)redactedStr[i]);
+
+	/* Find index of password token. */
+	passwordToken = strstr(redactedStr, TOKEN_PASSWORD);
+
+	if (passwordToken != NULL)
+	{
+		/* Copy query string up to password token. */
+		passwordPos = (passwordToken - redactedStr) + strlen(TOKEN_PASSWORD);
+
+		redactedStr = palloc(passwordPos + 1 + strlen(TOKEN_REDACTED) + 1);
+
+		strncpy(redactedStr, queryStr, passwordPos);
+
+		/* And append redacted token. */
+		redactedStr[passwordPos] = ' ';
+
+		strcpy(redactedStr + passwordPos + 1, TOKEN_REDACTED);
+
+		return redactedStr;
+	}
+
+	return queryStr;
 }

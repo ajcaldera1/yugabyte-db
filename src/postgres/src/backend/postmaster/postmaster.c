@@ -77,6 +77,10 @@
 #include <netdb.h>
 #include <limits.h>
 
+#ifdef HAVE_SYS_PRCTL_H
+#include <sys/prctl.h>
+#endif
+
 #ifdef HAVE_SYS_SELECT_H
 #include <sys/select.h>
 #endif
@@ -95,6 +99,7 @@
 
 #include "access/transam.h"
 #include "access/xlog.h"
+#include "access/xact.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/pg_control.h"
 #include "common/file_perm.h"
@@ -115,12 +120,17 @@
 #include "postmaster/postmaster.h"
 #include "postmaster/syslogger.h"
 #include "replication/logicallauncher.h"
+#include "replication/slot.h"
+#include "replication/syncrep.h"
 #include "replication/walsender.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/pg_shmem.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
+#include "storage/procarray.h"
+#include "storage/procsignal.h"
+#include "storage/sinvaladt.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/datetime.h"
@@ -133,6 +143,7 @@
 
 #include "common/pg_yb_common.h"
 #include "pg_yb_utils.h"
+#include "yb_ash.h"
 
 #ifdef EXEC_BACKEND
 #include "storage/spin.h"
@@ -279,6 +290,11 @@ static int	Shutdown = NoShutdown;
 
 static bool FatalError = false; /* T if recovering from backend crash */
 
+/* Crashed before fully acquiring a lock, or with unexpected error code.  */
+static bool YbCrashInUnmanageableState = false;
+
+static char *YbBackendOomScoreAdj = NULL;
+
 /*
  * We use a simple state machine to control startup, shutdown, and
  * crash recovery (which is rather like shutdown followed by startup).
@@ -405,6 +421,7 @@ static void startup_die(SIGNAL_ARGS);
 static void dummy_handler(SIGNAL_ARGS);
 static void StartupPacketTimeoutHandler(void);
 static void CleanupBackend(int pid, int exitstatus);
+static bool CleanupKilledProcess(PGPROC *proc);
 static bool CleanupBackgroundWorker(int pid, int exitstatus);
 static void HandleChildCrash(int pid, int exitstatus, const char *procname);
 static void LogChildExit(int lev, const char *procname,
@@ -420,7 +437,7 @@ static void SendNegotiateProtocolVersion(List *unrecognized_protocol_options);
 static void processCancelRequest(Port *port, void *pkt);
 static int	initMasks(fd_set *rmask);
 static void report_fork_failure_to_client(Port *port, int errnum);
-static CAC_state canAcceptConnections(void);
+static CAC_state canAcceptConnections(int backend_type);
 static bool RandomCancelKey(int32 *cancel_key);
 static void signal_child(pid_t pid, int signal);
 static bool SignalSomeChildren(int signal, int targets);
@@ -571,6 +588,16 @@ HANDLE		PostmasterHandle;
 #endif
 
 /*
+ * Wrap strdup so we can suppress LeakSanitizer (LSAN) warnings here without
+ * suppressing them in all occurrences of strdup.
+ */
+char *
+postmaster_strdup(const char *in)
+{
+	return strdup(in);
+}
+
+/*
  * Postmaster main entry point
  */
 void
@@ -582,6 +609,9 @@ PostmasterMain(int argc, char *argv[])
 	bool		listen_addr_saved = false;
 	int			i;
 	char	   *output_config_variable = NULL;
+
+	// This should be done as the first thing after process start.
+	YBSetParentDeathSignal();
 
 	MyProcPid = PostmasterPid = getpid();
 
@@ -690,11 +720,11 @@ PostmasterMain(int argc, char *argv[])
 				break;
 
 			case 'C':
-				output_config_variable = strdup(optarg);
+				output_config_variable = postmaster_strdup(optarg);
 				break;
 
 			case 'D':
-				userDoption = strdup(optarg);
+				userDoption = postmaster_strdup(optarg);
 				break;
 
 			case 'd':
@@ -944,6 +974,19 @@ PostmasterMain(int argc, char *argv[])
 	}
 
 	YBReportIfYugaByteEnabled();
+#ifdef __APPLE__
+	if (YBIsEnabledInPostgresEnvVar()) {
+		/*
+		 * Resolve local hostname to initialize macOS network libraries. If we
+		 * don't do this, there might be a lot of segmentation faults in
+		 * PostgreSQL backend processes in tests on macOS (especially debug
+		 * mode).
+		 *
+		 * See https://github.com/yugabyte/yugabyte-db/issues/2509 for details.
+		 */
+		YBCResolveHostname();
+	}
+#endif
 
 	/*
 	 * Create lockfile for data directory.
@@ -988,8 +1031,16 @@ PostmasterMain(int argc, char *argv[])
 	 * it needs to be called before InitializeMaxBackends(), and it's probably
 	 * a good idea to call it before any modules had chance to take the
 	 * background worker slots.
+	 *
+	 * Logical replication is not supported in YugaByte mode currently and the
+	 * registration is disabled.
 	 */
-	ApplyLauncherRegister();
+	if (!YBIsEnabledInPostgresEnvVar())
+		ApplyLauncherRegister();
+
+	/* Register ASH collector */
+	if (YBIsEnabledInPostgresEnvVar() && yb_ash_enable_infra)
+		YbAshRegister();
 
 	/*
 	 * process any libraries that should be preloaded at postmaster start
@@ -1637,6 +1688,13 @@ ServerLoop(void)
 	bool yb_enabled = YBIsEnabledInPostgresEnvVar();
 #endif
 
+#ifdef __linux__
+	if (getenv("FLAGS_yb_backend_oom_score_adj") != NULL)
+	{
+		YbBackendOomScoreAdj = strdup(getenv("FLAGS_yb_backend_oom_score_adj"));
+	}
+#endif
+
 	for (;;)
 	{
 		fd_set		rmask;
@@ -1923,13 +1981,31 @@ ProcessStartupPacket(Port *port, bool SSLdone)
 	MemoryContext oldcontext;
 
 	pq_startmsgread();
-	if (pq_getbytes((char *) &len, 4) == EOF)
+
+	/*
+	 * Grab the first byte of the length word separately, so that we can tell
+	 * whether we have no data at all or an incomplete packet.  (This might
+	 * sound inefficient, but it's not really, because of buffering in
+	 * pqcomm.c.)
+	 */
+	if (pq_getbytes((char *) &len, 1) == EOF)
 	{
 		/*
-		 * EOF after SSLdone probably means the client didn't like our
-		 * response to NEGOTIATE_SSL_CODE.  That's not an error condition, so
-		 * don't clutter the log with a complaint.
+		 * If we get no data at all, don't clutter the log with a complaint;
+		 * such cases often occur for legitimate reasons.  An example is that
+		 * we might be here after responding to NEGOTIATE_SSL_CODE, and if the
+		 * client didn't like our response, it'll probably just drop the
+		 * connection.  Service-monitoring software also often just opens and
+		 * closes a connection without sending anything.  (So do port
+		 * scanners, which may be less benign, but it's not really our job to
+		 * notice those.)
 		 */
+		return STATUS_ERROR;
+	}
+
+	if (pq_getbytes(((char *) &len) + 1, 3) == EOF)
+	{
+		/* Got a partial length word, so bleat about that */
 		if (!SSLdone)
 			ereport(COMMERROR,
 					(errcode(ERRCODE_PROTOCOL_VIOLATION),
@@ -2051,6 +2127,18 @@ retry1:
 		List	   *unrecognized_protocol_options = NIL;
 
 		/*
+		 * At this point we should have no data already buffered.  If we do,
+		 * it was received before we performed the SSL handshake, so it wasn't
+		 * encrypted and indeed may have been injected by a man-in-the-middle.
+		 * We report this case to the client.
+		 */
+		if (pq_buffer_has_data())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("received unencrypted data after SSL request"),
+					 errdetail("This could be either a client-software bug or evidence of an attempted man-in-the-middle attack.")));
+
+		/*
 		 * Scan packet body for name/option pairs.  We can assume any string
 		 * beginning within the packet body is null-terminated, thanks to
 		 * zeroing extra byte above.
@@ -2118,6 +2206,18 @@ retry1:
 			}
 			offset = valoffset + strlen(valptr) + 1;
 		}
+
+		/*
+		 * At this point we should have no data already buffered.  If we do,
+		 * it was received before we performed the GSS handshake, so it wasn't
+		 * encrypted and indeed may have been injected by a man-in-the-middle.
+		 * We report this case to the client.
+		 */
+		if (pq_buffer_has_data())
+			ereport(FATAL,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("received unencrypted data after GSSAPI encryption request"),
+					 errdetail("This could be either a client-software bug or evidence of an attempted man-in-the-middle attack.")));
 
 		/*
 		 * If we didn't find a packet terminator exactly at the end of the
@@ -2236,6 +2336,8 @@ retry1:
 					 errmsg("the database system is in recovery mode")));
 			break;
 		case CAC_TOOMANY:
+			/* increment rejection counter */
+			(*yb_too_many_conn)++;
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
 					 errmsg("sorry, too many clients already")));
@@ -2341,16 +2443,21 @@ processCancelRequest(Port *port, void *pkt)
 }
 
 /*
- * canAcceptConnections --- check to see if database state allows connections.
+ * canAcceptConnections --- check to see if database state allows connections
+ * of the specified type.  backend_type can be BACKEND_TYPE_NORMAL,
+ * BACKEND_TYPE_AUTOVAC, or BACKEND_TYPE_BGWORKER.  (Note that we don't yet
+ * know whether a NORMAL connection might turn into a walsender.)
  */
 static CAC_state
-canAcceptConnections(void)
+canAcceptConnections(int backend_type)
 {
 	CAC_state	result = CAC_OK;
 
 	/*
 	 * Can't start backends when in startup/shutdown/inconsistent recovery
-	 * state.
+	 * state.  We treat autovac workers the same as user backends for this
+	 * purpose.  However, bgworkers are excluded from this test; we expect
+	 * bgworker_should_start_now() decided whether the DB state allows them.
 	 *
 	 * In state PM_WAIT_BACKUP only superusers can connect (this must be
 	 * allowed so that a superuser can end online backup mode); we return
@@ -2358,7 +2465,8 @@ canAcceptConnections(void)
 	 * that neither CAC_OK nor CAC_WAITBACKUP can safely be returned until we
 	 * have checked for too many children.
 	 */
-	if (pmState != PM_RUN)
+	if (pmState != PM_RUN &&
+		backend_type != BACKEND_TYPE_BGWORKER)
 	{
 		if (pmState == PM_WAIT_BACKUP)
 			result = CAC_WAITBACKUP;	/* allow superusers only */
@@ -2378,9 +2486,9 @@ canAcceptConnections(void)
 	/*
 	 * Don't start too many children.
 	 *
-	 * We allow more connections than we can have backends here because some
+	 * We allow more connections here than we can have backends because some
 	 * might still be authenticating; they might fail auth, or some existing
-	 * backend might exit before the auth cycle is completed. The exact
+	 * backend might exit before the auth cycle is completed.  The exact
 	 * MaxBackends limit is enforced when a new backend tries to join the
 	 * shared-inval backend array.
 	 *
@@ -2530,7 +2638,7 @@ reset_shared(int port)
 	 * determine IPC keys.  This helps ensure that we will clean up dead IPC
 	 * objects if the postmaster crashes and is restarted.
 	 */
-	CreateSharedMemoryAndSemaphores(false, port);
+	CreateSharedMemoryAndSemaphores(port);
 }
 
 
@@ -2804,6 +2912,97 @@ reaper(SIGNAL_ARGS)
 	while ((pid = waitpid(-1, &exitstatus, WNOHANG)) > 0)
 	{
 		/*
+		 * We perform the following tasks when a process crashes
+		 * 1. If the killed process held no locks during a crash, we avoid
+		 *    postmaster restarts.
+		 * 2. If the killed process has acquired or is in the process acquiring
+		 *    a lock we take a conservative approach and restart the postmaster.
+		 * 3. If a process is killed before it can have a Proc struct assigned,
+		 *    we take a conservative approach and restart the postmaster.
+		 *    Examples of spinlocks accessed during process creation are:
+		 *    XLogCtl->info_lck, ProcStructLock.
+		 */
+
+		int i;
+		bool foundProcStruct = false;
+		for (i = 0; i < ProcGlobal->allProcCount; i++)
+		{
+			PGPROC	   *proc = &ProcGlobal->allProcs[i];
+
+			if (!proc || proc->pid != pid)
+				continue;
+
+			foundProcStruct = true;
+
+			/*
+			 * We take a conservative approach and restart the postmaster if
+			 * a process dies while holding a lock. Otherwise, we can do some
+			 * cleanup.
+			 */
+			if (proc->ybLWLockAcquired || proc->ybSpinLocksAcquired > 0)
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash while "
+								"acquiring %s", proc->ybLWLockAcquired ? "LWLock" : "SpinLock")));
+				break;
+			}
+
+			if (!WIFSIGNALED(exitstatus))
+				break;
+
+			if (WTERMSIG(exitstatus) != SIGABRT &&
+				WTERMSIG(exitstatus) != SIGKILL &&
+				WTERMSIG(exitstatus) != SIGSEGV)
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash from "
+								"unexpected error code %d",
+							WTERMSIG(exitstatus))));
+				break;
+			}
+
+			if (!proc->ybInitializationCompleted)
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash of a "
+								"process while it was initializing")));
+				break;
+			}
+
+			if (proc->ybTerminationStarted)
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash of a "
+								"process while it was terminating")));
+				break;
+			}
+
+			if (proc->ybEnteredCriticalSection)
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash of a "
+								"process while it was in a critical section")));
+				break;
+			}
+
+			elog(INFO, "cleaning up after process with pid %d exited with status %d",
+				 pid, exitstatus);
+			if (!CleanupKilledProcess(proc))
+			{
+				YbCrashInUnmanageableState = true;
+				ereport(WARNING,
+						(errmsg("terminating active server processes due to backend crash that is "
+								"unable to be cleaned up")));
+			}
+			break;
+		}
+
+		/*
 		 * Check if this child was a startup process.
 		 */
 		if (pid == StartupPID)
@@ -2874,6 +3073,7 @@ reaper(SIGNAL_ARGS)
 			 */
 			StartupStatus = STARTUP_NOT_RUNNING;
 			FatalError = false;
+			YbCrashInUnmanageableState = false;
 			Assert(AbortStartTime == 0);
 			ReachedNormalRunning = true;
 			pmState = PM_RUN;
@@ -3090,8 +3290,34 @@ reaper(SIGNAL_ARGS)
 
 		/*
 		 * Else do standard backend child cleanup.
+		 *
+		 * If there is no proc struct (and the crash is unexpected), restart.
+		 * We need to check for an unexpected exit because if a connection attempt is made while the
+		 * database system is starting up, that backend will fail. We do not want to restart the
+		 * postmaster in those cases because the postmaster may end up in a restart loop.
+		 * EXIT_STATUS_0 is normal termination, and EXIT_STATUS_1 is the process responding to a
+		 * termination request or terminating with a FATAL.
 		 */
+		if (!foundProcStruct && !EXIT_STATUS_0(exitstatus) && !EXIT_STATUS_1(exitstatus))
+		{
+			YbCrashInUnmanageableState = true;
+			ereport(WARNING,
+					(errmsg("terminating active server processes due to backend crash of a "
+							"partially initialized process")));
+		}
+
 		CleanupBackend(pid, exitstatus);
+		if (!YbCrashInUnmanageableState && !FatalError)
+		{
+			/*
+			 * Since this is not a fatal crash, we are pursuing a clean exit. All
+			 * we need to do is to clear the pgstat entry of the dead backend
+			 * pid. In case of postmaster restart, it is unnecessary as all the
+			 * shared memory state will be reset.
+			 */
+			yb_pgstat_clear_entry_pid(pid);
+
+		}
 	}							/* loop over pending child-death reports */
 
 	/*
@@ -3209,6 +3435,53 @@ CleanupBackgroundWorker(int pid,
 }
 
 /*
+ * CleanupKilledProcess - cleanup after an unexpectedly killed process.
+ *
+ * Returns true if the process was succesfully cleaned up, false if the process
+ * cannot be cleaned up.
+ */
+static bool
+CleanupKilledProcess(PGPROC *proc)
+{
+	KilledProcToClean = proc;
+	if (proc->backendId == InvalidBackendId)
+	{
+		/* These come from ShutdownAuxiliaryProcess */
+		ConditionVariableCancelSleepForProc(proc);
+		pgstat_report_wait_end_for_proc(proc);
+	}
+	else
+	{
+		/* From InitProcessPhase2 */
+		ProcArrayRemove(proc, InvalidTransactionId);
+
+		/* From ProcSignalInit */
+		CleanupProcSignalStateForProc(proc);
+
+		/* From SharedInvalBackendInit */
+		CleanupInvalidationStateForProc(proc);
+	}
+
+	/* From ProcKill */
+	ReplicationSlotCleanupForProc(proc);
+	SyncRepCleanupAtProcExit(proc);
+	ConditionVariableCancelSleepForProc(proc);
+
+	if (proc->lockGroupLeader != NULL)
+	{
+		elog(WARNING, "cannot cleanup after a process in a lockgroup");
+		return false;
+	}
+
+	DisownLatchOnBehalfOfPid(&proc->procLatch, proc->pid);
+
+	ReleaseProcToFreeList(proc);
+
+	KilledProcToClean = NULL;
+	return true;
+}
+
+/*
  * CleanupBackend -- cleanup after terminated backend.
  *
  * Remove all local state associated with backend.
@@ -3221,7 +3494,17 @@ CleanupBackend(int pid,
 {
 	dlist_mutable_iter iter;
 
-	LogChildExit(DEBUG2, _("server process"), pid, exitstatus);
+	if (YBIsEnabledInPostgresEnvVar())
+	{
+		LogChildExit(EXIT_STATUS_0(exitstatus) ? DEBUG2 : WARNING, _("server process"), pid, exitstatus);
+
+		if (WTERMSIG(exitstatus) == SIGKILL)
+			pgstat_report_query_termination("Terminated by SIGKILL", pid);
+		else if (WTERMSIG(exitstatus) == SIGSEGV)
+			pgstat_report_query_termination("Terminated by SIGSEGV", pid);
+	}
+	else
+		LogChildExit(DEBUG2, _("server process"), pid, exitstatus);
 
 	/*
 	 * If a backend dies in an ugly way then we must signal all other backends
@@ -3315,14 +3598,22 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 	 * clutter log.
 	 */
 	take_action = !FatalError && Shutdown != ImmediateShutdown;
-	if (YBIsEnabledInPostgresEnvVar()) {
-		take_action = take_action && YBShouldRestartAllChildrenIfOneCrashes();
+	/*
+	 * If we enable the flag yb_pg_terminate_child_backend to false, it means
+	 * that if a child has crashed in a safe state, we need not do a postmaster
+	 * restart. We check for that condition in determine if we need to restart
+	 * postmaster (the variable take_action determines that).
+	 */
+	if (YBIsEnabledInPostgresEnvVar() && !YBShouldRestartAllChildrenIfOneCrashes())
+	{
+		take_action = take_action && YbCrashInUnmanageableState;
 	}
 
 	if (take_action)
 	{
-		LogChildExit(LOG, procname, pid, exitstatus);
-		ereport(LOG,
+		int level = YBIsEnabledInPostgresEnvVar() ? INFO : LOG;
+		LogChildExit(level, procname, pid, exitstatus);
+		ereport(level,
 				(errmsg("terminating any other active server processes")));
 	}
 
@@ -3365,7 +3656,7 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 			 */
 			if (take_action)
 			{
-				ereport(DEBUG2,
+				ereport(INFO,
 						(errmsg_internal("sending %s to process %d",
 										 (SendStop ? "SIGSTOP" : "SIGQUIT"),
 										 (int) rw->rw_pid)));
@@ -3533,6 +3824,8 @@ HandleChildCrash(int pid, int exitstatus, const char *procname)
 		allow_immediate_pgstat_restart();
 	}
 
+	if (YBIsEnabledInPostgresEnvVar() && !YBShouldRestartAllChildrenIfOneCrashes() && !take_action)
+		return;
 	/* We do NOT restart the syslogger */
 
 	if (Shutdown != ImmediateShutdown)
@@ -3583,6 +3876,7 @@ LogChildExit(int lev, const char *procname, int pid, int exitstatus)
 						procname, pid, WEXITSTATUS(exitstatus)),
 				 activity ? errdetail("Failed process was running: %s", activity) : 0));
 	else if (WIFSIGNALED(exitstatus))
+	{
 #if defined(WIN32)
 		ereport(lev,
 
@@ -3614,6 +3908,7 @@ LogChildExit(int lev, const char *procname, int pid, int exitstatus)
 						procname, pid, WTERMSIG(exitstatus)),
 				 activity ? errdetail("Failed process was running: %s", activity) : 0));
 #endif
+	}
 	else
 		ereport(lev,
 
@@ -3982,6 +4277,41 @@ TerminateChildren(int signal)
 }
 
 /*
+ * SetOomScoreAdjForPid - sets /proc/<pid>/oom_score_adj for the given PID
+ *
+ * oom_score_adj varies from -1000 to 1000. The lower the value, the lower the
+ * chance that it's going to be killed. A high value is more likely to be
+ * killed by the OOM killer.
+ */
+static void
+SetOomScoreAdjForPid(pid_t pid, char *oom_score_adj)
+{
+#ifdef __linux__
+	if (oom_score_adj[0] == 0)
+		return;
+
+	char file_name[64];
+	snprintf(file_name, sizeof(file_name), "/proc/%d/oom_score_adj", pid);
+	FILE * fPtr;
+	fPtr = fopen(file_name, "w");
+
+	if(fPtr == NULL)
+	{
+		int saved_errno = errno;
+		ereport(LOG,
+			(errcode_for_file_access(),
+				errmsg("error %d: %s, unable to open file %s", saved_errno,
+				strerror(saved_errno), file_name)));
+	}
+	else
+	{
+		fputs(oom_score_adj, fPtr);
+		fclose(fPtr);
+	}
+#endif
+}
+
+/*
  * BackendStartup -- start backend process
  *
  * returns: STATUS_ERROR if the fork failed, STATUS_OK otherwise.
@@ -4024,7 +4354,7 @@ BackendStartup(Port *port)
 	bn->cancel_key = MyCancelKey;
 
 	/* Pass down canAcceptConnections state */
-	port->canAcceptConnections = canAcceptConnections();
+	port->canAcceptConnections = canAcceptConnections(BACKEND_TYPE_NORMAL);
 	bn->dead_end = (port->canAcceptConnections != CAC_OK &&
 					port->canAcceptConnections != CAC_WAITBACKUP);
 
@@ -4045,6 +4375,16 @@ BackendStartup(Port *port)
 	pid = fork_process();
 	if (pid == 0)				/* child */
 	{
+#ifdef HAVE_SYS_PRCTL_H
+		/*
+		 * In YB, all backends are stateless and upon PG master termination, all
+		 * backend processes should also terminate regardless what state they are
+		 * in. No clean-up procedure is needed in the backends.
+		 */
+		if (YBIsEnabledInPostgresEnvVar())
+			prctl(PR_SET_PDEATHSIG, SIGKILL);
+#endif
+
 		free(bn);
 
 		/* Detangle from postmaster */
@@ -4093,6 +4433,8 @@ BackendStartup(Port *port)
 	if (!bn->dead_end)
 		ShmemBackendArrayAdd(bn);
 #endif
+
+	SetOomScoreAdjForPid(pid, YbBackendOomScoreAdj);
 
 	return STATUS_OK;
 }
@@ -4302,6 +4644,11 @@ BackendInitialize(Port *port)
 	else
 		init_ps_display(port->user_name, port->database_name, remote_ps_data,
 						update_process_title ? "authentication" : "");
+
+	if (YBIsEnabledInPostgresEnvVar() && am_walsender)
+		YBC_LOG_INFO("Started Walsender backend with pid: %d, user_name: %s, "
+					 "remote_ps_data: %s",
+					 getpid(), port->user_name, remote_ps_data);
 
 	/*
 	 * Disable the timeout, and prevent SIGTERM/SIGQUIT again.
@@ -4910,7 +5257,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		/* And run the backend */
 		BackendRun(&port);		/* does not return */
@@ -4924,7 +5271,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitAuxiliaryProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AuxiliaryProcessMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4937,7 +5284,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AutoVacLauncherMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4950,7 +5297,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		AutoVacWorkerMain(argc - 2, argv + 2);	/* does not return */
 	}
@@ -4968,7 +5315,7 @@ SubPostmasterMain(int argc, char *argv[])
 		InitProcess();
 
 		/* Attach process to shared data structures */
-		CreateSharedMemoryAndSemaphores(false, 0);
+		CreateSharedMemoryAndSemaphores(0);
 
 		/* Fetch MyBgworkerEntry from shared memory */
 		shmem_slot = atoi(argv[1] + 15);
@@ -5445,7 +5792,7 @@ StartAutovacuumWorker(void)
 	 * we have to check to avoid race-condition problems during DB state
 	 * changes.
 	 */
-	if (canAcceptConnections() == CAC_OK)
+	if (canAcceptConnections(BACKEND_TYPE_AUTOVAC) == CAC_OK)
 	{
 		/*
 		 * Compute the cancel key that will be assigned to this session. We
@@ -5594,7 +5941,8 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("database connection requirement not indicated during registration")));
 
-	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, (flags & BGWORKER_BYPASS_ALLOWCONN) != 0);
+	InitPostgres(dbname, InvalidOid, username, InvalidOid, NULL, NULL,
+				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0);
 
 	/* it had better not gotten out of "init" mode yet */
 	if (!IsInitProcessingMode())
@@ -5607,7 +5955,8 @@ BackgroundWorkerInitializeConnection(const char *dbname, const char *username, u
  * Connect background worker to a database using OIDs.
  */
 void
-BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
+YbBackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid,
+											uint64_t *session_id, uint32 flags)
 {
 	BackgroundWorker *worker = MyBgworkerEntry;
 
@@ -5617,13 +5966,21 @@ BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid, uint32 flags)
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("database connection requirement not indicated during registration")));
 
-	InitPostgres(NULL, dboid, NULL, useroid, NULL, (flags & BGWORKER_BYPASS_ALLOWCONN) != 0);
+	InitPostgres(NULL, dboid, NULL, useroid, NULL, session_id,
+				 (flags & BGWORKER_BYPASS_ALLOWCONN) != 0);
 
 	/* it had better not gotten out of "init" mode yet */
 	if (!IsInitProcessingMode())
 		ereport(ERROR,
 				(errmsg("invalid processing mode in background worker")));
 	SetProcessingMode(NormalProcessing);
+}
+
+void
+BackgroundWorkerInitializeConnectionByOid(Oid dboid, Oid useroid,
+										  uint32 flags)
+{
+	YbBackgroundWorkerInitializeConnectionByOid(dboid, useroid, NULL, flags);
 }
 
 /*
@@ -5680,12 +6037,13 @@ do_start_bgworker(RegisteredBgWorker *rw)
 
 	/*
 	 * Allocate and assign the Backend element.  Note we must do this before
-	 * forking, so that we can handle out of memory properly.
+	 * forking, so that we can handle failures (out of memory or child-process
+	 * slots) cleanly.
 	 *
 	 * Treat failure as though the worker had crashed.  That way, the
-	 * postmaster will wait a bit before attempting to start it again; if it
-	 * tried again right away, most likely it'd find itself repeating the
-	 * out-of-memory or fork failure condition.
+	 * postmaster will wait a bit before attempting to start it again; if we
+	 * tried again right away, most likely we'd find ourselves hitting the
+	 * same resource-exhaustion condition.
 	 */
 	if (!assign_backendlist_entry(rw))
 	{
@@ -5737,6 +6095,8 @@ do_start_bgworker(RegisteredBgWorker *rw)
 			MemoryContextDelete(PostmasterContext);
 			PostmasterContext = NULL;
 
+			SetOomScoreAdjForPid(MyProcPid, rw->rw_worker.bgw_oom_score_adj);
+
 			StartBackgroundWorker();
 
 			exit(1);			/* should not get here */
@@ -5779,12 +6139,12 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 		case PM_RUN:
 			if (start_time == BgWorkerStart_RecoveryFinished)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_HOT_STANDBY:
 			if (start_time == BgWorkerStart_ConsistentState)
 				return true;
-			/* fall through */
+			switch_fallthrough();
 
 		case PM_RECOVERY:
 		case PM_STARTUP:
@@ -5810,6 +6170,19 @@ static bool
 assign_backendlist_entry(RegisteredBgWorker *rw)
 {
 	Backend    *bn;
+
+	/*
+	 * Check that database state allows another connection.  Currently the
+	 * only possible failure is CAC_TOOMANY, so we just log an error message
+	 * based on that rather than checking the error code precisely.
+	 */
+	if (canAcceptConnections(BACKEND_TYPE_BGWORKER) != CAC_OK)
+	{
+		ereport(LOG,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("no slot available for new worker process")));
+		return false;
+	}
 
 	/*
 	 * Compute the cancel key that will be assigned to this session. We
@@ -5879,12 +6252,6 @@ maybe_start_bgworkers(void)
 	/* Don't need to be called again unless we find a reason for it below */
 	StartWorkerNeeded = false;
 	HaveCrashedWorker = false;
-
-	/* Do not need any bgworkers in YugaByte mode at this point. */
-	if (YBIsEnabledInPostgresEnvVar())
-	{
-		return;
-	}
 
 	slist_foreach_modify(iter, &BackgroundWorkerList)
 	{

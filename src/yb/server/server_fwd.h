@@ -13,8 +13,7 @@
 //
 //
 
-#ifndef YB_SERVER_SERVER_FWD_H
-#define YB_SERVER_SERVER_FWD_H
+#pragma once
 
 #include "yb/gutil/ref_counted.h"
 
@@ -22,9 +21,10 @@ namespace yb {
 namespace server {
 
 class Clock;
-typedef scoped_refptr<Clock> ClockPtr;
+class GenericServiceProxy;
+class MonitoredTask;
+
+using ClockPtr = scoped_refptr<Clock>;
 
 } // namespace server
 } // namespace yb
-
-#endif // YB_SERVER_SERVER_FWD_H

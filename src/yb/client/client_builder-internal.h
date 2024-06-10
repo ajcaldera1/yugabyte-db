@@ -29,15 +29,24 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CLIENT_CLIENT_BUILDER_INTERNAL_H_
-#define YB_CLIENT_CLIENT_BUILDER_INTERNAL_H_
+#pragma once
 
+#include <stdint.h>
+
+#include <functional>
+#include <set>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <boost/version.hpp>
+
 #include "yb/client/client.h"
+
+#include "yb/common/common_net.pb.h"
 #include "yb/common/entity_ids.h"
-#include "yb/common/wire_protocol.h"
+
 #include "yb/gutil/ref_counted.h"
 
 namespace yb {
@@ -49,15 +58,21 @@ class YBClientBuilder::Data {
   Data();
   ~Data();
 
-  // This is a REST endpoint from which the list of master hosts and ports can be queried. This
-  // takes precedence over both 'master_server_addrs_file_' and 'master_server_addrs_'.
-  std::string master_server_endpoint_;
+  // If this is specified for thread pool size, we will use the same number of threads as the number
+  // of reactor threads.
+  static constexpr int kUseNumReactorsAsNumThreads = -1;
+
+  // Flag name to fetch master addresses from flagfile.
+  std::string master_address_flag_name_;
 
   // This vector holds the list of master server addresses. Note that each entry in this vector
   // can either be a single 'host:port' or a comma separated list of 'host1:port1,host2:port2,...'.
   std::vector<std::string> master_server_addrs_;
 
-  int32_t num_reactors_;
+  // This bool determines whether to use FLAGS_flagfile as an override of client-entered data.
+  bool skip_master_flagfile_ = false;
+
+  int32_t num_reactors_ = 0;
 
   MonoDelta default_admin_operation_timeout_;
   MonoDelta default_rpc_timeout_;
@@ -69,7 +84,12 @@ class YBClientBuilder::Data {
   std::string client_name_ = "ybclient";
 
   // The size of the threadpool to use for calling callbacks.
-  size_t threadpool_size_ = 0;
+  ssize_t threadpool_size_ = 0;
+
+  // If all masters are available but no leader is present on client init,
+  // this flag determines if the client returns failure right away
+  // or waits for a leader to be elected.
+  bool wait_for_leader_election_on_init_ = true;
 
   // Placement information for the client.
   CloudInfoPB cloud_info_pb_;
@@ -80,14 +100,13 @@ class YBClientBuilder::Data {
 
   std::shared_ptr<MemTracker> parent_mem_tracker_;
 
-  std::shared_ptr<rpc::Messenger> messenger_;
-
   bool skip_master_leader_resolution_ = false;
+
+  // See YBClient::Data::master_address_sources_
+  std::vector<MasterAddressSource> master_address_sources_;
  private:
   DISALLOW_COPY_AND_ASSIGN(Data);
 };
 
 }  // namespace client
 }  // namespace yb
-
-#endif // YB_CLIENT_CLIENT_BUILDER_INTERNAL_H_

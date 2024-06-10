@@ -31,62 +31,54 @@
 //
 
 #include <atomic>
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <string>
 #include <thread>
 #include <vector>
 
-#include <boost/scope_exit.hpp>
-
-#include <glog/logging.h>
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/gutil/atomicops.h"
-#include "yb/util/barrier.h"
-#include "yb/gutil/bind.h"
+
+#include "yb/util/blocking_queue.h"
 #include "yb/util/countdown_latch.h"
-#include "yb/util/metrics.h"
-#include "yb/util/promise.h"
-#include "yb/util/random.h"
-#include "yb/gutil/sysinfo.h"
-#include "yb/util/threadpool.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status.h"
 #include "yb/util/taskstream.h"
 #include "yb/util/test_macros.h"
-#include "yb/util/trace.h"
-
-#include "yb/util/locks.h"
-#include "yb/util/test_util.h"
+#include "yb/util/threadpool.h"
 
 using std::atomic;
-using std::shared_ptr;
 using std::string;
-using std::thread;
 using std::unique_ptr;
-using std::vector;
 
-using strings::Substitute;
 DECLARE_bool(enable_tracing);
-
-using std::shared_ptr;
 
 namespace yb {
 
 namespace {
-static Status BuildMinMaxTestPool(int min_threads, int max_threads, gscoped_ptr<ThreadPool> *pool) {
+
+static Status BuildMinMaxTestPool(
+    int min_threads, int max_threads, std::unique_ptr<ThreadPool> *pool) {
   return ThreadPoolBuilder("test").set_min_threads(min_threads)
       .set_max_threads(max_threads)
       .Build(pool);
 }
+
 } // anonymous namespace
 
 class TestTaskStream : public ::testing::Test {
  public:
   TestTaskStream() {
-    FLAGS_enable_tracing = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tracing) = true;
   }
+ protected:
+  const int32_t kTaskstreamQueueMaxSize = 100000;
+  const MonoDelta kTaskstreamQueueMaxWait = MonoDelta::FromMilliseconds(1000);
 };
 
 static void SimpleTaskStreamMethod(int* value, std::atomic<int32_t>* counter) {
@@ -101,13 +93,14 @@ static void SimpleTaskStreamMethod(int* value, std::atomic<int32_t>* counter) {
 
 TEST_F(TestTaskStream, TestSimpleTaskStream) {
   using namespace std::placeholders;
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(1, 1, &thread_pool));
 
   std::atomic<int32_t> counter(0);
   std::function<void (int*)> f1 = std::bind(&SimpleTaskStreamMethod, _1, &counter);
 
-  TaskStream<int> taskStream(f1, thread_pool.get());
+  TaskStream<int> taskStream(f1, thread_pool.get(), kTaskstreamQueueMaxSize,
+                             kTaskstreamQueueMaxWait);
   ASSERT_OK(taskStream.Start());
   int a[4] = {10, 9, 8, 7};
   for (int i = 0; i < 4; i++) {
@@ -121,7 +114,7 @@ TEST_F(TestTaskStream, TestSimpleTaskStream) {
 
 TEST_F(TestTaskStream, TestTwoTaskStreams) {
   using namespace std::placeholders;
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(1, 1, &thread_pool));
 
   std::atomic<int32_t> counter0(0);
@@ -129,8 +122,10 @@ TEST_F(TestTaskStream, TestTwoTaskStreams) {
   std::function<void (int*)> f0 = std::bind(&SimpleTaskStreamMethod, _1, &counter0);
   std::function<void (int*)> f1 = std::bind(&SimpleTaskStreamMethod, _1, &counter1);
 
-  TaskStream<int> taskStream0(f0, thread_pool.get());
-  TaskStream<int> taskStream1(f1, thread_pool.get());
+  TaskStream<int> taskStream0(f0, thread_pool.get(), kTaskstreamQueueMaxSize,
+                              kTaskstreamQueueMaxWait);
+  TaskStream<int> taskStream1(f1, thread_pool.get(), kTaskstreamQueueMaxSize,
+                              kTaskstreamQueueMaxWait);
   ASSERT_OK(taskStream0.Start());
   ASSERT_OK(taskStream1.Start());
   int a[4] = {10, 9, 8, 7};

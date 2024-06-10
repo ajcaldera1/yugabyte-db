@@ -14,6 +14,9 @@ oprofile_data
 .metadata/
 *.iml
 
+# spark testing
+extracted_from_archive.sha256
+
 # VIM/emacs stuff
 *.sw?
 *~
@@ -35,13 +38,13 @@ www/tracing.*
 # Python
 *.py[ocd]
 python_virtual_env/
+venv/
 
 # Backup files
 *.bak
 
 # Core dumps
-core*
-!java/yb-cql/src/test/java/com/datastax/driver/core
+core.*
 
 # CLion directories
 /cmake-build-debug
@@ -51,6 +54,7 @@ core*
 
 # Temporary files
 .DS_Store
+.DS_Store.out
 .\#*.proto
 
 # C# Object files
@@ -65,6 +69,7 @@ core*
 cscope.out
 
 build/python_virtual_env
+build/venv
 *.versionsBackup
 
 # We can use this for marking the thirdparty directory inside a working directory as "unusable" so
@@ -77,9 +82,47 @@ hs_err_pid*.log
 
 compile_commands.json
 
-# This might be added by some editors' Java plugins
-ent/java/yb-cqlent/bin/
-
 test_results.json
 test_failures.json
 *_test_report.json
+
+# Eclipse and Eclipse-compatible tools
+.classpath
+.metadata/
+
+# Diagram generator for docs
+rrdiagram*.jar*
+
+.clangd
+
+# Indexes built with clangd-indexer
+*.dex
+# Allows us to generate YAML-format clangd indexes.
+clangd_*.yml
+
+.cache
+
+target/
+
+thirdparty/
+
+# We don't use any submodules anymore.
+submodules/
+
+# Local Netlify folder
+.netlify/
+
+*.log
+!python/yugabyte/test_data/org_yb_pgsql_TestDropTableWithConcurrentTxn_testDmlTxnDrop_1pct_sample.log
+
+managed/yba-installer/bin/yba-ctl
+managed/.devspace
+managed/yba-installer/yba-ctl
+managed/devops/pex/pexEnv/
+managed/src/main/java/com/yugabyte/yw/common/operator/io/*
+
+*.bad_clang_tidy_output.*
+*.compiler_errors.txt
+
+# jenv local version
+**/.java-version

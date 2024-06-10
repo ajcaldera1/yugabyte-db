@@ -13,21 +13,33 @@
 //
 //
 
-#ifndef YB_COMMON_TRANSACTION_TEST_UTIL_H
-#define YB_COMMON_TRANSACTION_TEST_UTIL_H
+#pragma once
+
+#include <functional>
+#include <type_traits>
 
 #include <gtest/gtest.h>
 
 #include "yb/common/hybrid_time.h"
 #include "yb/common/transaction.h"
+
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+#include "yb/util/result.h"
+#include "yb/util/string_trim.h"
 #include "yb/util/test_macros.h"
+#include "yb/util/tsan_util.h"
 
 namespace yb {
 
 class TransactionStatusManagerMock : public TransactionStatusManager {
  public:
-  HybridTime LocalCommitTime(const TransactionId &id) override {
+  HybridTime LocalCommitTime(const TransactionId& id) override {
     return HybridTime::kInvalid;
+  }
+
+  boost::optional<TransactionLocalState> LocalTxnData(const TransactionId& id) override {
+    return boost::none;
   }
 
   void RequestStatusAt(const StatusRequest& request) override;
@@ -37,27 +49,52 @@ class TransactionStatusManagerMock : public TransactionStatusManager {
         << " has been already committed.";
   }
 
-  boost::optional<TransactionMetadata> Metadata(const TransactionId& id) override {
-    return boost::none;
+  Result<TransactionMetadata> PrepareMetadata(const LWTransactionMetadataPB& pb) override {
+    return STATUS(Expired, "");
   }
 
   void Abort(const TransactionId& id, TransactionStatusCallback callback) override {
   }
 
-  void Cleanup(TransactionIdSet&& set) override {
+  Status Cleanup(TransactionIdApplyOpIdMap&& set) override {
+    return Status::OK();
   }
 
-  int64_t RegisterRequest() override {
+  Result<int64_t> RegisterRequest() override {
     return 0;
   }
 
   void UnregisterRequest(int64_t) override {
   }
 
+  Status FillPriorities(
+      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) override {
+    return Status::OK();
+  }
+
+  Result<boost::optional<TabletId>> FindStatusTablet(const TransactionId& id) override {
+    return boost::none;
+  }
+
+  HybridTime MinRunningHybridTime() const override {
+    return HybridTime::kMin;
+  }
+
+  Result<HybridTime> WaitForSafeTime(HybridTime safe_time, CoarseTimePoint deadline) override {
+    return STATUS(NotSupported, "WaitForSafeTime not implemented");
+  }
+
+  const TabletId& tablet_id() const override {
+    static TabletId tablet_id;
+    return tablet_id;
+  }
+
+  void RecordConflictResolutionKeysScanned(int64_t num_keys) override {}
+
+  void RecordConflictResolutionScanLatency(MonoDelta latency) override {}
+
  private:
   std::unordered_map<TransactionId, HybridTime, TransactionIdHash> txn_commit_time_;
 };
 
 } // namespace yb
-
-#endif // YB_COMMON_TRANSACTION_TEST_UTIL_H

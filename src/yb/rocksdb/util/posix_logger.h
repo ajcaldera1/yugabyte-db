@@ -25,22 +25,27 @@
 // where enough posix functionality is available.
 
 #pragma once
-#include <algorithm>
+
 #include <stdio.h>
-#include "yb/rocksdb/port/sys_time.h"
 #include <time.h>
 #include <fcntl.h>
 
-#ifdef OS_LINUX
+#include <algorithm>
+#include <atomic>
+
+#ifdef __linux__
 #ifndef FALLOC_FL_KEEP_SIZE
 #include <linux/falloc.h>
 #endif
 #endif
 
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/util/iostats_context_imp.h"
-#include "yb/rocksdb/util/sync_point.h"
-#include <atomic>
+
+#include "yb/rocksdb/util/io_posix.h"
+
+#include "yb/util/sync_point.h"
+
+#include "yb/util/stats/iostats_context_imp.h"
 
 namespace rocksdb {
 
@@ -52,12 +57,13 @@ class PosixLogger : public Logger {
   uint64_t (*gettid_)();  // Return the thread id for the current thread
   std::atomic_size_t log_size_;
   int fd_;
-  const static uint64_t flush_every_seconds_ = 5;
+  static const uint64_t flush_every_seconds_ = 5;
   std::atomic_uint_fast64_t last_flush_micros_;
   Env* env_;
   std::atomic<bool> flush_pending_;
+  std::string fname_;
  public:
-  PosixLogger(FILE* f, uint64_t (*gettid)(), Env* env,
+  PosixLogger(const std::string& fname, FILE* f, uint64_t (*gettid)(), Env* env,
               const InfoLogLevel log_level = InfoLogLevel::ERROR_LEVEL)
       : Logger(log_level),
         file_(f),
@@ -66,12 +72,13 @@ class PosixLogger : public Logger {
         fd_(fileno(f)),
         last_flush_micros_(0),
         env_(env),
-        flush_pending_(false) {}
+        flush_pending_(false),
+        fname_(fname) {}
   virtual ~PosixLogger() {
     fclose(file_);
   }
   virtual void Flush() override {
-    TEST_SYNC_POINT_CALLBACK("PosixLogger::Flush:BeginCallback", nullptr);
+    DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("PosixLogger::Flush:BeginCallback", nullptr);
     {
       bool expected_flush_pending = true;
       // TODO: use a weaker memory order?
@@ -110,7 +117,7 @@ class PosixLogger : public Logger {
       struct tm t;
       localtime_r(&seconds, &t);
       p += snprintf(p, limit - p,
-                    "%04d/%02d/%02d-%02d:%02d:%02d.%06d %llx ",
+                    "%04d/%02d/%02d-%02d:%02d:%02d.%06d %" PRIx64 " ",
                     t.tm_year + 1900,
                     t.tm_mon + 1,
                     t.tm_mday,
@@ -118,7 +125,7 @@ class PosixLogger : public Logger {
                     t.tm_min,
                     t.tm_sec,
                     static_cast<int>(now_tv.tv_usec),
-                    static_cast<long long unsigned int>(thread_id));
+                    thread_id);
 
       // Print the message
       if (p < limit) {
@@ -151,14 +158,17 @@ class PosixLogger : public Logger {
       // allocations from filesystem allocsize options.
       const size_t log_size = log_size_;
       const size_t last_allocation_chunk =
-        ((kDebugLogChunkSize - 1 + log_size) / kDebugLogChunkSize);
+          ((kDebugLogChunkSize - 1 + log_size) / kDebugLogChunkSize);
       const size_t desired_allocation_chunk =
-        ((kDebugLogChunkSize - 1 + log_size + write_size) /
-           kDebugLogChunkSize);
+          ((kDebugLogChunkSize - 1 + log_size + write_size) / kDebugLogChunkSize);
       if (last_allocation_chunk != desired_allocation_chunk) {
-        fallocate(
-            fd_, FALLOC_FL_KEEP_SIZE, 0,
-            static_cast<off_t>(desired_allocation_chunk * kDebugLogChunkSize));
+        if (fallocate(
+                fd_, FALLOC_FL_KEEP_SIZE, 0,
+                static_cast<off_t>(desired_allocation_chunk * kDebugLogChunkSize)) != 0) {
+          LOG(ERROR) << STATUS_IO_ERROR(fname_, errno)
+                     << " desired_allocation_chunk: " << desired_allocation_chunk
+                     << " kDebugLogChunkSize: " << kDebugLogChunkSize;
+        }
       }
 #endif
 

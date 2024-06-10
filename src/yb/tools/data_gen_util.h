@@ -31,9 +31,9 @@
 //
 // Utility functions for generating data for use by tools and tests.
 
-#ifndef YB_TOOLS_DATA_GEN_UTIL_H_
-#define YB_TOOLS_DATA_GEN_UTIL_H_
+#pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace yb {
@@ -41,7 +41,6 @@ namespace yb {
 class QLValuePB;
 class QLWriteRequestPB;
 class Random;
-class YBPartialRow;
 
 namespace client {
 class YBSchema;
@@ -55,7 +54,7 @@ namespace tools {
 // For the numbers / bool, the value is truncated to fit the data type.
 // For the string, we encode the number as hex.
 void WriteValueToColumn(const client::YBSchema& schema,
-                        int col_idx,
+                        size_t col_idx,
                         uint64_t value,
                         QLValuePB* out);
 
@@ -66,5 +65,3 @@ void GenerateDataForRow(const client::YBSchema& schema, uint64_t record_id,
 
 } // namespace tools
 } // namespace yb
-
-#endif // YB_TOOLS_DATA_GEN_UTIL_H_

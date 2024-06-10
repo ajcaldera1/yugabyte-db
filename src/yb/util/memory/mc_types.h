@@ -39,22 +39,22 @@
 //   can be use to allocate new classes.
 //     MCList<int> mc_list(mc_string.memory_context());
 //--------------------------------------------------------------------------------------------------
-#ifndef YB_UTIL_MEMORY_MC_TYPES_H
-#define YB_UTIL_MEMORY_MC_TYPES_H
+#pragma once
 
+#include <atomic>
 #include <deque>
 #include <list>
 #include <map>
+#include <memory>
+#include <new>
 #include <set>
-#include <string>
-#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include <boost/tti/has_type.hpp>
 
-#include "yb/util/memory/arena.h"
+#include "yb/util/memory/arena_fwd.h"
 
 namespace yb {
 
@@ -174,5 +174,3 @@ class MCBase {
 };
 
 }  // namespace yb
-
-#endif // YB_UTIL_MEMORY_MC_TYPES_H

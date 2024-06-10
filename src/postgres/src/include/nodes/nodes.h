@@ -58,6 +58,8 @@ typedef enum NodeTag
 	T_IndexOnlyScan,
 	T_BitmapIndexScan,
 	T_BitmapHeapScan,
+	T_YbBitmapIndexScan,
+	T_YbBitmapTableScan,
 	T_TidScan,
 	T_SubqueryScan,
 	T_FunctionScan,
@@ -114,6 +116,8 @@ typedef enum NodeTag
 	T_IndexOnlyScanState,
 	T_BitmapIndexScanState,
 	T_BitmapHeapScanState,
+	T_YbBitmapIndexScanState,
+	T_YbBitmapTableScanState,
 	T_TidScanState,
 	T_SubqueryScanState,
 	T_FunctionScanState,
@@ -151,6 +155,7 @@ typedef enum NodeTag
 	T_Var,
 	T_Const,
 	T_Param,
+	T_YbBatchedExpr,
 	T_Aggref,
 	T_GroupingFunc,
 	T_WindowFunc,
@@ -226,6 +231,7 @@ typedef enum NodeTag
 	T_Path,
 	T_IndexPath,
 	T_BitmapHeapPath,
+	T_YbBitmapTablePath,
 	T_BitmapAndPath,
 	T_BitmapOrPath,
 	T_TidPath,
@@ -359,6 +365,7 @@ typedef enum NodeTag
 	T_LockStmt,
 	T_ConstraintsSetStmt,
 	T_ReindexStmt,
+	T_BackfillIndexStmt,
 	T_CheckPointStmt,
 	T_CreateSchemaStmt,
 	T_AlterDatabaseStmt,
@@ -373,6 +380,7 @@ typedef enum NodeTag
 	T_ExecuteStmt,
 	T_DeallocateStmt,
 	T_DeclareCursorStmt,
+	T_CreateTableGroupStmt,
 	T_CreateTableSpaceStmt,
 	T_DropTableSpaceStmt,
 	T_AlterObjectDependsStmt,
@@ -475,6 +483,8 @@ typedef enum NodeTag
 	T_PartitionRangeDatum,
 	T_PartitionCmd,
 	T_VacuumRelation,
+	T_OptSplit,
+	T_RowBounds,
 
 	/*
 	 * TAGS FOR REPLICATION GRAMMAR PARSE NODES (replnodes.h)
@@ -505,7 +515,23 @@ typedef enum NodeTag
 	T_IndexAmRoutine,			/* in access/amapi.h */
 	T_TsmRoutine,				/* in access/tsmapi.h */
 	T_ForeignKeyCacheInfo,		/* in utils/rel.h */
-	T_CallContext				/* in nodes/parsenodes.h */
+	T_CallContext,				/* in nodes/parsenodes.h */
+
+	/*
+	 * TAGS FOR YUGABYTE NODES.
+	 */
+	T_YbPgExecOutParam,
+	T_YbBackfillInfo,
+	T_PartitionPruneStepFuncOp,
+	T_YbExprColrefDesc,
+	T_YbSeqScan,
+	T_YbSeqScanState,
+	T_YbBatchedNestLoop,
+	T_YbBatchedNestLoopState,
+	T_YbCreateProfileStmt,
+	T_YbDropProfileStmt,
+	T_YbTIDBitmap,
+
 } NodeTag;
 
 /*
@@ -808,7 +834,8 @@ typedef enum OnConflictAction
 {
 	ONCONFLICT_NONE,			/* No "ON CONFLICT" clause */
 	ONCONFLICT_NOTHING,			/* ON CONFLICT ... DO NOTHING */
-	ONCONFLICT_UPDATE			/* ON CONFLICT ... DO UPDATE */
+	ONCONFLICT_UPDATE,			/* ON CONFLICT ... DO UPDATE */
+	ONCONFLICT_YB_REPLACE		/* Replace the existing tuple (upsert mode) */
 } OnConflictAction;
 
 #endif							/* NODES_H */

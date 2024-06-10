@@ -30,18 +30,20 @@ int main() {
 #else
 
 #include <vector>
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
 #include "yb/rocksdb/filter_policy.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/util/arena.h"
+
 #include "yb/util/enums.h"
+#include "yb/util/test_util.h"
 
 using GFLAGS::ParseCommandLineFlags;
 
-DEFINE_int32(bits_per_key, 10, "");
+DEFINE_NON_RUNTIME_int32(bits_per_key, 10, "");
 
 namespace rocksdb {
 
@@ -65,7 +67,7 @@ static size_t NextLength(size_t length) {
   return length;
 }
 
-class BloomTest : public testing::Test {
+class BloomTest : public RocksDBTest {
  private:
   const FilterPolicy* policy_;
   std::string filter_;
@@ -250,7 +252,7 @@ std::unique_ptr<const BloomTestContext> CreateContext(BuilderReaderBloomTestType
 
 } // namespace
 
-class BuilderReaderBloomTest : public testing::Test,
+class BuilderReaderBloomTest : public RocksDBTest,
     public ::testing::WithParamInterface<BuilderReaderBloomTestType> {
  protected:
   std::unique_ptr<const BloomTestContext> context_;

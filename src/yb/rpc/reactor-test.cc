@@ -30,16 +30,18 @@
 // under the License.
 //
 
-#include "yb/rpc/reactor.h"
-
 #include <thread>
 
 #include "yb/rpc/rpc-test-base.h"
-#include "yb/util/countdown_latch.h"
 
-using std::shared_ptr;
+#include "yb/util/countdown_latch.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/thread.h"
+
 using namespace std::literals;
 using namespace std::placeholders;
+
+DECLARE_int32(TEST_rpc_reactor_index_for_init_failure_simulation);
 
 namespace yb {
 namespace rpc {
@@ -53,7 +55,7 @@ MessengerOptions MakeMessengerOptions() {
 class ReactorTest : public RpcTestBase {
  public:
   ReactorTest()
-    : messenger_(CreateMessenger("my_messenger", MakeMessengerOptions())),
+    : messenger_(CreateMessenger("my_messenger", MakeMessengerOptions()).release()),
       latch_(1) {
   }
 
@@ -69,32 +71,45 @@ class ReactorTest : public RpcTestBase {
   }
 
   void ScheduledTaskScheduleAgain(const Status& status) {
-    auto task_id = messenger_->ScheduleOnReactor(
+    auto expected_task_id = messenger_->TEST_next_task_id();
+    auto task_id = ASSERT_RESULT(messenger_->ScheduleOnReactor(
         std::bind(&ReactorTest::ScheduledTaskCheckThread, this, _1, Thread::current_thread()),
-        0s, SOURCE_LOCATION(), nullptr /* messenger */);
-    ASSERT_EQ(task_id, 0);
+        0s, SOURCE_LOCATION()));
+    ASSERT_EQ(expected_task_id, task_id);
     latch_.CountDown();
   }
 
  protected:
-  const shared_ptr<Messenger> messenger_;
+  AutoShutdownMessengerHolder messenger_;
   CountDownLatch latch_;
 };
 
+TEST_F_EX(ReactorTest, MessengerInitFailure, YBTest) {
+  MessengerBuilder builder("test-msgr");
+  // Test Reactor::Init failure in very first Messenger's reactor
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation) = 0;
+  ASSERT_NOK(builder.Build());
+  // Test Reactor::Init failure in second Messenger's reactor
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_rpc_reactor_index_for_init_failure_simulation) = 1;
+  ASSERT_NOK(builder.Build());
+}
+
 TEST_F(ReactorTest, TestFunctionIsCalled) {
-  auto task_id = messenger_->ScheduleOnReactor(
+  auto expected_task_id = messenger_->TEST_next_task_id();
+  auto task_id = ASSERT_RESULT(messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()), 0s,
-      SOURCE_LOCATION(), nullptr /* messenger */);
-  ASSERT_EQ(task_id, 0);
+      SOURCE_LOCATION()));
+  ASSERT_EQ(expected_task_id, task_id);
   latch_.Wait();
 }
 
 TEST_F(ReactorTest, TestFunctionIsCalledAtTheRightTime) {
   MonoTime before = MonoTime::Now();
-  auto task_id = messenger_->ScheduleOnReactor(
+  auto expected_task_id = messenger_->TEST_next_task_id();
+  auto task_id = ASSERT_RESULT(messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTask, this, _1, Status::OK()),
-      100ms, SOURCE_LOCATION(), nullptr /* messenger */);
-  ASSERT_EQ(task_id, 0);
+      100ms, SOURCE_LOCATION()));
+  ASSERT_EQ(expected_task_id, task_id);
   latch_.Wait();
   MonoTime after = MonoTime::Now();
   MonoDelta delta = after.GetDeltaSince(before);
@@ -102,10 +117,11 @@ TEST_F(ReactorTest, TestFunctionIsCalledAtTheRightTime) {
 }
 
 TEST_F(ReactorTest, TestFunctionIsCalledIfReactorShutdown) {
-  auto task_id = messenger_->ScheduleOnReactor(
+  auto expected_task_id = messenger_->TEST_next_task_id();
+  auto task_id = ASSERT_RESULT(messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTask, this, _1, STATUS(Aborted, "doesn't matter")),
-      60s, SOURCE_LOCATION(), nullptr /* messenger */);
-  ASSERT_EQ(task_id, 0);
+      60s, SOURCE_LOCATION()));
+  ASSERT_EQ(expected_task_id, task_id);
   messenger_->Shutdown();
   latch_.Wait();
 }
@@ -114,10 +130,11 @@ TEST_F(ReactorTest, TestReschedulesOnSameReactorThread) {
   // Our scheduled task will schedule yet another task.
   latch_.Reset(2);
 
-  auto task_id = messenger_->ScheduleOnReactor(
+  auto expected_task_id = messenger_->TEST_next_task_id();
+  auto task_id = ASSERT_RESULT(messenger_->ScheduleOnReactor(
       std::bind(&ReactorTest::ScheduledTaskScheduleAgain, this, _1), 0s,
-      SOURCE_LOCATION(), nullptr /* messenger */);
-  ASSERT_EQ(task_id, 0);
+      SOURCE_LOCATION()));
+  ASSERT_EQ(expected_task_id, task_id);
   latch_.Wait();
   latch_.Wait();
 }

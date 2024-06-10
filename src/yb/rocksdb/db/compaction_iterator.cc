@@ -21,14 +21,19 @@
 //
 
 #include "yb/rocksdb/db/compaction_iterator.h"
+#include <iterator>
+
 #include "yb/rocksdb/table/internal_iterator.h"
+
+#include "yb/util/status_log.h"
+#include "yb/util/logging.h"
 
 namespace rocksdb {
 
 CompactionIterator::CompactionIterator(
     InternalIterator* input, const Comparator* cmp, MergeHelper* merge_helper,
     SequenceNumber last_sequence, std::vector<SequenceNumber>* snapshots,
-    SequenceNumber earliest_write_conflict_snapshot, Env* env,
+    SequenceNumber earliest_write_conflict_snapshot,
     bool expect_valid_internal_key, Compaction* compaction,
     CompactionFilter* compaction_filter, LogBuffer* log_buffer)
     : input_(input),
@@ -36,7 +41,6 @@ CompactionIterator::CompactionIterator(
       merge_helper_(merge_helper),
       snapshots_(snapshots),
       earliest_write_conflict_snapshot_(earliest_write_conflict_snapshot),
-      env_(env),
       expect_valid_internal_key_(expect_valid_internal_key),
       compaction_(compaction),
       compaction_filter_(compaction_filter),
@@ -63,6 +67,18 @@ CompactionIterator::CompactionIterator(
     ignore_snapshots_ = true;
   } else {
     ignore_snapshots_ = false;
+  }
+}
+
+void CompactionIterator::AddLiveRanges(const std::vector<std::pair<Slice, Slice>>& ranges) {
+  for (auto it = ranges.rbegin(); it != ranges.rend(); ++it) {
+    const auto& range = *it;
+    DCHECK(range.first.Less(range.second));
+    if (!live_key_ranges_stack_.empty()) {
+      DCHECK(live_key_ranges_stack_.back().first.GreaterOrEqual(range.second));
+    }
+    auto user_key_pair = std::make_pair(range.first, range.second);
+    live_key_ranges_stack_.push_back(user_key_pair);
   }
 }
 
@@ -124,9 +140,13 @@ void CompactionIterator::NextFromInput() {
   at_next_ = false;
   valid_ = false;
 
-  while (!valid_ && input_->Valid()) {
-    key_ = input_->key();
-    value_ = input_->value();
+  while (!valid_) {
+    const auto& entry = input_->Entry();
+    if (!entry) {
+      return;
+    }
+    key_ = entry.key;
+    value_ = entry.value;
     iter_stats_.num_input_records++;
 
     if (!ParseInternalKey(key_, &ikey_)) {
@@ -145,6 +165,34 @@ void CompactionIterator::NextFromInput() {
       iter_stats_.num_input_corrupt_records++;
       valid_ = true;
       break;
+    }
+
+    {
+      auto updated_live_range = false;
+      while (!live_key_ranges_stack_.empty() &&
+             !live_key_ranges_stack_.back().second.empty() &&
+             live_key_ranges_stack_.back().second.Less(ikey_.user_key)) {
+        // As long as the active range is before the compaction iterator's current progress, pop to
+        // the next active range.
+        live_key_ranges_stack_.pop_back();
+        updated_live_range = true;
+      }
+      if (updated_live_range) {
+        if (live_key_ranges_stack_.empty()) {
+          // If we've iterated past the last active range, we're done.
+          valid_ = false;
+          return;
+        }
+
+        auto next_range_start = live_key_ranges_stack_.back().first;
+        if (ikey_.user_key.Less(next_range_start)) {
+          // If the next active range starts after the current key, then seek to it and continue.
+          IterKey iter_key;
+          iter_key.SetInternalKey(next_range_start, kMaxSequenceNumber, kValueTypeForSeek);
+          input_->Seek(iter_key.GetKey());
+          continue;
+        }
+      }
     }
 
     // Update input statistics
@@ -178,14 +226,9 @@ void CompactionIterator::NextFromInput() {
         bool value_changed = false;
         bool to_delete = false;
         compaction_filter_value_.clear();
-        {
-          StopWatchNano timer(env_, true);
-          to_delete = compaction_filter_->Filter(
-              compaction_->level(), ikey_.user_key, value_,
-              &compaction_filter_value_, &value_changed) != FilterDecision::kKeep;
-          iter_stats_.total_filter_time +=
-              env_ != nullptr ? timer.ElapsedNanos() : 0;
-        }
+        to_delete = compaction_filter_->Filter(
+            compaction_->level(), ikey_.user_key, value_,
+            &compaction_filter_value_, &value_changed) != FilterDecision::kKeep;
         if (to_delete) {
           // convert the current key to a delete
           ikey_.type = kTypeDeletion;
@@ -387,7 +430,11 @@ void CompactionIterator::NextFromInput() {
       // have hit (A)
       // We encapsulate the merge related state machine in a different
       // object to minimize change to the existing flow.
-      merge_helper_->MergeUntil(input_, prev_snapshot, bottommost_level_);
+      auto merge_until_result = merge_helper_->MergeUntil(input_, prev_snapshot, bottommost_level_);
+      if (PREDICT_FALSE(!merge_until_result.ok())) {
+        YB_LOG_EVERY_N_SECS(WARNING, 100) << "Merge until failed: "
+          << merge_until_result.ToString();
+      }
       merge_out_iter_.SeekToFirst();
 
       if (merge_out_iter_.Valid()) {

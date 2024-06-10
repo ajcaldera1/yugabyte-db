@@ -21,14 +21,22 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include "yb/rocksdb/util/mock_env.h"
+
 #include <algorithm>
 #include <chrono>
 
-#include "yb/rocksdb/util/mock_env.h"
 #include "yb/rocksdb/port/sys_time.h"
-#include "yb/rocksdb/util/rate_limiter.h"
-#include "yb/rocksdb/util/random.h"
+#include "yb/rocksdb/rate_limiter.h"
 #include "yb/rocksdb/util/murmurhash.h"
+#include "yb/rocksdb/util/mutexlock.h"
+#include "yb/rocksdb/util/random.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+
+using std::unique_ptr;
+using std::shared_ptr;
 
 namespace rocksdb {
 
@@ -112,7 +120,7 @@ class MemFile {
     }
   }
 
-  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const {
+  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const {
     MutexLock lock(&mutex_);
     if (offset > Size()) {
       return STATUS(IOError, "Offset greater than file size.");
@@ -150,6 +158,8 @@ class MemFile {
   uint64_t ModifiedTime() const {
     return modified_time_;
   }
+
+  const std::string& filename() const { return fn_; }
 
  private:
   uint64_t Now() {
@@ -197,7 +207,7 @@ class MockSequentialFile : public SequentialFile {
     file_->Unref();
   }
 
-  Status Read(size_t n, Slice* result, char* scratch) override {
+  Status Read(size_t n, Slice* result, uint8_t* scratch) override {
     Status s = file_->Read(pos_, n, result, scratch);
     if (s.ok()) {
       pos_ += result->size();
@@ -217,6 +227,11 @@ class MockSequentialFile : public SequentialFile {
     return Status::OK();
   }
 
+  const std::string& filename() const override {
+    static const std::string kFilename = "MockSequentialFile";
+    return kFilename;
+  }
+
  private:
   MemFile* file_;
   size_t pos_;
@@ -232,12 +247,20 @@ class MockRandomAccessFile : public RandomAccessFile {
     file_->Unref();
   }
 
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-                      char* scratch) const override {
+  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
     return file_->Read(offset, n, result, scratch);
   }
 
+  yb::Result<uint64_t> Size() const override { return file_->Size(); }
+
+  yb::Result<uint64_t> INode() const override { return STATUS(NotSupported, "Not supported"); };
+
+  const std::string& filename() const override { return filename_; }
+
+  size_t memory_footprint() const override { return 0; }
+
  private:
+  std::string filename_ = "MockRandomAccessFile";
   MemFile* file_;
 };
 
@@ -276,9 +299,11 @@ class MockWritableFile : public WritableFile {
 
   uint64_t GetFileSize() override { return file_->Size(); }
 
+  const std::string& filename() const override { return file_->filename(); }
+
  private:
   inline size_t RequestToken(size_t bytes) {
-    if (rate_limiter_ && io_priority_ < Env::IO_TOTAL) {
+    if (rate_limiter_ && io_priority_ < yb::IOPriority::kTotal) {
       bytes = std::min(bytes,
           static_cast<size_t>(rate_limiter_->GetSingleBurstBytes()));
       rate_limiter_->Request(bytes, io_priority_);
@@ -315,7 +340,7 @@ class TestMemLogger : public Logger {
   static const uint64_t flush_every_seconds_ = 5;
   std::atomic_uint_fast64_t last_flush_micros_;
   Env* env_;
-  bool flush_pending_;
+  std::atomic_bool flush_pending_;
 
  public:
   TestMemLogger(std::unique_ptr<WritableFile> f, Env* env,
@@ -394,7 +419,7 @@ class TestMemLogger : public Logger {
       assert(p <= limit);
       const size_t write_size = p - base;
 
-      file_->Append(Slice(base, write_size));
+      CHECK_OK(file_->Append(Slice(base, write_size)));
       flush_pending_ = true;
       log_size_ += write_size;
       uint64_t now_micros = static_cast<uint64_t>(now_tv.tv_sec) * 1000000 +

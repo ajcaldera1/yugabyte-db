@@ -30,28 +30,49 @@
 // under the License.
 //
 
+#include <algorithm>
+#include <limits>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
-#include <glog/logging.h>
-#include <glog/stl_logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
-#include <gflags/gflags.h>
 
+#include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
+
+#include "yb/docdb/read_operation_data.h"
+
+#include "yb/dockv/partial_row.h"
 
 #include "yb/gutil/casts.h"
 #include "yb/gutil/strings/join.h"
+#include "yb/gutil/strings/numbers.h"
+#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/walltime.h"
 
+#include "yb/qlexpr/ql_rowblock.h"
+
+#include "yb/tablet/local_tablet_writer.h"
+#include "yb/tablet/read_result.h"
+#include "yb/tablet/tablet-test-util.h"
 #include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet-test-base.h"
-#include "yb/util/stopwatch.h"
 
-DEFINE_int32(keyspace_size, 300, "number of unique row keys to insert/mutate");
-DEFINE_int32(runtime_seconds, 1, "number of seconds to run the test");
-DEFINE_int32(sleep_between_background_ops_ms, 100,
+#include "yb/util/env.h"
+#include "yb/util/flags.h"
+#include "yb/util/status_log.h"
+#include "yb/util/stopwatch.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/test_util.h"
+#include "yb/util/thread.h"
+
+DEFINE_NON_RUNTIME_int32(keyspace_size, 300, "number of unique row keys to insert/mutate");
+DEFINE_NON_RUNTIME_int32(runtime_seconds, 1, "number of seconds to run the test");
+DEFINE_NON_RUNTIME_int32(sleep_between_background_ops_ms, 100,
              "number of milliseconds to sleep between flushing or compacting");
-DEFINE_int32(update_delete_ratio, 4, "ratio of update:delete when mutating existing rows");
+DEFINE_NON_RUNTIME_int32(update_delete_ratio, 4,
+             "ratio of update:delete when mutating existing rows");
 
 using std::string;
 using std::vector;
@@ -89,7 +110,8 @@ class TestRandomAccess : public YBTabletTest {
  public:
   TestRandomAccess()
     : YBTabletTest(
-        Schema({ ColumnSchema("key", INT32, false, true), ColumnSchema("val", INT32, true) }, 1)) {
+        Schema({ ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+                 ColumnSchema("val", DataType::INT32, ColumnKind::VALUE, Nullable::kTrue) })) {
     OverrideFlagForSlowTests("keyspace_size", "30000");
     OverrideFlagForSlowTests("runtime_seconds", "10");
     OverrideFlagForSlowTests("sleep_between_background_ops_ms", "1000");
@@ -99,7 +121,7 @@ class TestRandomAccess : public YBTabletTest {
 
   void SetUp() override {
     YBTabletTest::SetUp();
-    writer_.reset(new LocalTabletWriter(tablet().get()));
+    writer_.reset(new LocalTabletWriter(tablet()));
   }
 
   // Pick a random row of the table, verify its current state, and then
@@ -199,19 +221,21 @@ class TestRandomAccess : public YBTabletTest {
   // Random-read the given row, returning its current value.
   // If the row doesn't exist, returns "()".
   string GetRow(int key) {
-    ReadHybridTime read_time = ReadHybridTime::SingleTime(tablet()->SafeTime());
+    ReadHybridTime read_time = ReadHybridTime::SingleTime(CHECK_RESULT(tablet()->SafeTime()));
     QLReadRequestPB req;
     auto* condition = req.mutable_where_expr()->mutable_condition();
     QLSetInt32Condition(condition, kFirstColumnId, QL_OP_EQUAL, key);
     QLReadRequestResult result;
     TransactionMetadataPB transaction;
     QLAddColumns(schema_, {}, &req);
+    WriteBuffer rows_data(1024);
     EXPECT_OK(tablet()->HandleQLReadRequest(
-        CoarseTimePoint::max() /* deadline */, read_time, req, transaction, &result));
+        docdb::ReadOperationData::FromReadTime(read_time), req, transaction, &result, &rows_data));
 
     EXPECT_EQ(QLResponsePB::YQL_STATUS_OK, result.response.status());
 
-    auto row_block = CreateRowBlock(QLClient::YQL_CLIENT_CQL, schema_, result.rows_data);
+    auto row_block = qlexpr::CreateRowBlock(
+        QLClient::YQL_CLIENT_CQL, schema_, rows_data.ToBuffer());
     if (row_block->row_count() == 0) {
       return VALUE_NOT_FOUND;
     }
@@ -230,7 +254,7 @@ class TestRandomAccess : public YBTabletTest {
   // operations. This stops the compact/flush thread.
   CountDownLatch done_{1};
 
-  gscoped_ptr<LocalTabletWriter> writer_;
+  std::unique_ptr<LocalTabletWriter> writer_;
 
   unsigned int random_seed_ = SeedRandom();
 };
@@ -245,14 +269,13 @@ TEST_F(TestRandomAccess, Test) {
   flush_thread->Join();
 }
 
-void GenerateTestCase(vector<TestOp>* ops, int len) {
+void GenerateTestCase(vector<TestOp>* ops, size_t len) {
   bool exists = false;
   bool ops_pending = false;
   ops->clear();
   unsigned int random_seed = SeedRandom();
   while (ops->size() < len) {
-    TestOp r = tight_enum_cast<TestOp>(
-        rand_r(&random_seed) % enum_limits<TestOp>::max_enumerator);
+    TestOp r = static_cast<TestOp>(rand_r(&random_seed) % enum_limits<TestOp>::max_enumerator);
     switch (r) {
       case TEST_INSERT:
         if (exists) continue;
@@ -297,7 +320,7 @@ void TestRandomAccess::RunFuzzCase(const vector<TestOp>& test_ops,
                                    int update_multiplier = 1) {
   LOG(INFO) << "test case: " << DumpTestCase(test_ops);
 
-  LocalTabletWriter writer(tablet().get());
+  LocalTabletWriter writer(tablet());
   LocalTabletWriter::Batch batch;
 
   string cur_val = "";

@@ -32,12 +32,14 @@
 package org.yb.client;
 
 import com.google.protobuf.Message;
-import static org.yb.master.Master.*;
-
+import io.netty.buffer.ByteBuf;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.master.Master;
+import org.yb.master.MasterTypes;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
+
+import static org.yb.master.MasterDdlOuterClass.IsAlterTableDoneRequestPB;
+import static org.yb.master.MasterDdlOuterClass.IsAlterTableDoneResponsePB;
+import static org.yb.master.MasterTypes.TableIdentifierPB;
 
 /**
  * RPC used to check if an alter is running for the specified table
@@ -57,12 +59,12 @@ class IsAlterTableDoneRequest extends YRpc<IsAlterTableDoneResponse> {
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     final IsAlterTableDoneRequestPB.Builder builder = IsAlterTableDoneRequestPB.newBuilder();
     TableIdentifierPB tableID = TableIdentifierPB.newBuilder()
                                 .setTableName(name)
-                                .setNamespace(Master.NamespaceIdentifierPB.newBuilder()
+                                .setNamespace(MasterTypes.NamespaceIdentifierPB.newBuilder()
                                               .setName(this.keyspace))
                                 .build();
     builder.setTable(tableID);

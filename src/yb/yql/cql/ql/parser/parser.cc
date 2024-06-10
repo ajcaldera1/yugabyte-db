@@ -12,19 +12,13 @@
 // under the License.
 //
 //--------------------------------------------------------------------------------------------------
-
-#include <cstring>
-
 #include "yb/yql/cql/ql/parser/parser.h"
-#include "yb/util/logging.h"
 
 namespace yb {
 namespace ql {
 
 using std::endl;
-using std::shared_ptr;
 using std::string;
-using std::to_string;
 
 //--------------------------------------------------------------------------------------------------
 // Class Parser.

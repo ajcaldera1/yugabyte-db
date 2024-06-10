@@ -30,16 +30,17 @@
 // under the License.
 //
 
-#include <signal.h>
+#include <signal.h> // For sigaction
 #include <sys/time.h>
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/util/pstack_watcher.h"
 #include "yb/util/flags.h"
+#include "yb/util/init.h"
 #include "yb/util/status.h"
+#include "yb/util/status_log.h"
 #include "yb/util/debug-util.h"
 
 using testing::EmptyTestEventListener;
@@ -51,8 +52,9 @@ using yb::StackTraceLineFormat;
 
 using std::string;
 
-DEFINE_int32(test_timeout_after, 0,
+DEFINE_NON_RUNTIME_int32(test_timeout_after, 0,
              "Maximum total seconds allowed for all unit tests in the suite. Default: disabled");
+DECLARE_bool(TEST_promote_all_auto_flags);
 
 // Start timer that kills the process if --test_timeout_after is exceeded before
 // the tests complete.
@@ -90,6 +92,10 @@ int main(int argc, char **argv) {
   // removes gtest-related flags from argv that would trip up the latter.
   ::testing::InitGoogleTest(&argc, argv);
 
+  // Set before ParseCommandLineFlags so that user provided override takes precedence.
+  ANNOTATE_UNPROTECTED_WRITE(
+      FLAGS_TEST_promote_all_auto_flags) = yb::ShouldTestPromoteAllAutoFlags();
+
   yb::ParseCommandLineFlags(&argc, &argv, /* remove_flags */ true);
 
   // Create the test-timeout timer.
@@ -107,14 +113,10 @@ int main(int argc, char **argv) {
 }
 
 static void CreateAndStartTimer() {
-  struct sigaction action;
-  struct itimerval timer;
-
   // Create the test-timeout timer.
-  memset(&action, 0, sizeof(action));
-  action.sa_handler = &KillTestOnTimeout;
-  CHECK_ERR(sigaction(SIGALRM, &action, nullptr)) << "Unable to set timeout action";
+  CHECK_OK(yb::InstallSignalHandler(SIGALRM, &KillTestOnTimeout));
 
+  struct itimerval timer;
   timer.it_interval.tv_sec = 0;                      // No repeat.
   timer.it_interval.tv_usec = 0;
   timer.it_value.tv_sec = FLAGS_test_timeout_after;  // Fire in timeout seconds.

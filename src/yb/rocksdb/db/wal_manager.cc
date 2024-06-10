@@ -35,7 +35,6 @@
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/transaction_log_impl.h"
 #include "yb/rocksdb/db/log_reader.h"
-#include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/write_batch_internal.h"
 #include "yb/rocksdb/port/port.h"
 #include "yb/rocksdb/env.h"
@@ -45,12 +44,15 @@
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/sync_point.h"
+
+#include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
-#ifndef ROCKSDB_LITE
 
 Status WalManager::GetSortedWalFiles(VectorLogPtr* files) {
   // First get sorted files in db dir, then get sorted files from archived
@@ -67,8 +69,8 @@ Status WalManager::GetSortedWalFiles(VectorLogPtr* files) {
   // Reproduce the race condition where a log file is moved
   // to archived dir, between these two sync points, used in
   // (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::GetSortedWalFiles:1");
-  TEST_SYNC_POINT("WalManager::GetSortedWalFiles:2");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalFiles:1");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalFiles:2");
 
   files->clear();
   // list wal files in archive dir.
@@ -250,7 +252,7 @@ void WalManager::PurgeObsoleteWALFiles() {
 
   size_t files_del_num = log_files_num - files_keep_num;
   VectorLogPtr archived_logs;
-  GetSortedWalsOfType(archival_dir, &archived_logs, kArchivedLogFile);
+  CHECK_OK(GetSortedWalsOfType(archival_dir, &archived_logs, kArchivedLogFile));
 
   if (files_del_num > archived_logs.size()) {
     RLOG(InfoLogLevel::WARN_LEVEL, db_options_.info_log,
@@ -277,10 +279,10 @@ void WalManager::PurgeObsoleteWALFiles() {
 void WalManager::ArchiveWALFile(const std::string& fname, uint64_t number) {
   auto archived_log_name = ArchivedLogFileName(db_options_.wal_dir, number);
   // The sync point below is used in (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:1");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:1");
   Status s = env_->RenameFile(fname, archived_log_name);
   // The sync point below is used in (DBTest,TransactionLogIteratorRace)
-  TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:2");
+  DEBUG_ONLY_TEST_SYNC_POINT("WalManager::PurgeObsoleteFiles:2");
   RLOG(InfoLogLevel::INFO_LEVEL, db_options_.info_log,
       "Move log file %s to %s -- %s\n", fname.c_str(),
       archived_log_name.c_str(), s.ToString().c_str());
@@ -323,8 +325,8 @@ Status WalManager::GetSortedWalsOfType(const std::string& path,
       // Reproduce the race condition where a log file is moved
       // to archived dir, between these two sync points, used in
       // (DBTest,TransactionLogIteratorRace)
-      TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:1");
-      TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:2");
+      DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:1");
+      DEBUG_ONLY_TEST_SYNC_POINT("WalManager::GetSortedWalsOfType:2");
 
       uint64_t size_bytes;
       s = env_->GetFileSize(LogFileName(path, number), &size_bytes);
@@ -487,5 +489,4 @@ Status WalManager::ReadFirstLine(const std::string& fname,
   return status;
 }
 
-#endif  // ROCKSDB_LITE
 }  // namespace rocksdb

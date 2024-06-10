@@ -29,11 +29,15 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_INTEGRATION_TESTS_TEST_WORKLOAD_H_
-#define YB_INTEGRATION_TESTS_TEST_WORKLOAD_H_
+#pragma once
 
-#include "yb/client/client.h"
+#include "yb/client/client_fwd.h"
 #include "yb/client/table.h"
+#include "yb/client/yb_table_name.h"
+
+#include "yb/common/transaction.pb.h"
+
+#include "yb/util/monotime.h"
 
 namespace yb {
 
@@ -43,9 +47,13 @@ class Thread;
 struct TestWorkloadOptions {
   static const client::YBTableName kDefaultTableName;
 
-  int payload_bytes = 11;
+  size_t payload_bytes = 11;
   int num_write_threads = 4;
+  int num_read_threads = 0;
   int write_batch_size = 50;
+  int write_interval_millis = 0;
+  int ttl = -1;
+  int table_ttl = -1;
   MonoDelta default_rpc_timeout = std::chrono::seconds(60);
   std::chrono::milliseconds write_timeout = std::chrono::seconds(20);
   bool timeout_allowed = false;
@@ -53,9 +61,15 @@ struct TestWorkloadOptions {
   bool pathological_one_row_enabled = false;
   bool sequential_write = false;
   bool insert_failures_allowed = true;
+  bool retry_on_restart_required_error = false;
+  bool read_only_written_keys = false;
+  IsolationLevel isolation_level = IsolationLevel::NON_TRANSACTIONAL;
 
   int num_tablets = 1;
   client::YBTableName table_name = kDefaultTableName;
+
+  bool is_transactional() const { return isolation_level != IsolationLevel::NON_TRANSACTIONAL; }
+  bool has_table_ttl() const { return table_ttl != -1; }
 };
 
 // Utility class for generating a workload against a test cluster.
@@ -72,8 +86,12 @@ class TestWorkload {
 
   void operator=(TestWorkload&& rhs);
 
-  void set_payload_bytes(int n) {
+  void set_payload_bytes(size_t n) {
     options_.payload_bytes = n;
+  }
+
+  void set_num_read_threads(int n) {
+    options_.num_read_threads = n;
   }
 
   void set_num_write_threads(int n) {
@@ -84,6 +102,18 @@ class TestWorkload {
     options_.write_batch_size = s;
   }
 
+  void set_write_interval_millis(int t) {
+    options_.write_interval_millis = t;
+  }
+
+  void set_ttl(int ttl) {
+    options_.ttl = ttl;
+  }
+
+  void set_table_ttl(int ttl_sec) {
+    options_.table_ttl = ttl_sec;
+  }
+
   void set_client_default_rpc_timeout_millis(int t) {
     options_.default_rpc_timeout = MonoDelta::FromMilliseconds(t);
   }
@@ -92,7 +122,7 @@ class TestWorkload {
     options_.write_timeout = value;
   }
 
-  void set_write_timeout_millis(int t) {
+  void set_write_timeout_millis(int64_t t) {
     options_.write_timeout = std::chrono::milliseconds(t);
   }
 
@@ -125,6 +155,8 @@ class TestWorkload {
     return options_.table_name;
   }
 
+  client::YBClient& client() const;
+
   void set_pathological_one_row_enabled(bool enabled) {
     options_.pathological_one_row_enabled = enabled;
   }
@@ -136,6 +168,19 @@ class TestWorkload {
   void set_insert_failures_allowed(bool value) {
     options_.insert_failures_allowed = value;
   }
+
+  void set_retry_on_restart_required_error(const bool value) {
+    options_.retry_on_restart_required_error = value;
+  }
+
+  // Only read keys which have been successfully written.
+  // REQUIRED: works only when sequential_write is set and we have write threads to generate keys
+  // to read.
+  void set_read_only_written_keys(const bool value) {
+    options_.read_only_written_keys = value;
+  }
+
+  void set_transactional(IsolationLevel isolation_level, client::TransactionPool* pool);
 
   // Sets up the internal client and creates the table which will be used for
   // writing, if it doesn't already exist.
@@ -157,6 +202,16 @@ class TestWorkload {
   // during or after the write workload.
   int64_t rows_inserted() const;
 
+  int64_t rows_insert_failed() const;
+
+  int64_t rows_read_ok() const;
+
+  int64_t rows_read_empty() const;
+
+  int64_t rows_read_error() const;
+
+  int64_t rows_read_try_again() const;
+
   // Return the number of batches in which we have successfully inserted at
   // least one row.
   int64_t batches_completed() const;
@@ -169,4 +224,3 @@ class TestWorkload {
 };
 
 }  // namespace yb
-#endif  // YB_INTEGRATION_TESTS_TEST_WORKLOAD_H_

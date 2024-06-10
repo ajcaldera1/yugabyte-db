@@ -34,6 +34,9 @@
  *		index_getprocid - get a support procedure OID
  *		index_getprocinfo - get a support procedure's lookup info
  *
+ *		yb_index_might_recheck - could the scan possibly recheck indexquals?
+ *		yb_index_getbitmap - get all ybctids from a scan
+ *
  * NOTES
  *		This file contains the index_ routines which used
  *		to be a scattered collection of stuff in access/genam.
@@ -80,9 +83,6 @@
 #include "storage/predicate.h"
 #include "utils/snapmgr.h"
 #include "utils/tqual.h"
-
-#include "pg_yb_utils.h"
-#include "access/ybcin.h"
 
 /* ----------------------------------------------------------------
  *					macros used in index_ routines
@@ -208,7 +208,8 @@ index_insert(Relation indexRelation,
 			 HeapTuple heapTuple,
 			 Relation heapRelation,
 			 IndexUniqueCheck checkUnique,
-			 IndexInfo *indexInfo)
+			 IndexInfo *indexInfo,
+			 bool yb_shared_insert)
 {
 	RELATION_CHECKS;
 
@@ -221,12 +222,13 @@ index_insert(Relation indexRelation,
 	 * For YugaByte-based index, call the variant of aminsert that takes the full tuple instead of
 	 * the tuple id.
 	 */
-	if (IsYugaByteEnabled())
+	if (IsYugaByteEnabled() && IsYBRelation(indexRelation))
 	{
 		CHECK_REL_PROCEDURE(yb_aminsert);
 		return indexRelation->rd_amroutine->yb_aminsert(indexRelation, values, isnull,
 														heapTuple->t_ybctid, heapRelation,
-														checkUnique, indexInfo);
+														checkUnique, indexInfo,
+														yb_shared_insert);
 	}
 	else
 	{
@@ -239,7 +241,7 @@ index_insert(Relation indexRelation,
 
 /* ----------------
  *		index_delete - delete an index tuple from a relation.
- *      This is used only for indexes backed by YugaByte DB. For Postgres, when a tuple is updated,
+ *      This is used only for indexes backed by YugabyteDB. For Postgres, when a tuple is updated,
  *      the ctid of the original tuple will be invalid (except for heap-only tuple (HOT)). Because
  *      of this, index entries of the original tuple do not need to be deleted in UPDATE. For
  *      YugaByte-based tables, the ybctid is the primary key of the tuple and will remain valid
@@ -588,6 +590,16 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 	 * keys, and puts the TID into scan->xs_ctup.t_self.  It should also set
 	 * scan->xs_recheck and possibly scan->xs_itup/scan->xs_hitup, though we
 	 * pay no attention to those fields here.
+	 *
+	 * YB note:
+	 * TID (t_self or t_ybctid) should not be set for YB relations since it is
+	 * not used.  The slot is filled from other sources:
+	 * - aggregate pushdown: yb_agg_slot
+	 * - Index Scan: xs_hitup
+	 * - Index Only Scan: xs_itup
+	 * Upstream PG needs TID in these cases:
+	 * - Index Only Scan: heap fetch using TID in case of invisible tuples
+	 * - Index Scan: heap fetch using TID
 	 */
 	found = scan->indexRelation->rd_amroutine->amgettuple(scan, direction);
 
@@ -605,6 +617,17 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 		}
 		return NULL;
 	}
+
+	/*
+	 * YB should not set TID (neither t_self nor t_ybctid) and should instead
+	 * set at least one of yb_agg_slot, xs_hitup, or xs_itup.  (See above note.)
+	 */
+	Assert(!IsYBRelation(scan->indexRelation) ||
+		   (!ItemPointerIsValid(&scan->xs_ctup.t_self) &&
+			scan->xs_ctup.t_ybctid == 0 &&
+			(!TupIsNull(scan->yb_agg_slot) ||
+			 scan->xs_hitup != NULL ||
+			 scan->xs_itup != NULL)));
 
 	pgstat_count_index_tuples(scan->indexRelation, 1);
 
@@ -633,21 +656,8 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
 HeapTuple
 index_fetch_heap(IndexScanDesc scan)
 {
-	/*
-	 * For YugaByte secondary indexes, we need to select from the base table using
-	 * ybctid. For primary keys, the row is already prepared in "xs_hitup" that can
-	 * be returned directly.
-	 */
-	if (IsYugaByteEnabled())
-	{
-		if (scan->indexRelation->rd_index->indisprimary)
-		{
-			Assert(scan->xs_hitup != 0);
-			return scan->xs_hitup;
-		}
-
-		return YBCFetchTuple(scan->heapRelation, scan->xs_ctup.t_ybctid);
-	}
+	if (IsYBRelation(scan->heapRelation))
+		return scan->xs_hitup;
 
 	ItemPointer tid = &scan->xs_ctup.t_self;
 	bool		all_dead = false;
@@ -791,6 +801,33 @@ index_getbitmap(IndexScanDesc scan, TIDBitmap *bitmap)
 	 * have the am's getbitmap proc do all the work.
 	 */
 	ntids = scan->indexRelation->rd_amroutine->amgetbitmap(scan, bitmap);
+
+	pgstat_count_index_tuples(scan->indexRelation, ntids);
+
+	return ntids;
+}
+
+/* ----------------
+ *		yb_index_getbitmap - get all tuples at once from an index scan
+ *
+ * Adds the ybctids of all tuples satisfying the scan keys to a bitmap.
+ *
+ * Returns the number of matching tuples found.  (Note: this might be only
+ * approximate, so it should only be used for statistical purposes.)
+ * ----------------
+ */
+int64
+yb_index_getbitmap(IndexScanDesc scan, YbTIDBitmap *ybtbm, bool recheck)
+{
+	int64		ntids;
+
+	SCAN_CHECKS;
+	CHECK_SCAN_PROCEDURE(yb_amgetbitmap);
+
+	/*
+	 * have the am's getbitmap proc do all the work.
+	 */
+	ntids = scan->indexRelation->rd_amroutine->yb_amgetbitmap(scan, ybtbm, recheck);
 
 	pgstat_count_index_tuples(scan->indexRelation, ntids);
 
@@ -963,4 +1000,17 @@ index_getprocinfo(Relation irel,
 	}
 
 	return locinfo;
+}
+
+bool
+yb_index_might_recheck(Relation heapRelation, Relation indexRelation,
+					   bool xs_want_itup, ScanKey keys, int nkeys)
+{
+	RELATION_CHECKS;
+	CHECK_REL_PROCEDURE(yb_ammightrecheck);
+
+	return indexRelation->rd_amroutine->yb_ammightrecheck(heapRelation,
+														  indexRelation,
+														  xs_want_itup, keys,
+														  nkeys);
 }

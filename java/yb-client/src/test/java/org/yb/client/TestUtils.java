@@ -37,9 +37,10 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.BaseYBTest;
 import org.yb.client.YBClient.Condition;
+import org.yb.util.ConfForTesting;
 import org.yb.util.EnvAndSysPropertyUtil;
-import org.yb.util.RandomNumberUtil;
-import org.yb.util.SanitizerUtil;
+import org.yb.util.RandomUtil;
+import org.yb.util.BuildTypeUtil;
 
 import java.io.*;
 import java.net.*;
@@ -57,8 +58,8 @@ public class TestUtils {
 
   private static String ybRootDir = null;
 
-  public static final boolean IS_LINUX =
-      System.getProperty("os.name").toLowerCase().equals("linux");
+  public static final boolean IS_AARCH64 =
+      System.getProperty("os.arch").toLowerCase().equals("aarch64");
 
   private static final long startTimeMillis = System.currentTimeMillis();
 
@@ -95,6 +96,14 @@ public class TestUtils {
    * each line describing a test with this.
    */
   private static final String COLLECTED_TESTS_PREFIX = "YUGABYTE_JAVA_TEST: ";
+
+  /**
+   * An upper bound on test timeout enforced at the JUnit test framework level. This should be
+   * less than timeouts enforced at other levels, such as the process_tree_supervisor.py script
+   * (see PROCESS_TREE_SUPERVISOR_TEST_TIMEOUT_SEC in common-test-env.sh) as well as the
+   * yb.forked.test.process.timeout.sec value in the top-level pom.xml.
+   */
+  private static final int DEFAULT_MAX_TEST_TIMEOUT_SEC = 30 * 60;
 
   /**
    * @return the path of the flags file to pass to daemon processes
@@ -144,7 +153,8 @@ public class TestUtils {
     // Try to find the YB directory root by navigating upward from either the source code location,
     // or, if that does not work, from the current directory.
     for (String initialPath : new String[] { pathToCode, currentDir }) {
-      ybRootDir = findGitRepoContaining(initialPath);
+      // Cache the root dir so that we don't have to find it every time.
+      ybRootDir = findYbSrcRootContaining(initialPath);
       if (ybRootDir != null) {
         return ybRootDir;
       }
@@ -153,11 +163,11 @@ public class TestUtils {
         "Unable to find build dir! myUrl=" + myUrl + ", currentDir=" + currentDir);
   }
 
-  private static String findGitRepoContaining(String initialPath) {
+  private static String findYbSrcRootContaining(String initialPath) {
     File currentPath = new File(initialPath);
     while (currentPath != null) {
-      if (new File(currentPath, ".git").exists()) {
-        // Cache the root dir so that we don't have to find it every time.
+      if (new File(currentPath, "yb_build.sh").exists() &&
+          new File(currentPath, "build-support").exists()) {
         return currentPath.getAbsolutePath();
       }
       currentPath = currentPath.getParentFile();
@@ -250,9 +260,11 @@ public class TestUtils {
   public static String getBaseTmpDir() {
     String testTmpDir = System.getenv("TEST_TMPDIR");
     if (testTmpDir == null) {
-      // If we are generating the temporary directory name here, we are responsible for deleting it.
+      // If we are generating the temporary directory name here, we are responsible for deleting it
+      // unless told not to.
       testTmpDir = new File(defaultTestTmpDir).getAbsolutePath();
-      if (defaultTestTmpDirCleanupHookRegistered.compareAndSet(false, true)) {
+      if (!ConfForTesting.keepData() &&
+          defaultTestTmpDirCleanupHookRegistered.compareAndSet(false, true)) {
         final File tmpDirToCleanUp = new File(testTmpDir);
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
           if (tmpDirToCleanUp.isDirectory()) {
@@ -267,7 +279,9 @@ public class TestUtils {
     }
 
     File f = new File(testTmpDir);
-    f.mkdirs();
+    if (!f.exists() && !f.mkdirs()) {
+      throw new RuntimeException("Could not create " + testTmpDir + ", not enough permissions?");
+    }
     return f.getAbsolutePath();
   }
 
@@ -333,7 +347,7 @@ public class TestUtils {
   public static int findFreePort(String bindInterface) throws IOException {
     final InetAddress bindIp = InetAddress.getByName(bindInterface);
     final int MAX_ATTEMPTS = 1000;
-    Random rng = RandomNumberUtil.getRandomGenerator();
+    Random rng = RandomUtil.getRandomGenerator();
     for (int attempt = 0; attempt < MAX_ATTEMPTS; ++attempt) {
       final int port = MIN_PORT_TO_USE + rng.nextInt(MAX_PORT_TO_USE - MIN_PORT_TO_USE);
       if (!isReservedPort(bindIp, port) && isPortFree(bindIp, port, attempt == MAX_ATTEMPTS - 1)) {
@@ -350,7 +364,7 @@ public class TestUtils {
   }
 
   public static void waitFor(Condition condition, long timeoutMs, int sleepTime) throws Exception {
-    timeoutMs *= SanitizerUtil.getTimeoutMultiplier();
+    timeoutMs = BuildTypeUtil.adjustTimeout(timeoutMs);
     final long startTimeMs = System.currentTimeMillis();
     while (System.currentTimeMillis() - startTimeMs < timeoutMs && !condition.get()) {
       Thread.sleep(sleepTime);
@@ -410,20 +424,19 @@ public class TestUtils {
    * @return the adjusted timeout
    */
   public static long finalizeTestTimeoutSec(long timeoutSec) {
-    String minTimeoutStr =
-        EnvAndSysPropertyUtil.getEnvVarOrSystemProperty("YB_MIN_TEST_TIMEOUT_SEC", "0");
-    LOG.info("minTimeoutStr=" + minTimeoutStr);
-    long minTestTimeoutSec;
-    if (minTimeoutStr.toLowerCase().equals("inf")) {
-      minTestTimeoutSec = Integer.MAX_VALUE;
-    } else {
-      minTestTimeoutSec = Long.valueOf(minTimeoutStr);
+    long userSpecifiedMinTimeoutSec = EnvAndSysPropertyUtil.getLongEnvVarOrSystemProperty(
+        "YB_MIN_TEST_TIMEOUT_SEC", -1, true, "user-specified minimum test timeout in seconds");
+    if (userSpecifiedMinTimeoutSec > 0) {
+      timeoutSec = Math.max(userSpecifiedMinTimeoutSec, timeoutSec);
     }
-    if (minTestTimeoutSec <= 0) {
-      return timeoutSec;
+
+    long userSpecifiedMaxTimeoutSec = EnvAndSysPropertyUtil.getLongEnvVarOrSystemProperty(
+        "YB_MAX_TEST_TIMEOUT_SEC", DEFAULT_MAX_TEST_TIMEOUT_SEC, true,
+        "user-specified maximum test timeout in seconds");
+    if (userSpecifiedMaxTimeoutSec > 0) {
+      timeoutSec = Math.min(userSpecifiedMaxTimeoutSec, timeoutSec);
     }
-    // The lower bound on the timeout in seconds is minTestTimeoutSec, as specified by the user.
-    return Math.max(timeoutSec, minTestTimeoutSec);
+    return timeoutSec;
   }
 
   /**
@@ -503,15 +516,16 @@ public class TestUtils {
     throw new IllegalArgumentException("No numbers given to firstPositiveNumber");
   }
 
-  public static <T> List<T> joinLists(List<T> a, List<T> b) {
-    List<T> joinedList = new ArrayList();
-    if (a != null) {
-      joinedList.addAll(a);
+  /**
+   * @return true if YB_TEST_YB_CONTROLLER env variable is set.
+   */
+  public static boolean useYbController() {
+    String env = System.getenv("YB_TEST_YB_CONTROLLER");
+    if (env != null &&
+        (env.equals("1") || env.equalsIgnoreCase("true"))) {
+      return true;
     }
-    if (b != null) {
-      joinedList.addAll(b);
-    }
-    return joinedList;
+    return false;
   }
 
 }

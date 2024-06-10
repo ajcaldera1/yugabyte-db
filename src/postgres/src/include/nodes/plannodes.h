@@ -20,6 +20,7 @@
 #include "nodes/bitmapset.h"
 #include "nodes/lockoptions.h"
 #include "nodes/primnodes.h"
+#include "nodes/relation.h"
 
 
 /* ----------------------------------------------------------------
@@ -99,6 +100,14 @@ typedef struct PlannedStmt
 	/* statement location in source string (copied from Query) */
 	int			stmt_location;	/* start location, or -1 if unknown */
 	int			stmt_len;		/* length in bytes; 0 means "rest of string" */
+
+	/* YB specific fields */
+
+	/*
+	 * Number of relations that are still referenced by the plan after
+	 * constraint exclusion and partition pruning.
+	 */
+	int		yb_num_referenced_relations;
 } PlannedStmt;
 
 /* macro for fetching the Plan associated with a SubPlan node */
@@ -239,7 +248,12 @@ typedef struct ModifyTable
 	Node	   *onConflictWhere;	/* WHERE for ON CONFLICT UPDATE */
 	Index		exclRelRTI;		/* RTI of the EXCLUDED pseudo relation */
 	List	   *exclRelTlist;	/* tlist of the EXCLUDED pseudo relation */
-	bool       ybIsSingleRowWrite; /* can safely run as YB single-shard txn */
+
+	List	   *ybPushdownTlist;	/* tlist for the pushdown SET expressions */
+	List	   *ybReturningColumns;	/* columns to fetch from DocDB */
+	List	   *ybColumnRefs;	/* colrefs to evaluate pushdown expressions */
+	bool		no_row_trigger; /* planner has checked no triggers apply */
+	List	   *no_update_index_list; /* OIDs of indexes to be aren't updated */
 } ModifyTable;
 
 struct PartitionPruneInfo;		/* forward reference to struct below */
@@ -284,6 +298,8 @@ typedef struct MergeAppend
 	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
 	Oid		   *collations;		/* OIDs of collations */
 	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
+	/* Info for run-time subplan pruning; NULL if we're not doing that */
+	struct PartitionPruneInfo *part_prune_info;
 } MergeAppend;
 
 /* ----------------
@@ -353,6 +369,24 @@ typedef struct Scan
 typedef Scan SeqScan;
 
 /* ----------------
+ *		YB table sequential scan node
+ * ----------------
+ */
+
+typedef struct PushdownExprs
+{
+	List *quals;
+	List *colrefs;
+} PushdownExprs;
+
+typedef struct YbSeqScan
+{
+	Scan		scan;
+	PushdownExprs yb_pushdown;
+	YbPlanInfo	yb_plan_info;
+} YbSeqScan;
+
+/* ----------------
  *		table sample scan node
  * ----------------
  */
@@ -409,7 +443,13 @@ typedef struct IndexScan
 	List	   *indexorderby;	/* list of index ORDER BY exprs */
 	List	   *indexorderbyorig;	/* the same in original form */
 	List	   *indexorderbyops;	/* OIDs of sort ops for ORDER BY exprs */
+	List	   *indextlist;		/* TargetEntry list describing index's cols */
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
+	PushdownExprs yb_idx_pushdown;
+	PushdownExprs yb_rel_pushdown;
+	YbPlanInfo	yb_plan_info;
+	int         yb_distinct_prefixlen; /* distinct index scan prefix */
+	YbLockMechanism	yb_lock_mechanism;	/* locks possible as part of the scan */
 } IndexScan;
 
 /* ----------------
@@ -437,6 +477,15 @@ typedef struct IndexOnlyScan
 	List	   *indexorderby;	/* list of index ORDER BY exprs */
 	List	   *indextlist;		/* TargetEntry list describing index's cols */
 	ScanDirection indexorderdir;	/* forward or backward or don't care */
+	PushdownExprs yb_pushdown;
+	/*
+	 * yb_indexqual_for_recheck is the modified version of indexqual.
+	 * It is used in tuple recheck step only.
+	 * In majority of cases it is NULL which means that indexqual will be used for tuple recheck.
+	 */
+	List	   *yb_indexqual_for_recheck;
+	YbPlanInfo	yb_plan_info;
+	int			yb_distinct_prefixlen; /* distinct index scan prefix */
 } IndexOnlyScan;
 
 /* ----------------
@@ -444,9 +493,9 @@ typedef struct IndexOnlyScan
  *
  * BitmapIndexScan delivers a bitmap of potential tuple locations;
  * it does not access the heap itself.  The bitmap is used by an
- * ancestor BitmapHeapScan node, possibly after passing through
- * intermediate BitmapAnd and/or BitmapOr nodes to combine it with
- * the results of other BitmapIndexScans.
+ * ancestor BitmapHeapScan or YbBitmapTableScan node, possibly after
+ * passing through intermediate BitmapAnd and/or BitmapOr nodes to
+ * combine it with the results of other BitmapIndexScans.
  *
  * The fields have the same meanings as for IndexScan, except we don't
  * store a direction flag because direction is uninteresting.
@@ -466,6 +515,35 @@ typedef struct BitmapIndexScan
 } BitmapIndexScan;
 
 /* ----------------
+ *		yb bitmap index scan node
+ *
+ * BitmapIndexScan delivers a bitmap of potential tuple locations;
+ * it does not access the heap itself.  The bitmap is used by an
+ * ancestor BitmapHeapScan or YbBitmapTableScan node, possibly after
+ * passing through intermediate BitmapAnd and/or BitmapOr nodes to
+ * combine it with the results of other BitmapIndexScans.
+ *
+ * The fields have the same meanings as for IndexScan, except we don't
+ * store a direction flag because direction is uninteresting.
+ *
+ * In a BitmapIndexScan plan node, the targetlist and qual fields are
+ * not used and are always NIL.  The indexqualorig field is unused at
+ * run time too, but is saved for the benefit of EXPLAIN.
+ * ----------------
+ */
+typedef struct YbBitmapIndexScan
+{
+	Scan		scan;
+	Oid			indexid;		/* OID of index to scan */
+	bool		isshared;		/* Create shared bitmap if set */
+	List	   *indexqual;		/* list of index quals (OpExprs) */
+	List	   *indexqualorig;	/* the same in original form */
+	List	   *indextlist;		/* TargetEntry list describing index's cols */
+	PushdownExprs yb_idx_pushdown;
+	YbPlanInfo	yb_plan_info;
+} YbBitmapIndexScan;
+
+/* ----------------
  *		bitmap sequential scan node
  *
  * This needs a copy of the qual conditions being used by the input index
@@ -479,6 +557,28 @@ typedef struct BitmapHeapScan
 	Scan		scan;
 	List	   *bitmapqualorig; /* index quals, in standard expr form */
 } BitmapHeapScan;
+
+/* ----------------
+ *		yb bitmap sequential scan node
+ *
+ * This needs a copy of the qual conditions being used by the input index
+ * scans because there are various cases where we need to recheck the quals;
+ * for example, when the bitmap is lossy about the specific rows on a page
+ * that meet the index condition.
+ * ----------------
+ */
+typedef struct YbBitmapTableScan
+{
+	Scan		scan;
+	PushdownExprs rel_pushdown;		/* any pushable quals that aren't already
+									 * guaranteed by the Bitmap Index Scan
+									 * nodes. */
+	PushdownExprs recheck_pushdown;		/* pushable index quals */
+	List		 *recheck_local_quals;	/* non-pushable index quals */
+	PushdownExprs fallback_pushdown;	/* all pushable quals */
+	List		 *fallback_local_quals;	/* all non-pushable quals */
+	YbPlanInfo	  yb_plan_info;
+} YbBitmapTableScan;
 
 /* ----------------
  *		tid scan node
@@ -703,11 +803,49 @@ typedef struct NestLoop
 	List	   *nestParams;		/* list of NestLoopParam nodes */
 } NestLoop;
 
+/*
+ * Information to use for each hashable clause in a batched nested loop join.
+ * This is used by the hash batching strategy of BNL.
+ */
+typedef struct YbBNLHashClauseInfo
+{
+	Oid hashOp;				/*
+							 * Operator to hash the outer side of this clause
+							 * with. The inner side must be the left input of
+							 * this op.
+							 */
+	int innerHashAttNo;		/* Attno of inner side variable. */
+	Expr *outerParamExpr;	/* Outer expression of this clause. */
+	Expr *orig_expr;
+} YbBNLHashClauseInfo;
+
+typedef struct YbBatchedNestLoop
+{
+	NestLoop nl;
+
+	double first_batch_factor;
+	/* Only relevant if we're using the hash batching strategy. */
+
+	/*
+	 * Array of information about each
+	 * hashable join clause.
+	 */
+	YbBNLHashClauseInfo *hashClauseInfos;
+	int num_hashClauseInfos;
+	/* remaining fields are just like the sort-key info in struct Sort */
+	int			numSortCols;		/* number of sort-key columns */
+	AttrNumber *sortColIdx;		/* their indexes in the target list */
+	Oid		   *sortOperators;	/* OIDs of operators to sort them by */
+	Oid		   *collations;		/* OIDs of collations */
+	bool	   *nullsFirst;		/* NULLS FIRST/LAST directions */
+} YbBatchedNestLoop;
+
 typedef struct NestLoopParam
 {
 	NodeTag		type;
 	int			paramno;		/* number of the PARAM_EXEC Param to set */
 	Var		   *paramval;		/* outer-relation Var to assign to Param */
+	int	   		yb_batch_size;	/* Batch size of this param. */
 } NestLoopParam;
 
 /* ----------------
@@ -1191,6 +1329,11 @@ typedef struct PartitionPruneStepCombine
 	List	   *source_stepids;
 } PartitionPruneStepCombine;
 
+typedef struct PartitionPruneStepFuncOp
+{
+	PartitionPruneStep step;
+	List       *exprs;
+} PartitionPruneStepFuncOp;
 
 /*
  * Plan invalidation info

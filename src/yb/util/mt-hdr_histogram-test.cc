@@ -29,21 +29,22 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#include <gtest/gtest.h>
-#include <gflags/gflags.h>
 #include <vector>
+
+#include <gtest/gtest.h>
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/stl_util.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/hdr_histogram.h"
 #include "yb/util/status.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
+#include "yb/util/flags.h"
 
-DEFINE_int32(histogram_test_num_threads, 16,
+DEFINE_NON_RUNTIME_int32(histogram_test_num_threads, 16,
     "Number of threads to spawn for mt-hdr_histogram test");
-DEFINE_uint64(histogram_test_num_increments_per_thread, 100000LU,
+DEFINE_NON_RUNTIME_uint64(histogram_test_num_increments_per_thread, 100000LU,
     "Number of times to call Increment() per thread in mt-hdr_histogram test");
 
 using std::vector;

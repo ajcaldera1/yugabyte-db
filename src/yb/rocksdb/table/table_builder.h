@@ -21,8 +21,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_TABLE_BUILDER_H
-#define YB_ROCKSDB_TABLE_TABLE_BUILDER_H
+#pragma once
 
 #include <stdint.h>
 
@@ -30,16 +29,15 @@
 #include <utility>
 #include <vector>
 
-#include "yb/util/status.h"
-
 #include "yb/rocksdb/db/table_properties_collector.h"
-
-#include "yb/util/slice.h"
+#include "yb/rocksdb/env.h"
+#include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/table_properties.h"
+#include "yb/rocksdb/util/statistics.h"
 
-#include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/mutable_cf_options.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/slice.h"
 
 namespace rocksdb {
 
@@ -56,7 +54,7 @@ struct TableReaderOptions {
 
   const ImmutableCFOptions& ioptions;
   const EnvOptions& env_options;
-  const InternalKeyComparatorPtr& internal_comparator;
+  const InternalKeyComparatorPtr internal_comparator;
   // This is only used for BlockBasedTable (reader)
   bool skip_filters;
 };
@@ -64,7 +62,7 @@ struct TableReaderOptions {
 struct TableBuilderOptions {
   TableBuilderOptions(
       const ImmutableCFOptions& _ioptions,
-      const std::shared_ptr<const InternalKeyComparator>& _internal_comparator,
+      const InternalKeyComparatorPtr& _internal_comparator,
       const IntTblPropCollectorFactories& _int_tbl_prop_collector_factories,
       CompressionType _compression_type,
       const CompressionOptions& _compression_opts,
@@ -77,7 +75,7 @@ struct TableBuilderOptions {
         skip_filters(_skip_filters) {}
 
   const ImmutableCFOptions& ioptions;
-  std::shared_ptr<const InternalKeyComparator> internal_comparator;
+  InternalKeyComparatorPtr internal_comparator;
   const IntTblPropCollectorFactories* int_tbl_prop_collector_factories;
   CompressionType compression_type;
   const CompressionOptions& compression_opts;
@@ -133,8 +131,8 @@ class TableBuilder {
 
   // Returns table properties
   virtual TableProperties GetTableProperties() const = 0;
+
+  virtual const std::string& LastKey() const = 0;
 };
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_TABLE_BUILDER_H

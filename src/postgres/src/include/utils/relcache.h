@@ -61,7 +61,9 @@ typedef enum IndexAttrBitmapKind
 } IndexAttrBitmapKind;
 
 extern Bitmapset *RelationGetIndexAttrBitmap(Relation relation,
-						   IndexAttrBitmapKind keyAttrs);
+						   IndexAttrBitmapKind attrKind);
+extern bool CheckIndexForUpdate(Oid indexoid,
+						   const Bitmapset *updated_attrs, AttrNumber attr_offset);
 
 extern void RelationGetExclusionInfo(Relation indexRelation,
 						 Oid **operators,
@@ -92,6 +94,9 @@ extern void RelationCacheInitialize(void);
 extern void RelationCacheInitializePhase2(void);
 extern void RelationCacheInitializePhase3(void);
 
+/*
+ * Preload relations cache
+ */
 extern void YBPreloadRelCache();
 
 /*
@@ -112,7 +117,8 @@ extern Relation RelationBuildLocalRelation(const char *relname,
  * Routine to manage assignment of new relfilenode to a relation
  */
 extern void RelationSetNewRelfilenode(Relation relation, char persistence,
-						  TransactionId freezeXid, MultiXactId minmulti);
+						  TransactionId freezeXid, MultiXactId minmulti,
+						  bool yb_copy_split_options);
 
 /*
  * Routines for flushing/rebuilding relcache entries in various scenarios
@@ -122,6 +128,7 @@ extern void RelationForgetRelation(Oid rid);
 extern void RelationCacheInvalidateEntry(Oid relationId);
 
 extern void RelationCacheInvalidate(void);
+extern void YbRelationCacheInvalidate(void);
 
 extern void RelationCloseSmgrByOid(Oid relationId);
 
@@ -136,6 +143,7 @@ extern bool RelationIdIsInInitFile(Oid relationId);
 extern void RelationCacheInitFilePreInvalidate(void);
 extern void RelationCacheInitFilePostInvalidate(void);
 extern void RelationCacheInitFileRemove(void);
+extern bool YbRelationIdIsInInitFileAndNotCached(Oid relationId);
 
 /* should be used only by relcache.c and catcache.c */
 extern bool criticalRelcachesBuilt;

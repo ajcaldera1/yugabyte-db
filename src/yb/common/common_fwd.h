@@ -11,19 +11,67 @@
 // under the License.
 //
 
-#ifndef YB_COMMON_COMMON_FWD_H
-#define YB_COMMON_COMMON_FWD_H
+#pragma once
+
+#include <memory>
+#include <vector>
+
+#include "yb/common/common.fwd.h"
+#include "yb/common/pgsql_protocol.fwd.h"
+#include "yb/common/ql_protocol.fwd.h"
+#include "yb/common/redis_protocol.fwd.h"
+#include "yb/common/wire_protocol.fwd.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 
 class ClockBase;
+class ColumnId;
+class ColumnSchema;
+class ConstContiguousRow;
+class DocHybridTime;
+class EncodedDocHybridTime;
 class HybridTime;
-class IndexInfo;
-class IndexMap;
-class PartitionSchema;
-class QLType;
+class MissingValueProvider;
 class TableProperties;
+class TransactionStatusManager;
+class TypeInfo;
+
+class Schema;
+typedef std::shared_ptr<Schema> SchemaPtr;
+
+typedef std::string PartitionKey;
+typedef std::shared_ptr<const PartitionKey> PartitionKeyPtr;
+
+class QLType;
+class QLValue;
+
+struct DeletedColumn;
+struct OpId;
+struct PgObjectId;
+struct ReadHybridTime;
+struct TransactionMetadata;
+struct TransactionOperationContext;
+struct TransactionStatusResult;
+
+using ColocationId = uint32_t;
+using SchemaVersion = uint32_t;
+
+using QLTypePtr = std::shared_ptr<QLType>;
+
+using PgObjectIds = std::vector<PgObjectId>;
+
+enum class PgSystemAttrNum : int;
+enum class DataType;
+
+enum class SortingType;
+
+YB_STRONGLY_TYPED_BOOL(ClampUncertaintyWindow);
+
+namespace common {
+
+class Jsonb;
+
+} // namespace common
 
 } // namespace yb
-
-#endif // YB_COMMON_COMMON_FWD_H

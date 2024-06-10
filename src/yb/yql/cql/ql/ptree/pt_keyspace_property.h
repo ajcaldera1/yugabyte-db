@@ -11,14 +11,10 @@
 // under the License.
 //
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_KEYSPACE_PROPERTY_H_
-#define YB_YQL_CQL_QL_PTREE_PT_KEYSPACE_PROPERTY_H_
+#pragma once
 
-#include "yb/common/schema.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/master/master.pb.h"
 #include "yb/yql/cql/ql/ptree/list_node.h"
-#include "yb/yql/cql/ql/ptree/pt_expr.h"
 #include "yb/yql/cql/ql/ptree/pt_property.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 
@@ -40,12 +36,12 @@ class PTKeyspaceProperty : public PTProperty {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTKeyspaceProperty(MemoryContext *memctx,
-                     YBLocation::SharedPtr loc,
+                     YBLocationPtr loc,
                      const MCSharedPtr<MCString>& lhs_,
-                     const PTExpr::SharedPtr& rhs_);
+                     const PTExprPtr& rhs_);
 
   PTKeyspaceProperty(MemoryContext *memctx,
-                     YBLocation::SharedPtr loc);
+                     YBLocationPtr loc);
 
   virtual ~PTKeyspaceProperty();
 
@@ -56,7 +52,7 @@ class PTKeyspaceProperty : public PTProperty {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   const TreeListNode<PTKeyspaceProperty>::SharedPtr map_elements() const {
@@ -68,7 +64,8 @@ class PTKeyspaceProperty : public PTProperty {
   }
 
  protected:
-  KeyspacePropertyType property_type_;
+  // Just need an arbitrary default value here.
+  KeyspacePropertyType property_type_ = KeyspacePropertyType::kKVProperty;
 
  private:
   TreeListNode<PTKeyspaceProperty>::SharedPtr map_elements_;
@@ -83,7 +80,7 @@ class PTKeyspacePropertyListNode : public TreeListNode<PTKeyspaceProperty> {
   typedef MCSharedPtr<const PTKeyspacePropertyListNode> SharedPtrConst;
 
   explicit PTKeyspacePropertyListNode(MemoryContext *memory_context,
-                                      YBLocation::SharedPtr loc,
+                                      YBLocationPtr loc,
                                       const MCSharedPtr<PTKeyspaceProperty>& tnode = nullptr)
       : TreeListNode<PTKeyspaceProperty>(memory_context, loc, tnode) {
   }
@@ -96,7 +93,7 @@ class PTKeyspacePropertyListNode : public TreeListNode<PTKeyspaceProperty> {
     if (tnode_list == nullptr) {
       return;
     }
-    for (const auto tnode : tnode_list->node_list()) {
+    for (const auto& tnode : tnode_list->node_list()) {
       Append(tnode);
     }
   }
@@ -107,7 +104,7 @@ class PTKeyspacePropertyListNode : public TreeListNode<PTKeyspaceProperty> {
     return MCMakeShared<PTKeyspacePropertyListNode>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 };
 
 class PTKeyspacePropertyMap : public PTKeyspaceProperty {
@@ -117,7 +114,7 @@ class PTKeyspacePropertyMap : public PTKeyspaceProperty {
   typedef MCSharedPtr<PTKeyspacePropertyMap> SharedPtr;
   typedef MCSharedPtr<const PTKeyspacePropertyMap> SharedPtrConst;
 
-  PTKeyspacePropertyMap(MemoryContext *memctx, YBLocation::SharedPtr loc);
+  PTKeyspacePropertyMap(MemoryContext *memctx, YBLocationPtr loc);
 
   virtual ~PTKeyspacePropertyMap();
 
@@ -128,7 +125,7 @@ class PTKeyspacePropertyMap : public PTKeyspaceProperty {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   void SetPropertyName(MCSharedPtr<MCString> property_name) {
@@ -145,5 +142,3 @@ class PTKeyspacePropertyMap : public PTKeyspaceProperty {
 
 } // namespace ql
 } // namespace yb
-
-#endif // YB_YQL_CQL_QL_PTREE_PT_KEYSPACE_PROPERTY_H_

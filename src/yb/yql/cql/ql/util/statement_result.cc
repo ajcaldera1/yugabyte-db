@@ -14,18 +14,21 @@
 //
 // Different results of processing a statement.
 //--------------------------------------------------------------------------------------------------
-
 #include "yb/yql/cql/ql/util/statement_result.h"
 
-#include "yb/client/client.h"
-#include "yb/client/schema-internal.h"
+#include "yb/client/schema.h"
 #include "yb/client/table.h"
 #include "yb/client/yb_op.h"
-
+#include "yb/common/ql_protocol.messages.h"
 #include "yb/common/ql_protocol_util.h"
-#include "yb/common/wire_protocol.h"
-#include "yb/util/pb_util.h"
-#include "yb/yql/cql/ql/ptree/pt_select.h"
+#include "yb/common/schema_pbutil.h"
+#include "yb/qlexpr/ql_rowblock.h"
+#include "yb/common/schema.h"
+#include "yb/util/debug-util.h"
+#include "yb/yql/cql/ql/ptree/list_node.h"
+#include "yb/yql/cql/ql/ptree/pt_dml.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/yql/cql/ql/ptree/tree_node.h"
 
 namespace yb {
 namespace ql {
@@ -35,7 +38,6 @@ using std::vector;
 using std::unique_ptr;
 using std::shared_ptr;
 using std::make_shared;
-using strings::Substitute;
 
 using client::YBOperation;
 using client::YBqlOp;
@@ -50,14 +52,19 @@ namespace {
 void GetBindVariableSchemasFromDmlStmt(const PTDmlStmt& stmt,
                                        vector<ColumnSchema>* schemas,
                                        vector<YBTableName>* table_names = nullptr) {
-  schemas->reserve(schemas->size() + stmt.bind_variables().size());
-  if (table_names != nullptr) {
-    table_names->reserve(table_names->size() + stmt.bind_variables().size());
-  }
-  for (const PTBindVar *var : stmt.bind_variables()) {
-    schemas->emplace_back(string(var->name()->c_str()), var->ql_type());
+  // Only add the bind variables if the table name is determined
+  if (stmt.bind_table()) {
+    schemas->reserve(schemas->size() + stmt.bind_variables().size());
     if (table_names != nullptr) {
-      table_names->emplace_back(stmt.bind_table()->name());
+      table_names->reserve(table_names->size() + stmt.bind_variables().size());
+    }
+
+    for (const PTBindVar *var : stmt.bind_variables()) {
+      DCHECK_NOTNULL(var->name().get());
+      schemas->emplace_back(var->name() ? string(var->name()->c_str()) : string(), var->ql_type());
+      if (table_names != nullptr) {
+        table_names->emplace_back(stmt.bind_table()->name());
+      }
     }
   }
 }
@@ -77,8 +84,8 @@ shared_ptr<vector<ColumnSchema>> GetColumnSchemasFromOp(const YBqlOp& op, const 
     case YBOperation::Type::QL_WRITE: {
       shared_ptr<vector<ColumnSchema>> column_schemas = make_shared<vector<ColumnSchema>>();
       const auto& write_op = static_cast<const YBqlWriteOp&>(op);
-      column_schemas->reserve(write_op.response().column_schemas_size());
-      for (const auto column_schema : write_op.response().column_schemas()) {
+      column_schemas->reserve(write_op.response().column_schemas().size());
+      for (const auto& column_schema : write_op.response().column_schemas()) {
         column_schemas->emplace_back(ColumnSchemaFromPB(column_schema));
       }
       return column_schemas;
@@ -119,7 +126,7 @@ QLClient GetClientFromOp(const YBqlOp& op) {
 
 //------------------------------------------------------------------------------------------------
 PreparedResult::PreparedResult(const PTDmlStmt& stmt)
-    : table_name_(stmt.bind_table()->name()),
+    : table_name_(stmt.bind_table() ? stmt.bind_table()->name() : YBTableName()),
       hash_col_indices_(stmt.hash_col_indices()),
       column_schemas_(stmt.selected_schemas()) {
   GetBindVariableSchemasFromDmlStmt(stmt, &bind_variable_schemas_);
@@ -156,7 +163,7 @@ RowsResult::RowsResult(const PTDmlStmt *tnode)
     : table_name_(tnode->table()->name()),
       column_schemas_(tnode->selected_schemas()),
       client_(YQL_CLIENT_CQL),
-      rows_data_(QLRowBlock::ZeroRowsData(YQL_CLIENT_CQL)) {
+      rows_data_(qlexpr::QLRowBlock::ZeroRowsData(YQL_CLIENT_CQL)) {
   if (column_schemas_ == nullptr) {
     column_schemas_ = make_shared<vector<ColumnSchema>>();
   }
@@ -166,7 +173,7 @@ RowsResult::RowsResult(YBqlOp *op, const PTDmlStmt *tnode)
     : table_name_(op->table()->name()),
       column_schemas_(GetColumnSchemasFromOp(*op, tnode)),
       client_(GetClientFromOp(*op)),
-      rows_data_(std::move(*op->mutable_rows_data())) {
+      rows_data_(op->rows_data()) {
   if (column_schemas_ == nullptr) {
     column_schemas_ = make_shared<vector<ColumnSchema>>();
   }
@@ -175,7 +182,7 @@ RowsResult::RowsResult(YBqlOp *op, const PTDmlStmt *tnode)
 
 RowsResult::RowsResult(const YBTableName& table_name,
                        const shared_ptr<vector<ColumnSchema>>& column_schemas,
-                       const std::string& rows_data)
+                       const RefCntSlice& rows_data)
     : table_name_(table_name),
       column_schemas_(column_schemas),
       client_(QLClient::YQL_CLIENT_CQL),
@@ -185,12 +192,16 @@ RowsResult::RowsResult(const YBTableName& table_name,
 RowsResult::~RowsResult() {
 }
 
+void RowsResult::set_column_schema(int col_index, const std::shared_ptr<QLType>& type) {
+  (*column_schemas_)[col_index].set_type(type);
+}
+
 Status RowsResult::Append(RowsResult&& other) {
   column_schemas_ = std::move(other.column_schemas_);
   if (rows_data_.empty()) {
     rows_data_ = std::move(other.rows_data_);
   } else {
-    RETURN_NOT_OK(QLRowBlock::AppendRowsData(other.client_, other.rows_data_, &rows_data_));
+    RETURN_NOT_OK(qlexpr::QLRowBlock::AppendRowsData(other.client_, other.rows_data_, &rows_data_));
   }
   paging_state_ = std::move(other.paging_state_);
   return Status::OK();
@@ -202,18 +213,26 @@ void RowsResult::SetPagingState(YBqlOp *op) {
   if (op->response().has_paging_state()) {
     QLPagingStatePB *paging_state = op->mutable_response()->mutable_paging_state();
     paging_state->set_table_id(op->table()->id());
+    paging_state->set_schema_version(op->table()->schema().version());
     SetPagingState(*paging_state);
   }
 }
 
 void RowsResult::SetPagingState(const QLPagingStatePB& paging_state) {
-  faststring s;
-  CHECK(pb_util::SerializeToString(paging_state, &s));
-  paging_state_ = s.ToString();
+  paging_state_.clear();
+  CHECK(paging_state.SerializeToString(&paging_state_));
 }
 
 void RowsResult::SetPagingState(RowsResult&& other) {
   paging_state_ = std::move(other.paging_state_);
+}
+
+void RowsResult::OverrideSchemaVersionInPagingState(uint32_t schema_version) {
+  LOG_IF(DFATAL, paging_state_.empty()) << "PagingState is not available";
+  QLPagingStatePB paging_state;
+  paging_state.ParseFromString(paging_state_);
+  paging_state.set_schema_version(schema_version);
+  SetPagingState(paging_state);
 }
 
 void RowsResult::ClearPagingState() {
@@ -221,8 +240,8 @@ void RowsResult::ClearPagingState() {
   paging_state_.clear();
 }
 
-std::unique_ptr<QLRowBlock> RowsResult::GetRowBlock() const {
-  return CreateRowBlock(client_, Schema(*column_schemas_, 0), rows_data_);
+std::unique_ptr<qlexpr::QLRowBlock> RowsResult::GetRowBlock() const {
+  return qlexpr::CreateRowBlock(client_, Schema(*column_schemas_), rows_data_.AsSlice());
 }
 
 //------------------------------------------------------------------------------------------------

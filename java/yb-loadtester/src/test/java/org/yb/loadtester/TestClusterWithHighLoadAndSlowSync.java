@@ -19,7 +19,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.yb.YBTestRunner;
 import org.yb.minicluster.MiniYBClusterBuilder;
-import org.yb.util.SanitizerUtil;
+import org.yb.util.BuildTypeUtil;
 
 @RunWith(value=YBTestRunner.class)
 public class TestClusterWithHighLoadAndSlowSync extends TestClusterBase {
@@ -27,18 +27,19 @@ public class TestClusterWithHighLoadAndSlowSync extends TestClusterBase {
 
   @Override
   protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
-    builder.addCommonTServerArgs(
-        "--log_inject_latency",
-        "--log_inject_latency_ms_mean=100",
-        "--log_inject_latency_ms_stddev=50"
-    );
+    super.customizeMiniClusterBuilder(builder);
+    // Tests hearbeat batching (initially disabled) which is very beneficial during slow sync.
+    builder.addMasterFlag("catalog_manager_report_batch_size", "10");
+    builder.addCommonTServerFlag("log_inject_latency", "true");
+    builder.addCommonTServerFlag("log_inject_latency_ms_mean", "100");
+    builder.addCommonTServerFlag("log_inject_latency_ms_stddev", "50");
   }
 
   @Before
   public void startLoadTester() throws Exception {
     // Start the load tester.
     LOG.info("Using contact points for load tester: " + cqlContactPoints);
-    int nThreads =  SanitizerUtil.nonTsanVsTsan(16, 1);
+    int nThreads =  BuildTypeUtil.nonTsanVsTsan(16, 1);
     loadTesterRunnable = new LoadTester(WORKLOAD, cqlContactPoints, nThreads, nThreads);
     loadTesterThread = new Thread(loadTesterRunnable);
     loadTesterThread.start();

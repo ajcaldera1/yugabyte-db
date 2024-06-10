@@ -17,7 +17,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
@@ -29,7 +29,7 @@ import static org.yb.AssertionWrappers.assertFalse;
 import static org.yb.AssertionWrappers.assertTrue;
 import static org.yb.AssertionWrappers.fail;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgPrepareExecute extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgPrepareExecute.class);
 
@@ -116,14 +116,14 @@ public class TestPgPrepareExecute extends BasePgSQLTest {
     }
 
     // Test bind variable pushdown:
-    // Inequality on hash key -- expect index is used also with index condition. We do not support
-    // hash inequality in DocDB yet and the filtering is done inside the YB's index access method.
+    // Inequality on hash key -- until index range scan is supported, seq scan is still the best
+    // path.
     query = "EXPLAIN SELECT * FROM test WHERE h > ?";
     try (PreparedStatement sel = connection.prepareStatement(query)) {
       sel.setLong(1, 2);
       ResultSet rs = sel.executeQuery();
       List<Row> rows = getRowList(rs);
-      assertTrue(rows.toString().contains("Index Cond: "));
+      assertTrue(rows.toString().contains("Seq Scan"));
     }
   }
 

@@ -42,7 +42,7 @@
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
 
-
+#define Generation_CONTEXTSZ	MAXALIGN(sizeof(GenerationContext))
 #define Generation_BLOCKHDRSZ	MAXALIGN(sizeof(GenerationBlock))
 #define Generation_CHUNKHDRSZ	sizeof(GenerationChunk)
 
@@ -155,7 +155,8 @@ static Size GenerationGetChunkSpace(MemoryContext context, void *pointer);
 static bool GenerationIsEmpty(MemoryContext context);
 static void GenerationStats(MemoryContext context,
 				MemoryStatsPrintFunc printfunc, void *passthru,
-				MemoryContextCounters *totals);
+				MemoryContextCounters *totals,
+				bool print_to_stderr);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 static void GenerationCheck(MemoryContext context);
@@ -240,7 +241,7 @@ GenerationContextCreate(MemoryContext parent,
 	 * freeing the first generation of allocations.
 	 */
 
-	set = (GenerationContext *) malloc(MAXALIGN(sizeof(GenerationContext)));
+	set = (GenerationContext *) malloc(Generation_CONTEXTSZ);
 	if (set == NULL)
 	{
 		MemoryContextStats(TopMemoryContext);
@@ -250,6 +251,8 @@ GenerationContextCreate(MemoryContext parent,
 				 errdetail("Failed while creating memory context \"%s\".",
 						   name)));
 	}
+
+	YbPgMemAddConsumption(Generation_CONTEXTSZ);
 
 	/*
 	 * Avoid writing code that can fail between here and MemoryContextCreate;
@@ -301,7 +304,9 @@ GenerationReset(MemoryContext context)
 		wipe_mem(block, block->blksize);
 #endif
 
+		size_t freed_sz = block->endptr - ((char *) block);
 		free(block);
+		YbPgMemSubConsumption(freed_sz);
 	}
 
 	set->block = NULL;
@@ -318,8 +323,10 @@ GenerationDelete(MemoryContext context)
 {
 	/* Reset to release all the GenerationBlocks */
 	GenerationReset(context);
+
 	/* And free the context header */
 	free(context);
+	YbPgMemSubConsumption(Generation_CONTEXTSZ);
 }
 
 /*
@@ -351,6 +358,8 @@ GenerationAlloc(MemoryContext context, Size size)
 		block = (GenerationBlock *) malloc(blksize);
 		if (block == NULL)
 			return NULL;
+
+		YbPgMemAddConsumption(blksize);
 
 		/* block with a single (used) chunk */
 		block->blksize = blksize;
@@ -406,6 +415,8 @@ GenerationAlloc(MemoryContext context, Size size)
 
 		if (block == NULL)
 			return NULL;
+
+		YbPgMemAddConsumption(blksize);
 
 		block->blksize = blksize;
 		block->nchunks = 0;
@@ -522,7 +533,9 @@ GenerationFree(MemoryContext context, void *pointer)
 	if (set->block == block)
 		set->block = NULL;
 
+	size_t freed_sz = block->blksize;
 	free(block);
+	YbPgMemSubConsumption(freed_sz);
 }
 
 /*
@@ -678,6 +691,7 @@ GenerationIsEmpty(MemoryContext context)
  * printfunc: if not NULL, pass a human-readable stats string to this.
  * passthru: pass this pointer through to printfunc.
  * totals: if not NULL, add stats about this context into *totals.
+ * print_to_stderr: print stats to stderr if true, elog otherwise.
  *
  * XXX freespace only accounts for empty space at the end of the block, not
  * space of freed chunks (which is unknown).
@@ -685,7 +699,7 @@ GenerationIsEmpty(MemoryContext context)
 static void
 GenerationStats(MemoryContext context,
 				MemoryStatsPrintFunc printfunc, void *passthru,
-				MemoryContextCounters *totals)
+				MemoryContextCounters *totals, bool print_to_stderr)
 {
 	GenerationContext *set = (GenerationContext *) context;
 	Size		nblocks = 0;
@@ -717,7 +731,7 @@ GenerationStats(MemoryContext context,
 				 "%zu total in %zd blocks (%zd chunks); %zu free (%zd chunks); %zu used",
 				 totalspace, nblocks, nchunks, freespace,
 				 nfreechunks, totalspace - freespace);
-		printfunc(context, passthru, stats_string);
+		printfunc(context, passthru, stats_string, print_to_stderr);
 	}
 
 	if (totals)

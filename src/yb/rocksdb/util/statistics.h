@@ -18,72 +18,78 @@
 // under the License.
 //
 #pragma once
+
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "yb/gutil/ref_counted.h"
+
 #include "yb/rocksdb/statistics.h"
 
-#include <vector>
-#include <atomic>
-#include <string>
+namespace yb {
+class MetricEntity;
+class EventStats;
+class EventStatsPrototype;
 
-#include "yb/rocksdb/util/histogram.h"
-#include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/port/likely.h"
-
+template <class T>
+class AtomicGauge;
+template <class T>
+class GaugePrototype;
+}  // namespace yb
 
 namespace rocksdb {
 
-enum TickersInternal : uint32_t {
-  INTERNAL_TICKER_ENUM_START = TICKER_ENUM_MAX,
-  INTERNAL_TICKER_ENUM_MAX
-};
+class StatisticsMetricPrototypes;
 
-enum HistogramsInternal : uint32_t {
-  INTERNAL_HISTOGRAM_START = HISTOGRAM_ENUM_MAX,
-  INTERNAL_HISTOGRAM_ENUM_MAX
-};
-
-
-class StatisticsImpl : public Statistics {
+class StatisticsMetricImpl : public Statistics {
  public:
-  StatisticsImpl(std::shared_ptr<Statistics> stats,
-                 bool enable_internal_stats);
-  virtual ~StatisticsImpl();
+  StatisticsMetricImpl(
+      const scoped_refptr<yb::MetricEntity>& hist_entity,
+      const scoped_refptr<yb::MetricEntity>& tick_entity,
+      const bool for_intents);
 
-  virtual uint64_t getTickerCount(uint32_t ticker_type) const override;
-  virtual void histogramData(uint32_t histogram_type,
-                             HistogramData* const data) const override;
-  std::string getHistogramString(uint32_t histogram_type) const override;
+  virtual ~StatisticsMetricImpl();
 
-  virtual void setTickerCount(uint32_t ticker_type, uint64_t count) override;
-  virtual void recordTick(uint32_t ticker_type, uint64_t count) override;
-  virtual void measureTime(uint32_t histogram_type, uint64_t value) override;
+  uint64_t getTickerCount(uint32_t ticker_type) const override;
+  void histogramData(uint32_t histogram_type, HistogramData* const data) const override;
+  const yb::AggregateStats& getAggregateStats(uint32_t histogramType) const override;
 
-  virtual std::string ToString() const override;
-  virtual bool HistEnabledForType(uint32_t type) const override;
+  void setTickerCount(uint32_t ticker_type, uint64_t count) override;
+  void recordTick(uint32_t ticker_type, uint64_t count) override;
+  void measureTime(uint32_t histogram_type, uint64_t value) override;
+  void addHistogram(uint32_t histogramType, const yb::AggregateStats& stats) override;
+  void resetTickersForTest() override;
+
+  const char* GetTickerName(uint32_t ticker_type) const override;
 
  private:
-  std::shared_ptr<Statistics> stats_shared_;
-  Statistics* stats_;
-  bool enable_internal_stats_;
+  std::vector<scoped_refptr<yb::EventStats>> histograms_;
+  std::vector<scoped_refptr<yb::AtomicGauge<uint64_t>>> tickers_;
+};
 
-  struct Ticker {
-    Ticker() : value(uint_fast64_t()) {}
+class ScopedStatistics : public Statistics {
+ public:
+  ScopedStatistics();
 
-    std::atomic_uint_fast64_t value;
-    // Pad the structure to make it size of 64 bytes. A plain array of
-    // std::atomic_uint_fast64_t results in huge performance degradataion
-    // due to false sharing.
-    char padding[64 - sizeof(std::atomic_uint_fast64_t)];
-  };
+  uint64_t getTickerCount(uint32_t ticker_type) const override;
+  void histogramData(uint32_t histogram_type, HistogramData* const data) const override;
+  const yb::AggregateStats& getAggregateStats(uint32_t histogramType) const override;
 
-  static_assert(sizeof(Ticker) == 64, "Expecting to fit into 64 bytes");
+  void setTickerCount(uint32_t ticker_type, uint64_t count) override;
+  void recordTick(uint32_t ticker_type, uint64_t count) override;
+  void measureTime(uint32_t histogram_type, uint64_t value) override;
+  void addHistogram(uint32_t histogramType, const yb::AggregateStats& stats) override;
+  void resetTickersForTest() override;
 
-  // Attributes expand to nothing depending on the platform
-  __declspec(align(64))
-  Ticker tickers_[INTERNAL_TICKER_ENUM_MAX]
-     __attribute__((aligned(64)));
-  __declspec(align(64))
-  HistogramImpl histograms_[INTERNAL_HISTOGRAM_ENUM_MAX]
-      __attribute__((aligned(64)));
+  const char* GetTickerName(uint32_t ticker_type) const override;
+
+  void MergeAndClear(Statistics* target);
+
+ private:
+  std::vector<uint64_t> tickers_;
+  std::vector<yb::AggregateStats> histograms_;
 };
 
 // Utility functions
@@ -108,4 +114,4 @@ inline void SetTickerCount(Statistics* statistics, uint32_t ticker_type,
   }
 }
 
-}
+}  // namespace rocksdb

@@ -15,8 +15,7 @@
 // Tree node definitions for USE KEYSPACE statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_USE_KEYSPACE_H_
-#define YB_YQL_CQL_QL_PTREE_PT_USE_KEYSPACE_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 
@@ -36,7 +35,7 @@ class PTUseKeyspace : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTUseKeyspace(MemoryContext *memctx,
-                YBLocation::SharedPtr loc,
+                YBLocationPtr loc,
                 const MCSharedPtr<MCString>& name);
   virtual ~PTUseKeyspace();
 
@@ -51,12 +50,10 @@ class PTUseKeyspace : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
-  const char* name() const {
-    return name_->c_str();
-  }
+  const char* name() const;
 
  private:
   MCSharedPtr<MCString> name_;
@@ -64,5 +61,3 @@ class PTUseKeyspace : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_USE_KEYSPACE_H_

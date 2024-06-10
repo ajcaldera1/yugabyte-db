@@ -31,6 +31,7 @@
 #include "storage/freespace.h"
 #include "utils/builtins.h"
 #include "utils/index_selfuncs.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -149,7 +150,7 @@ brininsert(Relation idxRel, Datum *values, bool *nulls,
 	BrinRevmap *revmap;
 	Buffer		buf = InvalidBuffer;
 	MemoryContext tupcxt = NULL;
-	MemoryContext oldcxt = CurrentMemoryContext;
+	MemoryContext oldcxt = GetCurrentMemoryContext();
 	bool		autosummarize = BrinGetAutoSummarize(idxRel);
 
 	revmap = brinRevmapInitialize(idxRel, &pagesPerRange, NULL);
@@ -223,7 +224,7 @@ brininsert(Relation idxRel, Datum *values, bool *nulls,
 		/* First time through in this brininsert call? */
 		if (tupcxt == NULL)
 		{
-			tupcxt = AllocSetContextCreate(CurrentMemoryContext,
+			tupcxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 										   "brininsert cxt",
 										   ALLOCSET_DEFAULT_SIZES);
 			MemoryContextSwitchTo(tupcxt);
@@ -406,7 +407,7 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 * Setup and use a per-range memory context, which is reset every time we
 	 * loop below.  This avoids having to free the tuples within the loop.
 	 */
-	perRangeCxt = AllocSetContextCreate(CurrentMemoryContext,
+	perRangeCxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 										"bringetbitmap cxt",
 										ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(perRangeCxt);
@@ -495,7 +496,7 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 						tmp = index_getprocinfo(idxRel, keyattno,
 												BRIN_PROCNUM_CONSISTENT);
 						fmgr_info_copy(&consistentFn[keyattno - 1], tmp,
-									   CurrentMemoryContext);
+									   GetCurrentMemoryContext());
 					}
 
 					/*
@@ -869,6 +870,9 @@ brin_summarize_range(PG_FUNCTION_ARGS)
 	Oid			heapoid;
 	Relation	indexRel;
 	Relation	heapRel;
+	Oid			save_userid;
+	int			save_sec_context;
+	int			save_nestlevel;
 	double		numSummarized = 0;
 
 	if (RecoveryInProgress())
@@ -895,7 +899,22 @@ brin_summarize_range(PG_FUNCTION_ARGS)
 	 */
 	heapoid = IndexGetRelation(indexoid, true);
 	if (OidIsValid(heapoid))
+	{
 		heapRel = heap_open(heapoid, ShareUpdateExclusiveLock);
+
+		/*
+		 * Autovacuum calls us.  For its benefit, switch to the table owner's
+		 * userid, so that any index functions are run as that user.  Also
+		 * lock down security-restricted operations and arrange to make GUC
+		 * variable changes local to this command.  This is harmless, albeit
+		 * unnecessary, when called from SQL, because we fail shortly if the
+		 * user does not own the index.
+		 */
+		GetUserIdAndSecContext(&save_userid, &save_sec_context);
+		SetUserIdAndSecContext(heapRel->rd_rel->relowner,
+							   save_sec_context | SECURITY_RESTRICTED_OPERATION);
+		save_nestlevel = NewGUCNestLevel();
+	}
 	else
 		heapRel = NULL;
 
@@ -910,7 +929,7 @@ brin_summarize_range(PG_FUNCTION_ARGS)
 						RelationGetRelationName(indexRel))));
 
 	/* User must own the index (comparable to privileges needed for VACUUM) */
-	if (!pg_class_ownercheck(indexoid, GetUserId()))
+	if (heapRel != NULL && !pg_class_ownercheck(indexoid, save_userid))
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_INDEX,
 					   RelationGetRelationName(indexRel));
 
@@ -927,6 +946,12 @@ brin_summarize_range(PG_FUNCTION_ARGS)
 
 	/* OK, do it */
 	brinsummarize(indexRel, heapRel, heapBlk, true, &numSummarized, NULL);
+
+	/* Roll back any GUC changes executed by index functions */
+	AtEOXact_GUC(false, save_nestlevel);
+
+	/* Restore userid and security context */
+	SetUserIdAndSecContext(save_userid, save_sec_context);
 
 	relation_close(indexRel, ShareUpdateExclusiveLock);
 	relation_close(heapRel, ShareUpdateExclusiveLock);
@@ -969,6 +994,9 @@ brin_desummarize_range(PG_FUNCTION_ARGS)
 	 * passed indexoid isn't an index then IndexGetRelation() will fail.
 	 * Rather than emitting a not-very-helpful error message, postpone
 	 * complaining, expecting that the is-it-an-index test below will fail.
+	 *
+	 * Unlike brin_summarize_range(), autovacuum never calls this.  Hence, we
+	 * don't switch userid.
 	 */
 	heapoid = IndexGetRelation(indexoid, true);
 	if (OidIsValid(heapoid))
@@ -1030,7 +1058,7 @@ brin_build_desc(Relation rel)
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
+	cxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 								"brin desc cxt",
 								ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
@@ -1428,7 +1456,7 @@ union_tuples(BrinDesc *bdesc, BrinMemTuple *a, BrinTuple *b)
 	MemoryContext oldcxt;
 
 	/* Use our own memory context to avoid retail pfree */
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
+	cxt = AllocSetContextCreate(GetCurrentMemoryContext(),
 								"brin union",
 								ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);

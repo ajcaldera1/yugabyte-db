@@ -11,10 +11,8 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_EMPTY_VTABLE_H
-#define YB_MASTER_YQL_EMPTY_VTABLE_H
+#pragma once
 
-#include "yb/common/schema.h"
 #include "yb/master/yql_virtual_table.h"
 
 namespace yb {
@@ -26,13 +24,11 @@ namespace master {
 class YQLEmptyVTable : public YQLVirtualTable {
  public:
   explicit YQLEmptyVTable(const TableName& table_name,
+                          const NamespaceName& namespace_name,
                           const Master* const master,
                           const Schema& schema);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
 };
 
 }  // namespace master
 }  // namespace yb
-
-#endif // YB_MASTER_YQL_EMPTY_VTABLE_H

@@ -21,17 +21,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_DB_WRITE_BATCH_INTERNAL_H
-#define ROCKSDB_DB_WRITE_BATCH_INTERNAL_H
 
 #pragma once
+
 #include <vector>
+
 #include "yb/rocksdb/db/write_thread.h"
 #include "yb/rocksdb/types.h"
-#include "yb/rocksdb/write_batch.h"
-#include "yb/rocksdb/db.h"
-#include "yb/rocksdb/options.h"
 #include "yb/rocksdb/util/autovector.h"
+#include "yb/rocksdb/write_batch.h"
+
+#include "yb/util/enums.h"
 
 namespace rocksdb {
 
@@ -75,6 +75,12 @@ class ColumnFamilyMemTablesDefault : public ColumnFamilyMemTables {
   bool ok_;
   MemTable* mem_;
 };
+
+YB_DEFINE_ENUM(InsertFlag,
+               (kFilterDeletes)            // ignore deletes of non-existing keys
+               (kConcurrentMemtableWrites) // allow concurrent writes
+               );
+typedef yb::EnumBitSet<InsertFlag> InsertFlags;
 
 // WriteBatchInternal provides static methods for manipulating a
 // WriteBatch that we don't want in the public WriteBatch interface.
@@ -158,8 +164,7 @@ class WriteBatchInternal {
                            FlushScheduler* flush_scheduler,
                            bool ignore_missing_column_families = false,
                            uint64_t log_number = 0, DB* db = nullptr,
-                           const bool dont_filter_deletes = true,
-                           bool concurrent_memtable_writes = false);
+                           InsertFlags insert_flags = InsertFlags());
 
   // Convenience form of InsertInto when you have only one batch
   static Status InsertInto(const WriteBatch* batch,
@@ -167,8 +172,7 @@ class WriteBatchInternal {
                            FlushScheduler* flush_scheduler,
                            bool ignore_missing_column_families = false,
                            uint64_t log_number = 0, DB* db = nullptr,
-                           const bool dont_filter_deletes = true,
-                           bool concurrent_memtable_writes = false);
+                           InsertFlags insert_flags = InsertFlags());
 
   static void Append(WriteBatch* dst, const WriteBatch* src);
 
@@ -178,5 +182,3 @@ class WriteBatchInternal {
 };
 
 }  // namespace rocksdb
-
-#endif // ROCKSDB_DB_WRITE_BATCH_INTERNAL_H

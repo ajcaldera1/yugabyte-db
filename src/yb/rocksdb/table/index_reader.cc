@@ -15,6 +15,7 @@
 
 #include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/table/block_based_table_internal.h"
+#include "yb/rocksdb/table/iterator_wrapper.h"
 #include "yb/rocksdb/table/meta_blocks.h"
 #include "yb/util/slice.h"
 
@@ -37,6 +38,10 @@ Status BinarySearchIndexReader::Create(
   }
 
   return s;
+}
+
+Result<std::string> BinarySearchIndexReader::GetMiddleKey() const {
+  return index_block_->GetMiddleKey(kIndexBlockKeyValueEncodingFormat);
 }
 
 Status HashIndexReader::Create(const SliceTransform* hash_key_extractor,
@@ -124,12 +129,16 @@ Status HashIndexReader::Create(const SliceTransform* hash_key_extractor,
   return Status::OK();
 }
 
-class MultiLevelIterator : public InternalIterator {
+Result<std::string> HashIndexReader::GetMiddleKey() const {
+  return index_block_->GetMiddleKey(kIndexBlockKeyValueEncodingFormat);
+}
+
+class MultiLevelIterator final : public InternalIterator {
  public:
   static constexpr auto kIterChainInitialCapacity = 4;
 
   MultiLevelIterator(
-      TwoLevelIteratorState* state, InternalIterator* top_level_iter, int num_levels,
+      TwoLevelIteratorState* state, InternalIterator* top_level_iter, uint32_t num_levels,
       bool need_free_top_level_iter)
     : state_(state), iter_(num_levels), index_block_handle_(num_levels - 1),
       bottom_level_iter_(iter_.data() + (num_levels - 1)),
@@ -145,49 +154,43 @@ class MultiLevelIterator : public InternalIterator {
     }
   }
 
-  void Seek(const Slice& target) override {
+  const KeyValueEntry& Seek(Slice target) override {
     if (state_->check_prefix_may_match && !state_->PrefixMayMatch(target)) {
       bottommost_positioned_iter_ = &iter_[0];
-      return;
+      return Entry();
     }
 
-    DoSeek(std::bind(&IteratorWrapper::Seek, std::placeholders::_1, target));
+    return DoSeek(std::bind(&IteratorWrapper::Seek, std::placeholders::_1, target));
   }
 
-  void SeekToFirst() override {
-    DoSeek(std::bind(&IteratorWrapper::SeekToFirst, std::placeholders::_1));
+  const KeyValueEntry& SeekToFirst() override {
+    return DoSeek(std::bind(&IteratorWrapper::SeekToFirst, std::placeholders::_1));
   }
 
-  void SeekToLast() override {
-    DoSeek(std::bind(&IteratorWrapper::SeekToLast, std::placeholders::_1));
+  const KeyValueEntry& SeekToLast() override {
+    return DoSeek(std::bind(&IteratorWrapper::SeekToLast, std::placeholders::_1));
   }
 
-  void Next() override {
-    DoMove(
+  const KeyValueEntry& Next() override {
+    return DoMove(
         std::bind(&IteratorWrapper::Next, std::placeholders::_1),
         std::bind(&IteratorWrapper::SeekToFirst, std::placeholders::_1)
     );
   }
 
-  void Prev() override {
-    DoMove(
+  const KeyValueEntry& Prev() override {
+    return DoMove(
         std::bind(&IteratorWrapper::Prev, std::placeholders::_1),
         std::bind(&IteratorWrapper::SeekToLast, std::placeholders::_1)
     );
   }
 
-  bool Valid() const override {
-    return bottommost_positioned_iter_ == bottom_level_iter_ && bottom_level_iter_->Valid();
-  }
+  const KeyValueEntry& Entry() const override {
+    if (bottommost_positioned_iter_ == bottom_level_iter_) {
+      return bottom_level_iter_->Entry();
+    }
 
-  Slice key() const override {
-    DCHECK(Valid());
-    return bottom_level_iter_->key();
-  }
-
-  Slice value() const override {
-    DCHECK(Valid());
-    return bottom_level_iter_->value();
+    return KeyValueEntry::Invalid();
   }
 
   Status status() const override {
@@ -216,7 +219,7 @@ class MultiLevelIterator : public InternalIterator {
   }
 
   template <typename F>
-  void DoSeek(F seek_function) {
+  const KeyValueEntry& DoSeek(F seek_function) {
     IteratorWrapper* iter = iter_.data();
     seek_function(iter);
     bottommost_positioned_iter_ = iter;
@@ -226,10 +229,11 @@ class MultiLevelIterator : public InternalIterator {
       seek_function(iter);
     }
     bottommost_positioned_iter_ = iter;
+    return Entry();
   }
 
   template <typename F1, typename F2>
-  void DoMove(F1 move_function, F2 lower_levels_init_function) {
+  const KeyValueEntry& DoMove(F1 move_function, F2 lower_levels_init_function) {
     DCHECK(Valid());
     // First try to move iterator starting with bottom level.
     IteratorWrapper* iter = bottom_level_iter_;
@@ -240,7 +244,7 @@ class MultiLevelIterator : public InternalIterator {
     }
     if (!iter->Valid()) {
       bottommost_positioned_iter_ = iter;
-      return;
+      return Entry();
     }
     // Once we've moved iterator at some level, we need to reset iterators at levels below.
     while (iter < bottom_level_iter_) {
@@ -249,6 +253,7 @@ class MultiLevelIterator : public InternalIterator {
       lower_levels_init_function(iter);
     }
     bottommost_positioned_iter_ = bottom_level_iter_;
+    return Entry();
   }
 
   void InitSubIterator(IteratorWrapper* parent_iter) {
@@ -261,6 +266,8 @@ class MultiLevelIterator : public InternalIterator {
         && handle.compare(*child_index_block_handle) == 0) {
       // wrapper is already set to iterator for this handle, no need to change.
     } else {
+      // TODO(index_iter): consider updating existing iterator rather than recreating, measure
+      // potential perf impact.
       InternalIterator* iter = state_->NewSecondaryIterator(handle);
       handle.CopyToBuffer(child_index_block_handle);
       SetSubIterator(sub_iter, iter);
@@ -279,7 +286,7 @@ class MultiLevelIterator : public InternalIterator {
 };
 
 Result<std::unique_ptr<MultiLevelIndexReader>> MultiLevelIndexReader::Create(
-    RandomAccessFileReader* file, const Footer& footer, const int num_levels,
+    RandomAccessFileReader* file, const Footer& footer, const uint32_t num_levels,
     const BlockHandle& top_level_index_handle, Env* env, const ComparatorPtr& comparator,
     const std::shared_ptr<yb::MemTracker>& mem_tracker) {
   std::unique_ptr<Block> index_block;
@@ -292,10 +299,25 @@ Result<std::unique_ptr<MultiLevelIndexReader>> MultiLevelIndexReader::Create(
 
 InternalIterator* MultiLevelIndexReader::NewIterator(
     BlockIter* iter, TwoLevelIteratorState* index_iterator_state, bool) {
-  InternalIterator* top_level_iter =
-      top_level_index_block_->NewIterator(comparator_.get(), iter, true /* total_order_seek */);
+  InternalIterator* top_level_iter = top_level_index_block_->NewIndexIterator(
+      comparator_.get(), iter, /* total_order_seek = */ true);
   return new MultiLevelIterator(
       index_iterator_state, top_level_iter, num_levels_, top_level_iter != iter);
+}
+
+Result<std::string> MultiLevelIndexReader::GetMiddleKey() const {
+  const auto middle_key =
+      top_level_index_block_->GetMiddleKey(kIndexBlockKeyValueEncodingFormat, comparator_.get());
+  if (!middle_key.ok() && middle_key.status().IsIncomplete() && (num_levels_ > 1)) {
+    // Incomplete status means block has less than 2 entries and this shouldn't happen if there are
+    // more than 1 level in the block, see MultiLevelIndexBuilder::FlushNextBlock().
+    return STATUS_FORMAT(
+        InternalError,
+        "It is expected to have more than 1 entry in top-level block in case of more than 1 level,"
+        " num_levels: $0",
+        num_levels_);
+  }
+  return middle_key;
 }
 
 } // namespace rocksdb

@@ -130,7 +130,7 @@ static void MultiXactIdWait(MultiXactId multi, MultiXactStatus status, uint16 in
 static bool ConditionalMultiXactIdWait(MultiXactId multi, MultiXactStatus status,
 						   uint16 infomask, Relation rel, int *remaining);
 static XLogRecPtr log_heap_new_cid(Relation relation, HeapTuple tup);
-static HeapTuple ExtractReplicaIdentity(Relation rel, HeapTuple tup, bool key_modified,
+static HeapTuple ExtractReplicaIdentity(Relation rel, HeapTuple tup, bool key_changed,
 					   bool *copy);
 static bool ProjIndexIsUnchanged(Relation relation, HeapTuple oldtup, HeapTuple newtup);
 
@@ -238,8 +238,10 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	 */
 	if (scan->rs_parallel != NULL)
 		scan->rs_nblocks = scan->rs_parallel->phs_nblocks;
+	else if (RelationGetForm(scan->rs_rd)->relkind == RELKIND_SEQUENCE)
+	  scan->rs_nblocks = 1;
 	else
-		scan->rs_nblocks = RelationGetNumberOfBlocks(scan->rs_rd);
+    scan->rs_nblocks = RelationGetNumberOfBlocks(scan->rs_rd);
 
 	/*
 	 * If the table is large relative to NBuffers, use a bulk-read access
@@ -304,6 +306,7 @@ initscan(HeapScanDesc scan, ScanKey key, bool keep_startblock)
 	scan->rs_inited = false;
 	scan->rs_ctup.t_data = NULL;
 	ItemPointerSetInvalid(&scan->rs_ctup.t_self);
+	scan->rs_ctup.t_ybctid = (Datum) 0;
 	scan->rs_cbuf = InvalidBuffer;
 	scan->rs_cblock = InvalidBlockNumber;
 
@@ -432,9 +435,9 @@ heapgetpage(HeapScanDesc scan, BlockNumber page)
 		 lineoff <= lines;
 		 lineoff++, lpp++)
 	{
-		if (ItemIdIsNormal(lpp))
+    if (ItemIdIsNormal(lpp))
 		{
-			HeapTupleData loctup;
+      HeapTupleData loctup;
 			bool		valid;
 
 			loctup.t_tableOid = RelationGetRelid(scan->rs_rd);
@@ -1468,15 +1471,6 @@ heap_beginscan_internal(Relation relation, Snapshot snapshot,
 		return ybc_heap_beginscan(relation, snapshot, nkeys, key, temp_snap);
 	}
 
-	/* Give more specific error for sequence tables */
-	if (RelationGetForm(relation)->relkind == RELKIND_SEQUENCE)
-		ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-										 errmsg("\"%s\" is a sequence table",
-													  RelationGetRelationName(relation)),
-										 errdetail("Querying sequence tables is not supported yet."),
-										 errhint("Use lastval() and currval() instead.")));
-
 	/*
 	 * increment relation ref count while scanning relation
 	 *
@@ -2487,6 +2481,10 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 				        "Operation not allowed in YugaByte mode %s",
 				        __func__)));
 	}
+
+	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
+	Assert(HeapTupleHeaderGetNatts(tup->t_data) <=
+		   RelationGetNumberOfAttributes(relation));
 
 	/*
 	 * Fill in tuple header fields, assign an OID, and toast the tuple if
@@ -3611,6 +3609,10 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 
 	Assert(ItemPointerIsValid(otid));
 
+	/* Cheap, simplistic check that the tuple matches the rel's rowtype. */
+	Assert(HeapTupleHeaderGetNatts(newtup->t_data) <=
+		   RelationGetNumberOfAttributes(relation));
+
 	/*
 	 * Forbid this during a parallel operation, lest it allocate a combocid.
 	 * Other workers might need that combocid for visibility checks, and we
@@ -4560,14 +4562,14 @@ ProjIndexIsUnchanged(Relation relation, HeapTuple oldtup, HeapTuple newtup)
 			int			i;
 
 			ResetExprContext(econtext);
-			ExecStoreTuple(oldtup, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(oldtup, slot, false);
 			FormIndexDatum(indexInfo,
 						   slot,
 						   estate,
 						   old_values,
 						   old_isnull);
 
-			ExecStoreTuple(newtup, slot, InvalidBuffer, false);
+			ExecStoreHeapTuple(newtup, slot, false);
 			FormIndexDatum(indexInfo,
 						   slot,
 						   estate,
@@ -4776,6 +4778,12 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	tuple->t_data = (HeapTupleHeader) PageGetItem(page, lp);
 	tuple->t_len = ItemIdGetLength(lp);
 	tuple->t_tableOid = RelationGetRelid(relation);
+
+	/*
+	 * This will only be used for non-YB tuples (e.g. Temp tables) so we just
+	 * need to set the ybctid to 0 (NULL) here.
+	 */
+	tuple->t_ybctid = (Datum) 0;
 
 l3:
 	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
@@ -6435,9 +6443,15 @@ heap_abort_speculative(Relation relation, HeapTuple tuple)
  *
  * tuple is an in-memory tuple structure containing the data to be written
  * over the target tuple.  Also, tuple->t_self identifies the target tuple.
+ *
+ * if yb_shared_update is specified, this update will be done in every
+ * database (including template0 and template1). Such operation will assume
+ * the tuple is exactly the same in all databases.
+ * This is needed when creating shared relations.
+ * This flag should not be used during initdb bootstrap.
  */
 void
-heap_inplace_update(Relation relation, HeapTuple tuple)
+heap_inplace_update(Relation relation, HeapTuple tuple, bool yb_shared_update)
 {
 	Buffer		buffer;
 	Page		page;
@@ -6447,9 +6461,25 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 	uint32		oldlen;
 	uint32		newlen;
 
-	if (IsYugaByteEnabled())
+	if (IsYBRelation(relation))
 	{
-		YBCUpdateSysCatalogTuple(relation, NULL /* oldtuple */, tuple);
+		if (yb_shared_update)
+		{
+			if (!IsYsqlUpgrade)
+				elog(ERROR, "shared update cannot be done outside of YSQL upgrade");
+
+			YB_FOR_EACH_DB(pg_db_tuple)
+			{
+				Oid dboid = HeapTupleGetOid(pg_db_tuple);
+				/* YB doesn't use PG locks so it's okay not to take them. */
+				YBCUpdateSysCatalogTupleForDb(dboid, relation, NULL /* oldtuple */, tuple);
+			}
+			YB_FOR_EACH_DB_END;
+		}
+		else
+		{
+			YBCUpdateSysCatalogTuple(relation, NULL /* oldtuple */, tuple);
+		}
 		return;
 	}
 

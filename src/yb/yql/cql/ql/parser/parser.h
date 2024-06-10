@@ -15,8 +15,7 @@
 // Entry point for the parsing process. Conducting the whole scanning and parsing of SQL statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PARSER_PARSER_H_
-#define YB_YQL_CQL_QL_PARSER_PARSER_H_
+#pragma once
 
 #include <cstddef>
 
@@ -43,8 +42,8 @@ class Parser {
   // Returns 0 if Bison successfully parses SQL statements, and the compiler can continue on to
   // semantic analysis. Otherwise, it returns one of the errcodes that are defined in file
   // "yb/yql/cql/ql/errcodes.h", and the caller (QL API) should stop the compiling process.
-  CHECKED_STATUS Parse(const std::string& stmt, bool reparsed,
-                       const MemTrackerPtr& mem_tracker = nullptr, const bool internal = false);
+  Status Parse(const std::string& stmt, bool reparsed,
+               const MemTrackerPtr& mem_tracker = nullptr, const bool internal = false);
 
   // Returns the generated parse tree.
   ParseTree::UniPtr Done();
@@ -117,5 +116,3 @@ class Parser {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PARSER_PARSER_H_

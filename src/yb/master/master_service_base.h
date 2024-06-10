@@ -11,23 +11,38 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_MASTER_SERVICE_BASE_H
-#define YB_MASTER_MASTER_SERVICE_BASE_H
+#pragma once
+
+#include <functional>
 
 #include "yb/gutil/macros.h"
 
-namespace yb {
-class Status;
+#include "yb/master/master_fwd.h"
+#include "yb/rpc/rpc_fwd.h"
 
-namespace rpc {
-class RpcContext;
-} // namespace rpc
+#include "yb/util/strongly_typed_bool.h"
+
+namespace yb {
+
+class Status;
 
 namespace master {
 
 class Master;
 class CatalogManager;
 class FlushManager;
+class YsqlBackendsManager;
+class PermissionsManager;
+class EncryptionManager;
+class TabletHealthManager;
+struct LeaderEpoch;
+class XClusterManager;
+class MasterAutoFlagsManager;
+class MasterClusterHandler;
+
+// Tells HandleIn/HandleOnLeader to either acquire the lock briefly to check leadership (kFalse)
+// or to hold it throughout the handler invocation (kTrue).
+YB_STRONGLY_TYPED_BOOL(HoldCatalogLock);
 
 // Base class for any master service with a few helpers.
 class MasterServiceBase {
@@ -35,29 +50,83 @@ class MasterServiceBase {
   explicit MasterServiceBase(Master* server) : server_(server) {}
 
  protected:
-  // If 's' is not OK and 'resp' has no application specific error set,
-  // set the error field of 'resp' to match 's' and set the code to
-  // UNKNOWN_ERROR.
-  template<class RespClass>
-  static void CheckRespErrorOrSetUnknown(const Status& s, RespClass* resp);
-
-  template <class ReqType, class RespType, class FnType>
-  void HandleOnLeader(const ReqType* req, RespType* resp, rpc::RpcContext* rpc, FnType f);
-
-  template <class HandlerType, class ReqType, class RespType>
-  void HandleIn(const ReqType* req, RespType* resp, rpc::RpcContext* rpc,
-      Status (HandlerType::*f)(RespType*));
+  template <class RespType, class FnType>
+  void HandleOnLeader(
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      FnType f,
+      const char* file_name,
+      int line_number,
+      const char* function_name,
+      HoldCatalogLock hold_catalog_lock);
 
   template <class HandlerType, class ReqType, class RespType>
-  void HandleIn(const ReqType* req, RespType* resp, rpc::RpcContext* rpc,
-      Status (HandlerType::*f)(const ReqType*, RespType*));
+  void HandleOnAllMasters(
+      const ReqType* req,
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      Status (HandlerType::*f)(const ReqType*, RespType*),
+      const char* file_name,
+      int line_number,
+      const char* function_name);
 
   template <class HandlerType, class ReqType, class RespType>
-  void HandleIn(const ReqType* req, RespType* resp, rpc::RpcContext* rpc,
-      Status (HandlerType::*f)(const ReqType*, RespType*, rpc::RpcContext*));
+  void HandleIn(
+      const ReqType* req,
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      Status (HandlerType::*f)(RespType*),
+      const char* file_name,
+      int line,
+      const char* function_name,
+      HoldCatalogLock hold_catalog_lock);
 
-  YB_EDITION_NS_PREFIX CatalogManager* handler(CatalogManager*);
+  template <class HandlerType, class ReqType, class RespType>
+  void HandleIn(
+      const ReqType* req,
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      Status (HandlerType::*f)(const ReqType*, RespType*),
+      const char* file_name,
+      int line_number,
+      const char* function_name,
+      HoldCatalogLock hold_catalog_lock);
+
+  template <class HandlerType, class ReqType, class RespType>
+  void HandleIn(
+      const ReqType* req,
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      Status (HandlerType::*f)(const ReqType*, RespType*, rpc::RpcContext*),
+      const char* file_name,
+      int line_number,
+      const char* function_name,
+      HoldCatalogLock hold_catalog_lock);
+
+  template <class HandlerType, class ReqType, class RespType>
+  void HandleIn(
+      const ReqType* req,
+      RespType* resp,
+      rpc::RpcContext* rpc,
+      Status (HandlerType::*f)(
+          const ReqType*, RespType*, rpc::RpcContext*, const LeaderEpoch&),
+      const char* file_name,
+      int line_number,
+      const char* function_name,
+      HoldCatalogLock hold_catalog_lock);
+
+  CatalogManager* handler(CatalogManager*);
+  TabletSplitManager* handler(TabletSplitManager*);
   FlushManager* handler(FlushManager*);
+  TabletHealthManager* handler(TabletHealthManager*);
+  YsqlBackendsManager* handler(YsqlBackendsManager*);
+  PermissionsManager* handler(PermissionsManager*);
+  EncryptionManager* handler(EncryptionManager*);
+  XClusterManager* handler(XClusterManager*);
+  TestAsyncRpcManager* handler(TestAsyncRpcManager*);
+  MasterAutoFlagsManager* handler(MasterAutoFlagsManager*);
+  CloneStateManager* handler(CloneStateManager*);
+  MasterClusterHandler* handler(MasterClusterHandler*);
 
   Master* server_;
 
@@ -67,5 +136,3 @@ class MasterServiceBase {
 
 } // namespace master
 } // namespace yb
-
-#endif // YB_MASTER_MASTER_SERVICE_BASE_H

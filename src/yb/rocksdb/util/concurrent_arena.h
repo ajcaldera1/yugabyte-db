@@ -21,18 +21,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_UTIL_CONCURRENT_ARENA_H
-#define YB_ROCKSDB_UTIL_CONCURRENT_ARENA_H
 
 #pragma once
+
 #include <atomic>
-#include <memory>
-#include <utility>
-#include "yb/rocksdb/port/likely.h"
+#include <mutex>
+
 #include "yb/rocksdb/util/allocator.h"
 #include "yb/rocksdb/util/arena.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/rocksdb/util/thread_local.h"
 
 // Only generate field unused warning for padding array, or build under
 // GCC 4.8.1 will fail.
@@ -70,7 +67,7 @@ class ConcurrentArena : public Allocator {
 
   char* Allocate(size_t bytes) override {
     return AllocateImpl(bytes, false /*force_arena*/,
-                        [=]() { return arena_.Allocate(bytes); });
+                        [this, bytes]() { return arena_.Allocate(bytes); });
   }
 
   char* AllocateAligned(size_t bytes, size_t huge_page_size = 0,
@@ -79,7 +76,8 @@ class ConcurrentArena : public Allocator {
     assert(rounded_up >= bytes && rounded_up < bytes + sizeof(void*) &&
            (rounded_up % sizeof(void*)) == 0);
 
-    return AllocateImpl(rounded_up, huge_page_size != 0 /*force_arena*/, [=]() {
+    return AllocateImpl(rounded_up, huge_page_size != 0 /*force_arena*/,
+                        [this, rounded_up, huge_page_size, logger]() {
       return arena_.AllocateAligned(rounded_up, huge_page_size, logger);
     });
   }
@@ -183,7 +181,7 @@ class ConcurrentArena : public Allocator {
     size_t avail = s->allocated_and_unused_.load(std::memory_order_relaxed);
     if (avail < bytes) {
       // reload
-      std::lock_guard<SpinMutex> reload_lock(arena_mutex_);
+      std::lock_guard reload_lock(arena_mutex_);
 
       // If the arena's current block is within a factor of 2 of the right
       // size, we adjust our request to avoid arena waste.
@@ -223,5 +221,3 @@ class ConcurrentArena : public Allocator {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_UTIL_CONCURRENT_ARENA_H

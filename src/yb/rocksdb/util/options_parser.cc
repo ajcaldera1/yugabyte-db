@@ -20,7 +20,8 @@
 
 #include "yb/rocksdb/util/options_parser.h"
 
-#include <cmath>
+#include <math.h>
+
 #include <map>
 #include <string>
 #include <utility>
@@ -29,9 +30,10 @@
 #include "yb/rocksdb/convenience.h"
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/util/options_helper.h"
+
+#include "yb/util/status_log.h"
 #include "yb/util/string_util.h"
-#include "yb/rocksdb/util/sync_point.h"
-#include "yb/rocksdb/port/port.h"
+#include "yb/util/sync_point.h"
 #include "yb/util/version_info.h"
 
 namespace rocksdb {
@@ -47,8 +49,10 @@ static const std::string option_file_header =
 Status PersistRocksDBOptions(const DBOptions& db_opt,
                              const std::vector<std::string>& cf_names,
                              const std::vector<ColumnFamilyOptions>& cf_opts,
-                             const std::string& file_name, Env* env) {
-  TEST_SYNC_POINT("PersistRocksDBOptions:start");
+                             const std::string& file_name, Env* env,
+                             const IncludeHeader include_header,
+                             const IncludeFileVersion include_file_version) {
+  DEBUG_ONLY_TEST_SYNC_POINT("PersistRocksDBOptions:start");
   if (cf_names.size() != cf_opts.size()) {
     return STATUS(InvalidArgument,
         "cf_names.size() and cf_opts.size() must be the same");
@@ -59,54 +63,63 @@ Status PersistRocksDBOptions(const DBOptions& db_opt,
   if (!s.ok()) {
     return s;
   }
+
+  // Header section
+  if (include_header) {
+    RETURN_NOT_OK(writable->Append(option_file_header));
+  }
+
+  // Versions section
+  RETURN_NOT_OK(writable->Append(
+      "[" + opt_section_titles[kOptionSectionVersion] + "]\n"
+      "  yugabyte_version=" + yb::VersionInfo::GetShortVersionString() + "\n"));
+  if (include_file_version) {
+    RETURN_NOT_OK(writable->Append("  options_file_version=" +
+                                   ToString(ROCKSDB_OPTION_FILE_MAJOR) + "." +
+                                   ToString(ROCKSDB_OPTION_FILE_MINOR) + "\n"));
+  }
+
+  // DBOptions section
   std::string options_file_content;
-
-  writable->Append(option_file_header + "[" +
-                   opt_section_titles[kOptionSectionVersion] +
-                   "]\n"
-                   "  yugabyte_version=" + yb::VersionInfo::GetShortVersionString() + "\n");
-  writable->Append("  options_file_version=" +
-                   ToString(ROCKSDB_OPTION_FILE_MAJOR) + "." +
-                   ToString(ROCKSDB_OPTION_FILE_MINOR) + "\n");
-  writable->Append("\n[" + opt_section_titles[kOptionSectionDBOptions] +
-                   "]\n  ");
-
+  RETURN_NOT_OK(writable->Append("\n[" + opt_section_titles[kOptionSectionDBOptions] + "]\n  "));
   s = GetStringFromDBOptions(&options_file_content, db_opt, "\n  ");
   if (!s.ok()) {
-    writable->Close();
+    WARN_NOT_OK(writable->Close(), "Failed to close writable");
     return s;
   }
-  writable->Append(options_file_content + "\n");
+  RETURN_NOT_OK(writable->Append(options_file_content));
 
   for (size_t i = 0; i < cf_opts.size(); ++i) {
     // CFOptions section
-    writable->Append("\n[" + opt_section_titles[kOptionSectionCFOptions] +
-                     " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  ");
-    s = GetStringFromColumnFamilyOptions(&options_file_content, cf_opts[i],
-                                         "\n  ");
+    RETURN_NOT_OK(writable->Append("\n[" + opt_section_titles[kOptionSectionCFOptions] +
+                                   " \"" + EscapeOptionString(cf_names[i]) + "\"]\n  "));
+    s = GetStringFromColumnFamilyOptions(&options_file_content, cf_opts[i], "\n  ");
     if (!s.ok()) {
-      writable->Close();
+      WARN_NOT_OK(writable->Close(), "Failed to close writable");
       return s;
     }
-    writable->Append(options_file_content + "\n");
+    RETURN_NOT_OK(writable->Append(options_file_content));
+
     // TableOptions section
     auto* tf = cf_opts[i].table_factory.get();
     if (tf != nullptr) {
-      writable->Append("[" + opt_section_titles[kOptionSectionTableOptions] +
-                       tf->Name() + " \"" + EscapeOptionString(cf_names[i]) +
-                       "\"]\n  ");
+      RETURN_NOT_OK(writable->Append(
+          "[" + opt_section_titles[kOptionSectionTableOptions] +
+          tf->Name() + " \"" + EscapeOptionString(cf_names[i]) +
+          "\"]\n  "));
       s = GetStringFromTableFactory(&options_file_content, tf, "\n  ");
       if (!s.ok()) {
         return s;
       }
-      writable->Append(options_file_content + "\n");
+      RETURN_NOT_OK(writable->Append(options_file_content));
     }
   }
-  writable->Flush();
+
+  RETURN_NOT_OK(writable->Flush());
   if (!db_opt.disableDataSync) {
-    writable->Fsync();
+    RETURN_NOT_OK(writable->Fsync());
   }
-  writable->Close();
+  RETURN_NOT_OK(writable->Close());
 
   return RocksDBOptionsParser::VerifyRocksDBOptionsFromFile(
       db_opt, cf_names, cf_opts, file_name, env);
@@ -211,7 +224,7 @@ namespace {
 bool ReadOneLine(std::istringstream* iss, SequentialFile* seq_file,
                  std::string* output, bool* has_data, Status* result) {
   const int kBufferSize = 4096;
-  char buffer[kBufferSize + 1];
+  uint8_t buffer[kBufferSize + 1];
   Slice input_slice;
 
   std::string line;
@@ -441,7 +454,7 @@ Status RocksDBOptionsParser::EndSection(
       return s;
     }
   } else if (section == kOptionSectionVersion) {
-    for (const auto pair : opt_map) {
+    for (const auto& pair : opt_map) {
       if (pair.first == "rocksdb_version") {
         s = ParseVersionNumber(pair.first, pair.second, 3, db_version);
         if (!s.ok()) {
@@ -765,7 +778,7 @@ Status RocksDBOptionsParser::VerifyBlockBasedTableFactory(
     return STATUS(Corruption,
         "[RocksDBOptionsParser]: Inconsistent TableFactory class type");
   }
-  if (base_tf == nullptr) {
+  if (base_tf == nullptr || file_tf == nullptr) {
     return Status::OK();
   }
 

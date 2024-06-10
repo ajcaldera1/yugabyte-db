@@ -13,8 +13,22 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include "yb/yql/cql/ql/exec/executor.h"
+#include "yb/common/value.pb.h"
+#include "yb/qlexpr/ql_rowblock.h"
+#include "yb/common/ql_value.h"
+
+#include "yb/common/schema.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 #include "yb/util/yb_partition.h"
+
+#include "yb/yql/cql/ql/exec/exec_context.h"
+#include "yb/yql/cql/ql/exec/executor.h"
+#include "yb/yql/cql/ql/ptree/column_arg.h"
+#include "yb/yql/cql/ql/ptree/column_desc.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/yql/cql/ql/ptree/pt_select.h"
 
 namespace yb {
 namespace ql {
@@ -38,7 +52,7 @@ Status Executor::WhereClauseToPB(QLWriteRequestPB *req,
       LOG(FATAL) << "Unexpected non primary key column in this context";
     }
     RETURN_NOT_OK(PTExprToPB(op.expr(), col_expr_pb));
-    RETURN_NOT_OK(EvalExpr(col_expr_pb, QLTableRow::empty_row()));
+    RETURN_NOT_OK(EvalExpr(col_expr_pb, qlexpr::QLTableRow::empty_row()));
   }
 
   // Setup the rest of the columns.
@@ -53,16 +67,17 @@ Status Executor::WhereClauseToPB(QLWriteRequestPB *req,
     QLConditionPB *where_pb = req->mutable_where_expr()->mutable_condition();
     where_pb->set_op(QL_OP_AND);
     for (const auto &col_op : where_ops) {
-      RETURN_NOT_OK(WhereOpToPB(where_pb->add_operands()->mutable_condition(), col_op));
+      RETURN_NOT_OK(WhereColumnOpToPB(where_pb->add_operands()->mutable_condition(), col_op));
     }
   }
 
   return Status::OK();
 }
 
-Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
+Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB* req,
                                            const MCVector<ColumnOp>& key_where_ops,
                                            const MCList<ColumnOp>& where_ops,
+                                           const MCList<MultiColumnOp>& multi_col_where_ops,
                                            const MCList<SubscriptedColumnOp>& subcol_where_ops,
                                            const MCList<JsonColumnOp>& jsoncol_where_ops,
                                            const MCList<PartitionKeyOp>& partition_key_ops,
@@ -74,15 +89,16 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
   for (const auto& op : partition_key_ops) {
     QLExpressionPB expr_pb;
     RETURN_NOT_OK(PTExprToPB(op.expr(), &expr_pb));
-    QLValue result;
-    RETURN_NOT_OK(EvalExpr(expr_pb, QLTableRow::empty_row(), &result));
-    DCHECK(result.value().has_int64_value() || result.value().has_int32_value())
+    qlexpr::QLExprResult result;
+    RETURN_NOT_OK(EvalExpr(expr_pb, qlexpr::QLTableRow::empty_row(), result.Writer()));
+    const auto& value = result.Value();
+    DCHECK(value.has_int64_value() || value.has_int32_value())
         << "Partition key operations are expected to return 64/16 bit integer";
     uint16_t hash_code;
     // 64 bits for token and 32 bits for partition_hash.
-    if (result.value().has_int32_value()) {
+    if (value.has_int32_value()) {
       // Validate bounds for uint16_t.
-      int32_t val = result.int32_value();
+      int32_t val = value.int32_value();
       if (val < std::numeric_limits<uint16_t>::min() ||
           val > std::numeric_limits<uint16_t>::max()) {
         return STATUS_SUBSTITUTE(InvalidArgument, "$0 out of bounds for unsigned 16 bit integer",
@@ -90,7 +106,7 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
       }
       hash_code = val;
     } else {
-      hash_code = YBPartition::CqlToYBHashCode(result.int64_value());
+      hash_code = YBPartition::CqlToYBHashCode(value.int64_value());
     }
 
     // We always use inclusive intervals [start, end] for hash_code
@@ -109,7 +125,7 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
       case QL_OP_LESS_THAN:
         // Cassandra treats INT64_MIN upper bound as special case that includes everything (i.e. it
         // adds no real restriction). So we skip (do nothing) in that case.
-        if (!result.value().has_int64_value() || result.int64_value() != INT64_MIN) {
+        if (!value.has_int64_value() || value.int64_value() != INT64_MIN) {
           if (hash_code > YBPartition::kMinHashCode) {
             req->set_max_hash_code(hash_code - 1);
           } else {
@@ -121,7 +137,7 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
       case QL_OP_LESS_THAN_EQUAL:
         // Cassandra treats INT64_MIN upper bound as special case that includes everything (i.e. it
         // adds no real restriction). So we skip (do nothing) in that case.
-        if (!result.value().has_int64_value() || result.int64_value() != INT64_MIN) {
+        if (!value.has_int64_value() || value.int64_value() != INT64_MIN) {
           req->set_max_hash_code(hash_code);
         }
         break;
@@ -153,12 +169,12 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
           QLExpressionPB *col_pb = req->add_hashed_column_values();
           col_pb->set_column_id(col_desc->id());
           RETURN_NOT_OK(PTExprToPB(op.expr(), col_pb));
-          RETURN_NOT_OK(EvalExpr(col_pb, QLTableRow::empty_row()));
+          RETURN_NOT_OK(EvalExpr(col_pb, qlexpr::QLTableRow::empty_row()));
         } else {
           QLExpressionPB col_pb;
           col_pb.set_column_id(col_desc->id());
           RETURN_NOT_OK(PTExprToPB(op.expr(), &col_pb));
-          RETURN_NOT_OK(EvalExpr(&col_pb, QLTableRow::empty_row()));
+          RETURN_NOT_OK(EvalExpr(&col_pb, qlexpr::QLTableRow::empty_row()));
           tnode_context->hash_values_options().push_back({col_pb});
         }
         break;
@@ -179,8 +195,18 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
         }
 
         std::set<QLValuePB> set_values;
+        bool has_null = false;
         for (QLValuePB& value_pb : *col_pb.mutable_value()->mutable_list_value()->mutable_elems()) {
-          set_values.insert(std::move(value_pb));
+          if (QLValue::IsNull(value_pb)) {
+            has_null = true;
+          } else {
+            set_values.insert(std::move(value_pb));
+          }
+        }
+
+        // Special case: WHERE x IN (null)
+        if (has_null && set_values.empty() && req->hashed_column_values().empty()) {
+          req->add_hashed_column_values();
         }
 
         // Adding partition options information to the execution context.
@@ -211,20 +237,21 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
 
   // Generate query condition if where clause is not empty.
   if (!where_ops.empty() || !subcol_where_ops.empty() || !func_ops.empty() ||
-      !jsoncol_where_ops.empty()) {
+      !jsoncol_where_ops.empty() || !multi_col_where_ops.empty()) {
 
     // Setup the where clause.
     QLConditionPB *where_pb = req->mutable_where_expr()->mutable_condition();
     where_pb->set_op(QL_OP_AND);
     for (const auto& col_op : where_ops) {
       QLConditionPB* cond = where_pb->add_operands()->mutable_condition();
-      RETURN_NOT_OK(WhereOpToPB(cond, col_op));
+      RETURN_NOT_OK(WhereColumnOpToPB(cond, col_op));
       // Update the estimate for the number of selected rows if needed.
       if (col_op.desc()->is_primary()) {
         if (cond->op() == QL_OP_IN) {
           int in_size = cond->operands(1).value().list_value().elems_size();
-          if (in_size == 0 || // Can happen when binding an empty list as 'IN' argument.
-              max_rows_estimate <= std::numeric_limits<uint64_t>::max() / in_size) {
+          if (in_size == 0) {  // Fast path for returning no results when 'IN' list is empty.
+            return 0;
+          } else if (max_rows_estimate <= std::numeric_limits<uint64_t>::max() / in_size) {
             max_rows_estimate *= in_size;
           } else {
             max_rows_estimate = std::numeric_limits<uint64_t>::max();
@@ -235,6 +262,21 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
           // Cannot yet estimate num rows for inequality (and other) conditions.
           max_rows_estimate = std::numeric_limits<uint64_t>::max();
         }
+      }
+    }
+
+    for (const auto& col_op : multi_col_where_ops) {
+      QLConditionPB* cond = where_pb->add_operands()->mutable_condition();
+      RETURN_NOT_OK(WhereMultiColumnOpToPB(cond, col_op));
+      DCHECK(cond->op() == QL_OP_IN);
+      // Update the estimate for the number of selected rows if needed.
+      int in_size = cond->operands(1).value().list_value().elems_size();
+      if (in_size == 0) {  // Fast path for returning no results when 'IN' list is empty.
+        return 0;
+      } else if (max_rows_estimate <= std::numeric_limits<uint64_t>::max() / in_size) {
+        max_rows_estimate *= in_size;
+      } else {
+        max_rows_estimate = std::numeric_limits<uint64_t>::max();
       }
     }
 
@@ -249,7 +291,7 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
     }
   }
 
-  // If not all primary keys have '=' or 'IN' conditions the max rows estimate is not reliable.
+  // If not all primary keys have '=' or 'IN' conditions, the max rows estimate is not reliable.
   if (!static_cast<const PTSelectStmt*>(tnode_context->tnode())->HasPrimaryKeysSet()) {
     return std::numeric_limits<uint64_t>::max();
   }
@@ -257,7 +299,7 @@ Result<uint64_t> Executor::WhereClauseToPB(QLReadRequestPB *req,
   return max_rows_estimate;
 }
 
-Status Executor::WhereOpToPB(QLConditionPB *condition, const ColumnOp& col_op) {
+Status Executor::WhereColumnOpToPB(QLConditionPB* condition, const ColumnOp& col_op) {
   // Set the operator.
   condition->set_op(col_op.yb_op());
 
@@ -276,40 +318,93 @@ Status Executor::WhereOpToPB(QLConditionPB *condition, const ColumnOp& col_op) {
     QLExpressionPB tmp_expr_pb;
     RETURN_NOT_OK(PTExprToPB(col_op.expr(), &tmp_expr_pb));
     std::set<QLValuePB> opts_set;
-    for (auto &value_pb : *tmp_expr_pb.mutable_value()->mutable_list_value()->mutable_elems()) {
-      opts_set.insert(std::move(value_pb));
+    for (QLValuePB& value_pb :
+        *tmp_expr_pb.mutable_value()->mutable_list_value()->mutable_elems()) {
+      if (!QLValue::IsNull(value_pb)) {
+        opts_set.insert(std::move(value_pb));
+      }
     }
 
-    expr_pb->mutable_value()->mutable_list_value(); // Set value type to list.
-    for (auto &value_pb : opts_set) {
+    expr_pb->mutable_value()->mutable_list_value();  // Set value type to list.
+    for (const QLValuePB& value_pb : opts_set) {
       *expr_pb->mutable_value()->mutable_list_value()->add_elems() = value_pb;
     }
     return Status::OK();
   }
 
-  return PTExprToPB(col_op.expr(), expr_pb);
+  auto status = PTExprToPB(col_op.expr(), expr_pb);
+
+  // When evaluating CONTAINS or CONTAINS KEY expression with a bind variable, rhs may potentially
+  // be NULL. Detect this case and fail.
+  if (status.ok() && (col_op.yb_op() == QL_OP_CONTAINS || col_op.yb_op() == QL_OP_CONTAINS_KEY) &&
+      IsNull(expr_pb->value())) {
+    status = STATUS_FORMAT(
+        InvalidArgument, "CONTAINS$0 does not support NULL",
+        col_op.yb_op() == QL_OP_CONTAINS_KEY ? " KEY" : "");
+  }
+  return status;
+}
+
+Status Executor::WhereMultiColumnOpToPB(QLConditionPB* condition, const MultiColumnOp& col_op) {
+  DCHECK(col_op.yb_op() == QL_OP_IN);
+
+  // Set the operator.
+  condition->set_op(col_op.yb_op());
+
+  // Operand 1: The columns.
+  QLExpressionPB* expr_pb = condition->add_operands();
+  auto cols = expr_pb->mutable_tuple();
+  for (const auto& col_desc : col_op.descs()) {
+    VLOG(3) << "WHERE condition, column id = " << col_desc->id();
+    cols->add_elems()->set_column_id(col_desc->id());
+  }
+
+  // Operand 2: The expression.
+  expr_pb = condition->add_operands();
+
+  // Special case for IN condition arguments on primary key -- we de-duplicate and order them here
+  // to match Cassandra semantics.
+  QLExpressionPB tmp_expr_pb;
+  RETURN_NOT_OK(PTExprToPB(col_op.expr(), &tmp_expr_pb));
+
+  std::set<QLValuePB> opts_set;
+  for (QLValuePB& value_pb : *tmp_expr_pb.mutable_value()->mutable_list_value()->mutable_elems()) {
+    if (!QLValue::IsNull(value_pb)) {
+      opts_set.insert(std::move(value_pb));
+    }
+  }
+
+  expr_pb->mutable_value()->mutable_list_value();  // Set value type to list.
+  for (const QLValuePB& value_pb : opts_set) {
+    *expr_pb->mutable_value()->mutable_list_value()->add_elems() = value_pb;
+  }
+  return Status::OK();
 }
 
 Status Executor::WhereKeyToPB(QLReadRequestPB *req,
                               const Schema& schema,
-                              const QLRow& key) {
+                              const qlexpr::QLRow& key) {
   // Add the hash column values
   DCHECK(req->hashed_column_values().empty());
   for (size_t idx = 0; idx < schema.num_hash_key_columns(); idx++) {
     *req->add_hashed_column_values()->mutable_value() = key.column(idx).value();
   }
 
-  // Add the range column values to the where clause
-  QLConditionPB *where_pb = req->mutable_where_expr()->mutable_condition();
-  if (!where_pb->has_op()) {
-    where_pb->set_op(QL_OP_AND);
-  }
-  DCHECK_EQ(where_pb->op(), QL_OP_AND);
-  for (size_t idx = schema.num_hash_key_columns(); idx < schema.num_key_columns(); idx++) {
-    QLConditionPB *col_cond_pb = where_pb->add_operands()->mutable_condition();
-    col_cond_pb->set_op(QL_OP_EQUAL);
-    col_cond_pb->add_operands()->set_column_id(schema.column_id(idx));
-    *col_cond_pb->add_operands()->mutable_value() = key.column(idx).value();
+  if (schema.num_key_columns() > schema.num_hash_key_columns()) {
+    // Add the range column values to the where clause
+    QLConditionPB *where_pb = req->mutable_where_expr()->mutable_condition();
+    if (!where_pb->has_op()) {
+      where_pb->set_op(QL_OP_AND);
+    }
+    DCHECK_EQ(where_pb->op(), QL_OP_AND);
+    for (size_t idx = schema.num_hash_key_columns(); idx < schema.num_key_columns(); idx++) {
+      QLConditionPB *col_cond_pb = where_pb->add_operands()->mutable_condition();
+      col_cond_pb->set_op(QL_OP_EQUAL);
+      col_cond_pb->add_operands()->set_column_id(schema.column_id(idx));
+      *col_cond_pb->add_operands()->mutable_value() = key.column(idx).value();
+    }
+  } else {
+    VLOG(3) << "there is no range column for " << schema.ToString();
   }
 
   return Status::OK();
@@ -357,9 +452,9 @@ Status Executor::FuncOpToPB(QLConditionPB *condition, const FuncOp& func_op) {
   condition->set_op(func_op.yb_op());
 
   // Operand 1: The function call.
-  PTBcall::SharedPtr ptr = func_op.func_expr();
+  auto ptr = func_op.func_expr();
   QLExpressionPB *expr_pb = condition->add_operands();
-  RETURN_NOT_OK(PTExprToPB(static_cast<const PTBcall*>(ptr.get()), expr_pb));
+  RETURN_NOT_OK(PTExprToPB(ptr.get(), expr_pb));
 
   // Operand 2: The expression.
   expr_pb = condition->add_operands();

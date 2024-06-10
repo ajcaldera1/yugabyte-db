@@ -21,18 +21,18 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_BUILDER_H
-#define YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_BUILDER_H
+#pragma once
 
 #include <stdint.h>
+
 #include <limits>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/status.h"
+#include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table/table_builder.h"
 
 namespace rocksdb {
@@ -102,6 +102,10 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Get table properties
   TableProperties GetTableProperties() const override;
 
+  const std::string& LastKey() const override;
+
+  void TEST_skip_writing_key_value_encoding_format();
+
  private:
   struct FileWriterWithOffsetAndCachePrefix;
 
@@ -109,7 +113,7 @@ class BlockBasedTableBuilder : public TableBuilder {
   // Call block's Finish() method and then write the finalize block contents to
   // file. Returns number of bytes written to file.
   size_t WriteBlock(BlockBuilder* block, BlockHandle* handle,
-      FileWriterWithOffsetAndCachePrefix* writer_info);
+                    FileWriterWithOffsetAndCachePrefix* writer_info);
   // Directly write block content to the file. Returns number of bytes written to file.
   size_t WriteBlock(const Slice& block_contents, BlockHandle* handle,
       FileWriterWithOffsetAndCachePrefix* writer_info);
@@ -117,8 +121,8 @@ class BlockBasedTableBuilder : public TableBuilder {
       FileWriterWithOffsetAndCachePrefix* writer_info);
   Status InsertBlockInCache(const Slice& block_contents,
                             const CompressionType type,
-                            const BlockHandle* handle,
-                            FileWriterWithOffsetAndCachePrefix* writer_info);
+      const BlockHandle* handle,
+      FileWriterWithOffsetAndCachePrefix* writer_info);
 
   struct Rep;
   class BlockBasedTablePropertiesCollectorFactory;
@@ -130,10 +134,10 @@ class BlockBasedTableBuilder : public TableBuilder {
   // REQUIRES: Finish(), Abandon() have not been called.
   void FlushDataBlock(const Slice& next_block_first_key);
 
-  // Flush the current filter block into disk. next_block_first_key should be nullptr if this is the
-  // last block written to disk.
+  // Flush the current filter block into disk. next_block_first_filter_key should be nullptr if this
+  // is the last block written to disk.
   // REQUIRES: Finish(), Abandon() have not been called.
-  void FlushFilterBlock(const Slice& next_block_first_key);
+  void FlushFilterBlock(const Slice* const next_block_first_filter_key);
 
   // Some compression libraries fail when the raw size is bigger than int. If
   // uncompressed size is bigger than kCompressionSizeLimit, don't compress it
@@ -145,5 +149,3 @@ class BlockBasedTableBuilder : public TableBuilder {
 };
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_BUILDER_H

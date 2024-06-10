@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_GENERIC_SERVICE_H
-#define YB_SERVER_GENERIC_SERVICE_H
+#pragma once
 
 #include "yb/gutil/macros.h"
 #include "yb/server/server_base.service.h"
@@ -49,6 +48,19 @@ class GenericServiceImpl : public GenericServiceIf {
                SetFlagResponsePB* resp,
                rpc::RpcContext rpc) override;
 
+  void RefreshFlags(const RefreshFlagsRequestPB* req,
+                    RefreshFlagsResponsePB* resp,
+                    rpc::RpcContext rpc) override;
+
+  void GetFlag(const GetFlagRequestPB* req,
+               GetFlagResponsePB* resp,
+               rpc::RpcContext rpc) override;
+
+  void GetAutoFlagsConfigVersion(
+      const GetAutoFlagsConfigVersionRequestPB* req,
+      GetAutoFlagsConfigVersionResponsePB* resp,
+      rpc::RpcContext rpc) override;
+
   void FlushCoverage(const FlushCoverageRequestPB* req,
                      FlushCoverageResponsePB* resp,
                      rpc::RpcContext rpc) override;
@@ -63,6 +75,11 @@ class GenericServiceImpl : public GenericServiceIf {
 
   void Ping(const PingRequestPB* req, PingResponsePB* resp, rpc::RpcContext rpc) override;
 
+  // Reload TLS certificates to start using newly added certificates, if any.
+  void ReloadCertificates(const ReloadCertificatesRequestPB* req,
+                          ReloadCertificatesResponsePB* resp,
+                          rpc::RpcContext context) override;
+
  private:
   RpcServerBase* server_;
 
@@ -71,4 +88,3 @@ class GenericServiceImpl : public GenericServiceIf {
 
 } // namespace server
 } // namespace yb
-#endif /* YB_SERVER_GENERIC_SERVICE_H */

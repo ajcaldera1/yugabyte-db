@@ -29,42 +29,51 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CONSENSUS_LOG_TEST_BASE_H
-#define YB_CONSENSUS_LOG_TEST_BASE_H
+#pragma once
 
 #include <utility>
 #include <vector>
-#include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
-#include "yb/consensus/log.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/schema.h"
+#include "yb/common/transaction.h"
 #include "yb/common/wire_protocol-test-util.h"
+
+#include "yb/consensus/consensus.messages.h"
+#include "yb/consensus/log.h"
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/log_reader.h"
 #include "yb/consensus/opid_util.h"
+
 #include "yb/fs/fs_manager.h"
-#include "yb/gutil/gscoped_ptr.h"
+
+#include "yb/gutil/bind.h"
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
+
+#include "yb/rpc/lightweight_message.h"
+
 #include "yb/server/clock.h"
 #include "yb/server/hybrid_clock.h"
-#include "yb/server/metadata.h"
-#include "yb/tablet/tablet.h"
+
 #include "yb/tserver/tserver.pb.h"
+
+#include "yb/util/async_util.h"
 #include "yb/util/env_util.h"
 #include "yb/util/metrics.h"
 #include "yb/util/path_util.h"
+#include "yb/util/result.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
-#include "yb/util/stopwatch.h"
-#include "yb/docdb/docdb.pb.h"
-#include "yb/docdb/doc_key.h"
+#include "yb/util/threadpool.h"
+#include "yb/consensus/log_index.h"
 
+METRIC_DECLARE_entity(table);
 METRIC_DECLARE_entity(tablet);
 
 DECLARE_int32(log_min_seconds_to_retain);
@@ -72,40 +81,32 @@ DECLARE_int32(log_min_seconds_to_retain);
 namespace yb {
 namespace log {
 
-using consensus::OpId;
 using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
 using consensus::NO_OP;
 using consensus::MakeOpId;
+using consensus::MakeOpIdPB;
 
 using server::Clock;
 
 using tserver::WriteRequestPB;
 
-using tablet::Tablet;
-
-using docdb::KeyValuePairPB;
-using docdb::SubDocKey;
-using docdb::DocKey;
-using docdb::PrimitiveValue;
-using docdb::ValueType;
-
+const char* kTestNamespace = "test-ns";
 const char* kTestTable = "test-log-table";
 const char* kTestTablet = "test-log-tablet";
-const bool APPEND_SYNC = true;
-const bool APPEND_ASYNC = false;
 
-// Append a single batch of 'count' NoOps to the log.  If 'size' is not NULL, increments it by the
-// expected increase in log size.  Increments 'op_id''s index once for each operation logged.
-static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
-                                           Log* log,
-                                           OpId* op_id,
-                                           int count,
-                                           int* size = NULL) {
+YB_STRONGLY_TYPED_BOOL(AppendSync);
+
+// Append a single batch of 'count' NoOps to the log.  If 'size' is not nullptr, increments it by
+// the expected increase in log size.  Increments 'op_id''s index once for each operation logged.
+static Status AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
+                                   Log* log, OpIdPB* op_id,
+                                   int count,
+                                   ssize_t* size = nullptr) {
   ReplicateMsgs replicates;
   for (int i = 0; i < count; i++) {
-    auto replicate = std::make_shared<ReplicateMsg>();
-    ReplicateMsg* repl = replicate.get();
+    auto replicate = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
+    auto* repl = replicate.get();
 
     repl->mutable_id()->CopyFrom(*op_id);
     repl->set_op_type(NO_OP);
@@ -117,7 +118,7 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
     if (size) {
       // If we're tracking the sizes we need to account for the fact that the Log wraps the log
       // entry in an LogEntryBatchPB, and each actual entry will have a one-byte tag.
-      *size += repl->ByteSize() + 1;
+      *size += repl->SerializedSize() + 1;
     }
     replicates.push_back(replicate);
   }
@@ -135,25 +136,24 @@ static CHECKED_STATUS AppendNoOpsToLogSync(const scoped_refptr<Clock>& clock,
   return Status::OK();
 }
 
-static CHECKED_STATUS AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
-                                          Log* log,
-                                          OpId* op_id,
-                                          int* size = nullptr) {
+static Status AppendNoOpToLogSync(const scoped_refptr<Clock>& clock,
+                                          Log* log, OpIdPB* op_id,
+                                          ssize_t* size = nullptr) {
   return AppendNoOpsToLogSync(clock, log, op_id, 1, size);
 }
 
 class LogTestBase : public YBTest {
  public:
 
-  typedef pair<int, int> DeltaId;
+  typedef std::pair<int, int> DeltaId;
 
-  typedef std::tuple<int, int, string> TupleForAppend;
+  typedef std::tuple<int, int, std::string> TupleForAppend;
 
   LogTestBase()
-      : schema_({ ColumnSchema("key", INT32, false, true),
-                  ColumnSchema("int_val", INT32),
-                  ColumnSchema("string_val", STRING, true) },
-                1),
+      : schema_({
+            ColumnSchema("key", DataType::INT32, ColumnKind::HASH),
+            ColumnSchema("int_val", DataType::INT32),
+            ColumnSchema("string_val", DataType::STRING, ColumnKind::VALUE, Nullable::kTrue) }),
         log_anchor_registry_(new LogAnchorRegistry()) {
   }
 
@@ -162,16 +162,23 @@ class LogTestBase : public YBTest {
     current_index_ = 1;
     fs_manager_.reset(new FsManager(env_.get(), GetTestPath("fs_root"), "tserver_test"));
     metric_registry_.reset(new MetricRegistry());
-    metric_entity_ = METRIC_ENTITY_tablet.Instantiate(metric_registry_.get(), "log-test-base");
+    table_metric_entity_ = METRIC_ENTITY_table.Instantiate(metric_registry_.get(), "log-test-base");
+    tablet_metric_entity_ = METRIC_ENTITY_tablet.Instantiate(
+                                metric_registry_.get(), "log-test-base-tablet");
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
-    ASSERT_OK(fs_manager_->Open());
+    ASSERT_OK(fs_manager_->CheckAndOpenFileSystemRoots());
     tablet_wal_path_ = fs_manager_->GetFirstTabletWalDirOrDie(kTestTable, kTestTablet);
     clock_.reset(new server::HybridClock());
     ASSERT_OK(clock_->Init());
-    FLAGS_log_min_seconds_to_retain = 0;
-    ASSERT_OK(ThreadPoolBuilder("append")
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 0;
+    ASSERT_OK(ThreadPoolBuilder("log")
                  .unlimited_threads()
-                 .Build(&append_pool_));
+                 .Build(&log_thread_pool_));
+  }
+
+  void CleanTablet() {
+    ASSERT_OK(fs_manager_->DeleteFileSystemLayout(ShouldDeleteLogs::kTrue));
+    ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
   }
 
   void BuildLog() {
@@ -182,18 +189,22 @@ class LogTestBase : public YBTest {
                        fs_manager_->uuid(),
                        schema_with_ids,
                        0, // schema_version
-                       metric_entity_.get(),
-                       append_pool_.get(),
+                       table_metric_entity_.get(),
+                       tablet_metric_entity_.get(),
+                       log_thread_pool_.get(),
+                       log_thread_pool_.get(),
+                       log_thread_pool_.get(),
+                       std::numeric_limits<int64_t>::max(), // cdc_min_replicated_index
                        &log_));
+    LOG(INFO) << "Sucessfully opened the log at " << tablet_wal_path_;
   }
 
   void CheckRightNumberOfSegmentFiles(int expected) {
-    // Test that we actually have the expected number of files in the fs.  We should have n segments
-    // plus '.' and '..'
-    vector<string> files;
-    ASSERT_OK(env_->GetChildren(tablet_wal_path_, &files));
+    // Test that we actually have the expected number of files in the fs. We should have n segments.
+    const std::vector<std::string> files =
+        ASSERT_RESULT(env_->GetChildren(tablet_wal_path_, ExcludeDots::kTrue));
     int count = 0;
-    for (const string& s : files) {
+    for (const std::string& s : files) {
       if (HasPrefixString(s, FsManager::kWalFileNamePrefix)) {
         count++;
       }
@@ -205,81 +216,127 @@ class LogTestBase : public YBTest {
     ASSERT_OK(s);
   }
 
+  struct AppendReplicateBatchData {
+    yb::OpId op_id;
+    yb::OpId committed_op_id;
+    std::vector<TupleForAppend> writes;
+    AppendSync sync = AppendSync::kTrue;
+    consensus::OperationType op_type = consensus::OperationType::WRITE_OP;
+    TransactionId txn_id = TransactionId::Nil();
+    TransactionStatus txn_status = TransactionStatus::IMMEDIATE_CLEANUP;
+  };
+
+  void AppendReplicateBatch(AppendReplicateBatchData data) {
+    AppendReplicateBatch(
+        MakeOpIdPB(data.op_id),
+        MakeOpIdPB(data.committed_op_id),
+        std::move(data.writes),
+        data.sync,
+        data.op_type,
+        data.txn_id,
+        data.txn_status);
+  }
+
   // Appends a batch with size 2, or the given set of writes.
-  void AppendReplicateBatch(const OpId& opid,
-                            const OpId& committed_opid = MakeOpId(0, 0),
-                            std::vector<TupleForAppend> writes = {},
-                            bool sync = APPEND_SYNC,
-                            TableType table_type = TableType::YQL_TABLE_TYPE) {
-    auto replicate = std::make_shared<ReplicateMsg>();
-    replicate->set_op_type(WRITE_OP);
+  void AppendReplicateBatch(
+      const OpIdPB& opid,
+      const OpIdPB& committed_opid = MakeOpId(0, 0),
+      std::vector<TupleForAppend> writes = {},
+      AppendSync sync = AppendSync::kTrue,
+      consensus::OperationType op_type = consensus::OperationType::WRITE_OP,
+      TransactionId txn_id = TransactionId::Nil(),
+      TransactionStatus txn_status = TransactionStatus::APPLYING) {
+    auto replicate = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
+    replicate->set_op_type(op_type);
     replicate->mutable_id()->CopyFrom(opid);
     replicate->mutable_committed_op_id()->CopyFrom(committed_opid);
     replicate->set_hybrid_time(clock_->Now().ToUint64());
-    WriteRequestPB *batch_request = replicate->mutable_write_request();
-    if (writes.empty()) {
-      const int opid_index_as_int = static_cast<int>(opid.index());
-      writes.emplace_back(opid_index_as_int, 0, "this is a test insert");
-      writes.emplace_back(opid_index_as_int + 1, 0, "this is a test mutate");
-    }
-    auto write_batch = batch_request->mutable_write_batch();
-    for (const auto &w : writes) {
-      AddKVToPB(std::get<0>(w), std::get<1>(w), std::get<2>(w), write_batch);
+    auto *batch_request = replicate->mutable_write();
+
+    if (op_type == consensus::OperationType::UPDATE_TRANSACTION_OP) {
+      ASSERT_TRUE(!txn_id.IsNil());
+      replicate->mutable_transaction_state()->set_status(txn_status);
+      replicate->mutable_transaction_state()->dup_transaction_id(txn_id.AsSlice());
+    } else if (op_type == consensus::OperationType::WRITE_OP) {
+      if (writes.empty()) {
+        const int opid_index_as_int = static_cast<int>(opid.index());
+        // Since OpIds deal with int64 index and term, we are downcasting here. In order to be able
+        // to test with values > INT_MAX, we need to make sure we do not overflow, while still
+        // wanting to add 2 different values here.
+        //
+        // Picking x and x / 2 + 1 as the 2 values.
+        // For small numbers, special casing x <= 2.
+        const int other_int = opid_index_as_int <= 2 ? 3 : opid_index_as_int / 2 + 1;
+        writes.emplace_back(
+            /* key */ opid_index_as_int, /* int_val */ 0, /* string_val */ "this is a test insert");
+        writes.emplace_back(
+            /* key */ other_int, /* int_val */ 0, /* string_val */ "this is a test mutate");
+      }
+
+      auto write_batch = batch_request->mutable_write_batch();
+      if (!txn_id.IsNil()) {
+        write_batch->mutable_transaction()->dup_transaction_id(txn_id.AsSlice());
+      }
+      for (const auto &w : writes) {
+        AddKVToPB(std::get<0>(w), std::get<1>(w), std::get<2>(w), write_batch);
+      }
+    } else {
+      FAIL() << "Unexpected operation type: " << consensus::OperationType_Name(op_type);
     }
 
-    batch_request->set_tablet_id(kTestTablet);
     AppendReplicateBatch(replicate, sync);
   }
 
   // Appends the provided batch to the log.
   void AppendReplicateBatch(const consensus::ReplicateMsgPtr& replicate,
-                            bool sync = APPEND_SYNC) {
+                            AppendSync sync = AppendSync::kTrue) {
+    const auto committed_op_id = yb::OpId::FromPB(replicate->committed_op_id());
+    const auto batch_mono_time = restart_safe_coarse_mono_clock_.Now();
     if (sync) {
       Synchronizer s;
       ASSERT_OK(log_->AsyncAppendReplicates(
-          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
-          s.AsStatusCallback()));
+          { replicate }, committed_op_id, batch_mono_time, s.AsStatusCallback()));
       ASSERT_OK(s.Wait());
     } else {
       // AsyncAppendReplicates does not free the ReplicateMsg on completion, so we
       // need to pass it through to our callback.
       ASSERT_OK(log_->AsyncAppendReplicates(
-          { replicate }, yb::OpId() /* committed_op_id */, restart_safe_coarse_mono_clock_.Now(),
+          { replicate }, committed_op_id, batch_mono_time,
           Bind(&LogTestBase::CheckReplicateResult, replicate)));
     }
   }
 
-  // Appends 'count' ReplicateMsgs and the corresponding CommitMsgs to the log
-  void AppendReplicateBatchToLog(int count, TableType table_type, bool sync = true) {
-    for (int i = 0; i < count; i++) {
-      OpId opid = consensus::MakeOpId(1, current_index_);
-      AppendReplicateBatch(opid);
+  // Appends 'count' ReplicateMsgs to the log as committed entries.
+  void AppendReplicateBatchToLog(size_t count, AppendSync sync = AppendSync::kTrue) {
+    for (size_t i = 0; i < count; i++) {
+      OpIdPB opid = consensus::MakeOpId(1, current_index_);
+      AppendReplicateBatch(opid, opid, /* writes */ {}, sync);
       current_index_ += 1;
     }
   }
 
-  // Append a single NO_OP entry. Increments op_id by one.  If non-NULL, and if the write is
+  // Append a single NO_OP entry. Increments op_id by one.  If non-nullptr, and if the write is
   // successful, 'size' is incremented by the size of the written operation.
-  CHECKED_STATUS AppendNoOp(OpId* op_id, int* size = NULL) {
+  Status AppendNoOp(OpIdPB* op_id, ssize_t* size = nullptr) {
     return AppendNoOpToLogSync(clock_, log_.get(), op_id, size);
   }
 
   // Append a number of no-op entries to the log.  Increments op_id's index by the number of records
-  // written.  If non-NULL, 'size' keeps track of the size of the operations successfully written.
-  CHECKED_STATUS AppendNoOps(OpId* op_id, int num, int* size = NULL) {
+  // written.  If non-nullptr, 'size' keeps track of the size of the operations successfully
+  // written.
+  Status AppendNoOps(OpIdPB* op_id, int num, ssize_t* size = nullptr) {
     for (int i = 0; i < num; i++) {
       RETURN_NOT_OK(AppendNoOp(op_id, size));
     }
     return Status::OK();
   }
 
-  CHECKED_STATUS RollLog() {
-    RETURN_NOT_OK(log_->AsyncAllocateSegment());
-    return log_->RollOver();
+  Status RollLog() {
+    return log_->AllocateSegmentAndRollOver();
   }
 
-  string DumpSegmentsToString(const SegmentSequence& segments) {
-    string dump;
+  std::string DumpSegmentsToString(const SegmentSequence& segments) {
+    std::string dump;
     for (const scoped_refptr<ReadableLogSegment>& segment : segments) {
       dump.append("------------\n");
       strings::SubstituteAndAppend(&dump, "Segment: $0, Path: $1\n",
@@ -297,17 +354,18 @@ class LogTestBase : public YBTest {
 
  protected:
   const Schema schema_;
-  gscoped_ptr<FsManager> fs_manager_;
-  gscoped_ptr<MetricRegistry> metric_registry_;
-  scoped_refptr<MetricEntity> metric_entity_;
-  std::unique_ptr<ThreadPool> append_pool_;
+  std::unique_ptr<FsManager> fs_manager_;
+  std::unique_ptr<MetricRegistry> metric_registry_;
+  scoped_refptr<MetricEntity> table_metric_entity_;
+  scoped_refptr<MetricEntity> tablet_metric_entity_;
+  std::unique_ptr<ThreadPool> log_thread_pool_;
   scoped_refptr<Log> log_;
-  int32_t current_index_;
+  int64_t current_index_;
   LogOptions options_;
   // Reusable entries vector that deletes the entries on destruction.
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<Clock> clock_;
-  string tablet_wal_path_;
+  std::string tablet_wal_path_;
   RestartSafeCoarseMonoClock restart_safe_coarse_mono_clock_;
 };
 
@@ -318,8 +376,8 @@ enum CorruptionType {
   FLIP_BYTE
 };
 
-Status CorruptLogFile(Env* env, const string& log_path,
-                      CorruptionType type, int corruption_offset) {
+Status CorruptLogFile(Env* env, const std::string& log_path,
+                      CorruptionType type, size_t corruption_offset) {
   faststring buf;
   RETURN_NOT_OK_PREPEND(ReadFileToString(env, log_path, &buf),
                         "Couldn't read log");
@@ -341,7 +399,33 @@ Status CorruptLogFile(Env* env, const string& log_path,
   return Status::OK();
 }
 
+Result<SegmentSequence> GetReadableSegments(const std::string& wal_dir_path) {
+  SegmentSequence segments;
+  std::unique_ptr<LogReader> reader;
+  RETURN_NOT_OK(LogReader::Open(Env::Default(), nullptr, "Log reader", wal_dir_path,
+                                 nullptr, nullptr, &reader));
+  RETURN_NOT_OK(reader->GetSegmentsSnapshot(&segments));
+  return segments;
+}
+
+Result<uint32_t> GetEntries(const SegmentSequence& segments) {
+  uint32_t num_entries = 0;
+  for (const scoped_refptr<log::ReadableLogSegment>& segment : segments) {
+    auto read_entries = segment->ReadEntries();
+    num_entries += read_entries.entries.size();
+  }
+  return num_entries;
+}
+
+Result<uint32_t> GetEntries(const std::string& wal_dir_path) {
+  SegmentSequence segments = VERIFY_RESULT(GetReadableSegments(wal_dir_path));
+  return GetEntries(segments);
+}
+
+Result<size_t> GetSegmentsCount(const std::string& wal_dir_path) {
+  SegmentSequence segments = VERIFY_RESULT(GetReadableSegments(wal_dir_path));
+  return segments.size();
+}
+
 } // namespace log
 } // namespace yb
-
-#endif // YB_CONSENSUS_LOG_TEST_BASE_H

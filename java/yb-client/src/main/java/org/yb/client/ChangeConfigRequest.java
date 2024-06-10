@@ -15,18 +15,14 @@ package org.yb.client;
 
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import org.jboss.netty.buffer.ChannelBuffer;
-
+import io.netty.buffer.ByteBuf;
+import org.yb.CommonNet.HostPortPB;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.Common.HostPortPB;
 import org.yb.consensus.Consensus;
+import org.yb.consensus.ConsensusTypes;
 import org.yb.consensus.Metadata;
 import org.yb.consensus.Metadata.RaftPeerPB;
-import org.yb.master.Master;
 import org.yb.util.Pair;
-
-import java.util.ArrayList;
-import java.util.List;
 
 @InterfaceAudience.Private
 class ChangeConfigRequest extends YRpc<ChangeConfigResponse> {
@@ -37,7 +33,7 @@ class ChangeConfigRequest extends YRpc<ChangeConfigResponse> {
   }
 
   private final String tablet_id;
-  private final Consensus.ChangeConfigType changeType;
+  private final ConsensusTypes.ChangeConfigType changeType;
   private final int port;
   private final String host;
   private final String uuid;
@@ -52,13 +48,13 @@ class ChangeConfigRequest extends YRpc<ChangeConfigResponse> {
     this.host = host;
     this.port = port;
     this.useHost = useHost;
-    this.changeType = isAdd ? Consensus.ChangeConfigType.ADD_SERVER
-                            : Consensus.ChangeConfigType.REMOVE_SERVER;
+    this.changeType = isAdd ? ConsensusTypes.ChangeConfigType.ADD_SERVER
+                            : ConsensusTypes.ChangeConfigType.REMOVE_SERVER;
     this.serverType = ServerType.MASTER;
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     final Consensus.ChangeConfigRequestPB.Builder builder =
       Consensus.ChangeConfigRequestPB.newBuilder();
@@ -84,8 +80,8 @@ class ChangeConfigRequest extends YRpc<ChangeConfigResponse> {
       builder.setUseHost(true);
     }
 
-    if (this.changeType == Consensus.ChangeConfigType.ADD_SERVER) {
-      pbb.setMemberType(Metadata.RaftPeerPB.MemberType.PRE_VOTER);
+    if (this.changeType == ConsensusTypes.ChangeConfigType.ADD_SERVER) {
+      pbb.setMemberType(Metadata.PeerMemberType.PRE_VOTER);
     }
 
     builder.setType(this.changeType)

@@ -11,26 +11,35 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_DOC_ROWWISE_ITERATOR_H_
-#define YB_DOCDB_DOC_ROWWISE_ITERATOR_H_
+#pragma once
 
-#include <string>
 #include <atomic>
+#include <string>
+#include <variant>
+
+#include "yb/common/hybrid_time.h"
+#include "yb/common/read_hybrid_time.h"
+#include "yb/common/schema.h"
+
+#include "yb/docdb/doc_pgsql_scanspec.h"
+#include "yb/docdb/doc_ql_scanspec.h"
+#include "yb/docdb/doc_read_context.h"
+#include "yb/docdb/doc_reader.h"
+#include "yb/docdb/doc_rowwise_iterator_base.h"
+#include "yb/docdb/docdb_statistics.h"
+#include "yb/docdb/intent_aware_iterator.h"
+#include "yb/docdb/key_bounds.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
+
+#include "yb/dockv/subdocument.h"
+#include "yb/dockv/value.h"
+
+#include "yb/qlexpr/ql_scanspec.h"
 
 #include "yb/rocksdb/db.h"
 
-#include "yb/common/hybrid_time.h"
-#include "yb/common/ql_rowwise_iterator_interface.h"
-#include "yb/common/ql_scanspec.h"
-#include "yb/common/read_hybrid_time.h"
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/subdocument.h"
-#include "yb/docdb/doc_ql_scanspec.h"
-#include "yb/docdb/doc_pgsql_scanspec.h"
-#include "yb/docdb/value.h"
-#include "yb/docdb/deadline_info.h"
-#include "yb/util/status.h"
-#include "yb/util/pending_op_counter.h"
+#include "yb/util/operation_counter.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 namespace docdb {
@@ -38,172 +47,122 @@ namespace docdb {
 class IntentAwareIterator;
 class ScanChoices;
 
+// In tests we could set doc mode to kAny to allow fetching PgTableRow for CQL table.
+YB_DEFINE_ENUM(DocMode, (kGeneric)(kFlat)(kAny));
+
 // An SQL-mapped-to-document-DB iterator.
-class DocRowwiseIterator : public common::YQLRowwiseIteratorIf {
+class DocRowwiseIterator final : public DocRowwiseIteratorBase {
  public:
-  DocRowwiseIterator(const Schema &projection,
-                     const Schema &schema,
-                     const TransactionOperationContextOpt& txn_op_context,
+  DocRowwiseIterator(const dockv::ReaderProjection &projection,
+                     std::reference_wrapper<const DocReadContext> doc_read_context,
+                     const TransactionOperationContext& txn_op_context,
                      const DocDB& doc_db,
-                     CoarseTimePoint deadline,
-                     const ReadHybridTime& read_time,
-                     yb::util::PendingOperationCounter* pending_op_counter = nullptr);
+                     const ReadOperationData& read_operation_data,
+                     std::reference_wrapper<const ScopedRWOperation> pending_op,
+                     const DocDBStatistics* statistics = nullptr);
 
-  DocRowwiseIterator(std::unique_ptr<Schema> projection,
-                     const Schema &schema,
-                     const TransactionOperationContextOpt& txn_op_context,
+  DocRowwiseIterator(const dockv::ReaderProjection& projection,
+                     std::shared_ptr<DocReadContext> doc_read_context,
+                     const TransactionOperationContext& txn_op_context,
                      const DocDB& doc_db,
-                     CoarseTimePoint deadline,
-                     const ReadHybridTime& read_time,
-                     yb::util::PendingOperationCounter* pending_op_counter = nullptr)
-      : DocRowwiseIterator(
-            *projection, schema, txn_op_context, doc_db, deadline, read_time,
-            pending_op_counter) {
-    projection_owner_ = std::move(projection);
-  }
+                     const ReadOperationData& read_operation_data,
+                     ScopedRWOperation&& pending_op,
+                     const DocDBStatistics* statistics = nullptr);
 
-  virtual ~DocRowwiseIterator();
-
-  // Init scan iterator.
-  CHECKED_STATUS Init();
-
-  // Init QL read scan.
-  CHECKED_STATUS Init(const common::QLScanSpec& spec);
-  CHECKED_STATUS Init(const common::PgsqlScanSpec& spec);
-
-  // This must always be called before NextRow. The implementation actually finds the
-  // first row to scan, and NextRow expects the RocksDB iterator to already be properly
-  // positioned.
-  Result<bool> HasNext() const override;
+  ~DocRowwiseIterator() override;
 
   std::string ToString() const override;
-
-  const Schema& schema() const override {
-    // Note: this is the schema only for the columns in the projection, not all columns.
-    return projection_;
-  }
-
-  // Is the next row to read a row with a static column?
-  bool IsNextStaticColumn() const override;
-
-  const DocKey& row_key() const {
-    return row_key_;
-  }
 
   // Check if liveness column exists. Should be called only after HasNext() has been called to
   // verify the row exists.
   bool LivenessColumnExists() const;
 
-  // Skip the current row.
-  void SkipRow() override;
+  Result<HybridTime> RestartReadHt() override;
 
-  HybridTime RestartReadHt() override;
+  void Seek(Slice key) override;
 
-  virtual Result<std::string> GetRowKey() const override;
+  HybridTime TEST_MaxSeenHt() override;
 
-  // Seek to the given key.
-  virtual CHECKED_STATUS Seek(const std::string& row_key) override;
+  // key slice should point to block of memory, that contains kHighest after the end.
+  // So extended slice could be used as upperbound.
+  Result<bool> PgFetchNext(dockv::PgTableRow* table_row) override;
 
-  // Retrieves the next key to read after the iterator finishes for the given page.
-  CHECKED_STATUS GetNextReadSubDocKey(SubDocKey* sub_doc_key) const override;
+  bool TEST_is_flat_doc() const {
+    return doc_mode_ == DocMode::kFlat;
+  }
+
+  void TEST_force_allow_fetch_pg_table_row() {
+    CHECK(!use_fast_backward_scan_); // Refer to doc_mode_ description.
+    doc_mode_ = DocMode::kAny;
+  }
 
  private:
+  void InitIterator(
+      BloomFilterMode bloom_filter_mode = BloomFilterMode::DONT_USE_BLOOM_FILTER,
+      const boost::optional<const Slice>& user_key_for_filter = boost::none,
+      const rocksdb::QueryId query_id = rocksdb::kDefaultQueryId,
+      std::shared_ptr<rocksdb::ReadFileFilter> file_filter = nullptr) override;
 
-  // Get the non-key column values of a QL row.
-  CHECKED_STATUS GetValues(const Schema& projection, vector<SubDocument>* values);
+  Result<bool> DoFetchNext(
+      qlexpr::QLTableRow* table_row,
+      const dockv::ReaderProjection* projection,
+      qlexpr::QLTableRow* static_row,
+      const dockv::ReaderProjection* static_projection) override;
 
-  // Processes a value for a column(subdoc_key) and determines if the value is valid or not based on
-  // the hybrid time of subdoc_key. If valid, it is added to the values vector and is_null is set
-  // to false. Otherwise, is_null is set to true.
-  CHECKED_STATUS ProcessValues(const Value& value, const SubDocKey& subdoc_key,
-                               vector<PrimitiveValue>* values,
-                               bool *is_null) const;
+  template <class TableRow>
+  Result<bool> FetchNextImpl(TableRow table_row);
 
-  // Figures out whether the current sub_doc_key with the given top_level_value is a valid column
-  // that has not expired. Sets column_found to true if this is a valid column, false otherwise.
-  CHECKED_STATUS FindValidColumn(bool* column_found) const;
+  void SeekPrevDocKey(Slice key) override;
 
-  // Figures out whether we have a valid column present indicating the existence of the row.
-  // Sets column_found to true if a valid column is found, false otherwise.
-  CHECKED_STATUS ProcessColumnsForHasNext(bool* column_found) const;
-
-  // Verifies whether or not the column pointed to by subdoc_key is deleted by the current
-  // row_delete_marker_key_.
-  bool IsDeletedByRowDeletion(const SubDocKey& subdoc_key) const;
-
-  // Given a subdoc_key pointing to a column and its associated value, determine whether or not
-  // the column is valid based on TTL expiry, row level delete markers and column delete markers
-  CHECKED_STATUS CheckColumnValidity(const SubDocKey& subdoc_key,
-                                     const Value& value,
-                                     bool* is_valid) const;
+  void ConfigureForYsql();
+  void InitResult();
 
   // For reverse scans, moves the iterator to the first kv-pair of the previous row after having
   // constructed the current row. For forward scans nothing is necessary because GetSubDocument
   // ensures that the iterator will be positioned on the first kv-pair of the next row.
-  CHECKED_STATUS AdvanceIteratorToNextDesiredRow() const;
+  // row_finished - true when current row was fully iterated. So we would not have to perform
+  // extra Seek in case of full scan.
+  // current_fetched_row_skipped is true if we skipped processing the most recently fetched row.
+  Status AdvanceIteratorToNextDesiredRow(bool row_finished,
+                                         bool current_fetched_row_skipped);
 
   // Read next row into a value map using the specified projection.
-  CHECKED_STATUS DoNextRow(const Schema& projection, QLTableRow* table_row) override;
+  Status FillRow(qlexpr::QLTableRow* table_row, const dockv::ReaderProjection* projection);
 
-  const Schema& projection_;
-  // Used to maintain ownership of projection_.
-  // Separate field is used since ownership could be optional.
-  std::unique_ptr<Schema> projection_owner_;
+  struct QLTableRowPair {
+    qlexpr::QLTableRow* table_row;
+    const dockv::ReaderProjection* projection;
+    qlexpr::QLTableRow* static_row;
+    const dockv::ReaderProjection* static_projection;
+  };
 
-  // The schema for all columns, not just the columns we're scanning.
-  const Schema& schema_;
+  Result<DocReaderResult> FetchRow(const FetchedEntry& fetched_entry, dockv::PgTableRow* table_row);
+  Result<DocReaderResult> FetchRow(const FetchedEntry& fetched_entry, QLTableRowPair table_row);
 
-  const TransactionOperationContextOpt txn_op_context_;
+  Status FillRow(QLTableRowPair table_row);
+  Status FillRow(dockv::PgTableRow* table_row);
 
-  bool is_forward_scan_ = true;
-
-  const CoarseTimePoint deadline_;
-
-  const ReadHybridTime read_time_;
-
-  const DocDB doc_db_;
-
-  // A copy of the bound key of the end of the scan range (if any). We stop scan if iterator
-  // reaches this point. This is exclusive bound for forward scans and inclusive bound for
-  // reverse scans.
-  bool has_bound_key_;
-  DocKey bound_key_;
-
-  std::unique_ptr<ScanChoices> scan_choices_;
   std::unique_ptr<IntentAwareIterator> db_iter_;
+  KeyBuffer prefix_buffer_;
+  std::optional<IntentAwareIteratorUpperboundScope> upperbound_scope_;
+  std::optional<IntentAwareIteratorLowerboundScope> lowerbound_scope_;
 
-  // We keep the "pending operation" counter incremented for the lifetime of this iterator so that
-  // RocksDB does not get destroyed while the iterator is still in use.
-  yb::util::ScopedPendingOperation pending_op_;
+  // NB! Doc mode runtime change is not supported as it's value may be used in InitIterator()
+  // to configure usage of fast backward scan.
+  DocMode doc_mode_ = DocMode::kGeneric;
 
-  // The mutable fields that follow are modified by HasNext, a const method.
+  // Points to appropriate alternative owned by result_ field.
+  std::optional<dockv::SubDocument> row_;
 
-  // Indicates whether we've already finished iterating.
-  mutable bool done_;
+  std::unique_ptr<DocDBTableReader> doc_reader_;
 
-  // HasNext constructs the whole row's SubDocument.
-  mutable SubDocument row_;
+  // DocReader result returned by the previous fetch.
+  DocReaderResult prev_doc_found_ = DocReaderResult::kNotFound;
 
-  // The current row's primary key. It is set to lower bound in the beginning.
-  mutable DocKey row_key_;
+  bool use_fast_backward_scan_ = false;
 
-  // The current row's iterator key.
-  mutable KeyBytes iter_key_;
-
-  // When HasNext constructs a row, row_ready_ is set to true.
-  // When NextRow consumes the row, this variable is set to false.
-  // It is initialized to false, to make sure first HasNext constructs a new row.
-  mutable bool row_ready_;
-
-  mutable std::vector<PrimitiveValue> projection_subkeys_;
-
-  // Used for keeping track of errors in HasNext.
-  mutable Status has_next_status_;
-
-  mutable boost::optional<DeadlineInfo> deadline_info_;
+  const DocDBStatistics* statistics_;
 };
 
 }  // namespace docdb
 }  // namespace yb
-
-#endif  // YB_DOCDB_DOC_ROWWISE_ITERATOR_H_

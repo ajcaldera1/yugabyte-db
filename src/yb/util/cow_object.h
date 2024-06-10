@@ -29,17 +29,17 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_COW_OBJECT_H
-#define YB_UTIL_COW_OBJECT_H
+#pragma once
+
+#include <fcntl.h>
 
 #include <algorithm>
 
-#include <glog/logging.h>
-
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
-#include "yb/util/rwc_lock.h"
+
+#include "yb/util/fault_injection.h"
 #include "yb/util/logging.h"
+#include "yb/util/rwc_lock.h"
 
 namespace yb {
 
@@ -83,6 +83,7 @@ class CowObject {
   // changes made to the mutable copy.
   void AbortMutation() {
     dirty_state_.reset();
+    is_dirty_ = false;
     lock_.WriteUnlock();
   }
 
@@ -94,6 +95,7 @@ class CowObject {
     CHECK(dirty_state_);
     std::swap(state_, *dirty_state_);
     dirty_state_.reset();
+    is_dirty_ = false;
     lock_.CommitUnlock();
   }
 
@@ -112,6 +114,7 @@ class CowObject {
   // Should only be called by a thread who previously called StartMutation().
   State* mutable_dirty() {
     DCHECK(lock_.HasWriteLock());
+    is_dirty_ = true;
     return DCHECK_NOTNULL(dirty_state_.get());
   }
 
@@ -119,126 +122,188 @@ class CowObject {
     return *DCHECK_NOTNULL(dirty_state_.get());
   }
 
+  bool is_dirty() const {
+    DCHECK(lock_.HasReaders() || lock_.HasWriteLock());
+    return is_dirty_;
+  }
+
+  // Return true if the current thread holds the write lock.
+  //
+  // In DEBUG mode this is accurate -- we track the current holder's tid.
+  // In non-DEBUG mode, this may sometimes return true even if another thread
+  // is in fact the holder.
+  // Thus, this is only really useful in the context of a DCHECK assertion.
+  bool HasWriteLock() const { return lock_.HasWriteLock(); }
+
+  void WriteLockThreadChanged() {
+    lock_.WriteLockThreadChanged();
+  }
+
  private:
   mutable RWCLock lock_;
 
   State state_;
-  gscoped_ptr<State> dirty_state_;
+  std::unique_ptr<State> dirty_state_;
+
+  // Set only when mutable_dirty() method is called. Unset whenever dirty_state_ is reset().
+  bool is_dirty_ = false;
 
   DISALLOW_COPY_AND_ASSIGN(CowObject);
 };
 
 // A lock-guard-like scoped object to acquire the lock on a CowObject,
-// and obtain a pointer to the correct copy to read/write.
+// and obtain a pointer to the correct copy to read.
 //
 // Example usage:
 //
 //   CowObject<Foo> my_obj;
 //   {
-//     CowLock<Foo> l(&my_obj, CowLock<Foo>::READ);
+//     CowReadLock<Foo> l(&my_obj);
 //     l.data().get_foo();
 //     ...
 //   }
+template<class State>
+class CowReadLock {
+ public:
+  CowReadLock() : cow_(nullptr) {}
+
+  explicit CowReadLock(const CowObject<State>* cow)
+    : cow_(cow) {
+    cow_->ReadLock();
+  }
+
+  CowReadLock(const CowReadLock&) = delete;
+  void operator=(const CowReadLock&) = delete;
+
+  CowReadLock(CowReadLock&& rhs) noexcept
+      : cow_(rhs.cow_) {
+    rhs.cow_ = nullptr;
+  }
+
+  void operator=(CowReadLock&& rhs) noexcept {
+    Unlock();
+    cow_ = rhs.cow_;
+    rhs.cow_ = nullptr;
+  }
+
+  void Unlock() {
+    if (cow_) {
+      cow_->ReadUnlock();
+      cow_ = nullptr;
+    }
+  }
+
+  const State& data() const {
+    return cow_->state();
+  }
+
+  const State* operator->() const {
+    return &data();
+  }
+
+  bool locked() const {
+    return cow_ != nullptr;
+  }
+
+  ~CowReadLock() {
+    Unlock();
+  }
+
+ private:
+  const CowObject<State>* cow_;
+};
+
+// A lock-guard-like scoped object to acquire the lock on a CowObject,
+// and obtain a pointer to the correct copy to write.
+//
+// Example usage:
+//
+//   CowObject<Foo> my_obj;
 //   {
-//     CowLock<Foo> l(&my_obj, CowLock<Foo>::WRITE);
-//     l->mutable_data()->set_foo(...);
+//     CowWriteLock<Foo> l(&my_obj);
+//     l.mutable_data()->set_foo(...);
 //     ...
 //     l.Commit();
 //   }
 template<class State>
-class CowLock {
+class CowWriteLock {
  public:
-  enum LockMode {
-    READ, WRITE, RELEASED
-  };
+  CowWriteLock() : cow_(nullptr) {}
 
-  // Lock in either read or write mode.
-  CowLock(CowObject<State>* cow,
-          LockMode mode)
-    : cow_(cow),
-      mode_(mode) {
-    if (mode == READ) {
-      cow_->ReadLock();
-    } else if (mode_ == WRITE) {
-      cow_->StartMutation();
-    } else {
-      LOG(FATAL) << "Cannot lock in mode " << mode;
-    }
+  explicit CowWriteLock(CowObject<State>* cow)
+    : cow_(cow) {
+    cow_->StartMutation();
   }
 
-  // Lock in read mode.
-  // A const object may not be locked in write mode.
-  CowLock(const CowObject<State>* info,
-          LockMode mode)
-    : cow_(const_cast<CowObject<State>*>(info)),
-      mode_(mode) {
-    if (mode == READ) {
-      cow_->ReadLock();
-    } else if (mode_ == WRITE) {
-      LOG(FATAL) << "Cannot write-lock a const pointer";
-    } else {
-      LOG(FATAL) << "Cannot lock in mode " << mode;
-    }
+  CowWriteLock(const CowWriteLock&) = delete;
+  void operator=(const CowWriteLock&) = delete;
+
+  CowWriteLock(CowWriteLock&& rhs) noexcept
+      : cow_(rhs.cow_) {
+    rhs.cow_ = nullptr;
+  }
+
+  void operator=(CowWriteLock&& rhs) noexcept {
+    Unlock();
+    cow_ = rhs.cow_;
+    rhs.cow_ = nullptr;
   }
 
   // Commit the underlying object.
-  // Requires that the caller hold the lock in write mode.
+  // Requires that the caller hold the lock.
   void Commit() {
-    DCHECK_EQ(WRITE, mode_);
     cow_->CommitMutation();
-    mode_ = RELEASED;
+    cow_ = nullptr;
+  }
+
+  void CommitOrWarn(const Status& status, const char* action) {
+    if (!status.ok()) {
+      LOG(WARNING) << "An error occurred while " << action << ": " << status;
+      return;
+    }
+    Commit();
   }
 
   void Unlock() {
-    if (mode_ == READ) {
-      cow_->ReadUnlock();
-    } else if (mode_ == WRITE) {
+    if (cow_) {
       cow_->AbortMutation();
-    } else {
-      DCHECK_EQ(RELEASED, mode_);
+      cow_ = nullptr;
     }
-    mode_ = RELEASED;
   }
 
-  // Obtain the underlying data. In WRITE mode, this returns the
-  // same data as mutable_data() (not the safe unchanging copy).
+  // Obtain the underlying data.
+  // Returns the same data as mutable_data() (not the safe unchanging copy).
   const State& data() const {
-    if (mode_ == READ) {
-      return cow_->state();
-    } else if (mode_ == WRITE) {
-      return cow_->dirty();
-    } else {
-      FATAL_ERROR("Cannot access data after committing");
-    }
+    return cow_->dirty();
   }
 
-  // Obtain the mutable data. This may only be called in WRITE mode.
-  State* mutable_data() {
-    if (mode_ == READ) {
-      FATAL_ERROR("Cannot mutate data with READ lock");
-    } else if (mode_ == WRITE) {
-      return cow_->mutable_dirty();
-    } else {
-      FATAL_ERROR("Cannot access data after committing");
-    }
+  const State* operator->() const {
+    return &data();
   }
 
-  bool is_write_locked() const {
-    return mode_ == WRITE;
+  // Obtain the mutable data.
+  State* mutable_data() const {
+    return cow_->mutable_dirty();
   }
 
-  // Drop the lock. If the lock is held in WRITE mode, and the
-  // lock has not yet been released, aborts the mutation, restoring
-  // the underlying object to its original data.
-  ~CowLock() {
+  bool is_dirty() const {
+    return cow_->is_dirty();
+  }
+
+  bool locked() const {
+    return cow_ != nullptr;
+  }
+
+  void ThreadChanged() {
+    cow_->WriteLockThreadChanged();
+  }
+
+  ~CowWriteLock() {
     Unlock();
   }
 
  private:
   CowObject<State>* cow_;
-  LockMode mode_;
-  DISALLOW_COPY_AND_ASSIGN(CowLock);
 };
 
 } // namespace yb
-#endif /* YB_UTIL_COW_OBJECT_H */

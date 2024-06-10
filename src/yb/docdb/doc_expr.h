@@ -4,18 +4,14 @@
 // This module defines and executes expression-related operations in DocDB.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_DOCDB_DOC_EXPR_H_
-#define YB_DOCDB_DOC_EXPR_H_
+#pragma once
 
-#include "yb/common/ql_value.h"
-#include "yb/common/ql_expr.h"
-#include "yb/common/schema.h"
-#include "yb/docdb/key_bytes.h"
+#include "yb/qlexpr/ql_expr.h"
 
 namespace yb {
 namespace docdb {
 
-class DocExprExecutor : public QLExprExecutor {
+class DocExprExecutor : public qlexpr::QLExprExecutor {
  public:
   // Public types.
   typedef std::shared_ptr<DocExprExecutor> SharedPtr;
@@ -23,32 +19,52 @@ class DocExprExecutor : public QLExprExecutor {
 
   // Constructor.
   // TODO(neil) Investigate to see if constructor should take 'table_row' and bind_map.
-  DocExprExecutor() { }
-  virtual ~DocExprExecutor() { }
-
-  // Evaluate column reference.
-  virtual CHECKED_STATUS EvalColumnRef(ColumnIdRep col_id,
-                                       const QLTableRow::SharedPtrConst& table_row,
-                                       QLValue *result) override;
+  DocExprExecutor();
+  virtual ~DocExprExecutor();
 
   // Evaluate call to tablet-server builtin operator.
-  virtual CHECKED_STATUS EvalTSCall(const QLBCallPB& ql_expr,
-                                    const QLTableRow& table_row,
-                                    QLValue *result) override;
+  Status EvalTSCall(const QLBCallPB& ql_expr,
+                    const qlexpr::QLTableRow& table_row,
+                    QLValuePB *result,
+                    const Schema *schema = nullptr) override;
 
-  // Evaluate aggregate functions for each row.
-  CHECKED_STATUS EvalCount(QLValue *aggr_count);
-  CHECKED_STATUS EvalSum(const QLValue& val, QLValue *aggr_sum);
-  CHECKED_STATUS EvalMax(const QLValue& val, QLValue *aggr_max);
-  CHECKED_STATUS EvalMin(const QLValue& val, QLValue *aggr_min);
-  CHECKED_STATUS EvalAvg(const QLValue& val, QLValue *aggr_avg);
+  Status EvalTSCall(const PgsqlBCallPB& ql_expr,
+                    const dockv::PgTableRow& table_row,
+                    QLValuePB *result,
+                    const Schema *schema) override;
 
  protected:
-  virtual CHECKED_STATUS GetTupleId(QLValue *result) const;
-  vector<QLValue> aggr_result_;
+  // Evaluate aggregate functions for each row.
+  template <class Val>
+  Status EvalCount(Val *aggr_count);
+
+  template <class Val>
+  Status EvalSum(const Val& val, Val *aggr_sum);
+
+  template <class Expr, class Row, class Val, class Extractor>
+  Status EvalSumInt(
+      const Expr& expr, const Row& table_row, Val *aggr_sum, const Extractor& extractor);
+
+  template <class Expr, class Row, class Val, class Extractor, class Setter>
+  Status EvalSumReal(
+      const Expr& expr, const Row& table_row, Val *aggr_sum,
+      const Extractor& extractor, const Setter& setter);
+
+  template <class Val>
+  Status EvalMax(const Val& val, Val *aggr_max);
+
+  template <class Val>
+  Status EvalMin(const Val& val, Val *aggr_min);
+
+  template <class Val>
+  Status EvalAvg(const Val& val, Val *aggr_avg);
+
+  Result<QLValuePB> EvalParametricToJson(const QLExpressionPB& operand,
+                                         const qlexpr::QLTableRow& table_row,
+                                         const Schema *schema);
+
+  std::vector<qlexpr::QLExprResult> aggr_result_;
 };
 
 } // namespace docdb
 } // namespace yb
-
-#endif // YB_DOCDB_DOC_EXPR_H_

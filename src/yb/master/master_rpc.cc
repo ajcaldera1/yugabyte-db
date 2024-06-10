@@ -37,24 +37,22 @@
 
 #include "yb/common/wire_protocol.h"
 #include "yb/common/wire_protocol.pb.h"
-#include "yb/gutil/bind.h"
-#include "yb/gutil/strings/join.h"
-#include "yb/gutil/strings/substitute.h"
-#include "yb/master/master.proxy.h"
+
+#include "yb/master/master_cluster.proxy.h"
+
+#include "yb/util/async_util.h"
+#include "yb/util/flags.h"
 #include "yb/util/net/net_util.h"
-#include "yb/util/flag_tags.h"
 
 using std::shared_ptr;
 using std::string;
 using std::vector;
 
-using yb::consensus::RaftPeerPB;
 using yb::rpc::Messenger;
-using yb::rpc::Rpc;
 
 using namespace std::placeholders;
 
-DEFINE_int32(master_leader_rpc_timeout_ms, 500,
+DEFINE_RUNTIME_int32(master_leader_rpc_timeout_ms, 500,
              "Number of milliseconds that the tserver will keep querying for master leader before"
              "selecting a follower.");
 TAG_FLAG(master_leader_rpc_timeout_ms, advanced);
@@ -80,8 +78,8 @@ class GetMasterRegistrationRpc: public rpc::Rpc {
   // Invokes 'user_cb' upon failure or success of the RPC call.
   GetMasterRegistrationRpc(StatusFunctor user_cb,
                            const HostPort& addr,
-                           const MonoTime& deadline,
-                           const std::shared_ptr<rpc::Messenger>& messenger,
+                           CoarseTimePoint deadline,
+                           rpc::Messenger* messenger,
                            rpc::ProxyCache* proxy_cache,
                            ServerEntryPB* out)
       : Rpc(deadline, messenger, proxy_cache),
@@ -105,7 +103,7 @@ class GetMasterRegistrationRpc: public rpc::Rpc {
 };
 
 void GetMasterRegistrationRpc::SendRpc() {
-  MasterServiceProxy proxy(&retrier().proxy_cache(), addr_);
+  MasterClusterProxy proxy(&retrier().proxy_cache(), addr_);
   GetMasterRegistrationRequestPB req;
   proxy.GetMasterRegistrationAsync(
       req, &resp_, PrepareController(),
@@ -127,7 +125,7 @@ void GetMasterRegistrationRpc::Finished(const Status& status) {
       // If CatalogManager is not initialized, treat the node as a
       // FOLLOWER for the time being, as currently this RPC is only
       // used for the purposes of finding the leader master.
-      resp_.set_role(RaftPeerPB::FOLLOWER);
+      resp_.set_role(PeerRole::FOLLOWER);
       new_status = Status::OK();
     } else {
       out_->mutable_error()->CopyFrom(resp_.error().status());
@@ -151,16 +149,18 @@ void GetMasterRegistrationRpc::Finished(const Status& status) {
 
 GetLeaderMasterRpc::GetLeaderMasterRpc(LeaderCallback user_cb,
                                        const server::MasterAddresses& addrs,
-                                       MonoTime deadline,
-                                       const shared_ptr<Messenger>& messenger,
+                                       CoarseTimePoint deadline,
+                                       Messenger* messenger,
                                        rpc::ProxyCache* proxy_cache,
                                        rpc::Rpcs* rpcs,
-                                       bool should_timeout_to_follower)
+                                       bool should_timeout_to_follower,
+                                       bool wait_for_leader_election)
     : Rpc(deadline, messenger, proxy_cache),
       user_cb_(std::move(user_cb)),
       rpcs_(*rpcs),
-      should_timeout_to_follower_(should_timeout_to_follower) {
-  DCHECK(deadline.Initialized());
+      should_timeout_to_follower_(should_timeout_to_follower),
+      wait_for_leader_election_(wait_for_leader_election) {
+  DCHECK(deadline != CoarseTimePoint::max());
 
   for (const auto& list : addrs) {
     addrs_.insert(addrs_.end(), list.begin(), list.end());
@@ -183,15 +183,13 @@ void GetLeaderMasterRpc::SendRpc() {
   std::vector<rpc::Rpcs::Handle> handles;
   handles.reserve(size);
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     pending_responses_ = size;
-    for (int i = 0; i < size; i++) {
-      auto handle = rpcs_.Prepare();
-      if (handle == rpcs_.InvalidHandle()) {
-        GetMasterRegistrationRpcCbForNode(i, STATUS(Aborted, "Stopping"), self, handle);
-        continue;
-      }
-      *handle = std::make_shared<GetMasterRegistrationRpc>(
+  }
+
+  for (size_t i = 0; i < size; i++) {
+    auto handle = rpcs_.RegisterConstructed([this, i, self](const rpc::Rpcs::Handle& handle) {
+      return std::make_shared<GetMasterRegistrationRpc>(
           std::bind(
               &GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode, this, i, _1, self, handle),
           addrs_[i],
@@ -199,8 +197,12 @@ void GetLeaderMasterRpc::SendRpc() {
           retrier().messenger(),
           &retrier().proxy_cache(),
           &responses_[i]);
-      handles.push_back(handle);
+    });
+    if (handle == rpcs_.InvalidHandle()) {
+      GetMasterRegistrationRpcCbForNode(i, STATUS(Aborted, "Stopping"), self, handle);
+      continue;
     }
+    handles.push_back(handle);
   }
 
   for (const auto& handle : handles) {
@@ -213,26 +215,34 @@ void GetLeaderMasterRpc::Finished(const Status& status) {
   // the leader, or if there were network errors talking to all of the
   // nodes the error is retriable and we can perform a delayed retry.
   num_iters_++;
-  if (status.IsNetworkError() || status.IsNotFound()) {
+  if (status.IsNetworkError() || (wait_for_leader_election_ && status.IsNotFound())) {
+    VLOG(4) << "About to retry operation due to error: " << status.ToString();
     // TODO (KUDU-573): Allow cancelling delayed tasks on reactor so
     // that we can safely use DelayedRetry here.
-    auto status = mutable_retrier()->DelayedRetry(this, Status::OK());
-    LOG_IF(DFATAL, !status.ok()) << "Retry failed: " << status;
-    return;
+    auto retry_status = mutable_retrier()->DelayedRetry(this, status);
+    if (!retry_status.ok()) {
+      LOG(WARNING) << "Failed to schedule retry: " << retry_status;
+    } else {
+      return;
+    }
   }
+  VLOG(4) << "Completed GetLeaderMasterRpc, calling callback with status "
+          << status.ToString();
   {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     // 'completed_' prevents 'user_cb_' from being invoked twice.
     if (completed_) {
       return;
     }
     completed_ = true;
   }
-  user_cb_.Run(status, leader_master_);
+  auto callback = std::move(user_cb_);
+  user_cb_.Reset();
+  callback.Run(status, leader_master_);
 }
 
 void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(
-    int idx, const Status& status, const std::shared_ptr<rpc::RpcCommand>& self,
+    size_t idx, const Status& status, const std::shared_ptr<rpc::RpcCommand>& self,
     rpc::Rpcs::Handle handle) {
   rpcs_.Unregister(handle);
 
@@ -245,7 +255,7 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(
   // pick the one with the highest term/index as the leader.
   Status new_status = status;
   {
-    std::lock_guard<simple_spinlock> lock(lock_);
+    std::lock_guard lock(lock_);
     --pending_responses_;
     if (completed_) {
       // If 'user_cb_' has been invoked (see Finished above), we can
@@ -254,7 +264,7 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(
     }
     auto& resp = responses_[idx];
     if (new_status.ok()) {
-      if (resp.role() != RaftPeerPB::LEADER) {
+      if (resp.role() != PeerRole::LEADER) {
         // Use a STATUS(NotFound, "") to indicate that the node is not
         // the leader: this way, we can handle the case where we've
         // received a reply from all of the nodes in the cluster (no
@@ -296,7 +306,9 @@ void GetLeaderMasterRpc::GetMasterRegistrationRpcCbForNode(
   // Called if the leader has been determined, or if we've received
   // all of the responses.
   if (new_status.ok()) {
-    user_cb_.Run(new_status, leader_master_);
+    auto callback = std::move(user_cb_);
+    user_cb_.Reset();
+    callback.Run(new_status, leader_master_);
   } else {
     Finished(new_status);
   }

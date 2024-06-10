@@ -34,23 +34,28 @@
 
 #include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
-#include "yb/fs/fs_manager.h"
-#include "yb/gutil/strings/substitute.h"
-#include "yb/server/rpc_server.h"
-#include "yb/server/webserver.h"
 #include "yb/master/catalog_manager.h"
 #include "yb/master/master.h"
+
 #include "yb/rpc/messenger.h"
+
+#include "yb/util/net/net_util.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/tunnel.h"
 #include "yb/util/status.h"
+#include "yb/util/thread.h"
 
-using strings::Substitute;
+using std::string;
+using std::vector;
 
+
+DECLARE_bool(TEST_simulate_fs_create_failure);
 DECLARE_bool(rpc_server_allow_ephemeral_ports);
 DECLARE_double(leader_failure_max_missed_heartbeat_periods);
+DECLARE_int32(TEST_nodes_per_cloud);
+DECLARE_bool(durable_wal_write);
 
 namespace yb {
 namespace master {
@@ -70,9 +75,13 @@ MiniMaster::~MiniMaster() {
   }
 }
 
-Status MiniMaster::Start() {
+Status MiniMaster::Start(bool TEST_simulate_fs_create_failure) {
   CHECK(!running_);
+
   FLAGS_rpc_server_allow_ephemeral_ports = true;
+  FLAGS_TEST_simulate_fs_create_failure = TEST_simulate_fs_create_failure;
+  // Disable WAL fsync for tests
+  FLAGS_durable_wal_write = false;
   RETURN_NOT_OK(StartOnPorts(rpc_port_, web_port_));
   return master_->WaitForCatalogManagerInit();
 }
@@ -84,6 +93,7 @@ Status MiniMaster::StartDistributedMaster(const vector<uint16_t>& peer_ports) {
 }
 
 void MiniMaster::Shutdown() {
+  TEST_SetThreadPrefixScoped prefix_se(Format("m-$0", index_));
   if (tunnel_) {
     tunnel_->Shutdown();
   }
@@ -99,11 +109,19 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port) {
   CHECK(!running_);
   CHECK(!master_);
 
-  HostPort local_host_port;
-  RETURN_NOT_OK(local_host_port.ParseString(
-      server::TEST_RpcBindEndpoint(index_, rpc_port), rpc_port));
   auto master_addresses = std::make_shared<server::MasterAddresses>();
-  master_addresses->push_back({local_host_port});
+  if (use_custom_addresses_) {
+    HostPort local_host_port;
+    for (const auto & master_addr : custom_master_addresses_) {
+      RETURN_NOT_OK(local_host_port.ParseString(master_addr, rpc_port));
+      master_addresses->push_back({local_host_port});
+    }
+  } else if (pass_master_addresses_) {
+    HostPort local_host_port;
+    RETURN_NOT_OK(local_host_port.ParseString(
+        server::TEST_RpcBindEndpoint(index_, rpc_port), rpc_port));
+    master_addresses->push_back({local_host_port});
+  }
   MasterOptions opts(master_addresses);
 
   Status start_status = StartOnPorts(rpc_port, web_port, &opts);
@@ -117,22 +135,42 @@ Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port) {
 
 Status MiniMaster::StartOnPorts(uint16_t rpc_port, uint16_t web_port,
                                 MasterOptions* opts) {
-  opts->rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(index_, rpc_port);
+  TEST_SetThreadPrefixScoped prefix_se(Format("m-$0", index_));
+  if (use_custom_addresses_) {
+    opts->rpc_opts.rpc_bind_addresses = Format(
+        "$0:$1", custom_rpc_addresses_[0], rpc_port);
+    for (size_t i = 1; i < custom_rpc_addresses_.size(); i++) {
+      opts->rpc_opts.rpc_bind_addresses += Format(
+          ",$0:$1", custom_rpc_addresses_[i], rpc_port);
+    }
+
+    opts->broadcast_addresses = {};
+    HostPort host_port;
+    for (const auto & broadcast_addr : custom_broadcast_addresses_) {
+      RETURN_NOT_OK(host_port.ParseString(broadcast_addr, rpc_port));
+      opts->broadcast_addresses.push_back(host_port);
+    }
+  } else {
+    opts->rpc_opts.rpc_bind_addresses = server::TEST_RpcBindEndpoint(index_, rpc_port);
+    opts->broadcast_addresses = {
+        HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
+  }
+
   opts->webserver_opts.port = web_port;
   opts->fs_opts.wal_paths = { fs_root_ };
   opts->fs_opts.data_paths = { fs_root_ };
   // A.B.C.D.xip.io resolves to A.B.C.D so it is very useful for testing.
-  opts->broadcast_addresses = {
-      HostPort(server::TEST_RpcAddress(index_, server::Private::kFalse), rpc_port) };
 
   if (!opts->has_placement_cloud()) {
-    opts->SetPlacement(Format("cloud$0", (index_ + 1) / 2), Format("rack$0", index_), "zone");
+    opts->SetPlacement(
+        Format("cloud$0", (index_ + 1) / FLAGS_TEST_nodes_per_cloud),
+        Format("rack$0", index_), "zone");
   }
 
-  gscoped_ptr<Master> server(new YB_EDITION_NS_PREFIX Master(*opts));
+  std::unique_ptr<Master> server(new Master(*opts));
   RETURN_NOT_OK(server->Init());
 
-  server::TEST_SetupConnectivity(server->messenger().get(), index_);
+  server::TEST_SetupConnectivity(server->messenger(), index_);
 
   RETURN_NOT_OK(server->StartAsync());
 
@@ -155,16 +193,18 @@ Status MiniMaster::StartDistributedMasterOnPorts(uint16_t rpc_port, uint16_t web
   CHECK(!master_);
 
   auto peer_addresses = std::make_shared<server::MasterAddresses>();
-  peer_addresses->resize(peer_ports.size());
+  if (pass_master_addresses_) {
+    peer_addresses->resize(peer_ports.size());
 
-  int index = 0;
-  for (uint16_t peer_port : peer_ports) {
-    auto& addresses = (*peer_addresses)[index];
-    ++index;
-    addresses.push_back(VERIFY_RESULT(HostPort::FromString(
-        server::TEST_RpcBindEndpoint(index, peer_port), peer_port)));
-    addresses.push_back(VERIFY_RESULT(HostPort::FromString(
-        server::TEST_RpcAddress(index, server::Private::kFalse), peer_port)));
+    int index = 0;
+    for (uint16_t peer_port : peer_ports) {
+      auto& addresses = (*peer_addresses)[index];
+      ++index;
+      addresses.push_back(VERIFY_RESULT(HostPort::FromString(
+          server::TEST_RpcBindEndpoint(index, peer_port), peer_port)));
+      addresses.push_back(VERIFY_RESULT(HostPort::FromString(
+          server::TEST_RpcAddress(index, server::Private::kFalse), peer_port)));
+    }
   }
   MasterOptions opts(peer_addresses);
 
@@ -176,9 +216,10 @@ Status MiniMaster::Restart() {
 
   auto prev_rpc = bound_rpc_addr();
   Endpoint prev_http = bound_http_addr();
+  auto master_addresses = master_->opts().GetMasterAddresses();
   Shutdown();
 
-  MasterOptions opts(std::make_shared<server::MasterAddresses>());
+  MasterOptions opts(master_addresses);
   RETURN_NOT_OK(StartOnPorts(prev_rpc.port(), prev_http.port(), &opts));
   CHECK(running_);
   return WaitForCatalogManagerInit();
@@ -193,6 +234,19 @@ Status MiniMaster::WaitUntilCatalogManagerIsLeaderAndReadyForTests() {
   return master_->WaitUntilCatalogManagerIsLeaderAndReadyForTests();
 }
 
+void MiniMaster::SetCustomAddresses(const std::vector<std::string> &master_addresses,
+                                    const std::vector<std::string> &rpc_bind_addresses,
+                                    const std::vector<std::string> &broadcast_addresses) {
+  CHECK_GT(master_addresses.size(),  0);
+  CHECK_GT(rpc_bind_addresses.size(), 0);
+  CHECK_GT(broadcast_addresses.size(), 0);
+
+  custom_master_addresses_ = master_addresses;
+  custom_rpc_addresses_ = rpc_bind_addresses;
+  custom_broadcast_addresses_ = broadcast_addresses;
+  use_custom_addresses_ = true;
+}
+
 HostPort MiniMaster::bound_rpc_addr() const {
   CHECK(running_);
   return HostPort::FromBoundEndpoint(master_->first_rpc_address());
@@ -200,7 +254,7 @@ HostPort MiniMaster::bound_rpc_addr() const {
 
 Endpoint MiniMaster::bound_http_addr() const {
   CHECK(running_);
-  return master_->first_http_address();
+  return CHECK_RESULT(master_->first_http_address());
 }
 
 std::string MiniMaster::permanent_uuid() const {
@@ -209,7 +263,39 @@ std::string MiniMaster::permanent_uuid() const {
 }
 
 std::string MiniMaster::bound_rpc_addr_str() const {
-  return yb::ToString(bound_rpc_addr());
+  return bound_rpc_addr().ToString();
+}
+
+CatalogManagerIf& MiniMaster::catalog_manager() const {
+  return *master_->catalog_manager();
+}
+
+CatalogManager& MiniMaster::catalog_manager_impl() const {
+  return *master_->catalog_manager_impl();
+}
+
+tablet::TabletPeerPtr MiniMaster::tablet_peer() const {
+  return catalog_manager().tablet_peer();
+}
+
+rpc::Messenger& MiniMaster::messenger() const {
+  return *master_->messenger();
+}
+
+master::SysCatalogTable& MiniMaster::sys_catalog() const {
+  return *catalog_manager().sys_catalog();
+}
+
+master::TSManager& MiniMaster::ts_manager() const {
+  return *master_->ts_manager();
+}
+
+master::FlushManager& MiniMaster::flush_manager() const {
+  return *master_->flush_manager();
+}
+
+FsManager& MiniMaster::fs_manager() const {
+  return *master_->fs_manager();
 }
 
 } // namespace master

@@ -32,41 +32,37 @@
 
 #include "yb/util/net/net_util.h"
 
-#include <arpa/inet.h>
 #include <ifaddrs.h>
-#include <netdb.h>
 #include <sys/types.h>
-#include <sys/socket.h>
 
 #include <algorithm>
-#include <iostream>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <boost/algorithm/string.hpp>
-#include <boost/optional/optional.hpp>
-#include <boost/scope_exit.hpp>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/join.h"
 #include "yb/gutil/strings/numbers.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/strip.h"
 #include "yb/gutil/strings/substitute.h"
-#include "yb/gutil/strings/util.h"
 
 #include "yb/util/debug/trace_event.h"
-#include "yb/util/errno.h"
-#include "yb/util/faststring.h"
 #include "yb/util/env.h"
 #include "yb/util/env_util.h"
-#include "yb/util/memory/memory.h"
+#include "yb/util/errno.h"
+#include "yb/util/faststring.h"
+#include "yb/util/flags.h"
+#include "yb/util/locks.h"
 #include "yb/util/net/inetaddress.h"
 #include "yb/util/net/sockaddr.h"
 #include "yb/util/net/socket.h"
-#include "yb/util/random.h"
+#include "yb/util/random_util.h"
+#include "yb/util/result.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status_format.h"
 #include "yb/util/stopwatch.h"
 #include "yb/util/subprocess.h"
 
@@ -77,7 +73,21 @@
 
 using std::unordered_set;
 using std::vector;
+using std::string;
+using std::numeric_limits;
 using strings::Substitute;
+
+DEFINE_UNKNOWN_string(
+    net_address_filter,
+    "ipv4_external,ipv4_all,ipv6_external,ipv6_non_link_local,ipv6_all",
+    "Order in which to select ip addresses returned by the resolver"
+    "Can be set to something like \"ipv4_all,ipv6_all\" to prefer IPv4 over "
+    "IPv6 addresses."
+    "Can be set to something like \"ipv4_external,ipv4_all,ipv6_all\" to "
+    "prefer external IPv4 "
+    "addresses first. Other options include ipv6_external,ipv6_non_link_local");
+
+DECLARE_string(tmp_dir);
 
 namespace yb {
 
@@ -93,11 +103,18 @@ HostPort::HostPort()
     : port_(0) {
 }
 
+HostPort::HostPort(Slice host, uint16_t port)
+    : host_(host.cdata(), host.size()), port_(port) {}
+
 HostPort::HostPort(std::string host, uint16_t port)
     : host_(std::move(host)), port_(port) {}
 
 HostPort::HostPort(const Endpoint& endpoint)
     : host_(endpoint.address().to_string()), port_(endpoint.port()) {
+}
+
+HostPort::HostPort(const char* host, uint16_t port)
+    : HostPort(Slice(host), port) {
 }
 
 Status HostPort::RemoveAndGetHostPortList(
@@ -140,25 +157,65 @@ Status HostPort::RemoveAndGetHostPortList(
   return Status::OK();
 }
 
-Status HostPort::ParseString(const string& str, uint16_t default_port) {
-  std::pair<string, string> p = strings::Split(str, strings::delimiter::Limit(":", 1));
-
-  // Strip any whitespace from the host.
-  StripWhiteSpace(&p.first);
-
-  // Parse the port.
+// Accepts entries like: [::1], 127.0.0.1, [::1]:7100, 0.0.0.0:7100,
+// f.q.d.n:7100
+Status HostPort::ParseString(const string &str_in, uint16_t default_port) {
   uint32_t port;
-  if (p.second.empty() && strcount(str, ':') == 0) {
-    // No port specified.
+  string host;
+
+  string str(str_in);
+  StripWhiteSpace(&str);
+  size_t pos = str.rfind(':');
+  if (str[0] == '[' && str[str.length() - 1] == ']' && str.length() > 2) {
+    // The whole thing is an IPv6 address.
+    host = str.substr(1, str.length() - 2);
     port = default_port;
-  } else if (!SimpleAtoi(p.second, &port) ||
-             port > 65535) {
-    return STATUS(InvalidArgument, "Invalid port", str);
+  } else if (pos == string::npos) {
+    // No port was specified, the whole thing must be a host.
+    host = str;
+    port = default_port;
+  } else if (pos > 1 && pos + 1 < str.length() &&
+             SimpleAtoi(str.substr(pos + 1), &port)) {
+
+    if (port > numeric_limits<uint16_t>::max()) {
+      return STATUS(InvalidArgument, "Invalid port", str);
+    }
+
+    // Got a host:port
+    host = str.substr(0, pos);
+    if (host[0] == '[' && host[host.length() - 1] == ']' && host.length() > 2) {
+      // Remove brackets if we have an IPv6 address
+      host = host.substr(1, host.length() - 2);
+    }
+  } else {
+    return STATUS(InvalidArgument,
+                  Format(
+                      "Invalid port: expected port after ':' "
+                      "at position $0 in $1",
+                      pos, str));
   }
 
-  host_.swap(p.first);
+  host_ = host;
   port_ = port;
   return Status::OK();
+}
+
+Result<HostPort> HostPort::FromString(const std::string& str, uint16_t default_port) {
+  HostPort result;
+  RETURN_NOT_OK(result.ParseString(str, default_port));
+  return result;
+}
+
+Result<std::vector<HostPort>> HostPort::ParseStrings(
+    const std::string& comma_sep_addrs, uint16_t default_port,
+    const char* separator) {
+  std::vector<HostPort> result;
+  RETURN_NOT_OK(ParseStrings(comma_sep_addrs, default_port, &result, separator));
+  return result;
+}
+
+size_t HostPortHash::operator()(const HostPort& hostPort) const {
+  return GStringPiece(std::to_string(hostPort.port()) + hostPort.host()).hash();
 }
 
 namespace {
@@ -184,7 +241,7 @@ const string getaddrinfo_rc_to_string(int rc) {
 Result<std::unique_ptr<addrinfo, AddrinfoDeleter>> HostToInetAddrInfo(const std::string& host) {
   struct addrinfo hints;
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = AF_INET;
+  hints.ai_family = AF_UNSPEC;
   hints.ai_socktype = SOCK_STREAM;
   struct addrinfo* res = nullptr;
   int rc = 0;
@@ -201,10 +258,11 @@ Result<std::unique_ptr<addrinfo, AddrinfoDeleter>> HostToInetAddrInfo(const std:
 }
 
 template <typename F>
-CHECKED_STATUS ResolveInetAddresses(const std::string& host, F func) {
-  auto fast_resolve = TryFastResolve(host);
+Status ResolveInetAddresses(const std::string& host, F func) {
+  boost::optional<IpAddress> fast_resolve = TryFastResolve(host);
   if (fast_resolve) {
     func(*fast_resolve);
+    VLOG(4) << "Fast resolved " << host << " to " << fast_resolve->to_string();
     return Status::OK();
   }
 
@@ -233,13 +291,27 @@ CHECKED_STATUS ResolveInetAddresses(const std::string& host, F func) {
 Status HostPort::ResolveAddresses(std::vector<Endpoint>* addresses) const {
   TRACE_EVENT1("net", "HostPort::ResolveAddresses",
                "host", host_);
-  return ResolveInetAddresses(host_, [this, addresses](const IpAddress& address) {
-    Endpoint endpoint(address, port_);
-    if (addresses) {
-      addresses->push_back(endpoint);
-    }
-    VLOG(2) << "Resolved address " << endpoint << " for host/port " << ToString();
-  });
+  if (!addresses) {
+    return Status::OK();
+  }
+  vector<IpAddress> ip_addresses;
+  RETURN_NOT_OK(ResolveInetAddresses(
+      host_, [this, &ip_addresses](const IpAddress &ip_address) {
+        ip_addresses.push_back(ip_address);
+        VLOG(3) << "Resolved address " << ip_address.to_string() << " for host "
+                << host_;
+      }));
+
+  FilterAddresses(FLAGS_net_address_filter, &ip_addresses);
+
+  VLOG(2) << "Returned " << ip_addresses.size() << " addresses for host "
+          << host_;
+  for (const auto &ip_addr : ip_addresses) {
+    VLOG(2) << "Returned address " << ip_addr.to_string() << " for host "
+            << host_;
+    addresses->push_back(Endpoint(ip_addr, port_));
+  }
+  return Status::OK();
 }
 
 Status HostPort::ParseStrings(const string& comma_sep_addrs,
@@ -249,7 +321,7 @@ Status HostPort::ParseStrings(const string& comma_sep_addrs,
   std::vector<string> addr_strings = strings::Split(
       comma_sep_addrs, separator, strings::SkipEmpty());
   std::vector<HostPort> host_ports;
-  for (const string& addr_string : addr_strings) {
+  for (string& addr_string : addr_strings) {
     HostPort host_port;
     RETURN_NOT_OK(host_port.ParseString(addr_string, default_port));
     host_ports.push_back(host_port);
@@ -258,9 +330,7 @@ Status HostPort::ParseStrings(const string& comma_sep_addrs,
   return Status::OK();
 }
 
-string HostPort::ToString() const {
-  return Substitute("$0:$1", host_, port_);
-}
+string HostPort::ToString() const { return HostPortToString(host_, port_); }
 
 string HostPort::ToCommaSeparatedString(const std::vector<HostPort>& hostports) {
   vector<string> hostport_strs;
@@ -270,9 +340,7 @@ string HostPort::ToCommaSeparatedString(const std::vector<HostPort>& hostports) 
   return JoinStrings(hostport_strs, ",");
 }
 
-bool IsPrivilegedPort(uint16_t port) {
-  return port <= 1024 && port != 0;
-}
+bool IsPrivilegedPort(uint16_t port) { return port < 1024 && port != 0; }
 
 Status ParseAddressList(const std::string& addr_list,
                         uint16_t default_port,
@@ -304,9 +372,7 @@ Status GetHostname(string* hostname) {
   char name[HOST_NAME_MAX];
   int ret = gethostname(name, HOST_NAME_MAX);
   if (ret != 0) {
-    return STATUS(NetworkError, "Unable to determine local hostname",
-                                ErrnoToString(errno),
-                                errno);
+    return STATUS(NetworkError, "Unable to determine local hostname", Errno(errno));
   }
   *hostname = name;
   return Status::OK();
@@ -318,18 +384,22 @@ Result<string> GetHostname() {
   return result;
 }
 
+Status GetLocalAddresses(const string &filter_spec,
+                         std::vector<IpAddress> *result) {
+  RETURN_NOT_OK(GetLocalAddresses(result, AddressFilter::ANY));
+  FilterAddresses(filter_spec, result);
+  return Status::OK();
+}
+
 Status GetLocalAddresses(std::vector<IpAddress>* result, AddressFilter filter) {
   ifaddrs* addresses;
   if (getifaddrs(&addresses)) {
-    return STATUS(NetworkError,
-                  "Failed to list network interfaces: $0",
-                  ErrnoToString(errno),
-                  errno);
+    return STATUS(NetworkError, "Failed to list network interfaces", Errno(errno));
   }
 
-  BOOST_SCOPE_EXIT(addresses) {
+  auto se = ScopeExit([addresses] {
     freeifaddrs(addresses);
-  } BOOST_SCOPE_EXIT_END
+  });
 
   for (auto address = addresses; address; address = address->ifa_next) {
     if (address->ifa_addr != nullptr) {
@@ -378,8 +448,12 @@ Status GetFQDN(string* hostname) {
       return STATUS(NetworkError,
                     Substitute("Unable to lookup FQDN ($0), getaddrinfo returned $1",
                                *hostname, getaddrinfo_rc_to_string(rc)),
-                    ErrnoToString(errno), errno);
+                    Errno(errno));
     }
+  }
+
+  if (!result->ai_canonname) {
+    return STATUS(NetworkError, "Canonical name not specified");
   }
 
   *hostname = result->ai_canonname;
@@ -422,6 +496,22 @@ Status HostPortFromEndpointReplaceWildcard(const Endpoint& addr, HostPort* hp) {
   return Status::OK();
 }
 
+namespace {
+
+void TryRunCmd(const string& cmd, vector<string>* log = NULL) {
+  LOG_STRING(INFO, log) << "$ " << cmd;
+  vector<string> argv = { "bash", "-c", cmd };
+  string results;
+  Status s = Subprocess::Call(argv, &results);
+  if (!s.ok()) {
+    LOG_STRING(INFO, log) << s.ToString();
+    return;
+  }
+  LOG_STRING(INFO, log) << results;
+}
+
+} // anonymous namespace
+
 void TryRunLsof(const Endpoint& addr, vector<string>* log) {
 #if defined(__APPLE__)
   string cmd = strings::Substitute(
@@ -434,14 +524,17 @@ void TryRunLsof(const Endpoint& addr, vector<string>* log) {
   // Little inline bash script prints the full ancestry of any pid listening
   // on the same port as 'addr'. We could use 'pstree -s', but that option
   // doesn't exist on el6.
+  //
+  // Note the sed command to check for the process name wrapped in ().
+  // Example prefix of /proc/$pid/stat output, with a process with spaces in the name:
+  // 3917 (tmux: server) S 1
   string cmd = strings::Substitute(
       "export PATH=$$PATH:/usr/sbin ; "
       "lsof -n -i 'TCP:$0' -sTCP:LISTEN ; "
       "for pid in $$(lsof -F p -n -i 'TCP:$0' -sTCP:LISTEN | cut -f 2 -dp) ; do"
       "  while [ $$pid -gt 1 ] ; do"
       "    ps h -fp $$pid ;"
-      "    stat=($$(</proc/$$pid/stat)) ;"
-      "    pid=$${stat[3]} ;"
+      "    pid=$$(sed 's/.* (.*) [^ ] \\([0-9]*\\).*/\\1/g' /proc/$$pid/stat);"
       "  done ; "
       "done",
       addr.port());
@@ -450,14 +543,15 @@ void TryRunLsof(const Endpoint& addr, vector<string>* log) {
   LOG_STRING(WARNING, log) << "Failed to bind to " << addr << ". "
                            << "Trying to use lsof to find any processes listening "
                            << "on the same port:";
-  LOG_STRING(INFO, log) << "$ " << cmd;
-  vector<string> argv = { "bash", "-c", cmd };
-  string results;
-  Status s = Subprocess::Call(argv, &results);
-  if (PREDICT_FALSE(!s.ok())) {
-    LOG_STRING(WARNING, log) << s.ToString();
-  }
-  LOG_STRING(WARNING, log) << results;
+  TryRunCmd(cmd, log);
+}
+
+void TryRunChronycTracking(vector<string>* log) {
+  TryRunCmd("chronyc tracking", log);
+}
+
+void TryRunChronycSourcestats(vector<string>* log) {
+  TryRunCmd("chronyc sourcestats", log);
 }
 
 uint16_t GetFreePort(std::unique_ptr<FileLock>* file_lock) {
@@ -466,7 +560,14 @@ uint16_t GetFreePort(std::unique_ptr<FileLock>* file_lock) {
   // First create the directory, if it doesn't already exist, where these lock files will live.
   Env* env = Env::Default();
   bool created = false;
-  const string lock_file_dir = "/tmp/yb-port-locks";
+  string lock_file_dir;
+
+  auto dir_exist = Env::Default()->DoesDirectoryExist(FLAGS_tmp_dir);
+  if (!dir_exist.ok()) {
+    LOG(FATAL) << "Directory does not exist: " << FLAGS_tmp_dir;
+  }
+  lock_file_dir = Format("$0/yb-port-locks", FLAGS_tmp_dir);
+
   Status status = env_util::CreateDirIfMissing(env, lock_file_dir, &created);
   if (!status.ok()) {
     LOG(FATAL) << "Could not create " << lock_file_dir << " directory: "
@@ -476,10 +577,9 @@ uint16_t GetFreePort(std::unique_ptr<FileLock>* file_lock) {
   // Now, find a unused port in the [kMinPort..kMaxPort] range.
   constexpr uint16_t kMinPort = 15000;
   constexpr uint16_t kMaxPort = 30000;
-  static yb::Random rand(GetCurrentTimeMicros());
   Status s;
   for (int i = 0; i < 1000; ++i) {
-    const uint16_t random_port = kMinPort + rand.Next() % (kMaxPort - kMinPort + 1);
+    const uint16_t random_port = RandomUniformInt(kMinPort, kMaxPort);
     VLOG(1) << "Trying to bind to port " << random_port;
 
     Endpoint sock_addr(boost::asio::ip::address_v4::loopback(), random_port);
@@ -534,7 +634,11 @@ HostPort HostPort::FromBoundEndpoint(const Endpoint& endpoint) {
 std::string HostPortToString(const std::string& host, int port) {
   DCHECK_GE(port, 0);
   DCHECK_LE(port, 65535);
-  return Format("$0:$1", host, port);
+  if (host.find(':') != string::npos) {
+    return Format("[$0]:$1", host, port);
+  } else {
+    return Format("$0:$1", host, port);
+  }
 }
 
 Status HostToAddresses(
@@ -559,16 +663,49 @@ Result<IpAddress> HostToAddress(const std::string& host) {
   return addr;
 }
 
-boost::optional<IpAddress> TryFastResolve(const std::string& host) {
+bool IsWildcardAddress(const std::string& host_str) {
+  boost::system::error_code ec;
+  auto addr = IpAddress::from_string(host_str, ec);
+  return !ec && addr.is_unspecified();
+}
+
+Result<IpAddress> ParseIpAddress(const std::string& host) {
   boost::system::error_code ec;
   auto addr = IpAddress::from_string(host, ec);
-  if (!ec) {
-    return addr;
+  if (ec) {
+    return STATUS_FORMAT(InvalidArgument, "Failed to parse $0: $1", host, ec.message());
+  }
+
+  VLOG(4) << "Resolving ip address to itself for input: " << host;
+  return addr;
+}
+
+simple_spinlock fail_to_fast_resolve_address_mutex;
+std::string fail_to_fast_resolve_address;
+
+void TEST_SetFailToFastResolveAddress(const std::string& address) {
+  {
+    std::lock_guard lock(fail_to_fast_resolve_address_mutex);
+    fail_to_fast_resolve_address = address;
+  }
+  LOG(INFO) << "Setting fail_to_fast_resolve_address to: " << address;
+}
+
+boost::optional<IpAddress> TryFastResolve(const std::string& host) {
+  auto result = ParseIpAddress(host);
+  if (result.ok()) {
+    return *result;
   }
 
   // For testing purpose we resolve A.B.C.D.ip.yugabyte to A.B.C.D.
   static const std::string kYbIpSuffix = ".ip.yugabyte";
   if (boost::ends_with(host, kYbIpSuffix)) {
+    {
+      std::lock_guard lock(fail_to_fast_resolve_address_mutex);
+      if (PREDICT_FALSE(host == fail_to_fast_resolve_address)) {
+        return boost::none;
+      }
+    }
     boost::system::error_code ec;
     auto address = IpAddress::from_string(
         host.substr(0, host.length() - kYbIpSuffix.length()), ec);

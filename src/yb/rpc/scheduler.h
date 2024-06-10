@@ -13,10 +13,12 @@
 //
 //
 
-#ifndef YB_RPC_SCHEDULER_H
-#define YB_RPC_SCHEDULER_H
+#pragma once
 
 #include "yb/rpc/rpc_fwd.h"
+#include "yb/util/net/net_fwd.h"
+
+#include "yb/util/status.h"
 
 namespace yb {
 
@@ -56,6 +58,20 @@ class ScheduledTask : public ScheduledTaskBase {
   F f_;
 };
 
+template<class F>
+class ScheduledTaskWithId : public ScheduledTaskBase {
+ public:
+  explicit ScheduledTaskWithId(ScheduledTaskId id, const SteadyTimePoint& time, const F& f)
+      : ScheduledTaskBase(id, time), f_(f) {}
+
+  void Run(const Status& status) override {
+    f_(id(), status);
+  }
+
+ private:
+  F f_;
+};
+
 class Scheduler {
  public:
   explicit Scheduler(IoService* io_service);
@@ -67,15 +83,26 @@ class Scheduler {
   }
 
   template<class F>
-  ScheduledTaskId Schedule(const F& f, std::chrono::steady_clock::time_point time) {
+  auto Schedule(const F& f, std::chrono::steady_clock::time_point time) ->
+      decltype(f(Status()), ScheduledTaskId()) {
     auto id = NextId();
     DoSchedule(std::make_shared<ScheduledTask<F>>(id, time, f));
+    return id;
+  }
+
+  template<class F>
+  auto Schedule(const F& f, std::chrono::steady_clock::time_point time) ->
+      decltype(f(ScheduledTaskId(), Status()), ScheduledTaskId()) {
+    auto id = NextId();
+    DoSchedule(std::make_shared<ScheduledTaskWithId<F>>(id, time, f));
     return id;
   }
 
   void Abort(ScheduledTaskId task_id);
 
   void Shutdown();
+
+  IoService& io_service();
 
  private:
   ScheduledTaskId NextId();
@@ -86,7 +113,51 @@ class Scheduler {
   std::unique_ptr<Impl> impl_;
 };
 
+class ScheduledTaskTracker {
+ public:
+  ScheduledTaskTracker() = default;
+
+  explicit ScheduledTaskTracker(Scheduler* scheduler);
+
+  void Bind(Scheduler* scheduler) {
+    scheduler_ = scheduler;
+  }
+
+  template <class F>
+  void Schedule(const F& f, std::chrono::steady_clock::duration delay) {
+    Schedule(f, std::chrono::steady_clock::now() + delay);
+  }
+
+  template <class F>
+  void Schedule(const F& f, std::chrono::steady_clock::time_point time) {
+    Abort();
+    if (++num_scheduled_ < 0) { // Shutting down
+      --num_scheduled_;
+      return;
+    }
+    last_scheduled_task_id_ = scheduler_->Schedule(
+        [this, f](ScheduledTaskId task_id, const Status& status) {
+      last_scheduled_task_id_.compare_exchange_strong(task_id, rpc::kInvalidTaskId);
+      f(status);
+      --num_scheduled_;
+    }, time);
+  }
+
+  void Abort();
+
+  void StartShutdown();
+  void CompleteShutdown();
+
+  void Shutdown() {
+    StartShutdown();
+    CompleteShutdown();
+  }
+
+ private:
+  Scheduler* scheduler_ = nullptr;
+  std::atomic<int64_t> num_scheduled_{0};
+  std::atomic<rpc::ScheduledTaskId> last_scheduled_task_id_{rpc::kInvalidTaskId};
+};
+
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_SCHEDULER_H

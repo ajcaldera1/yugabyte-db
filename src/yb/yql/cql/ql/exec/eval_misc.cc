@@ -13,18 +13,24 @@
 //
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/common/ql_value.h"
+#include "yb/common/table_properties_constants.h"
 #include "yb/common/typedefs.h"
+
+#include "yb/yql/cql/ql/exec/exec_context.h"
 #include "yb/yql/cql/ql/exec/executor.h"
+
+#include "yb/yql/cql/ql/ptree/pt_dml.h"
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+#include "yb/yql/cql/ql/util/errcodes.h"
 
 namespace yb {
 namespace ql {
 
-using std::shared_ptr;
-
 //--------------------------------------------------------------------------------------------------
 
-CHECKED_STATUS Executor::PTExprToPBValidated(const PTExpr::SharedPtr& expr,
-                                             QLExpressionPB *expr_pb) {
+Status Executor::PTExprToPBValidated(const PTExprPtr& expr,
+                                     QLExpressionPB *expr_pb) {
   RETURN_NOT_OK(PTExprToPB(expr, expr_pb));
   if (expr_pb->has_value() && IsNull(expr_pb->value())) {
     return exec_context_->Error(expr, "Value cannot be null.", ErrorCode::INVALID_ARGUMENTS);
@@ -32,7 +38,7 @@ CHECKED_STATUS Executor::PTExprToPBValidated(const PTExpr::SharedPtr& expr,
   return Status::OK();
 }
 
-CHECKED_STATUS Executor::TimestampToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
+Status Executor::TimestampToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
   if (tnode->user_timestamp_usec() != nullptr) {
     QLExpressionPB timestamp_pb;
     RETURN_NOT_OK(PTExprToPBValidated(tnode->user_timestamp_usec(), &timestamp_pb));
@@ -42,7 +48,7 @@ CHECKED_STATUS Executor::TimestampToPB(const PTDmlStmt *tnode, QLWriteRequestPB 
         << "Integer constant expected for USING TIMESTAMP clause";
 
     UserTimeMicros user_timestamp = timestamp_pb.value().int64_value();
-    if (user_timestamp == common::kInvalidUserTimestamp) {
+    if (user_timestamp == common::kInvalidTimestamp) {
       return exec_context_->Error(tnode->user_timestamp_usec(), "Invalid timestamp",
                                   ErrorCode::INVALID_ARGUMENTS);
     }
@@ -51,7 +57,7 @@ CHECKED_STATUS Executor::TimestampToPB(const PTDmlStmt *tnode, QLWriteRequestPB 
   return Status::OK();
 }
 
-CHECKED_STATUS Executor::TtlToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
+Status Executor::TtlToPB(const PTDmlStmt *tnode, QLWriteRequestPB *req) {
   if (tnode->ttl_seconds() != nullptr) {
     QLExpressionPB ttl_pb;
     RETURN_NOT_OK(PTExprToPBValidated(tnode->ttl_seconds(), &ttl_pb));

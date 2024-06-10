@@ -487,7 +487,7 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 	/*
 	 * Initialize result slot, type and projection.
 	 */
-	ExecInitResultTupleSlotTL(estate, &scanstate->ss.ps);
+	ExecInitResultTypeTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfo(&scanstate->ss);
 
 	/*
@@ -503,7 +503,7 @@ ExecInitFunctionScan(FunctionScan *node, EState *estate, int eflags)
 	 * evaluation results into the query-lifespan context either.  We just
 	 * need one context, because we evaluate each function separately.
 	 */
-	scanstate->argcontext = AllocSetContextCreate(CurrentMemoryContext,
+	scanstate->argcontext = AllocSetContextCreate(GetCurrentMemoryContext(),
 												  "Table function arguments",
 												  ALLOCSET_DEFAULT_SIZES);
 
@@ -529,7 +529,8 @@ ExecEndFunctionScan(FunctionScanState *node)
 	/*
 	 * clean out the tuple table
 	 */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/*
@@ -563,7 +564,8 @@ ExecReScanFunctionScan(FunctionScanState *node)
 	int			i;
 	Bitmapset  *chgparam = node->ss.ps.chgParam;
 
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	for (i = 0; i < node->nfuncs; i++)
 	{
 		FunctionScanPerFuncState *fs = &node->funcstates[i];

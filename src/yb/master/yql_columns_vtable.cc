@@ -13,41 +13,83 @@
 
 #include "yb/master/yql_columns_vtable.h"
 
-#include "yb/common/ql_value.h"
-#include "yb/master/catalog_manager.h"
+#include <stdint.h>
 
-namespace yb {
-namespace master {
+#include "yb/util/logging.h"
 
-YQLColumnsVTable::YQLColumnsVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSchemaColumnsTableName, master, CreateSchema()) {
+#include "yb/qlexpr/ql_name.h"
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/gutil/casts.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
+#include "yb/master/master.h"
+
+#include "yb/util/status_log.h"
+#include "yb/util/uuid.h"
+
+using std::string;
+
+namespace yb::master {
+
+namespace {
+
+std::string SortingTypeToString(SortingType sorting_type) {
+  switch (sorting_type) {
+    case SortingType::kNotSpecified:
+      return "none";
+    case SortingType::kAscending:
+      return "asc";
+    case SortingType::kDescending:
+      return "desc";
+    case SortingType::kAscendingNullsLast:
+      return "asc nulls last";
+    case SortingType::kDescendingNullsLast:
+      return "desc nulls last";
+  }
+  FATAL_INVALID_ENUM_VALUE(SortingType, sorting_type);
+}
+
+} // namespace
+
+YQLColumnsVTable::YQLColumnsVTable(const TableName& table_name,
+                                   const NamespaceName& namespace_name,
+                                   Master* const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
 Status YQLColumnsVTable::PopulateColumnInformation(const Schema& schema,
                                                    const string& keyspace_name,
                                                    const string& table_name,
                                                    const size_t col_idx,
-                                                   QLRow* const row) const {
+                                                   qlexpr::QLRow* const row) const {
   RETURN_NOT_OK(SetColumnValue(kKeyspaceName, keyspace_name, row));
   RETURN_NOT_OK(SetColumnValue(kTableName, table_name, row));
-  RETURN_NOT_OK(SetColumnValue(kColumnName, schema.column(col_idx).name(), row));
-  RETURN_NOT_OK(SetColumnValue(kClusteringOrder, schema.column(col_idx).sorting_type_string(),
-                               row));
+  if (schema.table_properties().use_mangled_column_name()) {
+    RETURN_NOT_OK(SetColumnValue(kColumnName,
+                                 qlexpr::YcqlName::DemangleName(schema.column(col_idx).name()),
+                                 row));
+  } else {
+    RETURN_NOT_OK(SetColumnValue(kColumnName, schema.column(col_idx).name(), row));
+  }
+  RETURN_NOT_OK(SetColumnValue(
+      kClusteringOrder, SortingTypeToString(schema.column(col_idx).sorting_type()), row));
   const ColumnSchema& column = schema.column(col_idx);
   RETURN_NOT_OK(SetColumnValue(kType, column.is_counter() ? "counter" : column.type()->ToString(),
                                row));
   return Status::OK();
 }
 
-Status YQLColumnsVTable::RetrieveData(const QLReadRequestPB& request,
-                                      std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
-  std::vector<scoped_refptr<TableInfo> > tables;
-  master_->catalog_manager()->GetAllTables(&tables, true);
+Result<VTableDataPtr> YQLColumnsVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
+  auto tables = catalog_manager().GetTables(GetTablesMode::kVisibleToClient);
   for (scoped_refptr<TableInfo> table : tables) {
 
     // Skip non-YQL tables.
-    if (!CatalogManager::IsYcqlTable(*table)) {
+    if (!IsYcqlTable(*table)) {
       continue;
     }
 
@@ -55,18 +97,16 @@ Status YQLColumnsVTable::RetrieveData(const QLReadRequestPB& request,
     RETURN_NOT_OK(table->GetSchema(&schema));
 
     // Get namespace for table.
-    NamespaceIdentifierPB nsId;
-    nsId.set_id(table->namespace_id());
-    scoped_refptr<NamespaceInfo> nsInfo;
-    RETURN_NOT_OK(master_->catalog_manager()->FindNamespace(nsId, &nsInfo));
+    auto ns_info = VERIFY_RESULT(master_->catalog_manager()->FindNamespaceById(
+        table->namespace_id()));
 
-    const string& keyspace_name = nsInfo->name();
+    const string& keyspace_name = ns_info->name();
     const string& table_name = table->name();
 
     // Fill in the hash keys first.
-    int32_t num_hash_columns = schema.num_hash_key_columns();
+    auto num_hash_columns = narrow_cast<int32_t>(schema.num_hash_key_columns());
     for (int32_t i = 0; i < num_hash_columns; i++) {
-      QLRow& row = (*vtable)->Extend();
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(PopulateColumnInformation(schema, keyspace_name, table_name, i, &row));
       // kind (always partition_key for hash columns)
       RETURN_NOT_OK(SetColumnValue(kKind, "partition_key", &row));
@@ -74,9 +114,9 @@ Status YQLColumnsVTable::RetrieveData(const QLReadRequestPB& request,
     }
 
     // Now fill in the range columns
-    int32_t num_range_columns = schema.num_range_key_columns();
+    auto num_range_columns = narrow_cast<int32_t>(schema.num_range_key_columns());
     for (int32_t i = num_hash_columns; i < num_hash_columns + num_range_columns; i++) {
-      QLRow& row = (*vtable)->Extend();
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(PopulateColumnInformation(schema, keyspace_name, table_name, i, &row));
       // kind (always clustering for range columns)
       RETURN_NOT_OK(SetColumnValue(kKind, "clustering", &row));
@@ -84,16 +124,19 @@ Status YQLColumnsVTable::RetrieveData(const QLReadRequestPB& request,
     }
 
     // Now fill in the rest of the columns.
-    for (int32_t i = num_hash_columns + num_range_columns; i < schema.num_columns(); i++) {
-      QLRow &row = (*vtable)->Extend();
+    auto num_columns = narrow_cast<int32_t>(schema.num_columns());
+    for (auto i = num_hash_columns + num_range_columns; i < num_columns; i++) {
+      auto& row = vtable->Extend();
       RETURN_NOT_OK(PopulateColumnInformation(schema, keyspace_name, table_name, i, &row));
       // kind (always regular for regular columns)
-      RETURN_NOT_OK(SetColumnValue(kKind, "regular", &row));
+      const ColumnSchema& column = schema.column(i);
+      string kind = column.is_static() ? "static" : "regular";
+      RETURN_NOT_OK(SetColumnValue(kKind, kind, &row));
       RETURN_NOT_OK(SetColumnValue(kPosition, -1, &row));
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema YQLColumnsVTable::CreateSchema() const {
@@ -109,5 +152,4 @@ Schema YQLColumnsVTable::CreateSchema() const {
   return builder.Build();
 }
 
-}  // namespace master
-}  // namespace yb
+}  // namespace yb::master

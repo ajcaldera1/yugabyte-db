@@ -12,8 +12,10 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_DELETE_H_
-#define YB_YQL_PGGATE_PG_DELETE_H_
+#pragma once
+
+#include <memory>
+#include <utility>
 
 #include "yb/yql/pggate/pg_dml_write.h"
 
@@ -26,24 +28,23 @@ namespace pggate {
 
 class PgDelete : public PgDmlWrite {
  public:
-  // Public types.
-  typedef scoped_refptr<PgDelete> ScopedRefPtr;
-  typedef scoped_refptr<const PgDelete> ScopedRefPtrConst;
+  PgDelete(PgSession::ScopedRefPtr pg_session,
+           const PgObjectId& table_id,
+           bool is_region_local,
+           YBCPgTransactionSetting transaction_setting)
+      : PgDmlWrite(std::move(pg_session), table_id, is_region_local, transaction_setting) {}
 
-  typedef std::unique_ptr<PgDelete> UniPtr;
-  typedef std::unique_ptr<const PgDelete> UniPtrConst;
+  StmtOp stmt_op() const override { return StmtOp::STMT_DELETE; }
 
-  // Constructors.
-  PgDelete(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
-  virtual ~PgDelete();
-
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_DELETE; }
+  void SetIsPersistNeeded(const bool is_persist_needed) {
+    write_req_->set_is_delete_persist_needed(is_persist_needed);
+  }
 
  private:
-  virtual void AllocWriteRequest() override;
+  PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
+    return PgsqlWriteRequestPB::PGSQL_DELETE;
+  }
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_DELETE_H_

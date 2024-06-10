@@ -1,4 +1,3 @@
-// -*- Mode: C++; c-basic-offset: 2; indent-tabs-mode: nil -*-
 /* Copyright (c) 2006, Google Inc.
  * All rights reserved.
  *
@@ -51,12 +50,11 @@
 // If used within a signal handler, all lock holders
 // should block the signal even outside the signal handler.
 
-#ifndef YB_GUTIL_SPINLOCK_H
-#define YB_GUTIL_SPINLOCK_H
+#pragma once
 
 #include "yb/gutil/atomicops.h"
-#include "yb/gutil/basictypes.h"
 #include "yb/gutil/dynamic_annotations.h"
+#include "yb/gutil/macros.h"
 #include "yb/gutil/thread_annotations.h"
 
 // This isn't originally in the base:: namespace in tcmalloc,
@@ -64,9 +62,9 @@
 // don't namespace it differently, we conflict.
 namespace base {
 
-class LOCKABLE SpinLock {
+class CAPABILITY("mutex") SpinLock {
  public:
-  SpinLock() : lockword_(kSpinLockFree) { }
+  constexpr SpinLock() : lockword_(kSpinLockFree) { }
 
   // Special constructor for use with static SpinLock objects.  E.g.,
   //
@@ -77,39 +75,45 @@ class LOCKABLE SpinLock {
   // A SpinLock constructed like this can be freely used from global
   // initializers without worrying about the order in which global
   // initializers run.
-  explicit SpinLock(base::LinkerInitialized /*x*/) {
-    // Does nothing; lockword_ is already initialized
+  explicit SpinLock(base::LinkerInitialized /*x*/)
+      : lockword_(kSpinLockFree) {
   }
 
   // Acquire this SpinLock.
   // TODO(csilvers): uncomment the annotation when we figure out how to
   //                 support this macro with 0 args (see thread_annotations.h)
-  inline void Lock() EXCLUSIVE_LOCK_FUNCTION() {
+  inline void Lock() ACQUIRE() {
     if (base::subtle::Acquire_CompareAndSwap(&lockword_, kSpinLockFree,
                                              kSpinLockHeld) != kSpinLockFree) {
       SlowLock();
     }
     ANNOTATE_RWLOCK_ACQUIRED(this, 1);
+#ifdef __aarch64__
+    __asm__ __volatile__ ("dmb ish" ::: "memory");
+#endif
   }
 
   // Try to acquire this SpinLock without blocking and return true if the
   // acquisition was successful.  If the lock was not acquired, false is
   // returned.  If this SpinLock is free at the time of the call, TryLock
   // will return true with high probability.
-  inline bool TryLock() EXCLUSIVE_TRYLOCK_FUNCTION(true) {
+  inline bool TryLock() TRY_ACQUIRE(true) {
     bool res =
         (base::subtle::Acquire_CompareAndSwap(&lockword_, kSpinLockFree,
                                               kSpinLockHeld) == kSpinLockFree);
     if (res) {
       ANNOTATE_RWLOCK_ACQUIRED(this, 1);
     }
+#ifdef __aarch64__
+    __asm__ __volatile__ ("dmb ish" ::: "memory");
+#endif
     return res;
   }
 
   // Release this SpinLock, which must be held by the calling thread.
   // TODO(csilvers): uncomment the annotation when we figure out how to
   //                 support this macro with 0 args (see thread_annotations.h)
-  inline void Unlock() UNLOCK_FUNCTION() {
+  inline void Unlock() RELEASE() {
     ANNOTATE_RWLOCK_RELEASED(this, 1);
     uint64 wait_cycles = static_cast<uint64>(
         base::subtle::Release_AtomicExchange(&lockword_, kSpinLockFree));
@@ -119,6 +123,9 @@ class LOCKABLE SpinLock {
       // for the lock.
       SlowUnlock(wait_cycles);
     }
+#ifdef __aarch64__
+    __asm__ __volatile__ ("dmb ish" ::: "memory");
+#endif
   }
 
   // Determine if the lock is held.  When the lock is held by the invoking
@@ -146,20 +153,18 @@ class LOCKABLE SpinLock {
 
 // Corresponding locker object that arranges to acquire a spinlock for
 // the duration of a C++ scope.
-class SCOPED_LOCKABLE SpinLockHolder {
+class SCOPED_CAPABILITY SpinLockHolder {
  private:
   SpinLock* lock_;
  public:
-  inline explicit SpinLockHolder(SpinLock* l) EXCLUSIVE_LOCK_FUNCTION(l)
+  inline explicit SpinLockHolder(SpinLock* l) ACQUIRE(l)
       : lock_(l) {
     l->Lock();
   }
 
-  inline ~SpinLockHolder() UNLOCK_FUNCTION() { lock_->Unlock(); }
+  inline ~SpinLockHolder() RELEASE() { lock_->Unlock(); }
 };
 // Catch bug where variable name is omitted, e.g. SpinLockHolder (&lock);
 #define SpinLockHolder(x) COMPILE_ASSERT(0, spin_lock_decl_missing_var_name)
 
 } // namespace base
-
-#endif  // YB_GUTIL_SPINLOCK_H

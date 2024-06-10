@@ -30,14 +30,22 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_LOGGING_TEST_UTIL_H
-#define YB_UTIL_LOGGING_TEST_UTIL_H
+#pragma once
 
-#include <glog/logging.h>
+#include <atomic>
+#include <chrono>
+#include <regex>
 #include <string>
 #include <vector>
 
+#include "yb/util/logging.h"
+
+#include "yb/util/monotime.h"
+#include "yb/util/status_fwd.h"
+
 namespace yb {
+
+using namespace std::literals;
 
 // GLog sink that keeps an internal buffer of messages that have been logged.
 class StringVectorSink : public google::LogSink {
@@ -58,6 +66,39 @@ class StringVectorSink : public google::LogSink {
   std::vector<std::string> logged_msgs_;
 };
 
+// GLog sink that waits for specified pattern to appear in log.
+template<class Pattern>
+class PatternWaiterLogSink : public google::LogSink {
+ public:
+  explicit PatternWaiterLogSink<Pattern>(const std::string& pattern)
+      : pattern_source_(pattern), pattern_to_wait_for_(pattern) {
+    google::AddLogSink(this);
+  }
+
+  // Wait for string_to_wait to occur in log.
+  Status WaitFor(MonoDelta timeout);
+
+  void send(
+      google::LogSeverity severity, const char* full_filename, const char* base_filename, int line,
+      const struct ::tm* tm_time, const char* message, size_t message_len) override;
+
+  bool IsEventOccurred() { return event_occurred_; }
+
+  ~PatternWaiterLogSink() { google::RemoveLogSink(this); }
+
+ private:
+  static const char* kWaitingMessage;
+  // Stores the original pattern provided to constructor.
+  // For PatternWaiterLogSink<std::regex> this is raw (uncompiled) regex, for
+  // PatternWaiterLogSink<std::string> this is the same string pattern we are waiting for.
+  std::string pattern_source_;
+  Pattern pattern_to_wait_for_;
+  std::atomic<bool> event_occurred_{false};
+};
+
+using StringWaiterLogSink = PatternWaiterLogSink<std::string>;
+using RegexWaiterLogSink = PatternWaiterLogSink<std::regex>;
+
 // RAII wrapper around registering a LogSink with GLog.
 struct ScopedRegisterSink {
   explicit ScopedRegisterSink(google::LogSink* s) : s_(s) {
@@ -71,5 +112,3 @@ struct ScopedRegisterSink {
 };
 
 } // namespace yb
-
-#endif  // YB_UTIL_LOGGING_TEST_UTIL_H

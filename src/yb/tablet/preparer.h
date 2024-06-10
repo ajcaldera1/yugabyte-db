@@ -11,15 +11,13 @@
 // under the License.
 //
 
-#ifndef YB_TABLET_PREPARER_H
-#define YB_TABLET_PREPARER_H
+#pragma once
 
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/threadpool.h"
 
-DECLARE_int32(max_group_replicate_batch_size);
 DECLARE_int32(prepare_queue_max_size);
 
 namespace yb {
@@ -44,11 +42,13 @@ class Preparer {
   explicit Preparer(consensus::Consensus* consensus, ThreadPool* tablet_prepare_pool);
   ~Preparer();
 
-  CHECKED_STATUS Start();
+  Status Start();
   void Stop();
 
-  CHECKED_STATUS Submit(OperationDriver* txn_driver);
+  Status Submit(OperationDriver* txn_driver);
   ThreadPoolToken* PoolToken();
+
+  void DumpStatusHtml(std::ostream& out);
 
  private:
   std::unique_ptr<PreparerImpl> impl_;
@@ -56,4 +56,3 @@ class Preparer {
 
 };  // namespace tablet
 }  // namespace yb
-#endif  // YB_TABLET_PREPARER_H

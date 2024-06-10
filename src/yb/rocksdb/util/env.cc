@@ -23,12 +23,14 @@
 #include "yb/rocksdb/env.h"
 
 #include <thread>
-#include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/port/sys_time.h"
 
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/util/arena.h"
-#include "yb/rocksdb/util/autovector.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
+
+using std::unique_ptr;
+using std::shared_ptr;
 
 namespace rocksdb {
 
@@ -78,13 +80,21 @@ Status Env::GetChildrenFileAttributes(const std::string& dir,
   return Status::OK();
 }
 
-SequentialFile::~SequentialFile() {
+yb::Result<uint64_t> Env::GetFileSize(const std::string& fname) {
+  uint64_t result;
+  RETURN_NOT_OK(GetFileSize(fname, &result));
+  return result;
 }
 
-RandomAccessFile::~RandomAccessFile() {
+bool Env::CleanupFile(const std::string& fname, const std::string& log_prefix) {
+  Status s;
+  WARN_NOT_OK(s = DeleteFile(fname), log_prefix + "Failed to cleanup " + fname);
+  return s.ok();
 }
 
-WritableFile::~WritableFile() {
+void Env::GetChildrenWarnNotOk(const std::string& dir,
+                               std::vector<std::string>* result) {
+  WARN_NOT_OK(GetChildren(dir, result), "Failed to get children " + dir);
 }
 
 Logger::~Logger() {
@@ -350,7 +360,7 @@ Status WriteStringToFile(Env* env, const Slice& data, const std::string& fname,
     s = file->Sync();
   }
   if (!s.ok()) {
-    env->DeleteFile(fname);
+    env->CleanupFile(fname);
   }
   return s;
 }
@@ -358,16 +368,16 @@ Status WriteStringToFile(Env* env, const Slice& data, const std::string& fname,
 Status ReadFileToString(Env* env, const std::string& fname, std::string* data) {
   EnvOptions soptions;
   data->clear();
-  unique_ptr<SequentialFile> file;
+  std::unique_ptr<SequentialFile> file;
   Status s = env->NewSequentialFile(fname, &file, soptions);
   if (!s.ok()) {
     return s;
   }
   static const int kBufferSize = 8192;
-  char* space = new char[kBufferSize];
+  std::unique_ptr<uint8_t[]> space(new uint8_t[kBufferSize]);
   while (true) {
     Slice fragment;
-    s = file->Read(kBufferSize, &fragment, space);
+    s = file->Read(kBufferSize, &fragment, space.get());
     if (!s.ok()) {
       break;
     }
@@ -376,8 +386,112 @@ Status ReadFileToString(Env* env, const std::string& fname, std::string* data) {
       break;
     }
   }
-  delete[] space;
   return s;
+}
+
+Status EnvWrapper::NewSequentialFile(const std::string& f, std::unique_ptr<SequentialFile>* r,
+                                     const EnvOptions& options) {
+  return target_->NewSequentialFile(f, r, options);
+}
+
+Status EnvWrapper::NewRandomAccessFile(const std::string& f,
+                                       unique_ptr<RandomAccessFile>* r,
+                                       const EnvOptions& options) {
+  return target_->NewRandomAccessFile(f, r, options);
+}
+
+Status EnvWrapper::NewWritableFile(const std::string& f, unique_ptr<WritableFile>* r,
+                                   const EnvOptions& options) {
+  return target_->NewWritableFile(f, r, options);
+}
+
+Status EnvWrapper::ReuseWritableFile(const std::string& fname,
+                                     const std::string& old_fname,
+                                     unique_ptr<WritableFile>* r,
+                                     const EnvOptions& options) {
+  return target_->ReuseWritableFile(fname, old_fname, r, options);
+}
+
+Status EnvWrapper::NewDirectory(const std::string& name,
+                                unique_ptr<Directory>* result) {
+  return target_->NewDirectory(name, result);
+}
+
+Status EnvWrapper::FileExists(const std::string& f) {
+  return target_->FileExists(f);
+}
+
+Status EnvWrapper::GetChildren(const std::string& dir,
+                               std::vector<std::string>* r) {
+  return target_->GetChildren(dir, r);
+}
+
+Status EnvWrapper::GetChildrenFileAttributes(
+    const std::string& dir, std::vector<FileAttributes>* result) {
+  return target_->GetChildrenFileAttributes(dir, result);
+}
+
+Status EnvWrapper::DeleteFile(const std::string& f) {
+  return target_->DeleteFile(f);
+}
+
+Status EnvWrapper::CreateDir(const std::string& d) {
+  return target_->CreateDir(d);
+}
+
+Status EnvWrapper::CreateDirIfMissing(const std::string& d) {
+  return target_->CreateDirIfMissing(d);
+}
+
+Status EnvWrapper::DeleteDir(const std::string& d) {
+  return target_->DeleteDir(d);
+}
+
+Status EnvWrapper::GetFileSize(const std::string& f, uint64_t* s) {
+  return target_->GetFileSize(f, s);
+}
+
+Status EnvWrapper::GetFileModificationTime(const std::string& fname,
+                               uint64_t* file_mtime) {
+  return target_->GetFileModificationTime(fname, file_mtime);
+}
+
+Status EnvWrapper::RenameFile(const std::string& s, const std::string& t) {
+  return target_->RenameFile(s, t);
+}
+
+Status EnvWrapper::LinkFile(const std::string& s, const std::string& t) {
+  return target_->LinkFile(s, t);
+}
+
+Status EnvWrapper::LockFile(const std::string& f, FileLock** l) {
+  return target_->LockFile(f, l);
+}
+
+Status EnvWrapper::UnlockFile(FileLock* l) {
+  return target_->UnlockFile(l);
+}
+
+Status EnvWrapper::GetTestDirectory(std::string* path) {
+  return target_->GetTestDirectory(path);
+}
+
+Status EnvWrapper::NewLogger(const std::string& fname,
+                             shared_ptr<Logger>* result) {
+  return target_->NewLogger(fname, result);
+}
+
+Status EnvWrapper::GetHostName(char* name, uint64_t len) {
+  return target_->GetHostName(name, len);
+}
+
+Status EnvWrapper::GetCurrentTime(int64_t* unix_time) {
+  return target_->GetCurrentTime(unix_time);
+}
+
+Status EnvWrapper::GetAbsolutePath(const std::string& db_path,
+                                   std::string* output_path) {
+  return target_->GetAbsolutePath(db_path, output_path);
 }
 
 EnvWrapper::~EnvWrapper() {
@@ -413,6 +527,10 @@ EnvOptions Env::OptimizeForManifestWrite(const EnvOptions& env_options) const {
   return env_options;
 }
 
+Status Env::LinkFile(const std::string& src, const std::string& target) {
+  return STATUS(NotSupported, "LinkFile is not supported for this Env");
+}
+
 EnvOptions::EnvOptions(const DBOptions& options) {
   AssignEnvOptions(this, options);
 }
@@ -422,5 +540,32 @@ EnvOptions::EnvOptions() {
   AssignEnvOptions(this, options);
 }
 
+Status RocksDBFileFactoryWrapper::NewSequentialFile(
+    const std::string& f, unique_ptr<SequentialFile>* r,
+    const rocksdb::EnvOptions& options) {
+  return target_->NewSequentialFile(f, r, options);
+}
+Status RocksDBFileFactoryWrapper::NewRandomAccessFile(const std::string& f,
+                                                      unique_ptr <rocksdb::RandomAccessFile>* r,
+                                                      const EnvOptions& options) {
+  return target_->NewRandomAccessFile(f, r, options);
+}
+
+Status RocksDBFileFactoryWrapper::NewWritableFile(
+    const std::string& f, unique_ptr <rocksdb::WritableFile>* r,
+    const EnvOptions& options) {
+  return target_->NewWritableFile(f, r, options);
+}
+
+Status RocksDBFileFactoryWrapper::ReuseWritableFile(const std::string& fname,
+                                                    const std::string& old_fname,
+                                                    unique_ptr<WritableFile>* result,
+                                                    const EnvOptions& options) {
+  return target_->ReuseWritableFile(fname, old_fname, result, options);
+}
+
+Status RocksDBFileFactoryWrapper::GetFileSize(const std::string& fname, uint64_t* size) {
+  return target_->GetFileSize(fname, size);
+}
 
 }  // namespace rocksdb

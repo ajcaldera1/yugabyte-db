@@ -12,17 +12,18 @@
 //
 
 #include <atomic>
-#include <future>
 #include <mutex>
-#include <random>
 #include <stack>
 #include <thread>
 
+#include "yb/docdb/lock_batch.h"
 #include "yb/docdb/shared_lock_manager.h"
 
 #include "yb/rpc/thread_pool.h"
 
-#include "yb/util/random_util.h"
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/ref_cnt_buffer.h"
+#include "yb/util/result.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
@@ -30,14 +31,18 @@ using namespace std::literals;
 
 using std::string;
 using std::vector;
-using std::stack;
 using std::thread;
+
+DECLARE_bool(dump_lock_keys);
 
 namespace yb {
 namespace docdb {
 
-const RefCntPrefix kKey1("foo");
-const RefCntPrefix kKey2("bar");
+using dockv::IntentType;
+using dockv::IntentTypeSet;
+
+const RefCntPrefix kKey1("foo"s);
+const RefCntPrefix kKey2("bar"s);
 
 class SharedLockManagerTest : public YBTest {
  protected:
@@ -81,10 +86,10 @@ TEST_F(SharedLockManagerTest, LockBatchMoveConstructor) {
   EXPECT_FALSE(lb2.empty());
   ASSERT_OK(lb2.status());
 
-  // lb has been moved from and is now empty
-  EXPECT_EQ(0, lb.size());
-  EXPECT_TRUE(lb.empty());
-  ASSERT_OK(lb.status());
+  // lb has been moved from and is now empty.
+  EXPECT_EQ(0, lb.size()); // NOLINT(bugprone-use-after-move)
+  EXPECT_TRUE(lb.empty()); // NOLINT(bugprone-use-after-move)
+  ASSERT_OK(lb.status()); // NOLINT(bugprone-use-after-move)
 
   LockBatch lb_fail2(std::move(lb_fail));
   ASSERT_FALSE(lb_fail2.status().ok());
@@ -103,9 +108,9 @@ TEST_F(SharedLockManagerTest, LockBatchMoveAssignment) {
   EXPECT_FALSE(lb2.empty());
   ASSERT_OK(lb2.status());
 
-  // lb has been moved from and is now empty
-  EXPECT_EQ(0, lb.size());
-  EXPECT_TRUE(lb.empty());
+  // lb has been moved from and is now empty.
+  EXPECT_EQ(0, lb.size()); // NOLINT(bugprone-use-after-move)
+  EXPECT_TRUE(lb.empty()); // NOLINT(bugprone-use-after-move)
 
   LockBatch lb_fail2 = std::move(lb_fail);
   ASSERT_FALSE(lb_fail2.status().ok());
@@ -160,12 +165,15 @@ TEST_F(SharedLockManagerTest, QuickLockUnlock) {
 }
 
 TEST_F(SharedLockManagerTest, LockConflicts) {
-  rpc::ThreadPool tp(rpc::ThreadPoolOptions{"test_pool"s, 10, 1});
+  rpc::ThreadPool tp(rpc::ThreadPoolOptions{
+    .name = "test_pool"s,
+    .max_workers = 1,
+  });
 
-  for (size_t idx1 = 0; idx1 != kIntentTypeSetMapSize; ++idx1) {
+  for (size_t idx1 = 0; idx1 != dockv::kIntentTypeSetMapSize; ++idx1) {
     IntentTypeSet set1(idx1);
     SCOPED_TRACE(Format("Set1: $0", set1));
-    for (size_t idx2 = 0; idx2 != kIntentTypeSetMapSize; ++idx2) {
+    for (size_t idx2 = 0; idx2 != dockv::kIntentTypeSetMapSize; ++idx2) {
       IntentTypeSet set2(idx2);
       SCOPED_TRACE(Format("Set2: $0", set2));
       LockBatch lb1(&lm_, {{kKey1, set1}}, CoarseTimePoint::max());
@@ -182,6 +190,19 @@ TEST_F(SharedLockManagerTest, LockConflicts) {
   }
 
   tp.Shutdown();
+}
+
+TEST_F(SharedLockManagerTest, DumpKeys) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_dump_lock_keys) = true;
+
+  auto lb1 = TestLockBatch();
+  ASSERT_OK(lb1.status());
+  auto lb2 = TestLockBatch(CoarseMonoClock::now() + 10ms);
+  ASSERT_NOK(lb2.status());
+  ASSERT_STR_CONTAINS(
+      lb2.status().ToString(),
+      "[{ key: 666F6F intent_types: [kStrongRead, kStrongWrite] }, "
+      "{ key: 626172 intent_types: [kStrongRead, kStrongWrite] }]");
 }
 
 } // namespace docdb

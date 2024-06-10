@@ -12,24 +12,40 @@
 //
 
 #include "yb/master/system_tablet.h"
-#include "yb/server/hybrid_clock.h"
+
+#include "yb/common/common.pb.h"
+#include "yb/common/schema.h"
+#include "yb/common/transaction.h"
+
+#include "yb/docdb/doc_read_context.h"
+
+#include "yb/master/sys_catalog_constants.h"
+#include "yb/master/yql_virtual_table.h"
 
 namespace yb {
 namespace master {
 
 SystemTablet::SystemTablet(const Schema& schema, std::unique_ptr<YQLVirtualTable> yql_virtual_table,
                            const TabletId& tablet_id)
-    : schema_(schema),
+    : log_prefix_(Format("T $0: ", tablet_id)), // Don't have UUID here to log in T XX P YY format.
+      doc_read_context_(std::make_shared<docdb::DocReadContext>(
+          log_prefix_, TableType::YQL_TABLE_TYPE, docdb::Index::kFalse, schema,
+          kSysCatalogSchemaVersion)),
       yql_virtual_table_(std::move(yql_virtual_table)),
       tablet_id_(tablet_id) {
 }
 
-const Schema& SystemTablet::SchemaRef(const std::string& table_id) const {
+Result<docdb::DocReadContextPtr> SystemTablet::GetDocReadContext(
+    const std::string& table_id) const {
   // table_id is ignored. It should match the system table's id.
-  return schema_;
+  return GetDocReadContext();
 }
 
-const common::YQLStorageIf& SystemTablet::QLStorage() const {
+docdb::DocReadContextPtr SystemTablet::GetDocReadContext() const {
+  return doc_read_context_;
+}
+
+const YQLVirtualTable& SystemTablet::YQLTable() const {
   return *yql_virtual_table_;
 }
 
@@ -41,28 +57,23 @@ const TabletId& SystemTablet::tablet_id() const {
   return tablet_id_;
 }
 
-Status SystemTablet::RegisterReaderTimestamp(HybridTime read_point) {
-  return Status::OK();
-}
-
-void SystemTablet::UnregisterReader(HybridTime read_point) {
-  // NOOP.
-}
-
-HybridTime SystemTablet::DoGetSafeTime(
+Result<HybridTime> SystemTablet::DoGetSafeTime(
     tablet::RequireLease require_lease, HybridTime min_allowed, CoarseTimePoint deadline) const {
   // HybridTime doesn't matter for SystemTablets.
   return HybridTime::kMax;
 }
 
-Status SystemTablet::HandleQLReadRequest(CoarseTimePoint deadline,
-                                         const ReadHybridTime& read_time,
+Status SystemTablet::HandleQLReadRequest(const docdb::ReadOperationData& read_operation_data,
                                          const QLReadRequestPB& ql_read_request,
                                          const TransactionMetadataPB& transaction_metadata,
-                                         tablet::QLReadRequestResult* result) {
+                                         tablet::QLReadRequestResult* result,
+                                         WriteBuffer* rows_data) {
   DCHECK(!transaction_metadata.has_transaction_id());
-  return tablet::AbstractTablet::HandleQLReadRequest(
-      deadline, read_time, ql_read_request, boost::none, result);
+  // Passing empty ScopedRWOperation because we don't have underlying RocksDB here.
+  auto pending_op = ScopedRWOperation();
+  return AbstractTablet::HandleQLReadRequest(
+      read_operation_data, ql_read_request, TransactionOperationContext(), YQLTable(), pending_op,
+      result, rows_data, nullptr /* statistics */);
 }
 
 Status SystemTablet::CreatePagingStateForRead(const QLReadRequestPB& ql_read_request,

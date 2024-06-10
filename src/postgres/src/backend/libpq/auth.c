@@ -37,7 +37,15 @@
 #include "replication/walsender.h"
 #include "storage/ipc.h"
 #include "utils/backend_random.h"
+#include "utils/builtins.h"
 #include "utils/timestamp.h"
+
+#include "access/htup_details.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "commands/yb_profile.h"
+#include "pg_yb_utils.h"
+#include "utils/syscache.h"
+#include "yb/yql/pggate/ybc_pggate.h"
 
 
 /*----------------------------------------------------------------
@@ -46,9 +54,17 @@
  */
 static void sendAuthRequest(Port *port, AuthRequest areq, const char *extradata,
 				int extralen);
-static void auth_failed(Port *port, int status, char *logdetail);
+static void auth_failed(Port *port, int status, char *logdetail, bool lockout);
 static char *recv_password_packet(Port *port);
 
+/*
+ * GH #19781: FATAL or ERROR packet leads to a broken physical connection. Therefore,
+ * in auth passthrough, instead of FATAL/ERROR packet, WARNING packet along with
+ * FatalForLogicalConnection packet is used.
+ */
+static int YbAuthFailedErrorLevel(const bool auth_passthrough) {
+	return (YbIsClientYsqlConnMgr() && auth_passthrough == true) ? WARNING : FATAL;
+}
 
 /*----------------------------------------------------------------
  * Password-based authentication methods (password, md5, and scram-sha-256)
@@ -59,6 +75,8 @@ static int	CheckPWChallengeAuth(Port *port, char **logdetail);
 
 static int	CheckMD5Auth(Port *port, char *shadow_pass, char **logdetail);
 static int	CheckSCRAMAuth(Port *port, char *shadow_pass, char **logdetail);
+
+static int	CheckYbTserverKeyAuth(Port *port, char **logdetail);
 
 
 /*----------------------------------------------------------------
@@ -144,6 +162,8 @@ ULONG		(*__ldap_start_tls_sA) (
 
 static int	CheckLDAPAuth(Port *port);
 
+static char* get_ldap_password(char* ldapbindpasswd);
+
 /* LDAP_OPT_DIAGNOSTIC_MESSAGE is the newer spelling */
 #ifndef LDAP_OPT_DIAGNOSTIC_MESSAGE
 #define LDAP_OPT_DIAGNOSTIC_MESSAGE LDAP_OPT_ERROR_STRING
@@ -206,6 +226,11 @@ static int pg_SSPI_make_upn(char *accountname,
 static int	CheckRADIUSAuth(Port *port);
 static int	PerformRadiusTransaction(const char *server, const char *secret, const char *portstr, const char *identifier, const char *user_name, const char *passwd);
 
+/*----------------------------------------------------------------
+ * JWT Authentication
+ *----------------------------------------------------------------
+ */
+static int	YbCheckJwtAuth(Port *port);
 
 /*
  * Maximum accepted size of GSS and SSPI authentication tokens.
@@ -256,7 +281,7 @@ ClientAuthentication_hook_type ClientAuthentication_hook = NULL;
  * particular, if logdetail isn't NULL, we send that string to the log.
  */
 static void
-auth_failed(Port *port, int status, char *logdetail)
+auth_failed(Port *port, int status, char *logdetail, bool yb_role_is_locked_out)
 {
 	const char *errstr;
 	char	   *cdetail;
@@ -297,6 +322,10 @@ auth_failed(Port *port, int status, char *logdetail)
 			/* We use it to indicate if a .pgpass password failed. */
 			errcode_return = ERRCODE_INVALID_PASSWORD;
 			break;
+		case uaYbTserverKey:
+			errstr = gettext_noop("tserver key authentication failed for user \"%s\"");
+			errcode_return = ERRCODE_INVALID_PASSWORD;
+			break;
 		case uaGSS:
 			errstr = gettext_noop("GSSAPI authentication failed for user \"%s\"");
 			break;
@@ -318,22 +347,37 @@ auth_failed(Port *port, int status, char *logdetail)
 		case uaRADIUS:
 			errstr = gettext_noop("RADIUS authentication failed for user \"%s\"");
 			break;
+
+		case uaYbJWT:
+			errstr = gettext_noop("JWT authentication failed for user \"%s\"");
+			break;
+
 		default:
 			errstr = gettext_noop("authentication failed for user \"%s\": invalid authentication method");
 			break;
 	}
 
+	char *line_to_print = port->hba->maskedline;
+	if (!line_to_print)
+		line_to_print = port->hba->rawline;
+
 	cdetail = psprintf(_("Connection matched pg_hba.conf line %d: \"%s\""),
-					   port->hba->linenumber, port->hba->rawline);
+					   port->hba->linenumber, line_to_print);
 	if (logdetail)
 		logdetail = psprintf("%s\n%s", logdetail, cdetail);
 	else
 		logdetail = cdetail;
 
-	ereport(FATAL,
+	if (port->yb_is_auth_passthrough_req)
+		YbSendFatalForLogicalConnectionPacket();
+
+	ereport(YbAuthFailedErrorLevel(port->yb_is_auth_passthrough_req),
 			(errcode(errcode_return),
-			 errmsg(errstr, port->user_name),
-			 logdetail ? errdetail_log("%s", logdetail) : 0));
+			 (yb_role_is_locked_out ? errmsg("role \"%s\" is locked. Contact"
+											 " your database administrator.",
+											 port->user_name)
+									: errmsg(errstr, port->user_name)),
+			 (logdetail ? errdetail_log("%s", logdetail) : 0)));
 
 	/* doesn't return */
 }
@@ -348,6 +392,20 @@ ClientAuthentication(Port *port)
 {
 	int			status = STATUS_ERROR;
 	char	   *logdetail = NULL;
+
+	bool 		yb_auth_passthrough = port->yb_is_auth_passthrough_req;
+
+	if (yb_auth_passthrough)
+	{
+		/* Auth Passthrough can be enabled only for Ysql Connection Manager */
+		Assert(YbIsClientYsqlConnMgr());
+
+		/*
+		 * Connections from Ysql Connection Manager will never be of type
+		 * replication.
+		 */
+		Assert(am_walsender == false);
+	}
 
 	/*
 	 * Get the authentication method to use for this frontend/database
@@ -366,11 +424,28 @@ ClientAuthentication(Port *port)
 	 */
 	if (port->hba->clientcert)
 	{
+		if (YbIsClientYsqlConnMgr() && yb_auth_passthrough == true)
+		{
+			/*
+			 * Ysql Connection Manager does not know what is the
+			 * authentication type of a client, if authentication type is cert,
+			 * a FATAL packet is sent back to the Ysql Connection Manager.
+			 */
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
+					 errmsg("Cert authentication is not supported")));
+			return;
+		}
+
+
 		/* If we haven't loaded a root certificate store, fail */
 		if (!secure_loaded_verify_locations())
+		{
 			ereport(FATAL,
 					(errcode(ERRCODE_CONFIG_FILE_ERROR),
 					 errmsg("client certificates can only be checked if a root certificate store is available")));
+		}
+
 
 		/*
 		 * If we loaded a root certificate store, and if a certificate is
@@ -379,9 +454,11 @@ ClientAuthentication(Port *port)
 		 * already if it didn't verify ok.
 		 */
 		if (!port->peer_cert_valid)
+		{
 			ereport(FATAL,
 					(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 					 errmsg("connection requires a valid client certificate")));
+		}
 	}
 
 	/*
@@ -427,18 +504,26 @@ ClientAuthentication(Port *port)
 				else
 				{
 #ifdef USE_SSL
-					ereport(FATAL,
+					if (yb_auth_passthrough)
+						YbSendFatalForLogicalConnectionPacket();
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							 errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\", %s",
 									hostinfo, port->user_name,
 									port->database_name,
 									port->ssl_in_use ? _("SSL on") : _("SSL off"))));
+					return;
 #else
-					ereport(FATAL,
+					if (yb_auth_passthrough)
+						YbSendFatalForLogicalConnectionPacket();
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							 errmsg("pg_hba.conf rejects connection for host \"%s\", user \"%s\", database \"%s\"",
 									hostinfo, port->user_name,
 									port->database_name)));
+					return;
 #endif
 				}
 				break;
@@ -503,20 +588,28 @@ ClientAuthentication(Port *port)
 				else
 				{
 #ifdef USE_SSL
-					ereport(FATAL,
+					if (yb_auth_passthrough)
+						YbSendFatalForLogicalConnectionPacket();
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							 errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\", %s",
 									hostinfo, port->user_name,
 									port->database_name,
 									port->ssl_in_use ? _("SSL on") : _("SSL off")),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
+					return;
 #else
-					ereport(FATAL,
+					if (yb_auth_passthrough)
+						YbSendFatalForLogicalConnectionPacket();
+
+					ereport(YbAuthFailedErrorLevel(yb_auth_passthrough),
 							(errcode(ERRCODE_INVALID_AUTHORIZATION_SPECIFICATION),
 							 errmsg("no pg_hba.conf entry for host \"%s\", user \"%s\", database \"%s\"",
 									hostinfo, port->user_name,
 									port->database_name),
 							 HOSTNAME_LOOKUP_DETAIL(port)));
+					return;
 #endif
 				}
 				break;
@@ -561,6 +654,23 @@ ClientAuthentication(Port *port)
 			status = CheckPasswordAuth(port, &logdetail);
 			break;
 
+		case uaYbTserverKey:
+#ifdef HAVE_UNIX_SOCKETS
+			Assert(IsYugaByteEnabled());
+
+			if (YbIsClientYsqlConnMgr() && port->yb_is_auth_passthrough_req)
+			{
+				YbSendFatalForLogicalConnectionPacket();
+				elog(WARNING, "YbTserverKey authentication is not supported "
+							  " in auth passthrough");
+			}
+
+			status = CheckYbTserverKeyAuth(port, &logdetail);
+#else
+			Assert(false);
+#endif
+			break;
+
 		case uaPAM:
 #ifdef USE_PAM
 			status = CheckPAMAuth(port, port->user_name, "");
@@ -598,15 +708,72 @@ ClientAuthentication(Port *port)
 		case uaTrust:
 			status = STATUS_OK;
 			break;
+
+		case uaYbJWT:
+			status = YbCheckJwtAuth(port);
+			break;
 	}
 
 	if (ClientAuthentication_hook)
 		(*ClientAuthentication_hook) (port, status);
 
+
+	/*
+	 * If conditions are met, update the role's profile entry.  Specific
+	 * authentication methods are isolated from profile handling.
+	 */
+	if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist &&
+		IsProfileHandlingRequired(port->hba->auth_method))
+	{
+		bool profile_is_disabled = false;
+		HeapTuple roleTuple, profileTuple = NULL;
+		Oid roleid = InvalidOid;
+
+		/* Get role info from pg_authid */
+		roleTuple = SearchSysCache1(AUTHNAME, PointerGetDatum(port->user_name));
+		if (HeapTupleIsValid(roleTuple))
+		{
+			roleid = HeapTupleGetOid(roleTuple);
+			profileTuple = yb_get_role_profile_tuple_by_role_oid(roleid);
+			if (HeapTupleIsValid(profileTuple))
+			{
+				Form_pg_yb_role_profile rolprfform =
+					(Form_pg_yb_role_profile) GETSTRUCT(profileTuple);
+				if (rolprfform->rolprfstatus != YB_ROLPRFSTATUS_OPEN)
+					profile_is_disabled = true;
+			}
+			ReleaseSysCache(roleTuple);
+		}
+
+		if (status == STATUS_OK && !profile_is_disabled)
+		{
+			if (roleid != InvalidOid)
+				YbResetFailedAttemptsIfAllowed(roleid);
+			sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+
+			if (YbIsClientYsqlConnMgr() && yb_auth_passthrough)
+				YbCreateClientId();
+		}
+		else
+		{
+			/* Do not increment login attempts if no password was supplied */
+			if (roleid != InvalidOid && status != STATUS_EOF)
+				profile_is_disabled =
+					YbMaybeIncFailedAttemptsAndDisableProfile(roleid);
+			auth_failed(port, status, logdetail, profile_is_disabled);
+		}
+		return;
+	}
+
 	if (status == STATUS_OK)
+	{
 		sendAuthRequest(port, AUTH_REQ_OK, NULL, 0);
+
+		if (YbIsClientYsqlConnMgr() && yb_auth_passthrough)
+			YbCreateClientId();
+	}
 	else
-		auth_failed(port, status, logdetail);
+		auth_failed(port, status, logdetail, false /* yb_role_is_locked_out */);
 }
 
 
@@ -679,7 +846,7 @@ recv_password_packet(Port *port)
 	}
 
 	initStringInfo(&buf);
-	if (pq_getmessage(&buf, 1000))	/* receive password */
+	if (pq_getmessage(&buf, 0)) /* receive password */
 	{
 		/* EOF - pq_getmessage already logged a suitable message */
 		pfree(buf.data);
@@ -1016,6 +1183,39 @@ CheckSCRAMAuth(Port *port, char *shadow_pass, char **logdetail)
 	}
 
 	return STATUS_OK;
+}
+
+/*
+ * Yugabyte internal tserver to postgres key authentication.
+ */
+static int
+CheckYbTserverKeyAuth(Port *port, char **logdetail)
+{
+	char	   *passwd;
+	uint64_t	client_key;
+
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	passwd = recv_password_packet(port);
+	if (passwd == NULL)
+		return STATUS_EOF;		/* client wouldn't send password */
+	else
+	{
+		/* Convert client-supplied password string to uint64 key */
+		char *end;
+		errno = 0;
+		client_key = pg_strtouint64(passwd, &end, 10);
+		if (!(*passwd != '\0' && *end == '\0') || errno == ERANGE)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("auth key must be uint64")));
+		pfree(passwd);
+	}
+
+	uint64_t auth_key;
+	return yb_get_role_password(port->user_name, logdetail, &auth_key)
+		? yb_plain_key_verify(port->user_name, auth_key, client_key, logdetail)
+		: STATUS_ERROR;
 }
 
 
@@ -2615,9 +2815,13 @@ CheckLDAPAuth(Port *port)
 		 * Bind with a pre-defined username/password (if available) for
 		 * searching. If none is specified, this turns into an anonymous bind.
 		 */
+		char* hba_password = get_ldap_password(port->hba->ldapbindpasswd);
+
 		r = ldap_simple_bind_s(ldap,
 							   port->hba->ldapbinddn ? port->hba->ldapbinddn : "",
-							   port->hba->ldapbindpasswd ? port->hba->ldapbindpasswd : "");
+							   hba_password);
+		pfree(hba_password);
+
 		if (r != LDAP_SUCCESS)
 		{
 			ereport(LOG,
@@ -2639,6 +2843,7 @@ CheckLDAPAuth(Port *port)
 		else
 			filter = psprintf("(uid=%s)", port->user_name);
 
+		search_message = NULL;
 		r = ldap_search_s(ldap,
 						  port->hba->ldapbasedn,
 						  port->hba->ldapscope,
@@ -2653,6 +2858,8 @@ CheckLDAPAuth(Port *port)
 					(errmsg("could not search LDAP for filter \"%s\" on server \"%s\": %s",
 							filter, port->hba->ldapserver, ldap_err2string(r)),
 					 errdetail_for_ldap(ldap)));
+			if (search_message != NULL)
+				ldap_msgfree(search_message);
 			ldap_unbind(ldap);
 			pfree(passwd);
 			pfree(filter);
@@ -2778,6 +2985,24 @@ errdetail_for_ldap(LDAP *ldap)
 	return 0;
 }
 
+static char *
+get_ldap_password(char* ldapbindpasswd)
+{
+	/* Return password stored in YSQL_LDAP_BIND_PWD_ENV env var */
+	if (strncmp(ldapbindpasswd, "YSQL_LDAP_BIND_PWD_ENV", 22) == 0)
+	{
+		if (getenv("YSQL_LDAP_BIND_PWD_ENV") != NULL)
+		{
+			return pstrdup(getenv("YSQL_LDAP_BIND_PWD_ENV"));
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				errmsg("expected env variable YSQL_LDAP_BIND_PWD_ENV to be defined, got NULL")));
+	}
+
+	/* Return password as defined in hba.conf */
+	return pstrdup(ldapbindpasswd);
+}
 #endif							/* USE_LDAP */
 
 
@@ -3311,4 +3536,144 @@ PerformRadiusTransaction(const char *server, const char *secret, const char *por
 			continue;
 		}
 	}							/* while (true) */
+}
+
+/*----------------------------------------------------------------
+ * JWT authentication
+ *----------------------------------------------------------------
+ */
+
+static char *ybReadFile(const char *outer_filename, const char *inc_filename,
+						int elevel);
+
+static void
+ybGetJwtAuthOptionsFromPortAndJwks(Port *port, char *jwks,
+								   YBCPgJwtAuthOptions *opt)
+{
+	HbaLine	   *hba_line = port->hba;
+
+	opt->jwks = jwks;
+	opt->usermap = hba_line->usermap;
+	opt->username = port->user_name;
+
+	/* Use "sub" as the default matching claim key */
+	opt->matching_claim_key = hba_line->yb_jwt_matching_claim_key ?: "sub";
+
+	opt->allowed_issuers = (char **) YbPtrListToArray(
+		hba_line->yb_jwt_issuers, &opt->allowed_issuers_length);
+
+	opt->allowed_audiences = (char **) YbPtrListToArray(
+		hba_line->yb_jwt_audiences, &opt->allowed_audiences_length);
+}
+
+static int
+YbCheckJwtAuth(Port *port)
+{
+	char	   *jwt;
+	char	   *jwks;
+	int			auth_result;
+
+	/*
+	 * Read the jwks file before the password prompt so that we fail fast if we
+	 * fail to read the jwks file or the content is invalid.
+	 */
+	jwks = ybReadFile(HbaFileName, port->hba->yb_jwt_jwks_path, LOG);
+	if (jwks == NULL)
+		return STATUS_ERROR;
+
+	/* Send regular password request to client, and get the response */
+	sendAuthRequest(port, AUTH_REQ_PASSWORD, NULL, 0);
+
+	/* Interpret password as jwt */
+	jwt = recv_password_packet(port);
+	if (jwt == NULL)
+		return STATUS_EOF; /* client didn't send jwt */
+
+	/*
+	 * We are allocating a temporary array of char* for audiences and issuers
+	 * entries. We do that since there is no easy way to send the PG List to the
+	 * C++ layer.
+	 */
+	YBCPgJwtAuthOptions jwt_auth_options;
+	ybGetJwtAuthOptionsFromPortAndJwks(port, jwks, &jwt_auth_options);
+
+	YBCStatus s = YBCValidateJWT(jwt, &jwt_auth_options);
+	auth_result = (s) ? STATUS_ERROR : STATUS_OK;
+	if (s) /* !ok */
+	{
+		ereport(LOG,
+				(errmsg("JWT login failed with error: %s",
+						YBCStatusMessageBegin(s))));
+		YBCFreeStatus(s);
+	}
+
+	/* Free up the temporary arrays we made in YbJwtAuthOptionsFromHba */
+	pfree(jwt_auth_options.allowed_audiences);
+	pfree(jwt_auth_options.allowed_issuers);
+
+	pfree(jwks);
+	pfree(jwt);
+	return auth_result;
+}
+
+/*
+ * Reads the contents of the given file path. If the file path is a relative
+ * path, it is treated as relative to the directory of the provided
+ * outer_filename.
+ *
+ * An error is reported at elevel LOG if the file path is invalid,
+ * inaccessible or the contents are not in the database encoding.
+ *
+ * This function is derived from the tokenize_inc_file function from the
+ * src/postgres/src/backend/libpq/hba.c file. The tokenize_inc_file tokenizes
+ * the hba lines from an included file while this function just reads them.
+ */
+static char *
+ybReadFile(const char *outer_filename, const char *inc_filename, int elevel)
+{
+	char *file_fullname;
+	char *file_contents;
+	int len;
+
+	if (is_absolute_path(inc_filename))
+	{
+		/* absolute path is taken as-is */
+		file_fullname = pstrdup(inc_filename);
+	}
+	else
+	{
+		/* relative path is relative to dir of file from which the path was
+		 * referenced. */
+		file_fullname =
+			(char *) palloc(strlen(outer_filename) + 1 + strlen(inc_filename) + 1);
+		strcpy(file_fullname, outer_filename);
+		get_parent_directory(file_fullname);
+		join_path_components(file_fullname, file_fullname, inc_filename);
+		canonicalize_path(file_fullname);
+	}
+
+	file_contents = YbReadWholeFile(file_fullname, &len, elevel);
+	if (file_contents == NULL)
+	{
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	/*
+	 * Make sure the contents are valid.
+	 *
+	 * We use noError as true because we want to have control over the ereport
+	 * elevel in case of invalid file contents.
+	 */
+	if (!pg_verifymbstr(file_contents, len, /* noError */ true))
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_CHARACTER_NOT_IN_REPERTOIRE),
+				 errmsg("invalid encoding of file \"%s\"", inc_filename)));
+		pfree(file_fullname);
+		return NULL;
+	}
+
+	pfree(file_fullname);
+	return file_contents;
 }

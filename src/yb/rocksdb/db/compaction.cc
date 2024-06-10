@@ -32,12 +32,20 @@
 #include <algorithm>
 #include <vector>
 
+#include "yb/gutil/stl_util.h"
+
 #include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/db/column_family.h"
+#include "yb/rocksdb/db/compaction_picker.h"
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/util/logging.h"
-#include "yb/rocksdb/util/sync_point.h"
+
+#include "yb/util/format.h"
 #include "yb/util/logging.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/sync_point.h"
+
+using namespace yb::size_literals;
 
 namespace rocksdb {
 
@@ -59,10 +67,23 @@ LightweightBoundaries::LightweightBoundaries(Arena* arena,
     arena->AllocateAligned(sizeof(UserBoundaryTag) * num_user_values));
   user_values = reinterpret_cast<Slice*>(
     arena->AllocateAligned(sizeof(Slice) * num_user_values));
+  if (source.user_frontier) {
+    hybrid_time = source.user_frontier->GetHybridTimeAsUInt64();
+  }
   for (size_t i = 0; i != num_user_values; ++i) {
-    UserBoundaryValue& value = *source.user_values[i];
-    new (user_tags + i) UserBoundaryTag(value.Tag());
-    new (user_values + i) Slice(SliceDup(arena, value.Encode()));
+    const UserBoundaryValue& value = source.user_values[i];
+    new (user_tags + i) UserBoundaryTag(value.tag);
+    new (user_values + i) Slice(SliceDup(arena, value.AsSlice()));
+  }
+}
+
+FdWithBoundaries::FdWithBoundaries(Arena* arena, const FileMetaData& source)
+    : fd(source.fd), smallest(arena, source.smallest), largest(arena, source.largest) {
+  if (source.largest.user_frontier) {
+    auto filter = source.largest.user_frontier->FilterAsSlice();
+    if (!filter.empty()) {
+      user_filter_data = SliceDup(arena, filter);
+    }
   }
 }
 
@@ -200,6 +221,45 @@ bool Compaction::IsFullCompaction(
   return num_files_in_compaction == total_num_files;
 }
 
+std::unique_ptr<Compaction> Compaction::Create(
+    VersionStorageInfo* vstorage, const MutableCFOptions& _mutable_cf_options,
+    std::vector<CompactionInputFiles> inputs, int output_level, uint64_t target_file_size,
+    uint64_t max_grandparent_overlap_bytes, uint32_t output_path_id, CompressionType compression,
+    std::vector<FileMetaData*> grandparents, Logger* info_log, bool manual_compaction, double score,
+    bool deletion_compaction, CompactionReason compaction_reason) {
+  bool has_input_files = false;
+  for (auto& input : inputs) {
+    yb::EraseIf([info_log](FileMetaData* file) {
+      bool being_deleted = file->being_deleted;
+      if (being_deleted) {
+        RLOG(
+            InfoLogLevel::INFO_LEVEL, info_log,
+            yb::Format("Skipping compaction of file that is being deleted: $0", file).c_str());
+      }
+      return being_deleted;
+    }, &input.files);
+    has_input_files |= !input.empty();
+  }
+  if (!has_input_files) {
+    RLOG(
+        InfoLogLevel::INFO_LEVEL, info_log,
+        "Skipping compaction creation, no input files to compact");
+    return nullptr;
+  }
+  // We don't remove empty input levels, because empty input levels are handled differently
+  // than absent ones, for example by Compaction::IsTrivialMove.
+  // But we need to remove inputs[0] if it is empty and has level 0, otherwise
+  // Compaction::IsBottommostLevel will fail.
+  if (inputs[0].level == 0 && inputs[0].empty()) {
+    inputs.erase(inputs.begin());
+  }
+
+  return std::unique_ptr<Compaction>(new Compaction(
+      vstorage, _mutable_cf_options, inputs, output_level, target_file_size,
+      max_grandparent_overlap_bytes, output_path_id, compression, grandparents, manual_compaction,
+      score, deletion_compaction, compaction_reason));
+}
+
 Compaction::Compaction(VersionStorageInfo* vstorage,
                        const MutableCFOptions& _mutable_cf_options,
                        std::vector<CompactionInputFiles> _inputs,
@@ -232,9 +292,6 @@ Compaction::Compaction(VersionStorageInfo* vstorage,
       compaction_reason_(_compaction_reason) {
   seen_key_.store(false, std::memory_order_release);
   MarkFilesBeingCompacted(true);
-  if (is_manual_compaction_) {
-    compaction_reason_ = CompactionReason::kManualCompaction;
-  }
 
 #ifndef NDEBUG
   for (size_t i = 1; i < inputs_.size(); ++i) {
@@ -280,10 +337,10 @@ bool Compaction::InputCompressionMatchesOutput() const {
   bool matches = (GetCompressionType(*cfd_->ioptions(), start_level_,
                                      base_level) == output_compression_);
   if (matches) {
-    TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:Matches");
+    DEBUG_ONLY_TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:Matches");
     return true;
   }
-  TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:DidntMatch");
+  DEBUG_ONLY_TEST_SYNC_POINT("Compaction::InputCompressionMatchesOutput:DidntMatch");
   return matches;
 }
 

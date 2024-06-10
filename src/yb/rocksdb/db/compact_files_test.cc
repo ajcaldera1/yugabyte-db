@@ -18,7 +18,6 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
 #include <mutex>
 #include <string>
@@ -27,13 +26,16 @@
 
 #include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
-#include "yb/util/string_util.h"
-#include "yb/rocksdb/util/sync_point.h"
 #include "yb/rocksdb/util/testharness.h"
+#include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/string_util.h"
+#include "yb/util/sync_point.h"
+#include "yb/util/test_util.h"
 
 namespace rocksdb {
 
-class CompactFilesTest : public testing::Test {
+class CompactFilesTest : public RocksDBTest {
  public:
   CompactFilesTest() {
     env_ = Env::Default();
@@ -42,32 +44,6 @@ class CompactFilesTest : public testing::Test {
 
   std::string db_name_;
   Env* env_;
-};
-
-// A class which remembers the name of each flushed file.
-class FlushedFileCollector : public EventListener {
- public:
-  FlushedFileCollector() {}
-  ~FlushedFileCollector() {}
-
-  virtual void OnFlushCompleted(
-      DB* db, const FlushJobInfo& info) override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    flushed_files_.push_back(info.file_path);
-  }
-
-  std::vector<std::string> GetFlushedFiles() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    std::vector<std::string> result;
-    for (auto fname : flushed_files_) {
-      result.push_back(fname);
-    }
-    return result;
-  }
-
- private:
-  std::vector<std::string> flushed_files_;
-  std::mutex mutex_;
 };
 
 TEST_F(CompactFilesTest, ObsoleteFiles) {
@@ -85,19 +61,19 @@ TEST_F(CompactFilesTest, ObsoleteFiles) {
   options.compression = kNoCompression;
 
   // Add listener
-  FlushedFileCollector* collector = new FlushedFileCollector();
+  auto* collector = new test::FlushedFileCollector();
   options.listeners.emplace_back(collector);
 
   DB* db = nullptr;
-  DestroyDB(db_name_, options);
+  ASSERT_OK(DestroyDB(db_name_, options));
   Status s = DB::Open(options, db_name_, &db);
   assert(s.ok());
   assert(db);
 
   // create couple files
   for (int i = 1000; i < 2000; ++i) {
-    db->Put(WriteOptions(), ToString(i),
-            std::string(kWriteBufferSize / 10, 'a' + (i % 26)));
+    ASSERT_OK(db->Put(WriteOptions(), ToString(i),
+                      std::string(kWriteBufferSize / 10, 'a' + (i % 26))));
   }
 
   auto l0_files = collector->GetFlushedFiles();
@@ -119,29 +95,29 @@ TEST_F(CompactFilesTest, CapturingPendingFiles) {
   options.delete_obsolete_files_period_micros = 0;
 
   // Add listener.
-  FlushedFileCollector* collector = new FlushedFileCollector();
+  auto* collector = new test::FlushedFileCollector();
   options.listeners.emplace_back(collector);
 
   DB* db = nullptr;
-  DestroyDB(db_name_, options);
+  ASSERT_OK(DestroyDB(db_name_, options));
   Status s = DB::Open(options, db_name_, &db);
   assert(s.ok());
   assert(db);
 
   // Create 5 files.
   for (int i = 0; i < 5; ++i) {
-    db->Put(WriteOptions(), "key" + ToString(i), "value");
-    db->Flush(FlushOptions());
+    ASSERT_OK(db->Put(WriteOptions(), "key" + ToString(i), "value"));
+    ASSERT_OK(db->Flush(FlushOptions()));
   }
 
   auto l0_files = collector->GetFlushedFiles();
   EXPECT_EQ(5, l0_files.size());
 
-  rocksdb::SyncPoint::GetInstance()->LoadDependency({
+  yb::SyncPoint::GetInstance()->LoadDependency({
       {"CompactFilesImpl:2", "CompactFilesTest.CapturingPendingFiles:0"},
       {"CompactFilesTest.CapturingPendingFiles:1", "CompactFilesImpl:3"},
   });
-  rocksdb::SyncPoint::GetInstance()->EnableProcessing();
+  yb::SyncPoint::GetInstance()->EnableProcessing();
 
   // Start compacting files.
   std::thread compaction_thread(
@@ -149,13 +125,13 @@ TEST_F(CompactFilesTest, CapturingPendingFiles) {
 
   // In the meantime flush another file.
   TEST_SYNC_POINT("CompactFilesTest.CapturingPendingFiles:0");
-  db->Put(WriteOptions(), "key5", "value");
-  db->Flush(FlushOptions());
+  ASSERT_OK(db->Put(WriteOptions(), "key5", "value"));
+  ASSERT_OK(db->Flush(FlushOptions()));
   TEST_SYNC_POINT("CompactFilesTest.CapturingPendingFiles:1");
 
   compaction_thread.join();
 
-  rocksdb::SyncPoint::GetInstance()->DisableProcessing();
+  yb::SyncPoint::GetInstance()->DisableProcessing();
 
   delete db;
 
@@ -172,14 +148,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr,
-          "SKIPPED as DBImpl::CompactFiles is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

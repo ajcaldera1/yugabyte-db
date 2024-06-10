@@ -29,19 +29,15 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_USER_H
-#define YB_UTIL_USER_H
+#pragma once
 
 #include <string>
 
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
-// Get current logged-in user with getpwuid_r().
-// user name is written to user_name.
-Status GetLoggedInUser(std::string* user_name);
+// Returns current logged-in user.
+Result<std::string> GetLoggedInUser();
 
 } // namespace yb
-
-#endif // YB_UTIL_USER_H

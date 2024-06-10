@@ -200,11 +200,11 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	if (node->numCols > 0)
 	{
 		rustate->tempContext =
-			AllocSetContextCreate(CurrentMemoryContext,
+			AllocSetContextCreate(GetCurrentMemoryContext(),
 								  "RecursiveUnion",
 								  ALLOCSET_DEFAULT_SIZES);
 		rustate->tableContext =
-			AllocSetContextCreate(CurrentMemoryContext,
+			AllocSetContextCreate(GetCurrentMemoryContext(),
 								  "RecursiveUnion hash table",
 								  ALLOCSET_DEFAULT_SIZES);
 	}
@@ -230,7 +230,7 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 	 * RecursiveUnion nodes still have Result slots, which hold pointers to
 	 * tuples, so we have to initialize them.
 	 */
-	ExecInitResultTupleSlotTL(estate, &rustate->ps);
+	ExecInitResultTypeTL(&rustate->ps);
 
 	/*
 	 * Initialize result tuple type.  (Note: we have to set up the result type
@@ -254,7 +254,8 @@ ExecInitRecursiveUnion(RecursiveUnion *node, EState *estate, int eflags)
 		execTuplesHashPrepare(node->numCols,
 							  node->dupOperators,
 							  &rustate->eqfuncoids,
-							  &rustate->hashfunctions);
+							  &rustate->hashfunctions,
+							  NULL);
 		build_hash_table(rustate);
 	}
 
@@ -279,11 +280,6 @@ ExecEndRecursiveUnion(RecursiveUnionState *node)
 		MemoryContextDelete(node->tempContext);
 	if (node->tableContext)
 		MemoryContextDelete(node->tableContext);
-
-	/*
-	 * clean out the upper tuple table
-	 */
-	ExecClearTuple(node->ps.ps_ResultTupleSlot);
 
 	/*
 	 * close down subplans

@@ -11,12 +11,13 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_ALGORITHM_UTIL_H
-#define YB_UTIL_ALGORITHM_UTIL_H
+#pragma once
 
 #include <algorithm>
+#include <bitset>
+#include <type_traits>
 
-#include "yb/util/enums.h"
+#include <boost/container/small_vector.hpp>
 
 namespace yb {
 
@@ -37,6 +38,64 @@ void SortByKey(Iterator begin,
   });
 }
 
-};  // namespace yb
+// Returns an iterator pointing to last element that is <= k.
+// Returns map.end() if there are no such elements.
+//
+template <class Map, class Key>
+typename Map::const_iterator GetLastLessOrEqual(const Map& map, const Key& k) {
+  auto iter = map.upper_bound(k);
+  // iter is the first element > k.
+  if (iter == map.begin()) {
+    // All elements are > k => there are no elements that are <= k.
+    return map.end();
+  } else {
+    // Element previous to iter is the last element that <= k.
+    iter--;
+    return iter;
+  }
+}
 
-#endif  // YB_UTIL_ALGORITHM_UTIL_H
+template <class Col, class Extractor>
+bool IsMonotonic(const Col& collection, const Extractor& extractor) {
+  auto it = collection.begin();
+  auto end = collection.end();
+  if (it == end) {
+    return true;
+  }
+  auto prev = extractor(*it);
+  while (++it != end) {
+    auto next = extractor(*it);
+    if (next < prev) {
+      return false;
+    }
+    prev = next;
+  }
+  return true;
+}
+
+// Returns small vector of key and index pairs, sorted by extracted key.
+template <class Col, class Extractor>
+auto StableSorted(const Col& collection, const Extractor& extractor) {
+  struct Entry {
+    decltype(extractor(*collection.begin())) key;
+    decltype(collection.size()) original_index;
+    const std::remove_reference_t<decltype(*collection.begin())>* pointer;
+  };
+
+  boost::container::small_vector<Entry, 0x10> order;
+  order.reserve(collection.size());
+  decltype(collection.size()) index = 0;
+  for (const auto& value : collection) {
+    order.push_back(Entry {
+      .key = extractor(value),
+      .original_index = index++,
+      .pointer = &value,
+    });
+  }
+  std::sort(order.begin(), order.end(), [](const auto& lhs, const auto& rhs) {
+    return lhs.key < rhs.key || (lhs.key == rhs.key && lhs.original_index < rhs.original_index);
+  });
+  return order;
+}
+
+};  // namespace yb

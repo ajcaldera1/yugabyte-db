@@ -26,6 +26,7 @@
 
 #include "access/sysattr.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_type.h"
 #include "commands/dbcommands.h"
 #include "miscadmin.h"
@@ -154,6 +155,13 @@ parse_analyze_varparams(RawStmt *parseTree, const char *sourceText,
 	parse_variable_parameters(pstate, paramTypes, numParams);
 
 	query = transformTopLevelStmt(pstate, parseTree);
+
+	if (pstate->p_target_relation &&
+		pstate->p_target_relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP
+		&& IsYugaByteEnabled())
+	{
+		SetTxnWithPGRel();
+	}
 
 	/* make sure all is well with parameter types */
 	check_variable_parameters(pstate, query);
@@ -323,6 +331,16 @@ transformStmt(ParseState *pstate, Node *parseTree)
 			break;
 
 		case T_ExplainStmt:
+			/* Preemptively enable timing of storage-layer RPC requests in
+			 * case of Explain stmts. Enabling the timer here allows us to
+			 * capture system catalog requests that happen between the parse
+			 * phase and initialization of Explain context. If we discover in
+			 * the Explain context that the query has the timing option turned
+			 * off, this preemption reprsents a small but constant overhead of
+			 * invoking gettimeofday() twice per system catalog request in the
+			 * pg_analyze (and rewrite) phase. */
+			YbToggleSessionStatsTimer(true);
+
 			result = transformExplainStmt(pstate,
 										  (ExplainStmt *) parseTree);
 			break;
@@ -388,6 +406,10 @@ analyze_requires_snapshot(RawStmt *parseTree)
 		case T_CreateTableAsStmt:
 			/* yes, because we must analyze the contained statement */
 			result = true;
+			break;
+
+		case T_BackfillIndexStmt:
+			result = false;
 			break;
 
 		default:
@@ -860,7 +882,7 @@ transformInsertStmt(ParseState *pstate, InsertStmt *stmt)
 		qry->targetList = lappend(qry->targetList, tle);
 
 		rte->insertedCols = bms_add_member(rte->insertedCols,
-										   attr_num - FirstLowInvalidHeapAttributeNumber);
+										   attr_num - YBGetFirstLowInvalidAttributeNumber(pstate->p_target_relation));
 
 		icols = lnext(icols);
 		attnos = lnext(attnos);
@@ -2355,34 +2377,6 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist)
 							RelationGetRelationName(pstate->p_target_relation)),
 					 parser_errposition(pstate, origTarget->location)));
 
-		if (IsYBRelation(pstate->p_target_relation))
-		{
-
-			// Currently, YugaByte does not allow updating primary key columns that were specified
-			// when creating table.
-			YBCPgTableDesc ybc_tabledesc = NULL;
-			bool is_primary = false;
-			bool is_hash = false;
-			HandleYBStatus(YBCPgGetTableDesc(ybc_pg_session,
-											 YBCGetDatabaseOid(pstate->p_target_relation),
-											 RelationGetRelid(pstate->p_target_relation),
-											 &ybc_tabledesc));
-			HandleYBTableDescStatus(YBCPgGetColumnInfo(ybc_tabledesc,
-													   attrno,
-													   &is_primary,
-													   &is_hash), ybc_tabledesc);
-			HandleYBStatus(YBCPgDeleteTableDesc(ybc_tabledesc));
-			ybc_tabledesc = NULL;
-
-			if (is_hash || is_primary)
-			{
-				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("Update PRIMARY KEY columns are not yet supported"),
-						 errhint("Please contact YugaByte for its release schedule.")));
-			}
-		}
-
 		updateTargetListEntry(pstate, tle, origTarget->name,
 							  attrno,
 							  origTarget->indirection,
@@ -2390,7 +2384,7 @@ transformUpdateTargetList(ParseState *pstate, List *origTlist)
 
 		/* Mark the target column as requiring update permissions */
 		target_rte->updatedCols = bms_add_member(target_rte->updatedCols,
-												 attrno - FirstLowInvalidHeapAttributeNumber);
+												 attrno - YBGetFirstLowInvalidAttributeNumber(pstate->p_target_relation));
 
 		orig_tl = lnext(orig_tl);
 	}
@@ -2731,7 +2725,7 @@ CheckSelectLocking(Query *qry, LockClauseStrength strength)
 		  translator: %s is a SQL row locking clause such as FOR UPDATE */
 				 errmsg("%s is not allowed with DISTINCT clause",
 						LCS_asString(strength))));
-	if (qry->groupClause != NIL)
+	if (qry->groupClause != NIL || qry->groupingSets != NIL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*------
@@ -2796,13 +2790,22 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 
 	if (lockedRels == NIL)
 	{
-		/* all regular tables used in query */
+		/*
+		 * Lock all regular tables used in query and its subqueries.  We
+		 * examine inFromCl to exclude auto-added RTEs, particularly NEW/OLD
+		 * in rules.  This is a bit of an abuse of a mostly-obsolete flag, but
+		 * it's convenient.  We can't rely on the namespace mechanism that has
+		 * largely replaced inFromCl, since for example we need to lock
+		 * base-relation RTEs even if they are masked by upper joins.
+		 */
 		i = 0;
 		foreach(rt, qry->rtable)
 		{
 			RangeTblEntry *rte = (RangeTblEntry *) lfirst(rt);
 
 			++i;
+			if (!rte->inFromCl)
+				continue;
 			switch (rte->rtekind)
 			{
 				case RTE_RELATION:
@@ -2832,7 +2835,11 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 	}
 	else
 	{
-		/* just the named tables */
+		/*
+		 * Lock just the named tables.  As above, we allow locking any base
+		 * relation regardless of alias-visibility rules, so we need to
+		 * examine inFromCl to exclude OLD/NEW.
+		 */
 		foreach(l, lockedRels)
 		{
 			RangeVar   *thisrel = (RangeVar *) lfirst(l);
@@ -2853,6 +2860,8 @@ transformLockingClause(ParseState *pstate, Query *qry, LockingClause *lc,
 				RangeTblEntry *rte = (RangeTblEntry *) lfirst(rt);
 
 				++i;
+				if (!rte->inFromCl)
+					continue;
 				if (strcmp(rte->eref->aliasname, thisrel->relname) == 0)
 				{
 					switch (rte->rtekind)

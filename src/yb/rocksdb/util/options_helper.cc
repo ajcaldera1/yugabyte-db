@@ -17,17 +17,18 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/rocksdb/util/options_helper.h"
 
 #include <cassert>
-#include <cctype>
-#include <cstdlib>
-#include <unordered_set>
 #include <vector>
+
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/convenience.h"
+#include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/filter_policy.h"
+#include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/memtablerep.h"
 #include "yb/rocksdb/merge_operator.h"
 #include "yb/rocksdb/options.h"
@@ -36,12 +37,11 @@
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
 #include "yb/rocksdb/table/plain_table_factory.h"
-#include "yb/rocksdb/util/logging.h"
+
 #include "yb/util/string_util.h"
 
 namespace rocksdb {
 
-#ifndef ROCKSDB_LITE
 bool isSpecialChar(const char c) {
   if (c == '\\' || c == '#' || c == ':' || c == '\r' || c == '\n') {
     return true;
@@ -1234,16 +1234,6 @@ Status GetMemTableRepFactoryFromString(const std::string& opts_str,
     } else if (1 == len) {
       mem_factory = new VectorRepFactory();
     }
-  } else if (opts_list[0] == "cuckoo") {
-    // Expecting format
-    // cuckoo:<write_buffer_size>
-    if (2 == len) {
-      size_t write_buffer_size = ParseSizeT(opts_list[1]);
-      mem_factory = NewHashCuckooRepFactory(write_buffer_size);
-    } else if (1 == len) {
-      return STATUS(InvalidArgument, "Can't parse memtable_factory option ",
-                                     opts_str);
-    }
   } else {
     return STATUS(InvalidArgument, "Unrecognized memtable_factory option ",
                                    opts_str);
@@ -1476,5 +1466,4 @@ ColumnFamilyOptions BuildColumnFamilyOptions(
   return cf_opts;
 }
 
-#endif  // !ROCKSDB_LITE
 }  // namespace rocksdb

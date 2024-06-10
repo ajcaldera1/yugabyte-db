@@ -30,75 +30,86 @@
 // under the License.
 //
 
-#ifndef YB_TSERVER_REMOTE_BOOTSTRAP_CLIENT_TEST_H_
-#define YB_TSERVER_REMOTE_BOOTSTRAP_CLIENT_TEST_H_
+#pragma once
 
-#include "yb/tserver/remote_bootstrap-test-base.h"
+#include "yb/common/wire_protocol.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/quorum_util.h"
+
 #include "yb/gutil/strings/fastmem.h"
+
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
+
 #include "yb/tablet/tablet_bootstrap_if.h"
+
 #include "yb/tserver/remote_bootstrap_client.h"
+#include "yb/tserver/remote_bootstrap-test-base.h"
+
 #include "yb/util/env_util.h"
 #include "yb/util/net/net_util.h"
 
-using std::shared_ptr;
 
 namespace yb {
 namespace tserver {
 
 using consensus::GetRaftConfigLeader;
 using consensus::RaftPeerPB;
-using tablet::TabletMetadata;
+using tablet::RaftGroupMetadata;
+using tablet::RaftGroupMetadataPtr;
 using tablet::TabletStatusListener;
 
 class RemoteBootstrapClientTest : public RemoteBootstrapTest {
-  typedef YB_EDITION_NS_PREFIX RemoteBootstrapClient RemoteBootstrapClientClass;
  public:
   explicit RemoteBootstrapClientTest(TableType table_type = DEFAULT_TABLE_TYPE)
       : RemoteBootstrapTest(table_type) {}
 
-  virtual void SetUp() override {
+  void SetUp() override {
     RemoteBootstrapTest::SetUp();
 
     fs_manager_.reset(new FsManager(Env::Default(), GetTestPath("client_tablet"), "tserver_test"));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
-    ASSERT_OK(fs_manager_->Open());
+    ASSERT_OK(fs_manager_->CheckAndOpenFileSystemRoots());
 
     ASSERT_OK(tablet_peer_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10.0)));
     SetUpRemoteBootstrapClient();
   }
 
-  virtual void SetUpRemoteBootstrapClient() {
-    messenger_ = ASSERT_RESULT(
-        rpc::MessengerBuilder(CURRENT_TEST_NAME()).Build());
-    proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_);
+  void TearDown() override {
+    messenger_->Shutdown();
+    RemoteBootstrapTest::TearDown();
+  }
 
-    client_.reset(new RemoteBootstrapClientClass(GetTabletId(),
-                                                 fs_manager_.get(),
-                                                 fs_manager_->uuid()));
-    ASSERT_OK(GetRaftConfigLeader(tablet_peer_->consensus()
-        ->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED), &leader_));
+  virtual void SetUpRemoteBootstrapClient() {
+    messenger_ = ASSERT_RESULT(rpc::MessengerBuilder(CURRENT_TEST_NAME()).Build());
+    proxy_cache_ = std::make_unique<rpc::ProxyCache>(messenger_.get());
+
+    client_ = std::make_unique<RemoteBootstrapClient>(GetTabletId(), fs_manager_.get());
+    ASSERT_OK(GetRaftConfigLeader(
+        ASSERT_RESULT(tablet_peer_->GetConsensus())
+            ->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED),
+        &leader_));
 
     HostPort host_port = HostPortFromPB(leader_.last_known_private_addr()[0]);
-    ASSERT_OK(client_->Start(leader_.permanent_uuid(), proxy_cache_.get(), host_port, &meta_));
+    ASSERT_OK(client_->Start(leader_.permanent_uuid(), proxy_cache_.get(),
+        host_port, ServerRegistrationPB(), &meta_));
   }
 
  protected:
-  CHECKED_STATUS CompareFileContents(const string& path1, const string& path2);
+  Status CompareFileContents(const std::string& path1, const std::string& path2);
 
-  gscoped_ptr<FsManager> fs_manager_;
-  shared_ptr<rpc::Messenger> messenger_;
+  std::unique_ptr<FsManager> fs_manager_;
+  std::unique_ptr<rpc::Messenger> messenger_;
   std::unique_ptr<rpc::ProxyCache> proxy_cache_;
-  gscoped_ptr<RemoteBootstrapClientClass> client_;
-  scoped_refptr<TabletMetadata> meta_;
+  std::unique_ptr<RemoteBootstrapClient> client_;
+  RaftGroupMetadataPtr meta_;
   RaftPeerPB leader_;
 };
 
-Status RemoteBootstrapClientTest::CompareFileContents(const string& path1, const string& path2) {
-  shared_ptr<RandomAccessFile> file1, file2;
+Status RemoteBootstrapClientTest::CompareFileContents(
+    const std::string& path1, const std::string& path2) {
+  std::shared_ptr<RandomAccessFile> file1, file2;
   RETURN_NOT_OK(env_util::OpenFileForRandom(fs_manager_->env(), path1, &file1));
   RETURN_NOT_OK(env_util::OpenFileForRandom(fs_manager_->env(), path2, &file2));
 
@@ -124,5 +135,3 @@ Status RemoteBootstrapClientTest::CompareFileContents(const string& path1, const
 
 } // namespace tserver
 } // namespace yb
-
-#endif // YB_TSERVER_REMOTE_BOOTSTRAP_CLIENT_TEST_H_

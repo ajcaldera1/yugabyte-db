@@ -32,12 +32,17 @@
 
 #include <memory>
 #include <unordered_map>
+
 #include <boost/lexical_cast.hpp>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
+#include "yb/gutil/callback.h"
 #include "yb/gutil/map-util.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/tools/ysck.h"
+
 #include "yb/util/test_util.h"
 
 namespace yb {
@@ -49,6 +54,8 @@ using std::string;
 using std::unordered_map;
 using std::vector;
 using client::YBTableName;
+
+static const YBTableName kTableName(YQL_DATABASE_CQL, "test");
 
 class MockYsckTabletServer : public YsckTabletServer {
  public:
@@ -147,7 +154,7 @@ class YsckTest : public YBTest {
     shared_ptr<YsckTablet> tablet(new YsckTablet("1"));
     CreateAndFillTablet(tablet, 1, true);
 
-    CreateAndAddTable({ tablet }, YBTableName("test"), 1);
+    CreateAndAddTable({tablet}, kTableName, 1);
   }
 
   void CreateOneSmallReplicatedTable() {
@@ -161,7 +168,7 @@ class YsckTest : public YBTest {
       tablets.push_back(tablet);
     }
 
-    CreateAndAddTable(tablets, YBTableName("test"), num_replicas);
+    CreateAndAddTable(tablets, kTableName, num_replicas);
   }
 
   void CreateOneOneTabletReplicatedBrokenTable() {
@@ -171,12 +178,12 @@ class YsckTest : public YBTest {
     shared_ptr<YsckTablet> tablet(new YsckTablet("1"));
     CreateAndFillTablet(tablet, 2, false);
 
-    CreateAndAddTable({ tablet }, YBTableName("test"), 3);
+    CreateAndAddTable({tablet}, kTableName, 3);
   }
 
   void CreateAndAddTable(vector<shared_ptr<YsckTablet>> tablets,
                          const YBTableName& name, int num_replicas) {
-    shared_ptr<YsckTable> table(new YsckTable(name, Schema(), num_replicas,
+    shared_ptr<YsckTable> table(new YsckTable(/* id */ "", name, Schema(), num_replicas,
         TableType::YQL_TABLE_TYPE));
     table->set_tablets(tablets);
 

@@ -11,11 +11,12 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_MASTER_TSERVER_H
-#define YB_MASTER_MASTER_TSERVER_H
+#pragma once
 
+#include <future>
+
+#include "yb/tserver/tablet_peer_lookup.h"
 #include "yb/tserver/tablet_server_interface.h"
-#include "yb/util/metrics.h"
 
 namespace yb {
 namespace master {
@@ -36,19 +37,71 @@ class MasterTabletServer : public tserver::TabletServerIf,
   const scoped_refptr<MetricEntity>& MetricEnt() const override;
   rpc::Publisher* GetPublisher() override { return nullptr; }
 
-  CHECKED_STATUS GetTabletPeer(const std::string& tablet_id,
-                               std::shared_ptr<tablet::TabletPeer>* tablet_peer) const override;
+  Result<tablet::TabletPeerPtr> GetServingTablet(const TabletId& tablet_id) const override;
+  Result<tablet::TabletPeerPtr> GetServingTablet(const Slice& tablet_id) const override;
 
-  CHECKED_STATUS GetTabletStatus(const tserver::GetTabletStatusRequestPB* req,
-                                 tserver::GetTabletStatusResponsePB* resp) const override;
+  Status GetTabletStatus(const tserver::GetTabletStatusRequestPB* req,
+                         tserver::GetTabletStatusResponsePB* resp) const override;
+
+  bool LeaderAndReady(const TabletId& tablet_id, bool allow_stale = false) const override;
 
   const NodeInstancePB& NodeInstance() const override;
 
-  CHECKED_STATUS GetRegistration(ServerRegistrationPB* reg) const override;
+  Status GetRegistration(ServerRegistrationPB* reg) const override;
 
-  CHECKED_STATUS StartRemoteBootstrap(const consensus::StartRemoteBootstrapRequestPB& req) override;
+  Status StartRemoteBootstrap(const consensus::StartRemoteBootstrapRequestPB& req) override;
 
-  uint64_t ysql_catalog_version() const override;
+  // Get the global catalog versions.
+  void get_ysql_catalog_version(uint64_t* current_version,
+                                uint64_t* last_breaking_version) const override;
+  // Get the per-db catalog versions for database db_oid.
+  void get_ysql_db_catalog_version(uint32_t db_oid,
+                                   uint64_t* current_version,
+                                   uint64_t* last_breaking_version) const override;
+  Status get_ysql_db_oid_to_cat_version_info_map(
+      const tserver::GetTserverCatalogVersionInfoRequestPB& req,
+      tserver::GetTserverCatalogVersionInfoResponsePB *resp) const override;
+
+  client::TransactionPool& TransactionPool() override;
+
+  tserver::TServerSharedData& SharedObject() override;
+
+  const std::shared_future<client::YBClient*>& client_future() const override;
+
+  Status GetLiveTServers(
+      std::vector<master::TSInformationPB> *live_tservers) const override;
+
+  virtual Result<std::vector<client::internal::RemoteTabletServerPtr>>
+      GetRemoteTabletServers() const override;
+
+  virtual Result<std::vector<client::internal::RemoteTabletServerPtr>>
+      GetRemoteTabletServers(const std::unordered_set<std::string>& ts_uuids) const override;
+
+  const std::shared_ptr<MemTracker>& mem_tracker() const override;
+
+  void SetPublisher(rpc::Publisher service) override;
+
+  void SetCQLServer(yb::server::RpcAndWebServerBase* server,
+      server::YCQLStatementStatsProvider* stmt_provider) override {
+    LOG_WITH_FUNC(FATAL) << "should not be called on the master";
+  }
+
+  void RegisterCertificateReloader(tserver::CertificateReloader reloader) override {}
+
+  rpc::Messenger* GetMessenger(ash::Component component) const override;
+
+  std::shared_ptr<cdc::CDCServiceImpl> GetCDCService() const override {
+    // We don't have a CDC service on master, so return null from here.
+    // The caller is expected to do a null check.
+    return nullptr;
+  }
+
+  void ClearAllMetaCachesOnServer() override;
+
+  Status YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
+      tserver::PgYCQLStatementStatsResponsePB* resp) const override;
+
+  virtual Result<std::vector<tablet::TabletStatusPB>> GetLocalTabletsMetadata() const override;
 
  private:
   Master* master_ = nullptr;
@@ -57,4 +110,3 @@ class MasterTabletServer : public tserver::TabletServerIf,
 
 } // namespace master
 } // namespace yb
-#endif // YB_MASTER_MASTER_TSERVER_H

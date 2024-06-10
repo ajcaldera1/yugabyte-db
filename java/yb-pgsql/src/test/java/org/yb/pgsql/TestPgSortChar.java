@@ -17,12 +17,12 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import static org.yb.AssertionWrappers.*;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
-public class TestPgSortChar extends BasePgSortingOrder {
+@RunWith(value=YBTestRunner.class)
+public class TestPgSortChar extends BasePgSortingOrderTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgSortNumeric.class);
 
   // All typename MUST be in upper case for comparison purpose.
@@ -54,9 +54,12 @@ public class TestPgSortChar extends BasePgSortingOrder {
     { "NULL" }
   };
 
-  // Testing sorting order for the listed numeric types.
+  // Testing sorting order for the listed types.
   @Test
-  public void testSortChar() throws Exception {
-    RunTest(testTypes, testValues, testInvalidValues);
+  public void testSort() throws Exception {
+    runSortingOrderTest(testTypes, testValues, testInvalidValues);
+
+    // Test invalid type names.
+    createTablesWithInvalidPrimaryKey("BIT", "VARBIT", "TSQUERY", "TSVECTOR");
   }
 }

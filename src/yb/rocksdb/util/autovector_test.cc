@@ -17,15 +17,14 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
-#include <atomic>
-#include <iostream>
+#include <string>
 #include <utility>
+
+#include <gtest/gtest.h>
 
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/util/string_util.h"
-#include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 
 namespace rocksdb {
@@ -34,15 +33,13 @@ namespace rocksdb {
 // But we'll probably replace it with boost::small_vector.
 using namespace std; // NOLINT
 
-class AutoVectorTest : public testing::Test {};
+class AutoVectorTest : public RocksDBTest {};
 const size_t kSize = 8;
 
 namespace {
 template <class T>
 void AssertAutoVectorOnlyInStack(autovector<T, kSize>* vec, bool result) {
-#ifndef ROCKSDB_LITE
   ASSERT_EQ(vec->only_in_stack(), result);
-#endif  // !ROCKSDB_LITE
 }
 }  // namespace
 
@@ -125,9 +122,7 @@ void AssertEqual(
     const autovector<size_t, kSize>& a, const autovector<size_t, kSize>& b) {
   ASSERT_EQ(a.size(), b.size());
   ASSERT_EQ(a.empty(), b.empty());
-#ifndef ROCKSDB_LITE
   ASSERT_EQ(a.only_in_stack(), b.only_in_stack());
-#endif  // !ROCKSDB_LITE
   for (size_t i = 0; i < a.size(); ++i) {
     ASSERT_EQ(a[i], b[i]);
   }

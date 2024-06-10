@@ -20,6 +20,7 @@ import org.junit.runner.RunWith;
 import org.yb.YBTestRunner;
 import org.yb.cql.BaseCQLTest;
 import org.yb.minicluster.IOMetrics;
+import org.yb.minicluster.MiniYBClusterBuilder;
 import org.yb.minicluster.MiniYBDaemon;
 
 import java.util.Iterator;
@@ -31,6 +32,19 @@ import static org.yb.AssertionWrappers.assertTrue;
 
 @RunWith(value=YBTestRunner.class)
 public class TestSparkLocality extends BaseCQLTest {
+  @Override
+  protected void customizeMiniClusterBuilder(MiniYBClusterBuilder builder) {
+      super.customizeMiniClusterBuilder(builder);
+      // Disable the system.partitions vtable refresh bg thread.
+      builder.yqlSystemPartitionsVtableRefreshSecs(0);
+  }
+
+  @Override
+  protected void resetSettings() {
+    super.resetSettings();
+    // Disable the system query cache for spark tests.
+    systemQueryCacheUpdateMs = 0;
+  }
 
   // Timeout to wait for load balancing to complete.
   private static final int LOADBALANCE_TIMEOUT_MS = 120000; // 2 mins
@@ -50,9 +64,10 @@ public class TestSparkLocality extends BaseCQLTest {
     // Setup input table.
     session.execute("CREATE KEYSPACE ybdemo_keyspace");
     session.execute("USE ybdemo_keyspace");
-    session.execute("CREATE TABLE CassandraKeyValue(k text primary key, v blob)");
+    session.execute("CREATE TABLE CassandraKeyValue(k text primary key, v1 blob, v2 jsonb)");
     for (int i = 0; i < ROWS_COUNT; i++) {
-      session.execute("INSERT INTO CassandraKeyValue(k,v) VALUES('" + i + "', 0xabcdef012345)");
+      session.execute("INSERT INTO CassandraKeyValue(k, v1, v2) VALUES" +
+                              "('" + i + "', 0xabcdef012345, '{\"a\" : "+ i +" }')");
     }
 
     // Set up the app.
@@ -61,6 +76,9 @@ public class TestSparkLocality extends BaseCQLTest {
 
     // Wait for load-balancing to complete to reduce chance of load-balancing affecting locality.
     miniCluster.getClient().waitForLoadBalance(LOADBALANCE_TIMEOUT_MS, NUM_TABLET_SERVERS);
+
+    // Wait for load-balancing to become idle.
+    miniCluster.getClient().waitForLoadBalancerIdle(LOADBALANCE_TIMEOUT_MS);
 
     // Get the initial metrics.
     Map<MiniYBDaemon, IOMetrics> initialMetrics = getTSMetrics();

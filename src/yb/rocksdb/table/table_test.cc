@@ -25,20 +25,21 @@
 #include <stdio.h>
 
 #include <algorithm>
-#include <iostream>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <boost/optional.hpp>
+#include <gtest/gtest.h>
+
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/write_batch_internal.h"
 #include "yb/rocksdb/db/writebuffer.h"
-#include "yb/rocksdb/memtable/stl_wrappers.h"
-#include "yb/rocksdb/cache.h"
-#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/env.h"
+#include "yb/rocksdb/filter_policy.h"
+#include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/memtablerep.h"
 #include "yb/rocksdb/perf_context.h"
@@ -57,12 +58,20 @@
 #include "yb/rocksdb/table/plain_table_factory.h"
 #include "yb/rocksdb/table/scoped_arena_iterator.h"
 #include "yb/rocksdb/util/compression.h"
+#include "yb/rocksdb/util/file_reader_writer.h"
+#include "yb/rocksdb/util/logging.h"
 #include "yb/rocksdb/util/random.h"
 #include "yb/rocksdb/util/statistics.h"
-#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
+
 #include "yb/util/enums.h"
+#include "yb/util/string_util.h"
+#include "yb/util/test_macros.h"
+
+using std::unique_ptr;
+
+using namespace std::literals;
 
 DECLARE_double(cache_single_touch_ratio);
 
@@ -89,7 +98,7 @@ class ReverseKeyComparator : public Comparator {
     return "rocksdb.ReverseBytewiseComparator";
   }
 
-  int Compare(const Slice& a, const Slice& b) const override {
+  int Compare(Slice a, Slice b) const override {
     return BytewiseComparator()->Compare(Reverse(a), Reverse(b));
   }
 
@@ -186,7 +195,8 @@ class Constructor {
 
 class BlockConstructor: public Constructor {
  public:
-  explicit BlockConstructor(const Comparator* cmp)
+  explicit BlockConstructor(
+      const Comparator* cmp)
       : Constructor(cmp),
         comparator_(cmp),
         block_(nullptr) { }
@@ -200,9 +210,10 @@ class BlockConstructor: public Constructor {
                             const stl_wrappers::KVMap& kv_map) override {
     delete block_;
     block_ = nullptr;
-    BlockBuilder builder(table_options.block_restart_interval);
+    BlockBuilder builder(
+        table_options.block_restart_interval, table_options.data_block_key_value_encoding_format);
 
-    for (const auto kv : kv_map) {
+    for (const auto& kv : kv_map) {
       builder.Add(kv.first, kv.second);
     }
     // Open the block
@@ -211,14 +222,16 @@ class BlockConstructor: public Constructor {
     contents.data = data_;
     contents.cachable = false;
     block_ = new Block(std::move(contents));
+    key_value_encoding_format_ = table_options.data_block_key_value_encoding_format;
     return Status::OK();
   }
   InternalIterator* NewIterator() const override {
-    return block_->NewIterator(comparator_);
+    return block_->NewIterator(comparator_, key_value_encoding_format_);
   }
 
  private:
   const Comparator* comparator_;
+  KeyValueEncodingFormat key_value_encoding_format_;
   std::string data_;
   Block* block_;
 
@@ -226,11 +239,12 @@ class BlockConstructor: public Constructor {
 };
 
 // A helper class that converts internal format keys into user keys
-class KeyConvertingIterator : public InternalIterator {
+class KeyConvertingIterator final : public InternalIterator {
  public:
   explicit KeyConvertingIterator(InternalIterator* iter,
                                  bool arena_mode = false)
       : iter_(iter), arena_mode_(arena_mode) {}
+
   virtual ~KeyConvertingIterator() {
     if (arena_mode_) {
       iter_->~InternalIterator();
@@ -238,29 +252,51 @@ class KeyConvertingIterator : public InternalIterator {
       delete iter_;
     }
   }
-  bool Valid() const override { return iter_->Valid(); }
-  void Seek(const Slice& target) override {
+
+  const KeyValueEntry& Seek(Slice target) override {
     ParsedInternalKey ikey(target, kMaxSequenceNumber, kTypeValue);
     std::string encoded;
     AppendInternalKey(&encoded, ikey);
     iter_->Seek(encoded);
+    return Entry();
   }
-  void SeekToFirst() override { iter_->SeekToFirst(); }
-  void SeekToLast() override { iter_->SeekToLast(); }
-  void Next() override { iter_->Next(); }
-  void Prev() override { iter_->Prev(); }
 
-  Slice key() const override {
-    assert(Valid());
+  const KeyValueEntry& SeekToFirst() override {
+    iter_->SeekToFirst();
+    return Entry();
+  }
+
+  const KeyValueEntry& SeekToLast() override {
+    iter_->SeekToLast();
+    return Entry();
+  }
+
+  const KeyValueEntry& Next() override {
+    iter_->Next();
+    return Entry();
+  }
+
+  const KeyValueEntry& Prev() override {
+    iter_->Prev();
+    return Entry();
+  }
+
+  const KeyValueEntry& Entry() const override {
+    const auto& res = iter_->Entry();
+    if (!res) {
+      return KeyValueEntry::Invalid();
+    }
     ParsedInternalKey parsed_key;
     if (!ParseInternalKey(iter_->key(), &parsed_key)) {
       status_ = STATUS(Corruption, "malformed internal key");
-      return Slice("corrupted key");
+      entry_.key = Slice("corrupted key");
+    } else {
+      entry_.key = parsed_key.user_key;
     }
-    return parsed_key.user_key;
+    entry_.value = res.value;
+    return entry_;
   }
 
-  Slice value() const override { return iter_->value(); }
   Status status() const override {
     return status_.ok() ? iter_->status() : status_;
   }
@@ -269,6 +305,7 @@ class KeyConvertingIterator : public InternalIterator {
   mutable Status status_;
   InternalIterator* iter_;
   bool arena_mode_;
+  mutable KeyValueEntry entry_;
 
   // No copying allowed
   KeyConvertingIterator(const KeyConvertingIterator&);
@@ -291,9 +328,8 @@ class TableConstructor: public Constructor {
     Reset();
     soptions.use_mmap_reads = ioptions.allow_mmap_reads;
     file_writer_.reset(test::GetWritableFileWriter(new test::StringSink()));
-    unique_ptr<TableBuilder> builder;
     IntTblPropCollectorFactories int_tbl_prop_collector_factories;
-    builder.reset(ioptions.table_factory->NewTableBuilder(
+    auto builder = ioptions.table_factory->NewTableBuilder(
         TableBuilderOptions(ioptions,
                             internal_comparator,
                             int_tbl_prop_collector_factories,
@@ -301,9 +337,13 @@ class TableConstructor: public Constructor {
                             CompressionOptions(),
                             /* skip_filters */ false),
         TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
-        file_writer_.get()));
+        file_writer_.get());
+    if (TEST_skip_writing_key_value_encoding_format) {
+      dynamic_cast<BlockBasedTableBuilder*>(builder.get())
+          ->TEST_skip_writing_key_value_encoding_format();
+    }
 
-    for (const auto kv : kv_map) {
+    for (const auto& kv : kv_map) {
       if (convert_to_internal_key_) {
         ParsedInternalKey ikey(kv.first, kMaxSequenceNumber, kTypeValue);
         std::string encoded;
@@ -315,7 +355,7 @@ class TableConstructor: public Constructor {
       EXPECT_TRUE(builder->status().ok());
     }
     Status s = builder->Finish();
-    file_writer_->Flush();
+    RETURN_NOT_OK(file_writer_->Flush());
     EXPECT_TRUE(s.ok()) << s.ToString();
 
     EXPECT_EQ(GetSink()->contents().size(), builder->TotalFileSize());
@@ -363,6 +403,8 @@ class TableConstructor: public Constructor {
   TableProperties GetTableProperties() const {
     return table_properties_;
   }
+
+  bool TEST_skip_writing_key_value_encoding_format = false;
 
  private:
   void Reset() {
@@ -418,8 +460,10 @@ class MemTableConstructor: public Constructor {
                              write_buffer_, kMaxSequenceNumber);
     memtable_->Ref();
     int seq = 1;
-    for (const auto kv : kv_map) {
-      memtable_->Add(seq, kTypeValue, kv.first, kv.second);
+    for (const auto& kv : kv_map) {
+      Slice key(kv.first);
+      Slice value(kv.second);
+      memtable_->Add(seq, kTypeValue, SliceParts(&key, 1), SliceParts(&value, 1));
       seq++;
     }
     return Status::OK();
@@ -445,18 +489,43 @@ class MemTableConstructor: public Constructor {
 class InternalIteratorFromIterator : public InternalIterator {
  public:
   explicit InternalIteratorFromIterator(Iterator* it) : it_(it) {}
-  bool Valid() const override { return it_->Valid(); }
-  void Seek(const Slice& target) override { it_->Seek(target); }
-  void SeekToFirst() override { it_->SeekToFirst(); }
-  void SeekToLast() override { it_->SeekToLast(); }
-  void Next() override { it_->Next(); }
-  void Prev() override { it_->Prev(); }
-  Slice key() const override { return it_->key(); }
-  Slice value() const override { return it_->value(); }
+
+  const KeyValueEntry& Seek(Slice target) override {
+    it_->Seek(target);
+    return Entry();
+  }
+  const KeyValueEntry& SeekToFirst() override {
+    it_->SeekToFirst();
+    return Entry();
+  }
+  const KeyValueEntry& SeekToLast() override {
+    it_->SeekToLast();
+    return Entry();
+  }
+
+  const KeyValueEntry& Next() override {
+    it_->Next();
+    return Entry();
+  }
+
+  const KeyValueEntry& Prev() override {
+    it_->Prev();
+    return Entry();
+  }
+
+  const KeyValueEntry& Entry() const override {
+    const auto& entry = it_->Entry();
+    if (!entry) {
+      return KeyValueEntry::Invalid();
+    }
+    return entry_ = entry;
+  }
+
   Status status() const override { return it_->status(); }
 
  private:
   unique_ptr<Iterator> it_;
+  mutable KeyValueEntry entry_;
 };
 
 class DBConstructor: public Constructor {
@@ -478,7 +547,7 @@ class DBConstructor: public Constructor {
     delete db_;
     db_ = nullptr;
     NewDB();
-    for (const auto kv : kv_map) {
+    for (const auto& kv : kv_map) {
       WriteBatch batch;
       batch.Put(kv.first, kv.second);
       EXPECT_TRUE(db_->Write(WriteOptions(), &batch).ok());
@@ -514,11 +583,9 @@ class DBConstructor: public Constructor {
 
 enum TestType {
   BLOCK_BASED_TABLE_TEST,
-#ifndef ROCKSDB_LITE
   PLAIN_TABLE_SEMI_FIXED_PREFIX,
   PLAIN_TABLE_FULL_STR_PREFIX,
   PLAIN_TABLE_TOTAL_ORDER,
-#endif  // !ROCKSDB_LITE
   BLOCK_TEST,
   MEMTABLE_TEST,
   DB_TEST
@@ -537,11 +604,9 @@ static std::vector<TestArgs> GenerateArgList() {
   std::vector<TestArgs> test_args;
   std::vector<TestType> test_types = {
       BLOCK_BASED_TABLE_TEST,
-#ifndef ROCKSDB_LITE
       PLAIN_TABLE_SEMI_FIXED_PREFIX,
       PLAIN_TABLE_FULL_STR_PREFIX,
       PLAIN_TABLE_TOTAL_ORDER,
-#endif  // !ROCKSDB_LITE
       BLOCK_TEST,
       MEMTABLE_TEST, DB_TEST};
   std::vector<bool> reverse_compare_types = {false, true};
@@ -574,7 +639,6 @@ static std::vector<TestArgs> GenerateArgList() {
 
   for (auto test_type : test_types) {
     for (auto reverse_compare : reverse_compare_types) {
-#ifndef ROCKSDB_LITE
       if (test_type == PLAIN_TABLE_SEMI_FIXED_PREFIX ||
           test_type == PLAIN_TABLE_FULL_STR_PREFIX ||
           test_type == PLAIN_TABLE_TOTAL_ORDER) {
@@ -590,7 +654,6 @@ static std::vector<TestArgs> GenerateArgList() {
         test_args.push_back(one_arg);
         continue;
       }
-#endif  // !ROCKSDB_LITE
 
       for (auto restart_interval : restart_intervals) {
         for (auto compression_type : compression_types) {
@@ -639,7 +702,7 @@ class FixedOrLessPrefixTransform : public SliceTransform {
   }
 };
 
-class HarnessTest : public testing::Test {
+class HarnessTest : public RocksDBTest {
  public:
   HarnessTest()
       : ioptions_(options_),
@@ -675,8 +738,6 @@ class HarnessTest : public testing::Test {
             new BlockBasedTableFactory(table_options_));
         constructor_ = new TableConstructor(options_.comparator);
         break;
-// Plain table is not supported in ROCKSDB_LITE
-#ifndef ROCKSDB_LITE
       case PLAIN_TABLE_SEMI_FIXED_PREFIX:
         support_prev_ = false;
         only_support_prefix_seek_ = true;
@@ -713,7 +774,6 @@ class HarnessTest : public testing::Test {
         internal_comparator_.reset(
             new InternalKeyComparator(options_.comparator));
         break;
-#endif  // !ROCKSDB_LITE
       case BLOCK_TEST:
         table_options_.block_size = 256;
         options_.table_factory.reset(
@@ -767,6 +827,7 @@ class HarnessTest : public testing::Test {
       iter->Next();
     }
     ASSERT_TRUE(!iter->Valid());
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -785,6 +846,7 @@ class HarnessTest : public testing::Test {
       iter->Prev();
     }
     ASSERT_TRUE(!iter->Valid());
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -858,6 +920,7 @@ class HarnessTest : public testing::Test {
         }
       }
     }
+    ASSERT_OK(iter->status());
     if (constructor_->IsArenaMode() && !constructor_->AnywayDeleteIterator()) {
       iter->~InternalIterator();
     } else {
@@ -885,7 +948,7 @@ class HarnessTest : public testing::Test {
 
   std::string ToString(const InternalIterator* it) {
     if (!it->Valid()) {
-      return "END";
+      return it->status().ok() ? "END" : "Error: " + it->status().ToString();
     } else {
       return "'" + it->key().ToString() + "->" + it->value().ToString() + "'";
     }
@@ -945,7 +1008,7 @@ static bool Between(uint64_t val, uint64_t low, uint64_t high) {
 }
 
 // Tests against all kinds of tables
-class TableTest : public testing::Test {
+class TableTest : public RocksDBTest {
  public:
   const InternalKeyComparatorPtr& GetPlainInternalComparator(
       const Comparator* comp) {
@@ -966,7 +1029,7 @@ class TableTest : public testing::Test {
 class GeneralTableTest : public TableTest {};
 class BlockBasedTableTest : public TableTest {};
 class PlainTableTest : public TableTest {};
-class TablePropertyTest : public testing::Test {};
+class TablePropertyTest : public RocksDBTest {};
 
 // This test serves as the living tutorial for the prefix scan of user collected
 // properties.
@@ -982,7 +1045,7 @@ TEST_F(TablePropertyTest, PrefixScanTest) {
                                 {"num.555.3", "3"}, };
 
   // prefixes that exist
-  for (const std::string& prefix : {"num.111", "num.333", "num.555"}) {
+  for (auto prefix : {"num.111"s, "num.333"s, "num.555"s}) {
     int num = 0;
     for (auto pos = props.lower_bound(prefix);
          pos != props.end() &&
@@ -997,8 +1060,7 @@ TEST_F(TablePropertyTest, PrefixScanTest) {
   }
 
   // prefixes that don't exist
-  for (const std::string& prefix :
-       {"num.000", "num.222", "num.444", "num.666"}) {
+  for (auto prefix : {"num.000"s, "num.222"s, "num.444"s, "num.666"s}) {
     auto pos = props.lower_bound(prefix);
     ASSERT_TRUE(pos == props.end() ||
                 pos->first.compare(0, prefix.size(), prefix) != 0);
@@ -1044,7 +1106,7 @@ TEST_F(BlockBasedTableTest, BasicBlockBasedTableProperties) {
   ASSERT_EQ("", props.filter_policy_name);  // no filter policy is used
 
   // Verify data size.
-  BlockBuilder block_builder(1);
+  BlockBuilder block_builder(1, table_options.data_block_key_value_encoding_format);
   for (const auto& item : kvmap) {
     block_builder.Add(item.first, item.second);
   }
@@ -1453,6 +1515,7 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
     if (i == prefixes.size() - 1) {
       // last key
       ASSERT_TRUE(!iter->Valid());
+      ASSERT_OK(iter->status());
     } else {
       ASSERT_TRUE(iter->Valid());
       // seek the first element in the block
@@ -1467,7 +1530,6 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
     iter->Seek(InternalKey(prefix, 0, kTypeValue).Encode());
     // regular_iter->Seek(prefix);
 
-    ASSERT_OK(iter->status());
     // Seek to non-existing prefixes should yield either invalid, or a
     // key with prefix greater than the target.
     if (iter->Valid()) {
@@ -1475,6 +1537,7 @@ void TableTest::TestIndex(BlockBasedTableOptions table_options, int expected_num
       Slice ukey_prefix = options.prefix_extractor->Transform(ukey);
       ASSERT_LT(BytewiseComparator()->Compare(prefix, ukey_prefix), 0);
     }
+    ASSERT_OK(iter->status());
   }
 }
 
@@ -1638,7 +1701,7 @@ class BlockCachePropertiesSnapshot {
 TEST_F(BlockBasedTableTest, BlockCacheDisabledTest) {
   Options options;
   options.create_if_missing = true;
-  options.statistics = CreateDBStatistics();
+  options.statistics = CreateDBStatisticsForTests();
   BlockBasedTableOptions table_options;
   table_options.block_cache = NewLRUCache(1024);
   table_options.filter_policy.reset(NewBloomFilterPolicy(10));
@@ -1669,7 +1732,7 @@ TEST_F(BlockBasedTableTest, BlockCacheDisabledTest) {
                            GetContext::kNotFound, Slice(), nullptr, nullptr,
                            nullptr, nullptr);
     // a hack that just to trigger BlockBasedTable::GetFilter.
-    reader->Get(ReadOptions(), "non-exist-key", &get_context);
+    ASSERT_OK(reader->Get(ReadOptions(), "non-exist-key", &get_context));
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertIndexBlockStat(0, 0);
     props.AssertFilterBlockStat(0, 0);
@@ -1685,7 +1748,7 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
   // -- Table construction
   Options options;
   options.create_if_missing = true;
-  options.statistics = CreateDBStatistics();
+  options.statistics = CreateDBStatisticsForTests();
 
   // Enable the cache for index/filter blocks
   BlockBasedTableOptions table_options;
@@ -1771,10 +1834,10 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
   // In this test, no block will ever get hit since the block cache is
   // too small to fit even one entry.
   table_options.block_cache = NewLRUCache(1);
-  options.statistics = CreateDBStatistics();
+  options.statistics = CreateDBStatisticsForTests();
   options.table_factory.reset(new BlockBasedTableFactory(table_options));
   const ImmutableCFOptions ioptions2(options);
-  c.Reopen(ioptions2);
+  ASSERT_OK(c.Reopen(ioptions2));
   {
     BlockCachePropertiesSnapshot props(options.statistics.get());
     props.AssertEqual(0,  // index block miss
@@ -1825,7 +1888,7 @@ TEST_F(BlockBasedTableTest, FilterBlockInBlockCache) {
   // Open table with filter policy
   table_options.filter_policy.reset(NewBloomFilterPolicy(1));
   options.table_factory.reset(new BlockBasedTableFactory(table_options));
-  options.statistics = CreateDBStatistics();
+  options.statistics = CreateDBStatisticsForTests();
   ImmutableCFOptions ioptions4(options);
   ASSERT_OK(c3.Reopen(ioptions4));
   reader = dynamic_cast<BlockBasedTable*>(c3.GetTableReader());
@@ -2018,8 +2081,232 @@ TEST_F(BlockBasedTableTest, BlockCacheLeak) {
   }
 }
 
-// Plain table is not supported in ROCKSDB_LITE
-#ifndef ROCKSDB_LITE
+std::string GenerateKey(int primary_key, int secondary_key, int padding_size, Random* rnd) {
+  char buf[50];
+  char* p = &buf[0];
+  snprintf(buf, sizeof(buf), "%6d%4d", primary_key, secondary_key);
+  std::string k(p);
+  if (padding_size) {
+    k += RandomString(rnd, padding_size);
+  }
+
+  return k;
+}
+
+void RunPerformanceTest(
+    size_t block_size,
+    const IndexType& idx_type,
+    bool run_scan_test,  // if false, runs seek tests.
+    int restart_interval = 1,
+    int num_keys = 10000,
+    bool use_delta_encoding = false,
+    KeyValueEncodingFormat encoding_format =
+        KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix) {
+  BlockBasedTableOptions table_options;
+  table_options.index_type = idx_type;
+  table_options.block_size = block_size;
+  table_options.block_cache = NewLRUCache(1 * 1024 * 1024);
+  table_options.index_block_restart_interval = restart_interval;
+  table_options.min_keys_per_index_block = 100;
+  table_options.use_delta_encoding = use_delta_encoding;
+  table_options.data_block_key_value_encoding_format = encoding_format;
+
+  TableConstructor table_constructor(BytewiseComparator());
+  Random rnd(test::RandomSeed());
+  Slice value_slice;
+  for (int i = 0; i < num_keys; i++) {
+    /*10 digits value is generated for primary and secondary key by GenerateKey*/
+    auto key = GenerateKey(i, i + 1000, 32 - 10, &rnd);
+    table_constructor.Add(key, value_slice);
+  }
+
+  std::vector<std::string> keys;
+  stl_wrappers::KVMap kvmap;
+  Options options;
+  options.prefix_extractor.reset(NewFixedPrefixTransform(3));
+  options.table_factory.reset(NewBlockBasedTableFactory(table_options));
+
+  auto comparator = std::make_shared<InternalKeyComparator>(BytewiseComparator());
+  const ImmutableCFOptions ioptions(options);
+  table_constructor.Finish(options, ioptions, table_options, comparator, &keys, &kvmap);
+
+  auto* reader = down_cast<BlockBasedTable*>(table_constructor.GetTableReader());
+  LOG(INFO) << "IndexType: " << idx_type << ", KeyCount: " << num_keys
+            << ", BlockSize: " << block_size << ", RestartInterval: " << restart_interval
+            << ", UseDeltaEncoding: " << use_delta_encoding << ", Encoding: " << encoding_format;
+  if (run_scan_test) {
+    LOG(INFO) << "Result order: Next, Prev in nanosecond";
+  } else {
+    LOG(INFO) << "Result order: Incr order, Incr order with gaps, Decr order, Decr order with "
+                 "gaps, Random seek, Random seek with gaps";
+  }
+
+  unique_ptr<InternalIterator> iter;
+  std::stringstream result;
+  auto run_benchmark = [&](std::function<void()>&& callback, int multiplier = 1) {
+    iter.reset(table_constructor.NewIterator());
+
+    auto start = Env::Default()->NowNanos();
+    callback();
+    auto time_taken = (Env::Default()->NowNanos() - start);
+    auto per_key_ns = (time_taken * multiplier) / num_keys;
+    result << per_key_ns << ", ";
+  };
+
+  if (run_scan_test) {
+    // Next scan text.
+    run_benchmark([&]() {
+      for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
+        /*const auto k =*/ iter->key();
+        /*const auto v =*/ iter->value();
+      }
+      ASSERT_OK(iter->status());
+      return;
+    });
+
+    // Prev scan text.
+    run_benchmark([&]() {
+      for (iter->SeekToLast(); iter->Valid(); iter->Prev()) {
+        /*const auto k =*/ iter->key();
+        /*const auto v =*/ iter->value();
+      }
+      ASSERT_OK(iter->status());
+      return;
+    });
+  } else {
+    // Increasing order.
+    run_benchmark([&]() {
+      for (size_t k = 0; k < keys.size(); k++) {
+        iter->Seek(keys[k]);
+      }
+      ASSERT_OK(iter->status());
+      return;
+    });
+
+    // Increasing order with gaps.
+    run_benchmark(
+        [&]() {
+          for (size_t k = 0; k < keys.size(); k += 5) {
+            iter->Seek(keys[k]);
+          }
+          return;
+        },
+        5);
+
+    // Decreasing order.
+    run_benchmark([&]() {
+      for (int k = static_cast<int>(keys.size()) - 1; k >= 0; k--) {
+        iter->Seek(keys[k]);
+      }
+    });
+
+    // Decreasing order with gaps.
+    run_benchmark(
+        [&]() {
+          for (int k = static_cast<int>(keys.size()) - 1; k >= 0; k -= 5) {
+            iter->Seek(keys[k]);
+          }
+        },
+        5);
+
+    // Build the order.
+    std::vector<std::string> keys_random(keys.size());
+    for (size_t k = 0; k < keys.size(); k++) {
+      keys_random[k] = keys[rand() % keys.size()];
+    }
+
+    // Random seek.
+    run_benchmark([&]() {
+      for (size_t k = 0; k < keys.size(); k++) {
+        iter->Seek(keys_random[k]);
+      }
+    });
+
+    // Random seek with gaps.
+    run_benchmark(
+        [&]() {
+          for (size_t k = 0; k < keys.size(); k += 5) {
+            iter->Seek(keys_random[k]);
+          }
+        },
+        5);
+  }
+
+  LOG(INFO) << result.str();
+}
+
+void TestSeekPerformance(
+    size_t block_size, const IndexType& idx_type, int restart_interval = 1, int num_keys = 10000) {
+  // Run every test 2 times.
+  RunPerformanceTest(block_size, idx_type, false /*run_scan_test*/, restart_interval, num_keys);
+  RunPerformanceTest(block_size, idx_type, false /*run_scan_test*/, restart_interval, num_keys);
+}
+
+void TestScanPerformance(
+    size_t block_size,
+    bool use_delta_encoding = false,
+    KeyValueEncodingFormat encoding_format =
+        KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix) {
+  IndexType idx_type = IndexType::kBinarySearch;
+  // Run every test 2 times.
+  RunPerformanceTest(
+      block_size, IndexType::kBinarySearch, true /*run_scan_test*/, 1 /*restart_interval*/,
+      10000 /*num_keys*/, use_delta_encoding, encoding_format);
+  RunPerformanceTest(
+      block_size, IndexType::kBinarySearch, true /*run_scan_test*/, 1 /*restart_interval*/,
+      10000 /*num_keys*/, use_delta_encoding, encoding_format);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_ScanPerformanceTest) {
+  bool use_delta_encoding = true;
+  KeyValueEncodingFormat encoding_format =
+      KeyValueEncodingFormat::kKeyDeltaEncodingThreeSharedParts;
+  TestScanPerformance(8_KB, use_delta_encoding, encoding_format);
+  TestScanPerformance(16_KB, use_delta_encoding, encoding_format);
+  TestScanPerformance(32_KB, use_delta_encoding, encoding_format);
+  TestScanPerformance(64_KB, use_delta_encoding, encoding_format);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_IndexTypeSeekPerformanceTest) {
+  TestSeekPerformance(8_KB, IndexType::kBinarySearch);
+  TestSeekPerformance(16_KB, IndexType::kBinarySearch);
+  TestSeekPerformance(32_KB, IndexType::kBinarySearch);
+  TestSeekPerformance(64_KB, IndexType::kBinarySearch);
+
+  TestSeekPerformance(8_KB, IndexType::kMultiLevelBinarySearch);
+  TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch);
+  TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch);
+  TestSeekPerformance(64_KB, IndexType::kMultiLevelBinarySearch);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_RestartPointsSeekPerformanceTest) {
+  // 1 restart point.
+  TestSeekPerformance(16_KB, IndexType::kBinarySearch, 1);
+  TestSeekPerformance(32_KB, IndexType::kBinarySearch, 1);
+  TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch, 1);
+  TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch, 1);
+
+  // 16 restart point.
+  TestSeekPerformance(16_KB, IndexType::kBinarySearch, 16);
+  TestSeekPerformance(32_KB, IndexType::kBinarySearch, 16);
+  TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch, 16);
+  TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch, 16);
+}
+
+TEST_F(BlockBasedTableTest, DISABLED_KeysCountSeekPerformanceTest) {
+  // 10k keys.
+  TestSeekPerformance(16_KB, IndexType::kBinarySearch, 1);
+  TestSeekPerformance(32_KB, IndexType::kBinarySearch, 1);
+  TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch, 1);
+  TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch, 1);
+
+  // 100k keys.
+  TestSeekPerformance(16_KB, IndexType::kBinarySearch, 1, 100000);
+  TestSeekPerformance(32_KB, IndexType::kBinarySearch, 1, 100000);
+  TestSeekPerformance(16_KB, IndexType::kMultiLevelBinarySearch, 1, 100000);
+  TestSeekPerformance(32_KB, IndexType::kMultiLevelBinarySearch, 1, 100000);
+}
+
 TEST_F(PlainTableTest, BasicPlainTableProperties) {
   PlainTableOptions plain_table_options;
   plain_table_options.user_key_len = 8;
@@ -2051,7 +2338,7 @@ TEST_F(PlainTableTest, BasicPlainTableProperties) {
     builder->Add(key, value);
   }
   ASSERT_OK(builder->Finish());
-  file_writer->Flush();
+  ASSERT_OK(file_writer->Flush());
 
   test::StringSink* ss =
     static_cast<test::StringSink*>(file_writer->writable_file());
@@ -2073,7 +2360,6 @@ TEST_F(PlainTableTest, BasicPlainTableProperties) {
   ASSERT_EQ(26ul, props->num_entries);
   ASSERT_EQ(1ul, props->num_data_blocks);
 }
-#endif  // !ROCKSDB_LITE
 
 TEST_F(GeneralTableTest, ApproximateOffsetOfPlain) {
   TableConstructor c(BytewiseComparator());
@@ -2129,9 +2415,9 @@ static void DoCompressionTest(CompressionType comp) {
   ASSERT_TRUE(Between(c.ApproximateOffsetOf("abc"),       0,      0));
   ASSERT_TRUE(Between(c.ApproximateOffsetOf("k01"),       0,      0));
   ASSERT_TRUE(Between(c.ApproximateOffsetOf("k02"),       0,      0));
-  ASSERT_TRUE(Between(c.ApproximateOffsetOf("k03"),    2000,   3000));
-  ASSERT_TRUE(Between(c.ApproximateOffsetOf("k04"),    2000,   3000));
-  ASSERT_TRUE(Between(c.ApproximateOffsetOf("xyz"),    4000,   6100));
+  ASSERT_TRUE(Between(c.ApproximateOffsetOf("k03"),    2000,   3100));
+  ASSERT_TRUE(Between(c.ApproximateOffsetOf("k04"),    2000,   3100));
+  ASSERT_TRUE(Between(c.ApproximateOffsetOf("xyz"),    4000,   6200));
 }
 
 TEST_F(GeneralTableTest, ApproximateOffsetOfCompressed) {
@@ -2170,7 +2456,7 @@ TEST_F(GeneralTableTest, ApproximateOffsetOfCompressed) {
 }
 
 TEST_F(HarnessTest, Randomized) {
-#if defined(ROCKSDB_TSAN_RUN) || defined(THREAD_SANITIZER)
+#if defined(THREAD_SANITIZER)
   static constexpr int kMaxNumEntries = 200;
 #else
   static constexpr int kMaxNumEntries = 2000;
@@ -2195,7 +2481,6 @@ TEST_F(HarnessTest, Randomized) {
   }
 }
 
-#ifndef ROCKSDB_LITE
 TEST_F(HarnessTest, RandomizedLongDB) {
   Random rnd(test::RandomSeed());
   TestArgs args = {DB_TEST, false, 16, kNoCompression, 0, false};
@@ -2219,9 +2504,8 @@ TEST_F(HarnessTest, RandomizedLongDB) {
   }
   ASSERT_GT(files, 0);
 }
-#endif  // ROCKSDB_LITE
 
-class MemTableTest : public testing::Test {};
+class MemTableTest : public RocksDBTest {};
 
 TEST_F(MemTableTest, Simple) {
   InternalKeyComparator cmp(BytewiseComparator());
@@ -2253,6 +2537,7 @@ TEST_F(MemTableTest, Simple) {
             iter->value().ToString().c_str());
     iter->Next();
   }
+  ASSERT_OK(iter->status());
 
   delete memtable->Unref();
 }
@@ -2311,7 +2596,7 @@ TEST_F(HarnessTest, FooterTests) {
     footer.AppendEncodedTo(&encoded);
     Footer decoded_footer;
     Slice encoded_slice(encoded);
-    decoded_footer.DecodeFrom(&encoded_slice);
+    ASSERT_OK(decoded_footer.DecodeFrom(&encoded_slice));
     ASSERT_EQ(decoded_footer.table_magic_number(), kBlockBasedTableMagicNumber);
     ASSERT_EQ(decoded_footer.checksum(), kCRC32c);
     ASSERT_EQ(decoded_footer.metaindex_handle().offset(), meta_index.offset());
@@ -2331,7 +2616,7 @@ TEST_F(HarnessTest, FooterTests) {
     footer.AppendEncodedTo(&encoded);
     Footer decoded_footer;
     Slice encoded_slice(encoded);
-    decoded_footer.DecodeFrom(&encoded_slice);
+    ASSERT_OK(decoded_footer.DecodeFrom(&encoded_slice));
     ASSERT_EQ(decoded_footer.table_magic_number(), kBlockBasedTableMagicNumber);
     ASSERT_EQ(decoded_footer.checksum(), kxxHash);
     ASSERT_EQ(decoded_footer.metaindex_handle().offset(), meta_index.offset());
@@ -2340,8 +2625,6 @@ TEST_F(HarnessTest, FooterTests) {
     ASSERT_EQ(decoded_footer.index_handle().size(), index.size());
     ASSERT_EQ(decoded_footer.version(), 1U);
   }
-// Plain table is not supported in ROCKSDB_LITE
-#ifndef ROCKSDB_LITE
   {
     // upconvert legacy plain table
     std::string encoded;
@@ -2352,7 +2635,7 @@ TEST_F(HarnessTest, FooterTests) {
     footer.AppendEncodedTo(&encoded);
     Footer decoded_footer;
     Slice encoded_slice(encoded);
-    decoded_footer.DecodeFrom(&encoded_slice);
+    ASSERT_OK(decoded_footer.DecodeFrom(&encoded_slice));
     ASSERT_EQ(decoded_footer.table_magic_number(), kPlainTableMagicNumber);
     ASSERT_EQ(decoded_footer.checksum(), kCRC32c);
     ASSERT_EQ(decoded_footer.metaindex_handle().offset(), meta_index.offset());
@@ -2372,7 +2655,7 @@ TEST_F(HarnessTest, FooterTests) {
     footer.AppendEncodedTo(&encoded);
     Footer decoded_footer;
     Slice encoded_slice(encoded);
-    decoded_footer.DecodeFrom(&encoded_slice);
+    ASSERT_OK(decoded_footer.DecodeFrom(&encoded_slice));
     ASSERT_EQ(decoded_footer.table_magic_number(), kPlainTableMagicNumber);
     ASSERT_EQ(decoded_footer.checksum(), kxxHash);
     ASSERT_EQ(decoded_footer.metaindex_handle().offset(), meta_index.offset());
@@ -2381,7 +2664,6 @@ TEST_F(HarnessTest, FooterTests) {
     ASSERT_EQ(decoded_footer.index_handle().size(), index.size());
     ASSERT_EQ(decoded_footer.version(), 1U);
   }
-#endif  // !ROCKSDB_LITE
   {
     // version == 2
     std::string encoded;
@@ -2392,7 +2674,7 @@ TEST_F(HarnessTest, FooterTests) {
     footer.AppendEncodedTo(&encoded);
     Footer decoded_footer;
     Slice encoded_slice(encoded);
-    decoded_footer.DecodeFrom(&encoded_slice);
+    ASSERT_OK(decoded_footer.DecodeFrom(&encoded_slice));
     ASSERT_EQ(decoded_footer.table_magic_number(), kBlockBasedTableMagicNumber);
     ASSERT_EQ(decoded_footer.checksum(), kCRC32c);
     ASSERT_EQ(decoded_footer.metaindex_handle().offset(), meta_index.offset());
@@ -2421,53 +2703,70 @@ TEST_P(IndexBlockRestartIntervalTest, IndexBlockRestartInterval) {
 
   int index_block_restart_interval = GetParam();
 
-  Options options;
-  BlockBasedTableOptions table_options;
-  table_options.block_size = 64;  // small block size to get big index block
-  table_options.index_block_restart_interval = index_block_restart_interval;
-  options.table_factory.reset(new BlockBasedTableFactory(table_options));
-
-  TableConstructor c(BytewiseComparator());
-  static Random rnd(301);
-  for (int i = 0; i < kKeysInTable; i++) {
-    InternalKey k(RandomString(&rnd, kKeySize), 0, kTypeValue);
-    c.Add(k.Encode().ToString(), RandomString(&rnd, kValSize));
+  std::vector<boost::optional<KeyValueEncodingFormat>> formats_to_test;
+  for (const auto& format : KeyValueEncodingFormatList()) {
+    formats_to_test.push_back(format);
   }
+  // Also test backward compatibility with SST files without
+  // BlockBasedTablePropertyNames::kDataBlockKeyValueEncodingFormat property.
+  formats_to_test.push_back(boost::none);
 
-  std::vector<std::string> keys;
-  stl_wrappers::KVMap kvmap;
-  auto comparator = std::make_shared<InternalKeyComparator>(BytewiseComparator());
-  const ImmutableCFOptions ioptions(options);
-  c.Finish(options, ioptions, table_options, comparator, &keys, &kvmap);
-  auto reader = c.GetTableReader();
+  for (const auto& format : formats_to_test) {
+    Options options;
+    BlockBasedTableOptions table_options;
+    table_options.block_size = 64;  // small block size to get big index block
+    table_options.index_block_restart_interval = index_block_restart_interval;
+    // SST files without BlockBasedTablePropertyNames::kDataBlockKeyValueEncodingFormat only could
+    // be written with using KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix, because there
+    // were no other formats before we added this property.
+    table_options.data_block_key_value_encoding_format =
+        format.get_value_or(KeyValueEncodingFormat::kKeyDeltaEncodingSharedPrefix);
+    options.table_factory.reset(new BlockBasedTableFactory(table_options));
 
-  std::unique_ptr<InternalIterator> db_iter(reader->NewIterator(ReadOptions()));
+    TableConstructor c(BytewiseComparator());
+    if (!format.has_value()) {
+      // Backward compatibility: test that we can read files without
+      // BlockBasedTablePropertyNames::kDataBlockKeyValueEncodingFormat property.
+      c.TEST_skip_writing_key_value_encoding_format = true;
+    }
+    static Random rnd(301);
+    for (int i = 0; i < kKeysInTable; i++) {
+      InternalKey k(RandomString(&rnd, kKeySize), 0, kTypeValue);
+      c.Add(k.Encode().ToString(), RandomString(&rnd, kValSize));
+    }
 
-  // Test point lookup
-  for (auto& kv : kvmap) {
-    db_iter->Seek(kv.first);
+    std::vector<std::string> keys;
+    stl_wrappers::KVMap kvmap;
+    auto comparator = std::make_shared<InternalKeyComparator>(BytewiseComparator());
+    const ImmutableCFOptions ioptions(options);
+    c.Finish(options, ioptions, table_options, comparator, &keys, &kvmap);
+    auto reader = c.GetTableReader();
 
-    ASSERT_TRUE(db_iter->Valid());
+    std::unique_ptr<InternalIterator> db_iter(reader->NewIterator(ReadOptions()));
+
+    // Test point lookup
+    for (auto& kv : kvmap) {
+      db_iter->Seek(kv.first);
+
+      ASSERT_TRUE(db_iter->Valid());
+      ASSERT_OK(db_iter->status());
+      ASSERT_EQ(db_iter->key(), kv.first);
+      ASSERT_EQ(db_iter->value(), kv.second);
+    }
+
+    // Test iterating
+    auto kv_iter = kvmap.begin();
+    for (db_iter->SeekToFirst(); db_iter->Valid(); db_iter->Next()) {
+      ASSERT_EQ(db_iter->key(), kv_iter->first);
+      ASSERT_EQ(db_iter->value(), kv_iter->second);
+      kv_iter++;
+    }
     ASSERT_OK(db_iter->status());
-    ASSERT_EQ(db_iter->key(), kv.first);
-    ASSERT_EQ(db_iter->value(), kv.second);
+    ASSERT_EQ(kv_iter, kvmap.end());
   }
-
-  // Test iterating
-  auto kv_iter = kvmap.begin();
-  for (db_iter->SeekToFirst(); db_iter->Valid(); db_iter->Next()) {
-    ASSERT_EQ(db_iter->key(), kv_iter->first);
-    ASSERT_EQ(db_iter->value(), kv_iter->second);
-    kv_iter++;
-  }
-  ASSERT_EQ(kv_iter, kvmap.end());
 }
 
-class PrefixTest : public testing::Test {
- public:
-  PrefixTest() : testing::Test() {}
-  ~PrefixTest() {}
-};
+class PrefixTest : public RocksDBTest {};
 
 namespace {
 // A simple PrefixExtractor that only works for test PrefixAndWholeKeyTest
@@ -2534,7 +2833,7 @@ TEST_F(PrefixTest, PrefixAndWholeKeyTest) {
 
     const std::string kDBPath = test::TmpDir() + "/prefix_test";
     options.table_factory.reset(NewBlockBasedTableFactory(bbto));
-    DestroyDB(kDBPath, options);
+    ASSERT_OK(DestroyDB(kDBPath, options));
     rocksdb::DB* db;
     ASSERT_OK(rocksdb::DB::Open(options, kDBPath, &db));
 
@@ -2543,16 +2842,56 @@ TEST_F(PrefixTest, PrefixAndWholeKeyTest) {
       std::string prefix = "[" + std::to_string(i) + "]";
       for (int j = 0; j < 10; j++) {
         std::string key = prefix + std::to_string(j);
-        db->Put(rocksdb::WriteOptions(), key, "1");
+        ASSERT_OK(db->Put(rocksdb::WriteOptions(), key, "1"));
       }
     }
 
     // Trigger compaction.
-    db->CompactRange(CompactRangeOptions(), nullptr, nullptr);
+    ASSERT_OK(db->CompactRange(CompactRangeOptions(), nullptr, nullptr));
     delete db;
     // In the second round, turn whole_key_filtering off and expect
     // rocksdb still works.
   }
+}
+
+namespace {
+
+void GenerateSSTFile(rocksdb::DB* db, int start_index, int num_records) {
+  for (int j = start_index; j < start_index + num_records; j++) {
+    ASSERT_OK(db->Put(rocksdb::WriteOptions(), std::to_string(j), "1"));
+  }
+  ASSERT_OK(db->Flush(FlushOptions()));
+}
+
+} // namespace
+
+TEST_F(TableTest, MiddleOfMiddleKey) {
+  rocksdb::Options options;
+  options.compaction_style = rocksdb::kCompactionStyleNone;
+  options.num_levels = 1;
+  options.create_if_missing = true;
+  const std::string kDBPath = test::TmpDir() + "/mid_key";
+  ASSERT_OK(DestroyDB(kDBPath, options));
+  rocksdb::DB* db;
+  ASSERT_OK(rocksdb::DB::Open(options, kDBPath, &db));
+
+  // Create two files with 200 and 300 records.
+  GenerateSSTFile(db, 0, 200);
+  GenerateSSTFile(db, 200, 300);
+
+  // Same as the midkey of the largest sst which has 300 records.
+  const auto mkey_first = ASSERT_RESULT(db->GetMiddleKey());
+  const auto tw = ASSERT_RESULT(db->TEST_GetLargestSstTableReader());
+  const auto mid_key_of_sst = ASSERT_RESULT(tw->GetMiddleKey());
+  ASSERT_EQ(mkey_first, mid_key_of_sst);
+
+  // Create a file with 400 records. This is largest sst.
+  GenerateSSTFile(db, 500, 400);
+
+  const auto mkey_second = ASSERT_RESULT(db->GetMiddleKey());
+  // Still the same as the midkey of the previous largest sst.
+  ASSERT_EQ(mkey_second, mid_key_of_sst);
+  delete db;
 }
 
 }  // namespace rocksdb

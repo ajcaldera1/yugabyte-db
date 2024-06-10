@@ -47,6 +47,9 @@
 #include "utils/syscache.h"
 #include "tcop/utility.h"
 
+/* YB includes. */
+#include "pg_yb_utils.h"
+
 typedef struct EventTriggerQueryState
 {
 	/* memory context for this state's objects */
@@ -117,6 +120,7 @@ static event_trigger_support_data event_trigger_support[] = {
 	{"STATISTICS", true},
 	{"SUBSCRIPTION", true},
 	{"TABLE", true},
+	{"TABLEGROUP", false},
 	{"TABLESPACE", false},
 	{"TRANSFORM", true},
 	{"TRIGGER", true},
@@ -181,12 +185,13 @@ CreateEventTrigger(CreateEventTrigStmt *stmt)
 	 * this, but there are obvious privilege escalation risks which would have
 	 * to somehow be plugged first.
 	 */
-	if (!superuser())
+	if (!superuser() && !IsYbDbAdminUser(evtowner))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create event trigger \"%s\"",
 						stmt->trigname),
-				 errhint("Must be superuser to create an event trigger.")));
+				 errhint("Must be superuser or a member of the yb_db_admin "
+				 		 "role to create an event trigger.")));
 
 	/* Validate event name. */
 	if (strcmp(stmt->eventname, "ddl_command_start") != 0 &&
@@ -613,13 +618,14 @@ AlterEventTriggerOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 		aclcheck_error(ACLCHECK_NOT_OWNER, OBJECT_EVENT_TRIGGER,
 					   NameStr(form->evtname));
 
-	/* New owner must be a superuser */
-	if (!superuser_arg(newOwnerId))
+	/* New owner must be a superuser or yb_db_admin */
+	if (!superuser_arg(newOwnerId) && !IsYbDbAdminUser(newOwnerId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of event trigger \"%s\"",
 						NameStr(form->evtname)),
-				 errhint("The owner of an event trigger must be a superuser.")));
+				 errhint("The owner of an event trigger must be a superuser "
+				 		 "or a member of the yb_db_admin role.")));
 
 	form->evtowner = newOwnerId;
 	CatalogTupleUpdate(rel, &tup->t_self, tup);
@@ -800,6 +806,10 @@ EventTriggerDDLCommandStart(Node *parsetree)
 	if (!IsUnderPostmaster)
 		return;
 
+	/* Event triggers are also completely disabled in YSQL upgrade mode. */
+	if (IsYsqlUpgrade)
+		return;
+
 	runlist = EventTriggerCommonSetup(parsetree,
 									  EVT_DDLCommandStart,
 									  "ddl_command_start",
@@ -834,6 +844,10 @@ EventTriggerDDLCommandEnd(Node *parsetree)
 	 * triggers are disabled in single user mode.
 	 */
 	if (!IsUnderPostmaster)
+		return;
+
+	/* Event triggers are also completely disabled in YSQL upgrade mode. */
+	if (IsYsqlUpgrade)
 		return;
 
 	/*
@@ -882,6 +896,10 @@ EventTriggerSQLDrop(Node *parsetree)
 	 * triggers are disabled in single user mode.
 	 */
 	if (!IsUnderPostmaster)
+		return;
+
+	/* Event triggers are also completely disabled in YSQL upgrade mode. */
+	if (IsYsqlUpgrade)
 		return;
 
 	/*
@@ -969,6 +987,10 @@ EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason)
 	if (!IsUnderPostmaster)
 		return;
 
+	/* Event triggers are also completely disabled in YSQL upgrade mode. */
+	if (IsYsqlUpgrade)
+		return;
+
 	/*
 	 * Also do nothing if our state isn't set up, which it won't be if there
 	 * weren't any relevant event triggers at the start of the current DDL
@@ -1040,7 +1062,7 @@ EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata)
 	 * Let's evaluate event triggers in their own memory context, so that any
 	 * leaks get cleaned up promptly.
 	 */
-	context = AllocSetContextCreate(CurrentMemoryContext,
+	context = AllocSetContextCreate(GetCurrentMemoryContext(),
 									"event trigger context",
 									ALLOCSET_DEFAULT_SIZES);
 	oldcontext = MemoryContextSwitchTo(context);
@@ -1149,6 +1171,14 @@ EventTriggerSupportsObjectType(ObjectType obtype)
 		case OBJECT_VIEW:
 			return true;
 
+		/* YB cases */
+		case OBJECT_YBPROFILE:
+			/* no support for event triggers on profiles */
+			return false;
+		case OBJECT_YBTABLEGROUP:
+			/* no support for event triggers on tablegroups */
+			return false;
+
 			/*
 			 * There's intentionally no default: case here; we want the
 			 * compiler to warn if a new ObjectType hasn't been handled above.
@@ -1210,6 +1240,15 @@ EventTriggerSupportsObjectClass(ObjectClass objclass)
 		case OCLASS_SUBSCRIPTION:
 		case OCLASS_TRANSFORM:
 			return true;
+
+		/* YB cases */
+		case OCLASS_TBLGROUP:
+			/* no support for event triggers on tablegroups */
+			return false;
+		case OCLASS_YBPROFILE:
+		case OCLASS_YBROLE_PROFILE:
+			/* no support for event triggers on profiles */
+			return false;
 
 			/*
 			 * There's intentionally no default: case here; we want the
@@ -2282,6 +2321,12 @@ stringify_grant_objtype(ObjectType objtype)
 		case OBJECT_USER_MAPPING:
 		case OBJECT_VIEW:
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
+
+		/* YB cases */
+		case OBJECT_YBPROFILE:
+			return "PROFILE";
+		case OBJECT_YBTABLEGROUP:
+			return "TABLEGROUP";
 	}
 
 	return "???";				/* keep compiler quiet */
@@ -2364,6 +2409,12 @@ stringify_adefprivs_objtype(ObjectType objtype)
 		case OBJECT_USER_MAPPING:
 		case OBJECT_VIEW:
 			elog(ERROR, "unsupported object type: %d", (int) objtype);
+
+		/* YB cases */
+		case OBJECT_YBPROFILE:
+			return "PROFILES";
+		case OBJECT_YBTABLEGROUP:
+			return "TABLEGROUPS";
 	}
 
 	return "???";				/* keep compiler quiet */

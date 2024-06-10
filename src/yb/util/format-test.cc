@@ -13,17 +13,18 @@
 //
 //
 
-#include <deque>
-#include <list>
-#include <map>
-#include <vector>
-#include <unordered_map>
 #include <sstream>
+#include <string>
+#include <unordered_map>
+#include <vector>
 
-#include "yb/gutil/strings/substitute.h"
+#include <gtest/gtest.h>
 
-#include "yb/util/test_util.h"
-#include "yb/util/format.h"
+#include "yb/gutil/macros.h"
+
+#include "yb/util/monotime.h"
+#include "yb/util/status.h"
+#include "yb/util/test_macros.h"
 
 using namespace std::literals;
 
@@ -145,6 +146,17 @@ TEST(FormatTest, String) {
   }
 }
 
+// strings::Substitute ignores actual size of array.
+// That is why CheckPlain helper can't be used to check Format with array argument without '\0'.
+TEST(FormatTest, Array) {
+  union {
+    char data[10] = "head-tail";
+    char head[4];
+  } sub_array_accesor;
+  ASSERT_EQ("This should be head only",
+            Format("This should be $0 only", sub_array_accesor.head));
+}
+
 TEST(FormatTest, Collections) {
   for (const auto& format : kFormats) {
     CheckCollection<std::vector<int>>(format, {1, 2, 3});
@@ -155,6 +167,12 @@ TEST(FormatTest, Collections) {
 
 TEST(FormatTest, MultiArgs) {
   CheckPlain(kLongFormat, 5, "String", "zero\0zero"s);
+}
+
+TEST(FormatTest, MultiArgsTwoDigit) {
+  ASSERT_EQ(
+      Format("$0 $1 $2 $3 $4 $5 $6 $7 $8 $9 $10 $11", 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, "A", "B"),
+      "0 1 2 3 4 5 6 7 8 9 A B");
 }
 
 TEST(FormatTest, Custom) {
@@ -178,7 +196,9 @@ TEST(FormatTest, Time) {
   ASSERT_EQ("Time: 10.000s", Format("Time: $0", 10s));
   ASSERT_EQ("Time: 0.001s", Format("Time: $0", 1ms));
   std::ostringstream out;
-  out << 15s;
+  // libc++ that comes with LLVM 17 defines stream output operators for std::duration, so we
+  // convert the duration to MonoDelta for consistency.
+  out << MonoDelta(15s);
   ASSERT_EQ("15.000s", out.str());
 }
 

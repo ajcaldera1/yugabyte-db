@@ -13,20 +13,11 @@
 
 package org.yb.client;
 
-import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
-import org.jboss.netty.buffer.ChannelBuffer;
-
+import io.netty.buffer.ByteBuf;
 import org.yb.annotations.InterfaceAudience;
-import org.yb.Common.HostPortPB;
-import org.yb.consensus.Consensus;
-import org.yb.consensus.Metadata;
-import org.yb.consensus.Metadata.RaftPeerPB;
-import org.yb.master.Master;
+import org.yb.master.MasterClusterOuterClass;
 import org.yb.util.Pair;
-
-import java.util.ArrayList;
-import java.util.List;
 
 @InterfaceAudience.Public
 class GetLoadMovePercentRequest extends YRpc<GetLoadMovePercentResponse> {
@@ -35,10 +26,10 @@ class GetLoadMovePercentRequest extends YRpc<GetLoadMovePercentResponse> {
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
-    final Master.GetLoadMovePercentRequestPB.Builder builder =
-      Master.GetLoadMovePercentRequestPB.newBuilder();
+    final MasterClusterOuterClass.GetLoadMovePercentRequestPB.Builder builder =
+      MasterClusterOuterClass.GetLoadMovePercentRequestPB.newBuilder();
 
     return toChannelBuffer(header, builder.build());
   }
@@ -53,8 +44,8 @@ class GetLoadMovePercentRequest extends YRpc<GetLoadMovePercentResponse> {
   Pair<GetLoadMovePercentResponse, Object> deserialize(
       CallResponse callResponse,
       String masterUUID) throws Exception {
-    final Master.GetLoadMovePercentResponsePB.Builder respBuilder =
-      Master.GetLoadMovePercentResponsePB.newBuilder();
+    final MasterClusterOuterClass.GetLoadMovePercentResponsePB.Builder respBuilder =
+      MasterClusterOuterClass.GetLoadMovePercentResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
     boolean hasErr = respBuilder.hasError();
     GetLoadMovePercentResponse response =
@@ -62,6 +53,8 @@ class GetLoadMovePercentRequest extends YRpc<GetLoadMovePercentResponse> {
           deadlineTracker.getElapsedMillis(),
           masterUUID,
           hasErr ? 0 : respBuilder.getPercent(),
+          hasErr ? 0 : respBuilder.getRemaining(),
+          hasErr ? 0 : respBuilder.getTotal(),
           hasErr ? respBuilder.getErrorBuilder().build() : null);
     return new Pair<GetLoadMovePercentResponse, Object>(response,
                                                         hasErr ? respBuilder.getError() : null);

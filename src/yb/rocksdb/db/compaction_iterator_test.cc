@@ -24,7 +24,7 @@
 
 namespace rocksdb {
 
-class CompactionIteratorTest : public testing::Test {
+class CompactionIteratorTest : public RocksDBTest {
  public:
   CompactionIteratorTest() : cmp_(BytewiseComparator()), snapshots_({}) {}
 
@@ -37,7 +37,7 @@ class CompactionIteratorTest : public testing::Test {
     iter_->SeekToFirst();
     c_iter_.reset(new CompactionIterator(
         iter_.get(), cmp_, merge_helper_.get(), last_sequence, &snapshots_,
-        kMaxSequenceNumber, Env::Default(), false));
+        kMaxSequenceNumber, false));
   }
 
   const Comparator* cmp_;

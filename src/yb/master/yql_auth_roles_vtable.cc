@@ -11,26 +11,33 @@
 // under the License.
 //
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_auth_roles_vtable.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/permissions_manager.h"
+
+#include "yb/util/status_log.h"
 
 namespace yb {
 namespace master {
 
-YQLAuthRolesVTable::YQLAuthRolesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemAuthRolesTableName, master, CreateSchema()) {
+YQLAuthRolesVTable::YQLAuthRolesVTable(const TableName& table_name,
+                                       const NamespaceName& namespace_name,
+                                       Master * const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLAuthRolesVTable::RetrieveData(const QLReadRequestPB& request,
-                                        std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<VTableDataPtr> YQLAuthRolesVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<RoleInfo>> roles;
-  master_->catalog_manager()->GetAllRoles(&roles);
+  catalog_manager().permissions_manager()->GetAllRoles(&roles);
   for (const auto& role : roles) {
     auto l = role->LockForRead();
-    const auto& pb = l->data().pb;
-    QLRow& row = (*vtable)->Extend();
+    const auto& pb = l->pb;
+    auto& row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kRole, pb.role(), &row));
     RETURN_NOT_OK(SetColumnValue(kCanLogin, pb.can_login(), &row));
     RETURN_NOT_OK(SetColumnValue(kIsSuperuser, pb.is_superuser(), &row));
@@ -47,7 +54,7 @@ Status YQLAuthRolesVTable::RetrieveData(const QLReadRequestPB& request,
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 

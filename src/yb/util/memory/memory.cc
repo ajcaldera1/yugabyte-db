@@ -32,24 +32,20 @@
 // under the License.
 //
 
+#include "yb/util/memory/memory.h"
+
 #include <string.h>
 
 #include <algorithm>
 #include <cstdlib>
 
-#include <gflags/gflags.h>
-
 #include "yb/util/alignment.h"
-#include "yb/util/flag_tags.h"
-#include "yb/util/memory/memory.h"
+#include "yb/util/flags.h"
 #include "yb/util/mem_tracker.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/tcmalloc_impl_util.h"
 
-using std::copy;
-using std::max;
 using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 
 namespace yb {
 
@@ -121,7 +117,7 @@ void BufferAllocator::LogAllocation(size_t requested,
 // TODO(onufry) - test whether the code still tests OK if we set this to true,
 // or remove this code and add a test that Google allocator does not change it's
 // contract - 16-aligned in -c opt and %16 == 8 in debug.
-DEFINE_bool(allocator_aligned_mode, false,
+DEFINE_UNKNOWN_bool(allocator_aligned_mode, false,
             "Use 16-byte alignment instead of 8-byte, "
             "unless explicitly specified otherwise - to boost SIMD");
 TAG_FLAG(allocator_aligned_mode, hidden);
@@ -380,5 +376,20 @@ void MemoryTrackingBufferAllocator::FreeInternal(Buffer* buffer) {
   DelegateFree(delegate_, buffer);
   mem_tracker_->Release(buffer->size());
 }
+
+std::string TcMallocStats() {
+#if !YB_TCMALLOC_ENABLED
+  return std::string();
+#endif
+#if YB_GOOGLE_TCMALLOC
+  return ::tcmalloc::MallocExtension::GetStats();
+#endif
+#if YB_GPERFTOOLS_TCMALLOC
+  char buf[20_KB];
+  MallocExtension::instance()->GetStats(buf, sizeof(buf));
+  return buf;
+#endif  // YB_GPERFTOOLS_TCMALLOC
+}
+
 
 }  // namespace yb

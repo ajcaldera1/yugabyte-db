@@ -30,15 +30,14 @@
 // under the License.
 //
 
-#include <mutex>
+#include <functional>
 #include <thread>
-#include <vector>
 
-#include <boost/thread/shared_mutex.hpp>
 #include <gtest/gtest.h>
 
 #include "yb/util/monotime.h"
 #include "yb/util/rw_semaphore.h"
+#include "yb/util/shared_lock.h"
 
 using std::vector;
 
@@ -55,7 +54,7 @@ struct SharedState {
 void Writer(SharedState* state) {
   int i = 0;
   while (true) {
-    std::lock_guard<rw_semaphore> l(state->sem);
+    std::lock_guard l(state->sem);
     state->int_var += (i++);
     if (state->done) {
       break;
@@ -65,9 +64,9 @@ void Writer(SharedState* state) {
 
 // Thread which verifies that the value in the shared state only increases.
 void Reader(SharedState* state) {
-  int prev_val = 0;
+  int64_t prev_val = 0;
   while (true) {
-    boost::shared_lock<rw_semaphore> l(state->sem);
+    SharedLock<rw_semaphore> l(state->sem);
     // The int var should only be seen to increase.
     CHECK_GE(state->int_var, prev_val);
     prev_val = state->int_var;
@@ -93,7 +92,7 @@ TEST(RWSemaphoreTest, TestBasicOperation) {
 
   // Signal them to stop.
   {
-    std::lock_guard<rw_semaphore> l(s.sem);
+    std::lock_guard l(s.sem);
     s.done = true;
   }
 

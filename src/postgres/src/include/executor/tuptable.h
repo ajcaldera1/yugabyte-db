@@ -138,6 +138,8 @@ typedef struct TupleTableSlot
 
 	/* YugaByte support */
 	Datum tts_ybctid; /* selected ybctid value */
+	Datum tts_yb_insert_oid; /* OID specified in INSERT during YSQL upgrade,
+							  * should not be used for any other purpose. */
 } TupleTableSlot;
 
 #define TTS_HAS_PHYSICAL_TUPLE(slot)  \
@@ -156,10 +158,12 @@ extern void ExecResetTupleTable(List *tupleTable, bool shouldFree);
 extern TupleTableSlot *MakeSingleTupleTableSlot(TupleDesc tupdesc);
 extern void ExecDropSingleTupleTableSlot(TupleTableSlot *slot);
 extern void ExecSetSlotDescriptor(TupleTableSlot *slot, TupleDesc tupdesc);
-extern TupleTableSlot *ExecStoreTuple(HeapTuple tuple,
-			   TupleTableSlot *slot,
-			   Buffer buffer,
-			   bool shouldFree);
+extern TupleTableSlot *ExecStoreHeapTuple(HeapTuple tuple,
+				   TupleTableSlot *slot,
+				   bool shouldFree);
+extern TupleTableSlot *ExecStoreBufferHeapTuple(HeapTuple tuple,
+						 TupleTableSlot *slot,
+						 Buffer buffer);
 extern TupleTableSlot *ExecStoreMinimalTuple(MinimalTuple mtup,
 					  TupleTableSlot *slot,
 					  bool shouldFree);

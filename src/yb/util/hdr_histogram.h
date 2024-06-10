@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_HDRHISTOGRAM_H_
-#define YB_UTIL_HDRHISTOGRAM_H_
+#pragma once
 
 // C++ (TR1) port of HdrHistogram.
 // Original java implementation: http://giltene.github.io/HdrHistogram/
@@ -56,11 +55,13 @@
 // tracked value (1 hour), it would still maintain a resolution of 3.6 seconds
 // (or better).
 
-#include <stdint.h>
+#include <iosfwd>
+#include <memory>
 
 #include "yb/gutil/atomicops.h"
-#include "yb/gutil/gscoped_ptr.h"
-#include "yb/util/status.h"
+#include "yb/gutil/macros.h"
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -72,9 +73,9 @@ class RecordedValuesIterator;
 // digits) to support in an instance of a histogram. The class takes care of
 // the rest. At this time, only uint64_t values are supported.
 //
-// An HdrHistogram consists of a set of buckets, which bucket the magnitude of
-// a value stored, and a set of sub-buckets, which implement the tunable
-// precision of the storage. So if you specify 3 significant digits of
+// An HdrHistogram consists of a set of buckets (which bucket the magnitude of
+// a value stored), and a set of sub-buckets (which implement the tunable
+// precision of the storage). So if you specify 3 significant digits of
 // precision, then you will get about 10^3 sub-buckets (as a power of 2) for
 // each level of magnitude. Magnitude buckets are tracked in powers of 2.
 //
@@ -115,8 +116,20 @@ class HdrHistogram {
   // Count of all events recorded.
   uint64_t TotalCount() const { return base::subtle::NoBarrier_Load(&total_count_); }
 
+  // Count of all events recorded since last Reset. Resets to 0 after
+  // Reset().
+  uint64_t CurrentCount() const {
+    return base::subtle::NoBarrier_Load(&current_count_);
+  }
+
   // Sum of all events recorded.
   uint64_t TotalSum() const { return base::subtle::NoBarrier_Load(&total_sum_); }
+
+  // Sum of all events recorded since last Reset. Resets to 0 after
+  // Reset().
+  uint64_t CurrentSum() const {
+    return base::subtle::NoBarrier_Load(&current_sum_);
+  }
 
   // Return number of items at index.
   uint64_t CountAt(int bucket_index, int sub_bucket_index) const;
@@ -167,6 +180,10 @@ class HdrHistogram {
   // This is a percentile in percents, i.e. 99.99 percentile.
   uint64_t ValueAtPercentile(double percentile) const;
 
+  // Resets the counts_ array to reset the percentiles information.
+  // Preserves the values for TotalSum and TotalCount.
+  void Reset();
+
   // Get the percentile at a given value
   // TODO: implement
   // double PercentileAtOrBelowValue(uint64_t value) const;
@@ -174,7 +191,12 @@ class HdrHistogram {
   // Get the count of recorded values within a range of value levels.
   // (inclusive to within the histogram's resolution)
   // TODO: implement
-  //uint64_t CountBetweenValues(uint64_t low_value, uint64_t high_value) const;
+  // uint64_t CountBetweenValues(uint64_t low_value, uint64_t high_value) const;
+
+  // Dump a formatted, multiline string describing this histogram to 'out'.
+  void DumpHumanReadable(std::ostream* out) const;
+
+  size_t DynamicMemoryUsage() const;
 
  private:
   friend class AbstractHistogramIterator;
@@ -198,11 +220,15 @@ class HdrHistogram {
   uint32_t sub_bucket_mask_;
 
   // Also hot.
+  // Non-resetting sum and counts.
   base::subtle::Atomic64 total_count_;
   base::subtle::Atomic64 total_sum_;
+  // Resetting values
+  base::subtle::Atomic64 current_count_;
+  base::subtle::Atomic64 current_sum_;
   base::subtle::Atomic64 min_value_;
   base::subtle::Atomic64 max_value_;
-  gscoped_array<base::subtle::Atomic64> counts_;
+  std::unique_ptr<base::subtle::Atomic64[]> counts_;
 
   HdrHistogram& operator=(const HdrHistogram& other); // Disable assignment operator.
 };
@@ -259,7 +285,7 @@ class AbstractHistogramIterator {
   virtual bool HasNext() const;
 
   // Returns the next element in the iteration.
-  CHECKED_STATUS Next(HistogramIterationValue* value);
+  Status Next(HistogramIterationValue* value);
 
   virtual double PercentileIteratedTo() const;
   virtual double PercentileIteratedFrom() const;
@@ -356,5 +382,3 @@ class PercentileIterator : public AbstractHistogramIterator {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_HDRHISTOGRAM_H_

@@ -18,13 +18,13 @@
 #include "yb/gutil/strings/human_readable.h"
 
 #include <stddef.h>
-#include <stdlib.h>
 #include <string.h>
 
-#include <glog/logging.h>
-#include "yb/gutil/logging-inl.h"
+#include "yb/util/logging.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/strings/strip.h"
+
+using std::string;
 
 namespace {
 
@@ -58,8 +58,9 @@ bool HumanReadableNumBytes::ToInt64(const string &str, int64 *num_bytes) {
   char *end;
   double d = strtod(cstr, &end);
   // If this didn't consume the entire string, fail.
-  if ((end - str.c_str()) + 1 < str.size())
+  if (end + 1 < str.c_str() + str.size()) {
     return false;
+  }
   int64 scale = 1;
   switch (*end) {
     // NB: an int64 can only go up to <8 EB.
@@ -76,7 +77,8 @@ bool HumanReadableNumBytes::ToInt64(const string &str, int64 *num_bytes) {
       return false;
   }
   d *= scale;
-  if (d > kint64max || d < 0)
+  // We have to cast kint64max to double to avoid a warning on implicit cast that changes the value.
+  if (d > static_cast<double>(kint64max) || d < 0)
     return false;
   *num_bytes = static_cast<int64>(d + 0.5);
   if (neg) {
@@ -89,7 +91,7 @@ bool HumanReadableNumBytes::ToDouble(const string &str, double *num_bytes) {
   char *end;
   double d = strtod(str.c_str(), &end);
   // If this didn't consume the entire string, fail.
-  if ((end - str.c_str()) + 1 < str.size())
+  if (end + 1 < str.c_str() + str.size())
     return false;
   const char scale = *end;
   switch (scale) {
@@ -115,7 +117,7 @@ string HumanReadableNumBytes::DoubleToString(double num_bytes) {
   const char *neg_str = GetNegStr(&num_bytes);
   static const char units[] = "BKMGTPEZY";
   double scaled = num_bytes;
-  int i = 0;
+  size_t i = 0;
   for (; i < arraysize(units) && scaled >= 1024.0; ++i) {
     scaled /= 1024.0;
   }
@@ -163,7 +165,7 @@ string HumanReadableNumBytes::ToStringWithoutRounding(int64 num_bytes) {
   static const char units[] = "BKMGTPE";  // int64 only goes up to E.
 
   int64 num_units = num_bytes;
-  int unit_type = 0;
+  size_t unit_type = 0;
   for (; unit_type < arraysize(units); unit_type++) {
     if (num_units % 1024 != 0) {
       // Not divisible by the next unit.
@@ -243,7 +245,7 @@ bool HumanReadableNum::ToDouble(const string &str, double *value) {
   char *end;
   double d = strtod(str.c_str(), &end);
   // Allow the string to contain at most one extra character:
-  if ((end - str.c_str()) + 1 < str.size())
+  if (end + 1 < str.c_str() + str.size())
     return false;
   const char scale = *end;
   if ((scale == 'k') || (scale == 'K')) {
@@ -264,7 +266,8 @@ bool HumanReadableNum::ToDouble(const string &str, double *value) {
 bool HumanReadableInt::ToInt64(const string &str, int64 *value) {
   char *end;
   double d = strtod(str.c_str(), &end);
-  if (d > kint64max || d < kint64min)
+  // We have to cast kint64max to double to avoid a warning on implicit cast that changes the value.
+  if (d > static_cast<double>(kint64max) || d < kint64min)
     return false;
   if (*end == 'k') {
     d *= 1000;
@@ -420,7 +423,7 @@ bool HumanReadableElapsedTime::ToDouble(const string& str, double* value) {
     }
     unit_start = SkipLeadingWhiteSpace(unit_start);
     bool found_unit = false;
-    for (int i = 0; !found_unit && i < ARRAYSIZE(kUnits); ++i) {
+    for (size_t i = 0; !found_unit && i < ARRAYSIZE(kUnits); ++i) {
       const size_t unit_len = strlen(kUnits[i].unit);
       if (strncmp(unit_start, kUnits[i].unit, unit_len) == 0) {
         work_value += factor * kUnits[i].seconds;

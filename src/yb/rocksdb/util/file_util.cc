@@ -17,21 +17,24 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/rocksdb/util/file_util.h"
 
-#include <vector>
 #include <algorithm>
+#include <vector>
 
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/util/sst_file_manager_impl.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/gutil/strings/substitute.h"
+#include "yb/rocksdb/util/sst_file_manager_impl.h"
+
+#include "yb/util/path_util.h"
 
 namespace rocksdb {
 
 using std::string;
-using strings::Substitute;
+using std::vector;
+using std::unique_ptr;
 
 // Utility function to copy a file up to a specified length
 Status CopyFile(Env* env, const string& source,
@@ -63,7 +66,7 @@ Status CopyFile(Env* env, const string& source,
     dest_writer.reset(new WritableFileWriter(std::move(destfile), soptions));
   }
 
-  char buffer[4096];
+  uint8_t buffer[4096];
   Slice slice;
   while (size > 0) {
     size_t bytes_to_read = std::min(sizeof(buffer), static_cast<size_t>(size));
@@ -84,6 +87,38 @@ Status CopyFile(Env* env, const string& source,
   return Status::OK();
 }
 
+Status CheckIfDeleted(Env* env, const string& fname, const Status& s_del) {
+  if (!s_del.ok()) {
+    // NotFound is ok, the file was concurrently deleted.
+    if (env->FileExists(fname).IsNotFound()) {
+      return Status::OK(); // Already deleted.
+    }
+  }
+  return s_del; // Successfully deleted or IO error.
+}
+
+Status DeleteRecursively(Env* env, const string& dirname) {
+  // Some sanity checks.
+  SCHECK(
+      dirname != "/" && dirname != "./" && dirname != "." && dirname != "",
+      InvalidArgument, yb::Format("Invalid folder to delete: $0", dirname));
+
+  if (!env->DirExists(dirname)) {
+    // Try to delete as usual file.
+    return CheckIfDeleted(env, dirname, env->DeleteFile(dirname));
+  }
+
+  vector<string> subchildren;
+  RETURN_NOT_OK(env->GetChildren(dirname, &subchildren));
+  for (const string& subchild : subchildren) {
+    if (subchild != "." && subchild != "..") {
+      RETURN_NOT_OK(DeleteRecursively(env, yb::JoinPathSegments(dirname, subchild)));
+    }
+  }
+
+  return CheckIfDeleted(env, dirname, env->DeleteDir(dirname));
+}
+
 Status DeleteSSTFile(const DBOptions* db_options, const string& fname,
                      uint32_t path_id) {
   // TODO(tec): support sst_file_manager for multiple path_ids
@@ -94,58 +129,6 @@ Status DeleteSSTFile(const DBOptions* db_options, const string& fname,
   } else {
     return db_options->env->DeleteFile(fname);
   }
-}
-
-Status CopyDirectory(Env* env, const string& src_dir, const string& dest_dir,
-                     CreateIfMissing create_if_missing, UseHardLinks use_hard_links) {
-  RETURN_NOT_OK_PREPEND(
-      env->FileExists(src_dir),
-      Substitute("Source directory does not exist: $0", src_dir));
-
-  Status s = env->FileExists(dest_dir);
-  if (!s.ok()) {
-    if (create_if_missing) {
-      RETURN_NOT_OK_PREPEND(
-          env->CreateDir(dest_dir),
-          Substitute("Cannot create destination directory: $0", dest_dir));
-    } else {
-      return s.CloneAndPrepend(Substitute("Destination directory does not exist: $0", dest_dir));
-    }
-  }
-
-  // Copy files.
-  std::vector<string> files;
-  RETURN_NOT_OK_PREPEND(
-      env->GetChildren(src_dir, &files),
-      Substitute("Cannot get list of files for directory: $0", src_dir));
-
-  for (const string& file : files) {
-    if (file != "." && file != "..") {
-      const string file_path = src_dir + '/' + file;
-      const string target_path = dest_dir + '/' + file;
-
-      if (use_hard_links) {
-        s = env->LinkFile(file_path, target_path);
-
-        if (s.ok()) {
-          continue;
-        }
-      }
-
-      if (env->DirExists(file_path)) {
-        RETURN_NOT_OK_PREPEND(
-            CopyDirectory(env, file_path, target_path, CreateIfMissing::kTrue, use_hard_links),
-            yb::Format("Cannot copy directory: $0", file_path));
-      } else {
-        // Last argument size == 0 means coping whole file.
-        RETURN_NOT_OK_PREPEND(
-            CopyFile(env, file_path, target_path, 0),
-            yb::Format("Cannot copy file: $0", file_path));
-      }
-    }
-  }
-
-  return Status::OK();
 }
 
 }  // namespace rocksdb

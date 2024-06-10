@@ -30,140 +30,120 @@
 // under the License.
 //
 
-#ifndef YB_TABLET_OPERATIONS_CHANGE_METADATA_OPERATION_H
-#define YB_TABLET_OPERATIONS_CHANGE_METADATA_OPERATION_H
+#pragma once
 
 #include <mutex>
 #include <string>
 
-#include "yb/common/index.h"
+#include "yb/qlexpr/index.h"
+
+#include "yb/consensus/log_fwd.h"
+
 #include "yb/gutil/macros.h"
+
+#include "yb/tablet/operations.messages.h"
 #include "yb/tablet/operations/operation.h"
+
+#include "yb/tserver/tserver_fwd.h"
+#include "yb/tserver/tserver_admin.pb.h"
+
 #include "yb/util/locks.h"
 
 namespace yb {
 
 class Schema;
 
-namespace log {
-class Log;
-}
-
 namespace tablet {
+
+class TabletPeer;
 
 // Operation Context for the AlterSchema operation.
 // Keeps track of the Operation states (request, result, ...)
-class ChangeMetadataOperationState : public OperationState {
+class ChangeMetadataOperation
+    : public ExclusiveSchemaOperation<OperationType::kChangeMetadata,
+                                      LWChangeMetadataRequestPB> {
  public:
-  ~ChangeMetadataOperationState() {
-  }
+  ChangeMetadataOperation(TabletPtr tablet, log::Log* log,
+                          const LWChangeMetadataRequestPB* request = nullptr);
 
-  ChangeMetadataOperationState(Tablet* tablet, log::Log* log,
-                            const tserver::ChangeMetadataRequestPB* request = nullptr)
-      : OperationState(tablet), log_(log), request_(request) {
-  }
+  explicit ChangeMetadataOperation(const LWChangeMetadataRequestPB* request);
 
-  explicit ChangeMetadataOperationState(const tserver::ChangeMetadataRequestPB* request)
-      : ChangeMetadataOperationState(nullptr, nullptr, request) {
-  }
-
-  const tserver::ChangeMetadataRequestPB* request() const override { return request_; }
-
-  void UpdateRequestFromConsensusRound() override;
+  ~ChangeMetadataOperation();
 
   void set_schema(const Schema* schema) { schema_ = schema; }
   const Schema* schema() const { return schema_; }
 
   void SetIndexes(const google::protobuf::RepeatedPtrField<IndexInfoPB>& indexes);
 
-  IndexMap& index_map() {
+  qlexpr::IndexMap& index_map() {
     return index_map_;
   }
 
-  std::string new_table_name() const {
-    return request_->new_table_name();
+  Slice new_table_name() const {
+    return request()->new_table_name();
   }
 
   bool has_new_table_name() const {
-    return request_->has_new_table_name();
+    return request()->has_new_table_name();
   }
 
   uint32_t schema_version() const {
-    return request_->schema_version();
+    return request()->schema_version();
   }
 
-  void AcquireSchemaLock(rw_semaphore* l);
+  uint32_t wal_retention_secs() const {
+    return request()->wal_retention_secs();
+  }
 
-  // Release the acquired schema lock.
-  // Crashes if the lock was not already acquired.
-  void ReleaseSchemaLock();
+  bool has_wal_retention_secs() const {
+    return request()->has_wal_retention_secs();
+  }
 
-  // Note: request_ is set to NULL after this method returns.
-  void Finish() {
-    // Make the request NULL since after this transaction commits
-    // the request may be deleted at any moment.
-    request_ = nullptr;
+  bool has_table_id() const {
+    return request()->has_alter_table_id();
+  }
+
+  Slice table_id() const {
+    return request()->alter_table_id();
   }
 
   log::Log* log() const { return log_; }
 
+  log::Log* mutable_log() { return log_; }
+
   virtual std::string ToString() const override;
 
+  // Executes a Prepare for the metadata change operation.
+  //
+  // TODO: need a schema lock?
+
+  Status Prepare(IsLeaderSide is_leader_side) override;
+
+  Status Apply(int64_t leader_term, Status* complete_status);
+
  private:
+
+  // Starts the ChangeMetadataOperation by assigning it a timestamp.
+  Status DoReplicated(int64_t leader_term, Status* complete_status) override;
+
+  Status DoAborted(const Status& status) override;
+
+  Status ProcessCDCSDKCreateStreamContext();
+
   log::Log* const log_;
 
   // The new (target) Schema.
   const Schema* schema_ = nullptr;
+  std::unique_ptr<Schema> schema_holder_;
 
   // Lookup map for the associated indexes.
-  IndexMap index_map_;
-
-  // The original RPC request and response.
-  const tserver::ChangeMetadataRequestPB *request_;
-
-  // The lock held on the tablet's schema_lock_.
-  std::unique_lock<rw_semaphore> schema_lock_;
-
-  DISALLOW_COPY_AND_ASSIGN(ChangeMetadataOperationState);
+  qlexpr::IndexMap index_map_;
 };
 
-// Executes the alter schema transaction,.
-class ChangeMetadataOperation : public Operation {
- public:
-  explicit ChangeMetadataOperation(std::unique_ptr<ChangeMetadataOperationState> operation_state);
-
-  ChangeMetadataOperationState* state() override {
-    return down_cast<ChangeMetadataOperationState*>(Operation::state());
-  }
-
-  const ChangeMetadataOperationState* state() const override {
-    return down_cast<const ChangeMetadataOperationState*>(Operation::state());
-  }
-
-  consensus::ReplicateMsgPtr NewReplicateMsg() override;
-
-  // Executes a Prepare for the alter schema transaction.
-  //
-  // TODO: need a schema lock?
-
-  CHECKED_STATUS Prepare() override;
-
-  // Executes an Apply for the alter schema transaction
-  CHECKED_STATUS Apply(int64_t leader_term) override;
-
-  // Actually commits the transaction.
-  void Finish(OperationResult result) override;
-
-  std::string ToString() const override;
-
- private:
-  // Starts the AlterSchemaOperation by assigning it a timestamp.
-  void DoStart() override;
-
-  DISALLOW_COPY_AND_ASSIGN(ChangeMetadataOperation);
-};
+Status SyncReplicateChangeMetadataOperation(
+    const ChangeMetadataRequestPB* req,
+    tablet::TabletPeer* tablet_peer,
+    int64_t term);
 
 }  // namespace tablet
 }  // namespace yb
-
-#endif  // YB_TABLET_OPERATIONS_CHANGE_METADATA_OPERATION_H

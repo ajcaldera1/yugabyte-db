@@ -67,7 +67,8 @@ body {
 
 .nav-logo {
     display: inline-block;
-    height: 39px;
+    height: 42px;
+    width: auto;
     margin: 10px auto;
     padding-left: 5px;
 }
@@ -220,4 +221,45 @@ body {
 }
 .level6 td:first-child {
     padding-left: 105px;
+}
+
+.collapse .toggle {
+  background: url("images/collapse.png");
+}
+.expand .toggle {
+  background: url("images/expand.png");
+}
+.toggle {
+  height: 9px;
+  width: 9px;
+  display: inline-block;
+}
+
+/*
+Usage for collapsible style on base of checkbox:
+  <input type="checkbox" id="uinque-id" class="yb-collapsible-cb"/>
+  <label for="uinque-id">title</label>
+  <div>collapsible data</div>
+
+Note: <div> can be replaced with any element that supports 'display: block'
+*/
+.yb-collapsible-cb,
+.yb-collapsible-cb + label + * {
+  display: none;
+}
+.yb-collapsible-cb:checked + label + * {
+  display: block;
+}
+.yb-collapsible-cb + label {
+  cursor: pointer;
+  display: inline-block;
+  text-decoration: underline;
+  text-decoration-thickness: .1em;
+  text-underline-position: under;
+  text-decoration-style: dashed;
+  -ms-text-underline-position: under;
+  -moz-text-decoration-style: dashed;
+}
+.yb-collapsible-cb:hover + label {
+  opacity: .8;
 }

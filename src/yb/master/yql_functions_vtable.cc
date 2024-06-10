@@ -11,14 +11,21 @@
 // under the License.
 //
 
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_functions_vtable.h"
+
+#include <boost/asio/ip/address.hpp>
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+#include "yb/util/status_log.h"
 
 namespace yb {
 namespace master {
 
-YQLFunctionsVTable::YQLFunctionsVTable(const Master* const master)
-    : YQLEmptyVTable(master::kSystemSchemaFunctionsTableName, master, CreateSchema()) {
+YQLFunctionsVTable::YQLFunctionsVTable(const TableName& table_name,
+                                       const NamespaceName& namespace_name,
+                                       Master * const master)
+    : YQLEmptyVTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
 Schema YQLFunctionsVTable::CreateSchema() const {

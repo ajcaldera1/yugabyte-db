@@ -29,11 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_GLOG_METRICS_H
-#define YB_SERVER_GLOG_METRICS_H
+#pragma once
+
+#include <memory>
 
 #include "yb/gutil/macros.h"
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/ref_counted.h"
 
 namespace google {
@@ -54,7 +54,7 @@ class ScopedGLogMetrics {
   ~ScopedGLogMetrics();
 
  private:
-  gscoped_ptr<google::LogSink> sink_;
+  std::unique_ptr<google::LogSink> sink_;
 };
 
 
@@ -64,4 +64,3 @@ class ScopedGLogMetrics {
 void RegisterGLogMetrics(const scoped_refptr<MetricEntity>& entity);
 
 } // namespace yb
-#endif /* YB_SERVER_GLOG_METRICS_H */

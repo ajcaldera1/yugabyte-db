@@ -25,6 +25,8 @@
 #ifndef PG_YB_COMMON_H
 #define PG_YB_COMMON_H
 
+#define YB_INITDB_ALREADY_DONE_EXIT_CODE 125
+
 /**
  * Checks if the given environment variable is set to a "true" value (e.g. "1").
  */
@@ -75,4 +77,77 @@ extern bool YBIsUsingYBParser();
  * Returns ERROR or WARNING level depends on environment variable
  */
 extern int YBUnsupportedFeatureSignalLevel();
+
+/**
+ * Returns whether unsafe ALTER notice should be suppressed.
+ */
+extern bool YBSuppressUnsafeAlterNotice();
+
+/**
+ * Returns whether non-transactional COPY gflag is enabled.
+ */
+extern bool YBIsNonTxnCopyEnabled();
+
+/**
+ * Returns a null-terminated string representing the name of the
+ * cloud this process is running on.
+ */
+extern const char *YBGetCurrentCloud();
+
+/**
+ * Returns a null-terminated string representing the region this
+ * process is running on.
+ */
+extern const char *YBGetCurrentRegion();
+
+/**
+ * Returns a null-terminated string representing the zone this
+ * process is running on.
+ */
+extern const char *YBGetCurrentZone();
+
+/**
+ * Returns a null-terminated string representing the uuid of the
+ * placement this process is running on.
+ */
+extern const char *YBGetCurrentUUID();
+
+/**
+ * Returns a null-terminated string representing the metric node
+ * name that this process is associated with.
+ */
+extern const char *YBGetCurrentMetricNodeName();
+
+/**
+ * Returns a null-terminated string representing the custom tmp path
+ * Postgres process will use to keep some of its temporary files.
+ */
+extern const char *YbGetTmpDir();
+
+/**
+ * Returns whether COLLATION support is enabled.
+ */
+extern bool YBIsCollationEnabled();
+
+/**
+ * Returns the value of the configration variable `max_clock_sec_usec`
+ * returns -1 if the configuration was not found.
+ */
+extern int YBGetMaxClockSkewUsec();
+
+extern int YBGetYsqlOutputBufferSize();
+
+/**
+ * Test only constant. When set to true initdb imports default collation
+ * from the OS environment. As a result the default collation will be
+ * en_US.UTF-8. All the initial databases will have en_US.UTF-8 collation.
+ * The text columns of all system tables will have en_US.UTF-8 collation.
+ */
+extern const bool kTestOnlyUseOSDefaultCollation;
+
+/**
+ * Returns whether colocation is enabled by default for each database.
+ */
+extern bool YBColocateDatabaseByDefault();
+
 #endif /* PG_YB_COMMON_H */

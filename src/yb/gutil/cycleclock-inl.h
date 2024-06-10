@@ -45,8 +45,7 @@
 // with modifications by m3b.  See also
 //    https://setisvn.ssl.berkeley.edu/svn/lib/fftw-3.0.1/kernel/cycle.h
 
-#ifndef GUTIL_CYCLECLOCK_INL_H_
-#define GUTIL_CYCLECLOCK_INL_H_
+#pragma once
 
 #include <sys/time.h>
 
@@ -161,6 +160,19 @@ inline int64 CycleClock::Now() {
 }
 
 // ----------------------------------------------------------------
+#elif defined(__aarch64__)
+#include "yb/gutil/sysinfo.h"
+inline int64 CycleClock::Now() {
+  // System timer of ARMv8 runs at a different frequency than the CPU's.
+  // The frequency is fixed, typically in the range 1-50MHz.  It can be
+  // read at CNTFRQ special register.  We assume the OS has set up
+  // the virtual timer properly.
+  int64_t virtual_timer_value;
+  asm volatile("mrs %0, cntvct_el0" : "=r"(virtual_timer_value));
+  return virtual_timer_value;
+}
+
+// ----------------------------------------------------------------
 #elif defined(ARMV6)  // V6 is the earliest arm that has a standard cyclecount
 #include "yb/gutil/sysinfo.h"
 inline int64 CycleClock::Now() {
@@ -213,5 +225,3 @@ inline int64 CycleClock::Now() {
 // available.
 #error You need to define CycleTimer for your O/S and CPU
 #endif
-
-#endif  // GUTIL_CYCLECLOCK_INL_H_

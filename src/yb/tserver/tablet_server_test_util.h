@@ -29,12 +29,10 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TSERVER_TABLET_SERVER_TEST_UTIL_H_
-#define YB_TSERVER_TABLET_SERVER_TEST_UTIL_H_
+#pragma once
 
 #include <memory>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/util/net/net_fwd.h"
 
@@ -51,16 +49,16 @@ class GenericServiceProxy;
 namespace tserver {
 class TabletServerAdminServiceProxy;
 class TabletServerServiceProxy;
+class TabletServerBackupServiceProxy;
 
 // Create tablet server client proxies for tests.
 void CreateTsClientProxies(const HostPort& addr,
                            rpc::ProxyCache* proxy_cache,
-                           gscoped_ptr<TabletServerServiceProxy>* proxy,
-                           gscoped_ptr<TabletServerAdminServiceProxy>* admin_proxy,
-                           gscoped_ptr<consensus::ConsensusServiceProxy>* consensus_proxy,
-                           gscoped_ptr<server::GenericServiceProxy>* generic_proxy);
+                           std::unique_ptr<TabletServerServiceProxy>* proxy,
+                           std::unique_ptr<TabletServerAdminServiceProxy>* admin_proxy,
+                           std::unique_ptr<consensus::ConsensusServiceProxy>* consensus_proxy,
+                           std::unique_ptr<server::GenericServiceProxy>* generic_proxy,
+                           std::unique_ptr<TabletServerBackupServiceProxy>* backup_proxy);
 
 } // namespace tserver
 } // namespace yb
-
-#endif // YB_TSERVER_TABLET_SERVER_TEST_UTIL_H_

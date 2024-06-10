@@ -29,19 +29,20 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TABLET_MVCC_H_
-#define YB_TABLET_MVCC_H_
+#pragma once
 
 #include <condition_variable>
-#include <mutex>
 #include <deque>
-#include <queue>
 #include <vector>
 
+#include "yb/common/opid.h"
+
+#include "yb/gutil/thread_annotations.h"
+
 #include "yb/server/clock.h"
-#include "yb/util/debug-util.h"
-#include "yb/util/opid.h"
+
 #include "yb/util/enums.h"
+#include "yb/util/math_util.h"
 
 namespace yb {
 namespace tablet {
@@ -58,6 +59,21 @@ struct SafeTimeWithSource {
   std::string ToString() const;
 };
 
+struct FixedHybridTimeLease {
+  HybridTime time;
+  HybridTime lease = HybridTime::kMax;
+
+  bool empty() const {
+    return lease.GetPhysicalValueMicros() >= kMaxHybridTimePhysicalMicros;
+  }
+
+  std::string ToString() const;
+};
+
+inline std::ostream& operator<<(std::ostream& out, const FixedHybridTimeLease& ht_lease) {
+  return out << ht_lease.ToString();
+}
+
 // MvccManager is used to track operations.
 // When new operation is initiated its time should be added using AddPending.
 // When operation is replicated or aborted, MvccManager is notified using Replicated or Aborted
@@ -68,35 +84,38 @@ class MvccManager {
  public:
   // `prefix` is used for logging.
   explicit MvccManager(std::string prefix, server::ClockPtr clock);
+  ~MvccManager();
+
+  // Set special RF==1 mode flag to handle safe time requests correctly in case
+  // there are no heartbeats to update internal propagated_safe_time_ correctly.
+  void SetLeaderOnlyMode(bool leader_only) EXCLUDES(mutex_);
 
   // Sets time of last replicated operation, used after bootstrap.
-  void SetLastReplicated(HybridTime ht);
+  void SetLastReplicated(HybridTime ht) EXCLUDES(mutex_);
 
   // Sets safe time that was sent to us by the leader. Should be called on followers.
-  void SetPropagatedSafeTimeOnFollower(HybridTime ht);
+  void SetPropagatedSafeTimeOnFollower(HybridTime ht) EXCLUDES(mutex_);
 
   // Updates the propagated_safe_time field to the current safe time. This should be called in the
   // majority-replicated watermark callback from Raft. If we have some read requests that were
   // initiated when this server was a follower and are waiting for the safe time to advance past
   // a certain point, they can also get unblocked by this update of propagated_safe_time.
-  void UpdatePropagatedSafeTimeOnLeader(HybridTime ht_lease);
+  void UpdatePropagatedSafeTimeOnLeader(const FixedHybridTimeLease& ht_lease) EXCLUDES(mutex_);
 
-  // Adds time of new tracked operation.
-  // `ht` is in-out parameter.
-  // In case of replica `ht` is already assigned, in case of leader we should assign ht by
-  // by ourselves.
-  // We pass ht as pointer here, because clock should be accessed with locked mutex, otherwise
-  // SafeTime could return time greater than added.
-  //
+  // Adds time of new tracked follower operation.
   // OpId is being passed for the ease of debugging.
-  void AddPending(HybridTime* ht);
+  void AddFollowerPending(HybridTime ht, const OpId& op_id) EXCLUDES(mutex_);
+
+  // Adds leader operation and returns its time.
+  // OpId is being passed for the ease of debugging.
+  HybridTime AddLeaderPending(const OpId& op_id) EXCLUDES(mutex_);
 
   // Notifies that operation with appropriate time was replicated.
   // It should be first operation in queue.
-  void Replicated(HybridTime ht);
+  void Replicated(HybridTime ht, const OpId& op_id) EXCLUDES(mutex_);
 
   // Notifies that operation with appropriate time was aborted.
-  void Aborted(HybridTime ht);
+  void Aborted(HybridTime ht, const OpId& op_id) EXCLUDES(mutex_);
 
   // Returns maximum allowed timestamp to read at. No operations that are initiated after this call
   // will receive hybrid time less than what's returned, provided that `ht_lease` is set to the
@@ -114,38 +133,71 @@ class MvccManager {
   // Returns invalid hybrid time in case it cannot satisfy provided requirements, for instance
   // because of timeout.
   HybridTime SafeTime(
-      HybridTime min_allowed, CoarseTimePoint deadline, HybridTime ht_lease) const;
+      HybridTime min_allowed, CoarseTimePoint deadline, const FixedHybridTimeLease& ht_lease) const
+      EXCLUDES(mutex_);
 
-  HybridTime SafeTime(HybridTime ht_lease) const {
+  HybridTime SafeTime(const FixedHybridTimeLease& ht_lease) const EXCLUDES(mutex_) {
     return SafeTime(HybridTime::kMin /* min_allowed */, CoarseTimePoint::max() /* deadline */,
                     ht_lease);
   }
 
-  HybridTime SafeTimeForFollower(HybridTime min_allowed, CoarseTimePoint deadline) const;
+  HybridTime SafeTimeForFollower(HybridTime min_allowed, CoarseTimePoint deadline) const
+      EXCLUDES(mutex_);
 
   // Returns time of last replicated operation.
-  HybridTime LastReplicatedHybridTime() const;
+  HybridTime LastReplicatedHybridTime() const EXCLUDES(mutex_);
+
+  class MvccOpTrace;
+
+  void TEST_DumpTrace(std::ostream* out);
 
  private:
   HybridTime DoGetSafeTime(HybridTime min_allowed,
                            CoarseTimePoint deadline,
-                           HybridTime ht_lease,
-                           std::unique_lock<std::mutex>* lock) const;
+                           const FixedHybridTimeLease& ht_lease,
+                           std::unique_lock<std::mutex>* lock) const REQUIRES(mutex_);
 
   const std::string& LogPrefix() const { return prefix_; }
-  void PopFront(std::lock_guard<std::mutex>* lock);
+
+  struct InvariantViolationLoggingHelper;
+  InvariantViolationLoggingHelper InvariantViolationLogPrefix() const REQUIRES(mutex_);
+
+  friend std::ostream& operator<<(
+      std::ostream& out, const InvariantViolationLoggingHelper& helper);
+
+  void AddPending(HybridTime ht, const OpId& op_id, bool is_follower_side) REQUIRES(mutex_);
 
   std::string prefix_;
   server::ClockPtr clock_;
   mutable std::mutex mutex_;
   mutable std::condition_variable cond_;
 
-  // An ordered queue of times of tracked operations.
-  std::deque<HybridTime> queue_;
+  struct QueueItem {
+    HybridTime hybrid_time;
+    OpId op_id;
 
-  // Priority queue (min-heap, hence std::greater<> as the "less" comparator) of aborted operations.
-  // Required because we could abort operations from the middle of the queue.
-  std::priority_queue<HybridTime, std::vector<HybridTime>, std::greater<>> aborted_;
+    std::string ToString() const;
+    bool Eq(const QueueItem& rhs) const;
+
+    friend bool operator==(const QueueItem& lhs, const QueueItem& rhs) {
+      return lhs.Eq(rhs);
+    }
+
+    friend bool operator<(const QueueItem& lhs, const QueueItem& rhs) {
+      return lhs.hybrid_time < rhs.hybrid_time ||
+             (lhs.hybrid_time == rhs.hybrid_time && lhs.op_id < rhs.op_id);
+    }
+
+    friend bool operator>(const QueueItem& lhs, const QueueItem& rhs) {
+      return rhs < lhs;
+    }
+
+    friend std::ostream& operator<<(std::ostream& out, const QueueItem& item) {
+      return out << item.ToString();
+    }
+  };
+  // An ordered queue of times of tracked operations.
+  std::deque<QueueItem> queue_;
 
   HybridTime last_replicated_ = HybridTime::kMin;
 
@@ -153,18 +205,15 @@ class MvccManager {
   // leader, this is a safe time that gets updated every time the majority-replicated watermarks
   // change.
   HybridTime propagated_safe_time_ = HybridTime::kMin;
-
-  // Because different calls that have current hybrid time leader lease as an argument can come to
-  // us out of order, we might see an older value of hybrid time leader lease expiration after a
-  // newer value. We mitigate this by always using the highest value we've seen.
-  mutable HybridTime max_ht_lease_seen_ = HybridTime::kMin;
+  // Special flag for RF==1 mode when propagated_safe_time_ can be not up-to-date.
+  bool leader_only_mode_ = false;
 
   mutable SafeTimeWithSource max_safe_time_returned_with_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_without_lease_;
   mutable SafeTimeWithSource max_safe_time_returned_for_follower_ { HybridTime::kMin };
+
+  std::unique_ptr<MvccOpTrace> op_trace_ GUARDED_BY(mutex_);
 };
 
 }  // namespace tablet
 }  // namespace yb
-
-#endif  // YB_TABLET_MVCC_H_

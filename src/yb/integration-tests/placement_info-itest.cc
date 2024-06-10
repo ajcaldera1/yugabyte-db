@@ -11,19 +11,31 @@
 // under the License.
 //
 
-#include "yb/client/client.h"
 #include "yb/client/client-internal.h"
+#include "yb/client/client.h"
 #include "yb/client/meta_cache.h"
+#include "yb/client/schema.h"
 #include "yb/client/table_creator.h"
 
 #include "yb/integration-tests/mini_cluster.h"
-#include "yb/master/master.pb.h"
-#include "yb/master/master.proxy.h"
+
+#include "yb/master/master_client.proxy.h"
+#include "yb/master/master_defaults.h"
 #include "yb/master/mini_master.h"
+
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
+#include "yb/rpc/rpc_controller.h"
+
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
+
+using std::vector;
+using std::string;
 
 DECLARE_bool(TEST_check_broadcast_address);
 
@@ -40,7 +52,7 @@ class PlacementInfoTest : public YBTest {
 
  protected:
   void SetUp() override {
-    FLAGS_TEST_check_broadcast_address = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_check_broadcast_address) = false;
 
     YBTest::SetUp();
     MiniClusterOptions opts;
@@ -56,33 +68,32 @@ class PlacementInfoTest : public YBTest {
       tserver_opts.push_back(*opts);
     }
 
-    cluster_.reset(new MiniCluster(env_.get(), opts));
+    cluster_.reset(new MiniCluster(opts));
     ASSERT_OK(cluster_->Start(tserver_opts));
-    for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+    for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
       std::string ts_uuid = cluster_->mini_tablet_server(i)->server()->fs_manager()->uuid();
       ts_uuid_to_index_.emplace(ts_uuid, i);
     }
 
-    YBClientBuilder builder;
-    ASSERT_OK(cluster_->CreateClient(&builder, &client_));
+    client_ = ASSERT_RESULT(cluster_->CreateClient());
     rpc::MessengerBuilder bld("Client");
     client_messenger_ = ASSERT_RESULT(bld.Build());
-    rpc::ProxyCache proxy_cache(client_messenger_);
-    proxy_.reset(new master::MasterServiceProxy(&proxy_cache,
-                                                cluster_->leader_mini_master()->bound_rpc_addr()));
+    rpc::ProxyCache proxy_cache(client_messenger_.get());
+    proxy_.reset(new master::MasterClientProxy(
+        &proxy_cache, ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->bound_rpc_addr()));
 
     // Create the table.
     YBSchema schema;
     YBSchemaBuilder b;
-    b.AddColumn("key")->Type(INT32)->NotNull()->PrimaryKey();
-    b.AddColumn("int_val")->Type(INT32)->NotNull();
+    b.AddColumn("key")->Type(DataType::INT32)->NotNull()->PrimaryKey();
+    b.AddColumn("int_val")->Type(DataType::INT32)->NotNull();
     CHECK_OK(b.Build(&schema));
-    gscoped_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
-    table_name_ = std::make_unique<YBTableName>("test_tablet_locations");
+    std::unique_ptr<YBTableCreator> table_creator(client_->NewTableCreator());
+    table_name_ = std::make_unique<YBTableName>(YQL_DATABASE_CQL, "test_tablet_locations");
     table_name_->set_namespace_name(yb::master::kSystemNamespaceName);
     CHECK_OK(table_creator->table_name(*table_name_)
                  .schema(&schema)
-                 .hash_schema(YBHashSchema::kMultiColumnHash)
+                 .hash_schema(dockv::YBHashSchema::kMultiColumnHash)
                  .wait(true)
                  .num_tablets(1)
                  .Create());
@@ -98,6 +109,8 @@ class PlacementInfoTest : public YBTest {
   }
 
   void TearDown() override {
+    client_messenger_->Shutdown();
+    client_.reset();
     if (cluster_) {
       cluster_->Shutdown();
       cluster_.reset();
@@ -124,7 +137,6 @@ class PlacementInfoTest : public YBTest {
                              const std::string& placement_region,
                              int expected_ts_index,
                              internal::RemoteTablet* remote_tablet) {
-    std::shared_ptr<client::YBClient> client;
     CloudInfoPB cloud_info;
     cloud_info.set_placement_zone(placement_zone);
     cloud_info.set_placement_region(placement_region);
@@ -132,8 +144,9 @@ class PlacementInfoTest : public YBTest {
     YBClientBuilder client_builder;
     client_builder.set_tserver_uuid(client_uuid);
     client_builder.set_cloud_info_pb(cloud_info);
-    client_builder.add_master_server_addr(cluster_->leader_mini_master()->bound_rpc_addr_str());
-    CHECK_OK(client_builder.Build(&client));
+    client_builder.add_master_server_addr(
+        ASSERT_RESULT(cluster_->GetLeaderMiniMaster())->bound_rpc_addr_str());
+    auto client = CHECK_RESULT(client_builder.Build());
 
     // Select tserver.
     vector<internal::RemoteTabletServer *> candidates;
@@ -146,9 +159,9 @@ class PlacementInfoTest : public YBTest {
   }
 
   std::unique_ptr<MiniCluster> cluster_;
-  std::shared_ptr<YBClient> client_;
-  std::unique_ptr<master::MasterServiceProxy> proxy_;
-  std::shared_ptr<rpc::Messenger> client_messenger_;
+  std::unique_ptr<YBClient> client_;
+  std::unique_ptr<master::MasterClientProxy> proxy_;
+  std::unique_ptr<rpc::Messenger> client_messenger_;
   std::map<std::string, int> ts_uuid_to_index_;
   std::unique_ptr<YBTableName> table_name_;
 };
@@ -178,10 +191,11 @@ TEST_F(PlacementInfoTest, TestSelectTServer) {
   master::TabletLocationsPB tablet_locations;
   GetTabletLocations(&tablet_locations);
 
-  Partition partition;
-  Partition::FromPB(tablet_locations.partition(), &partition);
+  dockv::Partition partition;
+  dockv::Partition::FromPB(tablet_locations.partition(), &partition);
   internal::RemoteTabletPtr remote_tablet = new internal::RemoteTablet(
-      tablet_locations.tablet_id(), partition);
+      tablet_locations.tablet_id(), partition, /* partition_list_version = */ 0,
+      /* split_depth = */ 0, /* split_parent_id = */ "", internal::RemoteTablet::kUnknownOpIdIndex);
 
   // Build remote tserver map.
   internal::TabletServerMap tserver_map;

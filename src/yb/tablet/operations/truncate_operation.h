@@ -11,14 +11,13 @@
 // under the License.
 //
 
-#ifndef YB_TABLET_OPERATIONS_TRUNCATE_OPERATION_H
-#define YB_TABLET_OPERATIONS_TRUNCATE_OPERATION_H
+#pragma once
 
 #include <mutex>
 #include <string>
 
 #include "yb/gutil/macros.h"
-#include "yb/docdb/doc_key.h"
+#include "yb/tablet/operations.messages.h"
 #include "yb/tablet/operations/operation.h"
 #include "yb/util/locks.h"
 
@@ -34,56 +33,20 @@ namespace tablet {
 
 // Operation Context for the Truncate operation.
 // Keeps track of the Operation states (request, result, ...)
-class TruncateOperationState : public OperationState {
- public:
-  explicit TruncateOperationState(Tablet* tablet,
-                                  const tserver::TruncateRequestPB* request = nullptr)
-      : OperationState(tablet), request_(request) {}
-  ~TruncateOperationState() {}
-
-  const tserver::TruncateRequestPB* request() const override { return request_; }
-
-  void UpdateRequestFromConsensusRound() override;
-
-  virtual std::string ToString() const override;
-
- private:
-  // The original RPC request.
-  const tserver::TruncateRequestPB *request_;
-
-  DISALLOW_COPY_AND_ASSIGN(TruncateOperationState);
-};
-
 // Executes the truncate transaction.
-class TruncateOperation : public Operation {
+class TruncateOperation : public OperationBase<OperationType::kTruncate, LWTruncatePB> {
  public:
-  explicit TruncateOperation(std::unique_ptr<TruncateOperationState> operation_state);
+  template <class... Args>
+  explicit TruncateOperation(Args&&... args)
+      : OperationBase(std::forward<Args>(args)...) {}
 
-  TruncateOperationState* state() override {
-    return down_cast<TruncateOperationState*>(Operation::state());
-  }
-
-  const TruncateOperationState* state() const override {
-    return down_cast<const TruncateOperationState*>(Operation::state());
-  }
-
-  consensus::ReplicateMsgPtr NewReplicateMsg() override;
-
-  CHECKED_STATUS Prepare() override { return Status::OK(); }
-
-  // Executes an Apply for the truncate transaction.
-  CHECKED_STATUS Apply(int64_t leader_term) override;
-
-  std::string ToString() const override;
+  Status Prepare(IsLeaderSide is_leader_side) override { return Status::OK(); }
 
  private:
   // Starts the TruncateOperation by assigning it a timestamp.
-  void DoStart() override;
-
-  DISALLOW_COPY_AND_ASSIGN(TruncateOperation);
+  Status DoReplicated(int64_t leader_term, Status* complete_status) override;
+  Status DoAborted(const Status& status) override;
 };
 
 }  // namespace tablet
 }  // namespace yb
-
-#endif  // YB_TABLET_OPERATIONS_TRUNCATE_OPERATION_H

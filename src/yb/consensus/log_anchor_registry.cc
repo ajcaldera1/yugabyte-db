@@ -29,7 +29,6 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/consensus/log_anchor_registry.h"
 
 #include <mutex>
@@ -37,13 +36,10 @@
 
 #include "yb/consensus/opid_util.h"
 
-#include "yb/gutil/strings/substitute.h"
-
 namespace yb {
 namespace log {
 
 using consensus::kInvalidOpIdIndex;
-using std::pair;
 using std::string;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
@@ -58,33 +54,32 @@ LogAnchorRegistry::~LogAnchorRegistry() {
 void LogAnchorRegistry::Register(int64_t log_index,
                                  const string& owner,
                                  LogAnchor* anchor) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   RegisterUnlocked(log_index, owner, anchor);
 }
 
 Status LogAnchorRegistry::UpdateRegistration(int64_t log_index,
-                                             const std::string& owner,
                                              LogAnchor* anchor) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   RETURN_NOT_OK_PREPEND(UnregisterUnlocked(anchor),
                         "Unable to swap registration, anchor not registered")
-  RegisterUnlocked(log_index, owner, anchor);
+  RegisterUnlocked(log_index, std::string(), anchor);
   return Status::OK();
 }
 
 Status LogAnchorRegistry::Unregister(LogAnchor* anchor) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   return UnregisterUnlocked(anchor);
 }
 
 Status LogAnchorRegistry::UnregisterIfAnchored(LogAnchor* anchor) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   if (!anchor->is_registered) return Status::OK();
   return UnregisterUnlocked(anchor);
 }
 
 Status LogAnchorRegistry::GetEarliestRegisteredLogIndex(int64_t* log_index) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   auto iter = anchors_.begin();
   if (iter == anchors_.end()) {
     static Status no_anchors_status = STATUS(NotFound, "No anchors in registry");
@@ -97,13 +92,13 @@ Status LogAnchorRegistry::GetEarliestRegisteredLogIndex(int64_t* log_index) {
 }
 
 size_t LogAnchorRegistry::GetAnchorCountForTests() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   return anchors_.size();
 }
 
 std::string LogAnchorRegistry::DumpAnchorInfo() const {
   string buf;
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   MonoTime now = MonoTime::Now();
   for (const AnchorMultiMap::value_type& entry : anchors_) {
     const LogAnchor* anchor = entry.second;
@@ -124,7 +119,9 @@ void LogAnchorRegistry::RegisterUnlocked(int64_t log_index,
   DCHECK(!anchor->is_registered);
 
   anchor->log_index = log_index;
-  anchor->owner.assign(owner);
+  if (!owner.empty()) { // Keep existing owner during registration update.
+    anchor->owner = owner;
+  }
   anchor->is_registered = true;
   anchor->when_registered = MonoTime::Now();
   AnchorMultiMap::value_type value(log_index, anchor);
@@ -157,40 +154,6 @@ LogAnchor::LogAnchor()
 
 LogAnchor::~LogAnchor() {
   CHECK(!is_registered) << "Attempted to destruct a registered LogAnchor";
-}
-
-MinLogIndexAnchorer::MinLogIndexAnchorer(LogAnchorRegistry* registry,
-                                         string owner)
-    : registry_(DCHECK_NOTNULL(registry)),
-      owner_(std::move(owner)),
-      minimum_log_index_(kInvalidOpIdIndex) {}
-
-MinLogIndexAnchorer::~MinLogIndexAnchorer() {
-  CHECK_OK(ReleaseAnchor());
-}
-
-void MinLogIndexAnchorer::AnchorIfMinimum(int64_t log_index) {
-  std::lock_guard<simple_spinlock> l(lock_);
-  if (PREDICT_FALSE(minimum_log_index_ == kInvalidOpIdIndex)) {
-    minimum_log_index_ = log_index;
-    registry_->Register(minimum_log_index_, owner_, &anchor_);
-  } else if (log_index < minimum_log_index_) {
-    minimum_log_index_ = log_index;
-    CHECK_OK(registry_->UpdateRegistration(minimum_log_index_, owner_, &anchor_));
-  }
-}
-
-Status MinLogIndexAnchorer::ReleaseAnchor() {
-  std::lock_guard<simple_spinlock> l(lock_);
-  if (PREDICT_TRUE(minimum_log_index_ != kInvalidOpIdIndex)) {
-    return registry_->Unregister(&anchor_);
-  }
-  return Status::OK(); // If there were no inserts, return OK.
-}
-
-int64_t MinLogIndexAnchorer::minimum_log_index() const {
-  std::lock_guard<simple_spinlock> l(lock_);
-  return minimum_log_index_;
 }
 
 } // namespace log

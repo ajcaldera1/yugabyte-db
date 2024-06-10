@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_AUTH_RESOURCE_ROLE_PERMISSIONS_INDEX_H
-#define YB_MASTER_YQL_AUTH_RESOURCE_ROLE_PERMISSIONS_INDEX_H
+#pragma once
 
 #include "yb/master/yql_virtual_table.h"
 
@@ -22,10 +21,11 @@ namespace master {
 // VTable implementation of system_auth.resource_role_permissions_index
 class YQLAuthResourceRolePermissionsIndexVTable : public YQLVirtualTable {
  public:
-  explicit YQLAuthResourceRolePermissionsIndexVTable(const Master* const master);
+  explicit YQLAuthResourceRolePermissionsIndexVTable(const TableName& table_name,
+                                                     const NamespaceName& namespace_name,
+                                                     Master* const master);
 
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
 
  protected:
   Schema CreateSchema() const;
@@ -37,4 +37,3 @@ class YQLAuthResourceRolePermissionsIndexVTable : public YQLVirtualTable {
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_AUTH_RESOURCE_ROLE_PERMISSIONS_INDEX_H

@@ -18,21 +18,24 @@
 // under the License.
 //
 
-#include <gtest/gtest.h>
-
 #include <climits>
 
 #include <queue>
 #include <random>
 #include <utility>
 
+#include <gtest/gtest.h>
+
+#include "yb/util/logging.h"
+
 #include "yb/rocksdb/util/heap.h"
+#include "yb/rocksdb/util/testutil.h"
 
 #ifndef GFLAGS
-const int64_t FLAGS_iters = 100000;
+const int64_t ANNOTATE_UNPROTECTED_WRITE(FLAGS_iters) = 100000;
 #else
-#include <gflags/gflags.h>
-DEFINE_int64(iters, 100000, "number of pseudo-random operations in each test");
+#include "yb/util/flags.h"
+DEFINE_NON_RUNTIME_int64(iters, 100000, "number of pseudo-random operations in each test");
 #endif  // GFLAGS
 
 /*
@@ -45,7 +48,8 @@ namespace rocksdb {
 using HeapTestValue = uint64_t;
 using Params = std::tuple<size_t, HeapTestValue, int64_t>;
 
-class HeapTest : public ::testing::TestWithParam<Params> {
+class HeapTest : public RocksDBTest,
+                 public ::testing::WithParamInterface<Params> {
 };
 
 TEST_P(HeapTest, Test) {
@@ -111,7 +115,7 @@ TEST_P(HeapTest, Test) {
 
   // Probabilities should be set up to occasionally hit the max heap size and
   // drain it
-  assert(ndrains > 0);
+  ASSERT_GT(ndrains, 0);
 
   heap.clear();
   ASSERT_TRUE(heap.empty());
@@ -142,6 +146,27 @@ INSTANTIATE_TEST_CASE_P(
   OneElementHeap, HeapTest,
   ::testing::Values(Params(1, 3, 0x176a1019ab0b612e))
 );
+
+TEST(HeapTest, SecondTopTest) {
+  BinaryHeap<HeapTestValue> heap;
+  heap.push(100);
+  ASSERT_EQ(100, heap.top());
+  heap.push(120);
+  ASSERT_EQ(120, heap.top());
+  ASSERT_EQ(100, heap.second_top());
+  heap.push(140);
+  ASSERT_EQ(140, heap.top());
+  ASSERT_EQ(120, heap.second_top());
+
+  heap.push(110);
+  ASSERT_EQ(140, heap.top());
+  ASSERT_EQ(120, heap.second_top());
+
+  heap.push(130);
+  ASSERT_EQ(140, heap.top());
+  ASSERT_EQ(130, heap.second_top());
+}
+
 
 }  // namespace rocksdb
 

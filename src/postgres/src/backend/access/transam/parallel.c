@@ -19,8 +19,10 @@
 #include "access/session.h"
 #include "access/xact.h"
 #include "access/xlog.h"
+#include "catalog/pg_enum.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/yb_catalog_version.h"
 #include "commands/async.h"
 #include "executor/execParallel.h"
 #include "libpq/libpq.h"
@@ -29,6 +31,7 @@
 #include "miscadmin.h"
 #include "optimizer/planmain.h"
 #include "pgstat.h"
+#include "pg_yb_utils.h"
 #include "storage/ipc.h"
 #include "storage/sinval.h"
 #include "storage/spin.h"
@@ -70,6 +73,7 @@
 #define PARALLEL_KEY_ENTRYPOINT				UINT64CONST(0xFFFFFFFFFFFF0009)
 #define PARALLEL_KEY_SESSION_DSM			UINT64CONST(0xFFFFFFFFFFFF000A)
 #define PARALLEL_KEY_REINDEX_STATE			UINT64CONST(0xFFFFFFFFFFFF000B)
+#define PARALLEL_KEY_ENUMBLACKLIST          UINT64CONST(0xFFFFFFFFFFFF000D)
 
 /* Fixed-size parallel state. */
 typedef struct FixedParallelState
@@ -86,6 +90,8 @@ typedef struct FixedParallelState
 	PGPROC	   *parallel_master_pgproc;
 	pid_t		parallel_master_pid;
 	BackendId	parallel_master_backend_id;
+	bool		parallel_master_is_yb_session;
+	YBCPgSessionParallelData parallel_master_yb_session_data;
 	TimestampTz xact_ts;
 	TimestampTz stmt_ts;
 
@@ -215,11 +221,24 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	Size		asnaplen = 0;
 	Size		tstatelen = 0;
 	Size		reindexlen = 0;
+	Size		enumblacklistlen = 0;
 	Size		segsize = 0;
 	int			i;
 	FixedParallelState *fps;
 	dsm_handle	session_dsm_handle = DSM_HANDLE_INVALID;
-	Snapshot	transaction_snapshot = GetTransactionSnapshot();
+	Snapshot	transaction_snapshot;
+	/*
+	 * Postgres unconditionally takes the snapshot, however Yugabyte has
+	 * undesired side effect if transaction isolation is READ COMMITTED: it
+	 * resets the read point, so the next DocDB request picks new read time.
+	 * This can result in a change of read snapshot in the middle of the query.
+	 * Fortunately we can skip that call in READ COMMITTED mode, because
+	 * the transaction_snapshot is only used if the isolation level is
+	 * REPEATABLE READ or SERIALIZABLE.
+	 * For safety, keep original behavior if Yugabyte is not enabled.
+	 */
+	if (IsolationUsesXactSnapshot() || !IsYugaByteEnabled())
+		transaction_snapshot = GetTransactionSnapshot();
 	Snapshot	active_snapshot = GetActiveSnapshot();
 
 	/* We might be running in a very short-lived memory context. */
@@ -227,7 +246,9 @@ InitializeParallelDSM(ParallelContext *pcxt)
 
 	/* Allow space to store the fixed-size parallel state. */
 	shm_toc_estimate_chunk(&pcxt->estimator, sizeof(FixedParallelState));
-	shm_toc_estimate_keys(&pcxt->estimator, 1);
+	enumblacklistlen = EstimateEnumBlacklistSpace();
+	shm_toc_estimate_chunk(&pcxt->estimator, enumblacklistlen);
+	shm_toc_estimate_keys(&pcxt->estimator, 2);
 
 	/*
 	 * Normally, the user will have requested at least one worker process, but
@@ -257,8 +278,11 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		shm_toc_estimate_chunk(&pcxt->estimator, guc_len);
 		combocidlen = EstimateComboCIDStateSpace();
 		shm_toc_estimate_chunk(&pcxt->estimator, combocidlen);
-		tsnaplen = EstimateSnapshotSpace(transaction_snapshot);
-		shm_toc_estimate_chunk(&pcxt->estimator, tsnaplen);
+		if (IsolationUsesXactSnapshot())
+		{
+			tsnaplen = EstimateSnapshotSpace(transaction_snapshot);
+			shm_toc_estimate_chunk(&pcxt->estimator, tsnaplen);
+		}
 		asnaplen = EstimateSnapshotSpace(active_snapshot);
 		shm_toc_estimate_chunk(&pcxt->estimator, asnaplen);
 		tstatelen = EstimateTransactionStateSpace();
@@ -323,6 +347,9 @@ InitializeParallelDSM(ParallelContext *pcxt)
 	fps->parallel_master_pgproc = MyProc;
 	fps->parallel_master_pid = MyProcPid;
 	fps->parallel_master_backend_id = MyBackendId;
+	/* Capture our Session ID to share with the background workers. */
+	fps->parallel_master_is_yb_session =
+		YBCGetCurrentPgSessionParallelData(&fps->parallel_master_yb_session_data);
 	fps->xact_ts = GetCurrentTransactionStartTimestamp();
 	fps->stmt_ts = GetCurrentStatementStartTimestamp();
 	SpinLockInit(&fps->mutex);
@@ -342,6 +369,7 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		char	   *error_queue_space;
 		char	   *session_dsm_handle_space;
 		char	   *entrypointstate;
+		char	   *enumblacklistspace;
 		Size		lnamelen;
 
 		/* Serialize shared libraries we have loaded. */
@@ -359,11 +387,19 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		SerializeComboCIDState(combocidlen, combocidspace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_COMBO_CID, combocidspace);
 
-		/* Serialize transaction snapshot and active snapshot. */
-		tsnapspace = shm_toc_allocate(pcxt->toc, tsnaplen);
-		SerializeSnapshot(transaction_snapshot, tsnapspace);
-		shm_toc_insert(pcxt->toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT,
-					   tsnapspace);
+		/*
+		 * Serialize the transaction snapshot if the transaction
+		 * isolation-level uses a transaction snapshot.
+		 */
+		if (IsolationUsesXactSnapshot())
+		{
+			tsnapspace = shm_toc_allocate(pcxt->toc, tsnaplen);
+			SerializeSnapshot(transaction_snapshot, tsnapspace);
+			shm_toc_insert(pcxt->toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT,
+						   tsnapspace);
+		}
+
+		/* Serialize the active snapshot. */
 		asnapspace = shm_toc_allocate(pcxt->toc, asnaplen);
 		SerializeSnapshot(active_snapshot, asnapspace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_ACTIVE_SNAPSHOT, asnapspace);
@@ -384,6 +420,12 @@ InitializeParallelDSM(ParallelContext *pcxt)
 		reindexspace = shm_toc_allocate(pcxt->toc, reindexlen);
 		SerializeReindexState(reindexlen, reindexspace);
 		shm_toc_insert(pcxt->toc, PARALLEL_KEY_REINDEX_STATE, reindexspace);
+
+		/* Serialize enum blacklist state. */
+		enumblacklistspace = shm_toc_allocate(pcxt->toc, enumblacklistlen);
+		SerializeEnumBlacklist(enumblacklistspace, enumblacklistlen);
+		shm_toc_insert(pcxt->toc, PARALLEL_KEY_ENUMBLACKLIST,
+					   enumblacklistspace);
 
 		/* Allocate space for worker information. */
 		pcxt->worker = palloc0(sizeof(ParallelWorkerInfo) * pcxt->nworkers);
@@ -978,7 +1020,7 @@ HandleParallelMessages(void)
 	HOLD_INTERRUPTS();
 
 	/*
-	 * Moreover, CurrentMemoryContext might be pointing almost anywhere.  We
+	 * Moreover, GetCurrentMemoryContext() might be pointing almost anywhere.  We
 	 * don't want to risk leaking data into long-lived contexts, so let's do
 	 * our work here in a private context that we can reset on each use.
 	 */
@@ -1217,8 +1259,11 @@ ParallelWorkerMain(Datum main_arg)
 	char	   *asnapspace;
 	char	   *tstatespace;
 	char	   *reindexspace;
+	char       *enumblacklistspace;
 	StringInfoData msgbuf;
 	char	   *session_dsm_handle_space;
+	Snapshot	tsnapshot;
+	Snapshot	asnapshot;
 
 	/* Set flag to indicate that we're initializing a parallel worker. */
 	InitializingParallelWorker = true;
@@ -1326,9 +1371,10 @@ ParallelWorkerMain(Datum main_arg)
 	entrypt = LookupParallelWorkerFunction(library_name, function_name);
 
 	/* Restore database connection. */
-	BackgroundWorkerInitializeConnectionByOid(fps->database_id,
-											  fps->authenticated_user_id,
-											  0);
+	YbBackgroundWorkerInitializeConnectionByOid(
+		fps->database_id, fps->authenticated_user_id,
+		fps->parallel_master_is_yb_session ?
+			&fps->parallel_master_yb_session_data.session_id : NULL, 0);
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what
@@ -1363,14 +1409,25 @@ ParallelWorkerMain(Datum main_arg)
 		shm_toc_lookup(toc, PARALLEL_KEY_SESSION_DSM, false);
 	AttachSession(*(dsm_handle *) session_dsm_handle_space);
 
-	/* Restore transaction snapshot. */
-	tsnapspace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT, false);
-	RestoreTransactionSnapshot(RestoreSnapshot(tsnapspace),
-							   fps->parallel_master_pgproc);
-
-	/* Restore active snapshot. */
+	/*
+	 * If the transaction isolation level is REPEATABLE READ or SERIALIZABLE,
+	 * the leader has serialized the transaction snapshot and we must restore
+	 * it. At lower isolation levels, there is no transaction-lifetime
+	 * snapshot, but we need TransactionXmin to get set to a value which is
+	 * less than or equal to the xmin of every snapshot that will be used by
+	 * this worker. The easiest way to accomplish that is to install the
+	 * active snapshot as the transaction snapshot. Code running in this
+	 * parallel worker might take new snapshots via GetTransactionSnapshot()
+	 * or GetLatestSnapshot(), but it shouldn't have any way of acquiring a
+	 * snapshot older than the active snapshot.
+	 */
 	asnapspace = shm_toc_lookup(toc, PARALLEL_KEY_ACTIVE_SNAPSHOT, false);
-	PushActiveSnapshot(RestoreSnapshot(asnapspace));
+	tsnapspace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_SNAPSHOT, true);
+	asnapshot = RestoreSnapshot(asnapspace);
+	tsnapshot = tsnapspace ? RestoreSnapshot(tsnapspace) : asnapshot;
+	RestoreTransactionSnapshot(tsnapshot,
+							   fps->parallel_master_pgproc);
+	PushActiveSnapshot(asnapshot);
 
 	/*
 	 * We've changed which tuples we can see, and must therefore invalidate
@@ -1397,11 +1454,30 @@ ParallelWorkerMain(Datum main_arg)
 	RestoreReindexState(reindexspace);
 
 	/*
+	 * TODO Revisit initialization of the catalog cache version.
+	 * DocDB scans running in background workers need a catalog cache version
+	 * to put into the request. However, I'm not sure what is the right way to
+	 * obtain it. Perhaps master scan should share the value it has.
+	 */
+	if (IsYugaByteEnabled())
+	{
+		YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
+		YBCPgResetCatalogReadTime();
+		if (fps->parallel_master_is_yb_session)
+			YBCRestorePgSessionParallelData(&fps->parallel_master_yb_session_data);
+	}
+
+	/*
 	 * We've initialized all of our state now; nothing should change
 	 * hereafter.
 	 */
 	InitializingParallelWorker = false;
 	EnterParallelMode();
+
+	/* Restore enum blacklist. */
+	enumblacklistspace = shm_toc_lookup(toc, PARALLEL_KEY_ENUMBLACKLIST,
+										false);
+	RestoreEnumBlacklist(enumblacklistspace);
 
 	/*
 	 * Time to do the real work: invoke the caller-supplied code.

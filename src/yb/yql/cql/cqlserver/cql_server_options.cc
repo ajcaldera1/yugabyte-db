@@ -13,11 +13,11 @@
 
 #include "yb/yql/cql/cqlserver/cql_server_options.h"
 
-#include "yb/util/flag_tags.h"
-#include "yb/yql/cql/cqlserver/cql_rpc.h"
+#include "yb/util/flags.h"
+
 #include "yb/yql/cql/cqlserver/cql_server.h"
 
-DEFINE_int32(cql_rpc_keepalive_time_ms, 120000,
+DEFINE_UNKNOWN_int32(cql_rpc_keepalive_time_ms, 120000,
              "If an RPC connection from a client is idle for this amount of time, the server "
              "will disconnect the client. Setting flag to 0 disables this clean up.");
 TAG_FLAG(cql_rpc_keepalive_time_ms, advanced);
@@ -25,9 +25,8 @@ TAG_FLAG(cql_rpc_keepalive_time_ms, advanced);
 namespace yb {
 namespace cqlserver {
 
-CQLServerOptions::CQLServerOptions() {
+CQLServerOptions::CQLServerOptions() : ServerBaseOptions(CQLServer::kDefaultPort) {
   server_type = "tserver";
-  rpc_opts.default_port = CQLServer::kDefaultPort;
   rpc_opts.connection_keepalive_time_ms = FLAGS_cql_rpc_keepalive_time_ms;
 }
 

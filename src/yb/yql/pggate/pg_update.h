@@ -12,8 +12,7 @@
 // under the License.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_PG_UPDATE_H_
-#define YB_YQL_PGGATE_PG_UPDATE_H_
+#pragma once
 
 #include "yb/yql/pggate/pg_session.h"
 #include "yb/yql/pggate/pg_dml_write.h"
@@ -27,20 +26,19 @@ namespace pggate {
 
 class PgUpdate : public PgDmlWrite {
  public:
-  // Public types.
-  typedef scoped_refptr<PgUpdate> ScopedRefPtr;
+  PgUpdate(PgSession::ScopedRefPtr pg_session,
+           const PgObjectId& table_id,
+           bool is_region_local,
+           YBCPgTransactionSetting transaction_setting)
+      : PgDmlWrite(std::move(pg_session), table_id, is_region_local, transaction_setting) {}
 
-  // Constructors.
-  PgUpdate(PgSession::ScopedRefPtr pg_session, const PgObjectId& table_id);
-  virtual ~PgUpdate();
-
-  virtual StmtOp stmt_op() const override { return StmtOp::STMT_UPDATE; }
+  StmtOp stmt_op() const override { return StmtOp::STMT_UPDATE; }
 
  private:
-  virtual void AllocWriteRequest() override;
+  PgsqlWriteRequestPB::PgsqlStmtType stmt_type() const override {
+    return PgsqlWriteRequestPB::PGSQL_UPDATE;
+  }
 };
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_PG_UPDATE_H_

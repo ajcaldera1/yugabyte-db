@@ -17,16 +17,18 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 
-#ifndef YB_UTIL_STRING_UTIL_H
-#define YB_UTIL_STRING_UTIL_H
 
 #pragma once
 
-#include <cstring>
+#include <algorithm>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
+#include <boost/range/iterator_range.hpp>
+
+#include "yb/util/slice.h"
 #include "yb/util/tostring.h"
 
 namespace yb {
@@ -42,10 +44,10 @@ template<class T, class... Args>
 size_t ItemCount(const T&, const Args&...);
 
 template<class T, class... Args>
-void AppendItem(vector<string>* dest, const T& t, const Args&... args);
+void AppendItem(std::vector<std::string>* dest, const T& t, const Args&... args);
 
 inline size_t ItemCount() { return 0; }
-inline void AppendItem(vector<string>* dest) {}
+inline void AppendItem(std::vector<std::string>* dest) {}
 
 template<class T>
 struct ToStringVectorHelper {
@@ -55,7 +57,7 @@ struct ToStringVectorHelper {
   }
 
   template<class... Args>
-  static void Append(vector<string>* dest, const T& t, const Args&... args) {
+  static void Append(std::vector<std::string>* dest, const T& t, const Args&... args) {
     dest->push_back(ToString(t));
     AppendItem(dest, args...);
   }
@@ -70,7 +72,7 @@ struct ToStringVectorHelper<Unpacker<T> > {
   }
 
   template<class... Args>
-  static void Append(vector<string>* dest, const Unpacker<T>& unpacker, const Args&... args) {
+  static void Append(std::vector<std::string>* dest, const Unpacker<T>& unpacker, const Args&... args) {
     for(auto&& i : unpacker.container) {
       dest->push_back(ToString(i));
     }
@@ -84,20 +86,24 @@ size_t ItemCount(const T& t, const Args&...args) {
 }
 
 template<class T, class... Args>
-void AppendItem(vector<string>* dest, const T& t, const Args&... args) {
+void AppendItem(std::vector<std::string>* dest, const T& t, const Args&... args) {
   return ToStringVectorHelper<T>::Append(dest, t, args...);
 }
 
 } // namespace details
 
 // Whether the string contains (arbitrary long) integer value
-bool IsBigInteger(const std::string& s);
+bool IsBigInteger(const Slice& s);
 
 // Whether the string contains (arbitrary long) decimal or integer value
-bool IsDecimal(const std::string& s);
+bool IsDecimal(const Slice& s);
 
 // Whether the string is "true"/"false" (case-insensitive)
-bool IsBoolean(const std::string& s);
+bool IsBoolean(const Slice& s);
+
+// Whether the string is 32 lowercase hex characters like the one used as an ID for namespaces,
+// (non-special) tables, tablegroups, etc.
+bool IsIdLikeUuid(const Slice& s);
 
 using StringVector = std::vector<std::string>;
 StringVector StringSplit(const std::string& arg, char delim);
@@ -119,7 +125,24 @@ inline std::string VectorToString(const std::vector<T>& vec) {
 bool EqualsIgnoreCase(const std::string &string1,
                       const std::string &string2);
 
-std::string RightPadToWidth(const std::string& s, int w);
+template <class T>
+std::string RightPadToWidth(const T& val, int width) {
+  std::stringstream ss;
+  ss << val;
+  std::string ss_str = ss.str();
+  int64_t padding = width - ss_str.size();
+  if (padding <= 0) {
+    return ss_str;
+  }
+  return ss_str + std::string(padding, ' ');
+}
+
+// Returns true if s starts with substring start.
+bool StringStartsWithOrEquals(const std::string& s, const char* start, size_t start_len);
+
+inline bool StringStartsWithOrEquals(const std::string& s, const std::string start) {
+  return StringStartsWithOrEquals(s, start.c_str(), start.length());
+}
 
 // Returns true if s ends with substring end, and s has at least one more character before
 // end. If left is a valid string pointer, it will contain s minus the end substring.
@@ -151,11 +174,37 @@ auto unpack(Container&& container) {
 }
 
 template<class... Args>
-vector<string> ToStringVector(Args&&... args) {
-  vector<string> result;
+std::vector<std::string> ToStringVector(Args&&... args) {
+  std::vector<std::string> result;
   result.reserve(details::ItemCount(args...));
   details::AppendItem(&result, args...);
   return result;
+}
+
+inline void EnlargeBufferIfNeeded(std::string* buffer, const size_t new_capacity) {
+  if (new_capacity <= buffer->capacity()) {
+    return;
+  }
+  buffer->reserve(new_capacity);
+}
+
+// Takes a vector of strings and treats each element as a list of items separated by the given set
+// of separator characters (only comma by default). Splits each string using these separators and
+// returns the combined list of all items.
+std::vector<std::string> SplitAndFlatten(
+    const std::vector<std::string>& input,
+    const char* separators = ",");
+
+template<class Iterator>
+Iterator FindSubstring(std::string_view str, const Iterator& begin, const Iterator& end) {
+  return std::find_if(
+      begin, end, [str](const auto& substr) { return str.find(substr) != std::string::npos; });
+}
+
+template<class Container>
+bool HasSubstring(std::string_view str, const Container& container) {
+  auto end = std::end(container);
+  return FindSubstring(str, std::begin(container), end) != end;
 }
 
 }  // namespace yb
@@ -165,5 +214,3 @@ using yb::ToString;
 using yb::StringSplit;
 using yb::VectorToString;
 }
-
-#endif // YB_UTIL_STRING_UTIL_H

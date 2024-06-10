@@ -37,36 +37,39 @@
 #include <memory>
 #include <vector>
 
-#include <boost/function.hpp>
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include "yb/util/logging.h"
+
+#include "yb/common/schema.h"
 
 #include "yb/consensus/log_anchor_registry.h"
 #include "yb/consensus/log_util.h"
-#include "yb/consensus/log_reader.h"
+
 #include "yb/fs/fs_manager.h"
+
 #include "yb/gutil/strings/human_readable.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/strings/util.h"
+
+#include "yb/master/sys_catalog_constants.h"
+
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
 #include "yb/tablet/tablet_options.h"
+
 #include "yb/util/env.h"
-#include "yb/util/logging.h"
-#include "yb/util/mem_tracker.h"
-#include "yb/util/memory/arena.h"
 #include "yb/util/status.h"
 
 namespace yb {
 namespace tools {
 
-using log::LogReader;
 using log::ReadableLogSegment;
 using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
 using tablet::Tablet;
-using tablet::TabletMetadata;
+using tablet::RaftGroupMetadata;
+using tablet::RaftGroupMetadataPtr;
 
 namespace {
 string Indent(int indent) {
@@ -94,7 +97,7 @@ Status FsTool::Init() {
   // TODO(bogdan): do we use this tool? would we use it for more than tservers?
   opts.server_type = "tserver";
   fs_manager_.reset(new FsManager(Env::Default(), opts));
-  RETURN_NOT_OK(fs_manager_->Open());
+  RETURN_NOT_OK(fs_manager_->CheckAndOpenFileSystemRoots());
 
   LOG(INFO) << "Opened file system with uuid: " << fs_manager_->uuid();
 
@@ -155,8 +158,8 @@ Status FsTool::ListAllLogSegments() {
 Status FsTool::ListLogSegmentsForTablet(const string& tablet_id) {
   DCHECK(initialized_);
 
-  scoped_refptr<TabletMetadata> meta;
-  RETURN_NOT_OK(TabletMetadata::Load(fs_manager_.get(), tablet_id, &meta));
+  fs_manager_->LookupTablet(tablet_id);
+  auto meta = VERIFY_RESULT(RaftGroupMetadata::Load(fs_manager_.get(), tablet_id));
 
   const string& tablet_wal_dir = meta->wal_dir();
   if (!fs_manager_->Exists(tablet_wal_dir)) {
@@ -177,8 +180,7 @@ Status FsTool::ListLogSegmentsForTablet(const string& tablet_id) {
 Status FsTool::ListAllTablets() {
   DCHECK(initialized_);
 
-  vector<string> tablets;
-  RETURN_NOT_OK(fs_manager_->ListTabletIds(&tablets));
+  vector<string> tablets = VERIFY_RESULT(fs_manager_->ListTabletIds());
   for (const string& tablet : tablets) {
     if (detail_level_ >= HEADERS_ONLY) {
       std::cout << "Tablet: " << tablet << std::endl;
@@ -212,20 +214,20 @@ Status FsTool::ListSegmentsInDir(const string& segments_dir) {
 
 Status FsTool::PrintLogSegmentHeader(const string& path,
                                      int indent) {
-  scoped_refptr<ReadableLogSegment> segment;
-  Status s = ReadableLogSegment::Open(fs_manager_->env(),
-                                      path,
-                                      &segment);
-
-  if (s.IsUninitialized()) {
-    LOG(ERROR) << path << " is not initialized: " << s.ToString();
-    return Status::OK();
+  auto segment_result = ReadableLogSegment::Open(fs_manager_->env(), path);
+  if (!segment_result.ok()) {
+    auto s = segment_result.status();
+    if (s.IsUninitialized()) {
+      LOG(ERROR) << path << " is not initialized: " << s.ToString();
+      return Status::OK();
+    }
+    if (s.IsCorruption()) {
+      LOG(ERROR) << path << " is corrupt: " << s.ToString();
+      return Status::OK();
+    }
+    return s.CloneAndPrepend("Unexpected error reading log segment " + path);
   }
-  if (s.IsCorruption()) {
-    LOG(ERROR) << path << " is corrupt: " << s.ToString();
-    return Status::OK();
-  }
-  RETURN_NOT_OK_PREPEND(s, "Unexpected error reading log segment " + path);
+  const auto& segment = *segment_result;
 
   std::cout << Indent(indent) << "Size: "
             << HumanReadableNumBytes::ToStringWithoutRounding(segment->file_size())
@@ -236,20 +238,20 @@ Status FsTool::PrintLogSegmentHeader(const string& path,
 }
 
 Status FsTool::PrintTabletMeta(const string& tablet_id, int indent) {
-  scoped_refptr<TabletMetadata> meta;
-  RETURN_NOT_OK(TabletMetadata::Load(fs_manager_.get(), tablet_id, &meta));
+  fs_manager_->LookupTablet(tablet_id);
+  auto meta = VERIFY_RESULT(RaftGroupMetadata::Load(fs_manager_.get(), tablet_id));
 
-  const Schema& schema = meta->schema();
+  const SchemaPtr schema = meta->schema();
 
   std::cout << Indent(indent) << "Partition: "
-            << meta->partition_schema().PartitionDebugString(meta->partition(), meta->schema())
+            << meta->partition_schema()->PartitionDebugString(*meta->partition(), *schema)
             << std::endl;
   std::cout << Indent(indent) << "Table name: " << meta->table_name()
             << " Table id: " << meta->table_id() << std::endl;
   std::cout << Indent(indent) << "Schema (version=" << meta->schema_version() << "): "
-            << schema.ToString() << std::endl;
+            << schema->ToString() << std::endl;
 
-  tablet::TabletSuperBlockPB pb;
+  tablet::RaftGroupReplicaSuperBlockPB pb;
   meta->ToSuperBlock(&pb);
   std::cout << "Superblock:\n" << pb.DebugString() << std::endl;
 
@@ -259,15 +261,36 @@ Status FsTool::PrintTabletMeta(const string& tablet_id, int indent) {
 Status FsTool::DumpTabletData(const std::string& tablet_id) {
   DCHECK(initialized_);
 
-  scoped_refptr<TabletMetadata> meta;
-  RETURN_NOT_OK(TabletMetadata::Load(fs_manager_.get(), tablet_id, &meta));
+  fs_manager_->LookupTablet(tablet_id);
+  auto meta = VERIFY_RESULT(RaftGroupMetadata::Load(fs_manager_.get(), tablet_id));
 
   scoped_refptr<log::LogAnchorRegistry> reg(new log::LogAnchorRegistry());
   tablet::TabletOptions tablet_options;
-  Tablet t(meta, std::shared_future<client::YBClientPtr>(), scoped_refptr<server::Clock>(),
-           shared_ptr<MemTracker>(), nullptr, reg.get(), tablet_options,
-           std::string() /* log_prefix_suffix */, nullptr,
-           client::LocalTabletFilter(), nullptr);
+  tablet::TabletInitData tablet_init_data = {
+      .metadata = meta,
+      .client_future = std::shared_future<client::YBClient*>(),
+      .clock = scoped_refptr<server::Clock>(),
+      .parent_mem_tracker = shared_ptr<MemTracker>(),
+      .block_based_table_mem_tracker = shared_ptr<MemTracker>(),
+      .metric_registry = nullptr,
+      .log_anchor_registry = reg.get(),
+      .tablet_options = tablet_options,
+      .log_prefix_suffix = std::string(),
+      .transaction_participant_context = nullptr,
+      .local_tablet_filter = client::LocalTabletFilter(),
+      .transaction_coordinator_context = nullptr,
+      .txns_enabled = tablet::TransactionsEnabled::kTrue,
+      .is_sys_catalog = tablet::IsSysCatalogTablet(tablet_id == master::kSysCatalogTabletId),
+      .snapshot_coordinator = nullptr,
+      .tablet_splitter = nullptr,
+      .allowed_history_cutoff_provider = {},
+      .transaction_manager_provider = nullptr,
+      .full_compaction_pool = nullptr,
+      .admin_triggered_compaction_pool = nullptr,
+      .post_split_compaction_added = nullptr,
+      .metadata_cache = nullptr
+  };
+  Tablet t(tablet_init_data);
   RETURN_NOT_OK_PREPEND(t.Open(), "Couldn't open tablet");
   vector<string> lines;
   RETURN_NOT_OK_PREPEND(t.DebugDump(&lines), "Couldn't dump tablet");

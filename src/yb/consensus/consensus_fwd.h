@@ -11,29 +11,41 @@
 // under the License.
 //
 
-#ifndef YB_CONSENSUS_CONSENSUS_FWD_H
-#define YB_CONSENSUS_CONSENSUS_FWD_H
+#pragma once
+
+#include <memory>
+#include <type_traits>
+
+#include "yb/consensus/consensus.fwd.h"
 
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/util/enums.h"
+#include "yb/util/math_util.h"
+#include "yb/util/strongly_typed_bool.h"
 
 namespace yb {
 namespace consensus {
 
 class Consensus;
+class ConsensusContext;
+class ConsensusRoundCallback;
+class ConsensusMetadata;
+class LWReplicateMsgsHolder;
+class MultiRaftManager;
 class PeerProxyFactory;
 class PeerMessageQueue;
-class ReplicaOperationFactory;
+class RaftConsensus;
 class ReplicateMsg;
 class ReplicateMsgsHolder;
 class RetryableRequests;
+class RetryableRequestsManager;
 class SafeOpIdWaiter;
-class VoteRequestPB;
-class VoteResponsePB;
 
 struct ConsensusOptions;
 struct ConsensusBootstrapInfo;
 struct LeaderState;
+struct ReadOpsResult;
 struct RetryableRequestsCounts;
 struct StateChangeContext;
 
@@ -50,6 +62,9 @@ typedef scoped_refptr<LeaderElection> LeaderElectionPtr;
 class PeerProxy;
 typedef std::unique_ptr<PeerProxy> PeerProxyPtr;
 
+class MultiRaftHeartbeatBatcher;
+using MultiRaftHeartbeatBatcherPtr = std::shared_ptr<MultiRaftHeartbeatBatcher>;
+
 struct LeaderElectionData;
 
 // The elected Leader (this peer) can be in not-ready state because it's not yet synced.
@@ -65,13 +80,12 @@ YB_DEFINE_ENUM(
 
 typedef int64_t ConsensusTerm;
 
-typedef std::shared_ptr<ReplicateMsg> ReplicateMsgPtr;
-typedef std::vector<ReplicateMsgPtr> ReplicateMsgs;
+using ReplicateMsgPtr = std::shared_ptr<LWReplicateMsg>;
+using ReplicateMsgs = std::vector<ReplicateMsgPtr>;
 
 YB_STRONGLY_TYPED_BOOL(TEST_SuppressVoteRequest);
 YB_STRONGLY_TYPED_BOOL(PreElection);
 
 } // namespace consensus
-} // namespace yb
 
-#endif // YB_CONSENSUS_CONSENSUS_FWD_H
+} // namespace yb

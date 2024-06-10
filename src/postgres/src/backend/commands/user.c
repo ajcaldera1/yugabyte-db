@@ -39,6 +39,10 @@
 #include "utils/timestamp.h"
 #include "utils/tqual.h"
 
+#include "catalog/pg_yb_role_profile.h"
+#include "commands/yb_profile.h"
+#include "pg_yb_utils.h"
+
 /* Potentially set by pg_upgrade_support functions */
 Oid			binary_upgrade_next_pg_authid_oid = InvalidOid;
 
@@ -303,10 +307,11 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	}
 	else if (bypassrls)
 	{
-		if (!superuser())
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to change bypassrls attribute")));
+					 errmsg("must be superuser or a member of the yb_db_admin "
+					 		"role to change bypassrls attribute")));
 	}
 	else
 	{
@@ -429,7 +434,7 @@ CreateRole(ParseState *pstate, CreateRoleStmt *stmt)
 	 * pg_largeobject_metadata contains pg_authid.oid's, so we use the
 	 * binary-upgrade override.
 	 */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade && !yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_pg_authid_oid))
 			ereport(ERROR,
@@ -526,6 +531,8 @@ AlterRole(AlterRoleStmt *stmt)
 	Datum		validUntil_datum;	/* same, as timestamptz Datum */
 	bool		validUntil_null;
 	int			bypassrls = -1;
+	char       *profile = NULL;
+	int			unlocked = -1;
 	DefElem    *dpassword = NULL;
 	DefElem    *dissuper = NULL;
 	DefElem    *dinherit = NULL;
@@ -537,6 +544,9 @@ AlterRole(AlterRoleStmt *stmt)
 	DefElem    *drolemembers = NULL;
 	DefElem    *dvalidUntil = NULL;
 	DefElem    *dbypassRLS = NULL;
+	DefElem    *dprofile = NULL;
+	DefElem    *dnoprofile = NULL;
+	DefElem    *dunlocked = NULL;
 	Oid			roleid;
 
 	check_rolespec_name(stmt->role,
@@ -636,6 +646,30 @@ AlterRole(AlterRoleStmt *stmt)
 						 errmsg("conflicting or redundant options")));
 			dbypassRLS = defel;
 		}
+		else if (strcmp(defel->defname, "profile") == 0)
+		{
+			if (dprofile)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dprofile = defel;
+		}
+		else if (strcmp(defel->defname, "noprofile") == 0)
+		{
+			if (dnoprofile)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dnoprofile = defel;
+		}
+		else if (strcmp(defel->defname, "unlocked") == 0)
+		{
+			if (dunlocked)
+				ereport(ERROR,
+						(errcode(ERRCODE_SYNTAX_ERROR),
+						 errmsg("conflicting or redundant options")));
+			dunlocked = defel;
+		}
 		else
 			elog(ERROR, "option \"%s\" not recognized",
 				 defel->defname);
@@ -669,6 +703,10 @@ AlterRole(AlterRoleStmt *stmt)
 		validUntil = strVal(dvalidUntil->arg);
 	if (dbypassRLS)
 		bypassrls = intVal(dbypassRLS->arg);
+	if (dprofile && dprofile->arg)
+		profile = strVal(dprofile->arg);
+	if (dunlocked && dunlocked->arg)
+		unlocked = intVal(dunlocked->arg);
 
 	/*
 	 * Scan the pg_authid relation to be certain the user exists.
@@ -682,8 +720,10 @@ AlterRole(AlterRoleStmt *stmt)
 	roleid = HeapTupleGetOid(tuple);
 
 	/*
-	 * To mess with a superuser you gotta be superuser; else you need
-	 * createrole, or just want to change your own password
+	 * To mess with a superuser or replication role in any way you gotta be
+	 * superuser.  We also insist on superuser to change the BYPASSRLS
+	 * property.  Otherwise, if you don't have createrole, you're only allowed
+	 * to change your own password.
 	 */
 	if (authform->rolsuper || issuper >= 0)
 	{
@@ -699,20 +739,29 @@ AlterRole(AlterRoleStmt *stmt)
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("must be superuser to alter replication users")));
 	}
-	else if (authform->rolbypassrls || bypassrls >= 0)
+	else if (bypassrls >= 0)
 	{
-		if (!superuser())
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-					 errmsg("must be superuser to change bypassrls attribute")));
+					 errmsg("must be superuser or a member of the yb_db_admin "
+					 		"role to change bypassrls attribute")));
+	}
+	else if (profile != NULL || dnoprofile != NULL || dunlocked != NULL)
+	{
+		if (!superuser() && !IsYbDbAdminUser(GetUserId()))
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser or a member of the yb_db_admin "
+							"role to change profile configuration")));
 	}
 	else if (!have_createrole_privilege())
 	{
+		/* We already checked issuper, isreplication, and bypassrls */
 		if (!(inherit < 0 &&
 			  createrole < 0 &&
 			  createdb < 0 &&
 			  canlogin < 0 &&
-			  isreplication < 0 &&
 			  !dconnlimit &&
 			  !rolemembers &&
 			  !validUntil &&
@@ -721,6 +770,25 @@ AlterRole(AlterRoleStmt *stmt)
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied")));
+	}
+
+	if (profile != NULL || dnoprofile != NULL || dunlocked != NULL)
+	{
+		if (profile != NULL)
+			YbCreateRoleProfile(roleid, rolename, profile);
+		else if (dunlocked != NULL)
+			YbSetRoleProfileStatus(roleid, rolename,
+								   unlocked == 0 ? YB_ROLPRFSTATUS_LOCKED
+												 : YB_ROLPRFSTATUS_OPEN);
+		else
+		{
+			Assert(dnoprofile);
+			YbRemoveRoleProfileForRoleIfExists(roleid);
+		}
+
+		ReleaseSysCache(tuple);
+		heap_close(pg_authid_rel, NoLock);
+		return roleid;
 	}
 
 	/* Convert validuntil to internal form */
@@ -798,6 +866,12 @@ AlterRole(AlterRoleStmt *stmt)
 
 	if (dconnlimit)
 	{
+		/* Check connection limit for postgres. */
+		if (roleid == 10 && connlimit != -1)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("cannot set connection limit for postgres"),
+					 errhint("did you mean ALTER ROLE %s CONNECTION LIMIT -1", rolename)));
 		new_record[Anum_pg_authid_rolconnlimit - 1] = Int32GetDatum(connlimit);
 		new_record_repl[Anum_pg_authid_rolconnlimit - 1] = true;
 	}
@@ -1056,12 +1130,24 @@ DropRole(DropRoleStmt *stmt)
 		/* Check for pg_shdepend entries depending on this role */
 		if (checkSharedDependencies(AuthIdRelationId, roleid,
 									&detail, &detail_log))
+		{
+			if (IsYugaByteEnabled() && detail != NULL)
+			{
+				detail = YBDetailSorted(detail);
+			}
 			ereport(ERROR,
 					(errcode(ERRCODE_DEPENDENT_OBJECTS_STILL_EXIST),
 					 errmsg("role \"%s\" cannot be dropped because some objects depend on it",
 							role),
 					 errdetail_internal("%s", detail),
 					 errdetail_log("%s", detail_log)));
+		}
+
+		/*
+		 * If the role is attached to a profile, auto-remove that association.
+		 */
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+			YbRemoveRoleProfileForRoleIfExists(roleid);
 
 		/*
 		 * Remove the role from the pg_authid table
@@ -1202,6 +1288,14 @@ RenameRole(const char *oldname, const char *newname)
 				 errmsg("role name \"%s\" is reserved",
 						newname),
 				 errdetail("Role names starting with \"pg_\" are reserved.")));
+
+	/* Check whether postgres is being renamed. */
+	if (roleid == 10 && strcmp(newname, "postgres") != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("cannot rename postgres"),
+				 strcmp(oldname, "postgres") != 0 ?
+				  errhint("ALTER ROLE %s RENAME TO postgres", oldname) : 0));
 
 	/* make sure the new name doesn't exist */
 	if (SearchSysCacheExists1(AUTHNAME, CStringGetDatum(newname)))
@@ -1367,16 +1461,24 @@ ReassignOwnedObjects(ReassignOwnedStmt *stmt)
 	{
 		Oid			roleid = lfirst_oid(cell);
 
-		if (!has_privs_of_role(GetUserId(), roleid))
+		if (!has_privs_of_role(GetUserId(), roleid) &&
+			!IsYbDbAdminUser(GetUserId()))
 			ereport(ERROR,
 					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 					 errmsg("permission denied to reassign objects")));
+
+		if (superuser_arg(roleid) && !superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("non-superuser cannot reassign objects "
+					 		"from superuser")));
 	}
 
 	/* Must have privileges on the receiving side too */
 	newrole = get_rolespec_oid(stmt->newrole, false);
 
-	if (!has_privs_of_role(GetUserId(), newrole))
+	if (!has_privs_of_role(GetUserId(), newrole) &&
+		!IsYbDbAdminUser(GetUserId()))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to reassign objects")));

@@ -15,13 +15,12 @@
 // Tree node definitions for INSERT statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_INSERT_H_
-#define YB_YQL_CQL_QL_PTREE_PT_INSERT_H_
+#pragma once
 
-#include "yb/yql/cql/ql/ptree/column_desc.h"
 #include "yb/yql/cql/ql/ptree/list_node.h"
 #include "yb/yql/cql/ql/ptree/pt_dml.h"
 #include "yb/yql/cql/ql/ptree/pt_insert_values_clause.h"
+#include "yb/yql/cql/ql/ptree/pt_name.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 
 namespace yb {
@@ -39,13 +38,13 @@ class PTInsertStmt : public PTDmlStmt {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTInsertStmt(MemoryContext *memctx,
-               YBLocation::SharedPtr loc,
+               YBLocationPtr loc,
                PTQualifiedName::SharedPtr relation,
                PTQualifiedNameListNode::SharedPtr columns,
                const PTCollection::SharedPtr& inserting_value,
-               PTExpr::SharedPtr if_clause = nullptr,
+               PTExprPtr if_clause = nullptr,
                bool else_error = false,
-               PTDmlUsingClause::SharedPtr using_clause = nullptr,
+               PTDmlUsingClausePtr using_clause = nullptr,
                const bool returns_status = false);
   virtual ~PTInsertStmt();
 
@@ -56,7 +55,7 @@ class PTInsertStmt : public PTDmlStmt {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
   ExplainPlanPB AnalysisResultToPB() override;
 
@@ -75,26 +74,37 @@ class PTInsertStmt : public PTDmlStmt {
     return relation_->loc();
   }
 
+  const PTCollection::SharedPtr& InsertingValue() const {
+    return inserting_value_;
+  }
+
+  bool IsWriteOp() const override {
+    return true;
+  }
+
  private:
 
   //
   // Analyze helper functions
   //
 
-  CHECKED_STATUS AnalyzeInsertingValue(PTCollection* inserting_value,
-                                       SemContext* sem_context);
-
-  CHECKED_STATUS AnanlyzeValuesClause(PTInsertValuesClause* values_clause,
-                                      SemContext* sem_context);
-
-  CHECKED_STATUS ProcessColumn(const MCSharedPtr<MCString>& mc_col_name,
-                               const ColumnDesc* col_desc,
-                               const PTExpr::SharedPtr& value_expr,
+  Status AnalyzeInsertingValue(PTCollection* inserting_value,
                                SemContext* sem_context);
 
+  Status AnanlyzeValuesClause(PTInsertValuesClause* values_clause,
+                              SemContext* sem_context);
+
+  Status AnanlyzeJsonClause(PTInsertJsonClause* json_clause,
+                            SemContext* sem_context);
+
+  Status ProcessColumn(const MCSharedPtr<MCString>& mc_col_name,
+                       const ColumnDesc* col_desc,
+                       const PTExprPtr& value_expr,
+                       SemContext* sem_context);
+
   // Initialize all non-initialized columns according to their configured defaults
-  CHECKED_STATUS InitRemainingColumns(bool is_json_clause,
-                                      SemContext* sem_context);
+  Status InitRemainingColumns(bool is_json_clause,
+                              SemContext* sem_context);
 
   // --- The parser will decorate this node with the following information --
 
@@ -108,5 +118,3 @@ class PTInsertStmt : public PTDmlStmt {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_INSERT_H_

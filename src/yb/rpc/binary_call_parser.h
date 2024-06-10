@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_RPC_BINARY_CALL_PARSER_H
-#define YB_RPC_BINARY_CALL_PARSER_H
+#pragma once
 
 #include "yb/util/mem_tracker.h"
 #include "yb/util/net/socket.h"
@@ -20,16 +19,18 @@
 
 #include "yb/rpc/rpc_fwd.h"
 #include "yb/rpc/call_data.h"
+#include "yb/rpc/reactor_thread_role.h"
 
 namespace yb {
 namespace rpc {
 
 YB_STRONGLY_TYPED_BOOL(IncludeHeader);
+YB_STRONGLY_TYPED_BOOL(SkipEmptyMessages);
 
 // Listener of BinaryCallParser, invoked when call is parsed.
 class BinaryCallParserListener {
  public:
-  virtual CHECKED_STATUS HandleCall(const ConnectionPtr& connection, CallData* call_data) = 0;
+  virtual Status HandleCall(const ConnectionPtr& connection, CallData* call_data) = 0;
  protected:
   ~BinaryCallParserListener() {}
 };
@@ -39,24 +40,32 @@ class BinaryCallParser {
  public:
   explicit BinaryCallParser(const MemTrackerPtr& parent_tracker,
                             size_t header_size, size_t size_offset, size_t max_message_length,
-                            IncludeHeader include_header, BinaryCallParserListener* listener);
+                            IncludeHeader include_header, SkipEmptyMessages skip_empty_messages,
+                            BinaryCallParserListener* listener);
 
-  Result<ProcessDataResult> Parse(const rpc::ConnectionPtr& connection, const IoVecs& data,
-                                  ReadBufferFull read_buffer_full);
+  // If tracker_for_throttle is not nullptr - throttle big requests when tracker_for_throttle
+  // (or any of its ancestors) exceeds soft memory limit.
+  Result<ProcessCallsResult> Parse(
+      const rpc::ConnectionPtr& connection, const IoVecs& data,
+      ReadBufferFull read_buffer_full,
+      const MemTrackerPtr* tracker_for_throttle) ON_REACTOR_THREAD;
 
  private:
-  MemTrackerPtr mandatory_tracker_;
   MemTrackerPtr buffer_tracker_;
-  std::vector<char> buffer_;
+  std::vector<char> call_header_buffer_;
   ScopedTrackedConsumption call_data_consumption_;
   CallData call_data_;
   const size_t size_offset_;
   const size_t max_message_length_;
   const IncludeHeader include_header_;
+  const SkipEmptyMessages skip_empty_messages_;
   BinaryCallParserListener* const listener_;
 };
 
+// Returns whether we should throttle RPC call based on its size and memory consumption.
+// Uses specified throttle_message when logging a warning about throttling an RPC call.
+bool ShouldThrottleRpc(
+    const MemTrackerPtr& throttle_tracker, ssize_t call_data_size, const char* throttle_message);
+
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_BINARY_CALL_PARSER_H

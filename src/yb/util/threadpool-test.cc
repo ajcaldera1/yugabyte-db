@@ -39,25 +39,24 @@
 #include <thread>
 #include <vector>
 
-#include <boost/scope_exit.hpp>
-
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
 #include "yb/gutil/atomicops.h"
-#include "yb/util/barrier.h"
 #include "yb/gutil/bind.h"
+#include "yb/gutil/sysinfo.h"
+
+#include "yb/util/barrier.h"
 #include "yb/util/countdown_latch.h"
+#include "yb/util/locks.h"
 #include "yb/util/metrics.h"
 #include "yb/util/promise.h"
 #include "yb/util/random.h"
-#include "yb/gutil/sysinfo.h"
-#include "yb/util/threadpool.h"
+#include "yb/util/scope_exit.h"
 #include "yb/util/test_macros.h"
-#include "yb/util/trace.h"
-
-#include "yb/util/locks.h"
 #include "yb/util/test_util.h"
+#include "yb/util/threadpool.h"
+#include "yb/util/trace.h"
 
 using std::atomic;
 using std::shared_ptr;
@@ -74,22 +73,25 @@ using std::shared_ptr;
 namespace yb {
 
 namespace {
-static Status BuildMinMaxTestPool(int min_threads, int max_threads, gscoped_ptr<ThreadPool>* pool) {
+
+static Status BuildMinMaxTestPool(
+    int min_threads, int max_threads, std::unique_ptr<ThreadPool>* pool) {
   return ThreadPoolBuilder("test").set_min_threads(min_threads)
                                   .set_max_threads(max_threads)
                                   .Build(pool);
 }
+
 } // anonymous namespace
 
 class TestThreadPool : public ::testing::Test {
  public:
   TestThreadPool() {
-    FLAGS_enable_tracing = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_tracing) = true;
   }
 };
 
 TEST_F(TestThreadPool, TestNoTaskOpenClose) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(4, 4, &thread_pool));
   thread_pool->Shutdown();
 }
@@ -117,7 +119,7 @@ class SimpleTask : public Runnable {
 };
 
 TEST_F(TestThreadPool, TestSimpleTasks) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(4, 4, &thread_pool));
 
   Atomic32 counter(0);
@@ -140,7 +142,7 @@ static void IssueTraceStatement() {
 // Test that the thread-local trace is propagated to tasks
 // submitted to the threadpool.
 TEST_F(TestThreadPool, TestTracePropagation) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(1, 1, &thread_pool));
 
   scoped_refptr<Trace> t(new Trace);
@@ -153,7 +155,7 @@ TEST_F(TestThreadPool, TestTracePropagation) {
 }
 
 TEST_F(TestThreadPool, TestSubmitAfterShutdown) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(BuildMinMaxTestPool(1, 1, &thread_pool));
   thread_pool->Shutdown();
   Status s = thread_pool->SubmitFunc(&IssueTraceStatement);
@@ -180,7 +182,7 @@ class SlowTask : public Runnable {
 
 TEST_F(TestThreadPool, TestThreadPoolWithNoMinimum) {
   MonoDelta idle_timeout = MonoDelta::FromMilliseconds(1);
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
       .set_min_threads(0).set_max_threads(3)
       .set_idle_timeout(idle_timeout).Build(&thread_pool));
@@ -188,9 +190,9 @@ TEST_F(TestThreadPool, TestThreadPoolWithNoMinimum) {
   ASSERT_EQ(0, thread_pool->num_threads_);
   // We get up to 3 threads when submitting work.
   CountDownLatch latch(1);
-  BOOST_SCOPE_EXIT(&latch) {
+  auto se = ScopeExit([&latch] {
       latch.CountDown();
-  } BOOST_SCOPE_EXIT_END;
+  });
   ASSERT_OK(thread_pool->Submit(SlowTask::NewSlowTask(&latch)));
   ASSERT_OK(thread_pool->Submit(SlowTask::NewSlowTask(&latch)));
   ASSERT_EQ(2, thread_pool->num_threads_);
@@ -212,16 +214,16 @@ TEST_F(TestThreadPool, TestThreadPoolWithNoMaxThreads) {
   // this test submits more tasks than that to ensure that the number of CPUs
   // isn't some kind of upper bound.
   const int kNumCPUs = base::NumCPUs();
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
 
   // Build a threadpool with no limit on the maximum number of threads.
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_max_threads(std::numeric_limits<int>::max())
                 .Build(&thread_pool));
   CountDownLatch latch(1);
-  BOOST_SCOPE_EXIT(&latch) {
+  auto se = ScopeExit([&latch] {
     latch.CountDown();
-    } BOOST_SCOPE_EXIT_END;
+    });
 
   // Submit tokenless tasks. Each should create a new thread.
   for (int i = 0; i < kNumCPUs * 2; i++) {
@@ -254,7 +256,7 @@ TEST_F(TestThreadPool, TestThreadPoolWithNoMaxThreads) {
 TEST_F(TestThreadPool, TestRace) {
   alarm(10);
   MonoDelta idle_timeout = MonoDelta::FromMicroseconds(1);
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
       .set_min_threads(0).set_max_threads(1)
       .set_idle_timeout(idle_timeout).Build(&thread_pool));
@@ -271,7 +273,7 @@ TEST_F(TestThreadPool, TestRace) {
 
 TEST_F(TestThreadPool, TestVariableSizeThreadPool) {
   MonoDelta idle_timeout = MonoDelta::FromMilliseconds(1);
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
       .set_min_threads(1).set_max_threads(4).set_max_queue_size(1)
       .set_idle_timeout(idle_timeout).Build(&thread_pool));
@@ -302,7 +304,7 @@ TEST_F(TestThreadPool, TestVariableSizeThreadPool) {
 }
 
 TEST_F(TestThreadPool, TestMaxQueueSize) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
       .set_min_threads(1).set_max_threads(1)
       .set_max_queue_size(1).Build(&thread_pool));
@@ -323,7 +325,7 @@ TEST_F(TestThreadPool, TestMaxQueueSize) {
 }
 
 void TestQueueSizeZero(int max_threads) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_min_threads(0).set_max_threads(max_threads)
                 .set_max_queue_size(0).Build(&thread_pool));
@@ -352,7 +354,7 @@ TEST_F(TestThreadPool, TestMaxQueueZeroNoThreads) {
 // Test that setting a promise from another thread yields
 // a value on the current thread.
 TEST_F(TestThreadPool, TestPromises) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
       .set_min_threads(1).set_max_threads(1)
       .set_max_queue_size(1).Build(&thread_pool));
@@ -366,14 +368,14 @@ TEST_F(TestThreadPool, TestPromises) {
 
 
 METRIC_DEFINE_entity(test_entity);
-METRIC_DEFINE_histogram(test_entity, queue_length, "queue length",
-                        MetricUnit::kTasks, "queue length", 1000, 1);
+METRIC_DEFINE_event_stats(test_entity, queue_length, "queue length",
+                        MetricUnit::kTasks, "queue length");
 
-METRIC_DEFINE_histogram(test_entity, queue_time, "queue time",
-                        MetricUnit::kMicroseconds, "queue time", 1000000, 1);
+METRIC_DEFINE_event_stats(test_entity, queue_time, "queue time",
+                        MetricUnit::kMicroseconds, "queue time");
 
-METRIC_DEFINE_histogram(test_entity, run_time, "run time",
-                        MetricUnit::kMicroseconds, "run time", 1000, 1);
+METRIC_DEFINE_event_stats(test_entity, run_time, "run time",
+                        MetricUnit::kMicroseconds, "run time");
 
 TEST_F(TestThreadPool, TestMetrics) {
   MetricRegistry registry;
@@ -389,7 +391,7 @@ TEST_F(TestThreadPool, TestMetrics) {
   }
 
   // Enable metrics for the thread pool.
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
             .set_min_threads(1).set_max_threads(1)
             .set_metrics(all_metrics[0])
@@ -410,17 +412,17 @@ TEST_F(TestThreadPool, TestMetrics) {
   thread_pool->Wait();
 
   // The total counts should reflect the number of submissions to each token.
-  ASSERT_EQ(1, all_metrics[1].queue_length_histogram->TotalCount());
-  ASSERT_EQ(1, all_metrics[1].queue_time_us_histogram->TotalCount());
-  ASSERT_EQ(1, all_metrics[1].run_time_us_histogram->TotalCount());
-  ASSERT_EQ(2, all_metrics[2].queue_length_histogram->TotalCount());
-  ASSERT_EQ(2, all_metrics[2].queue_time_us_histogram->TotalCount());
-  ASSERT_EQ(2, all_metrics[2].run_time_us_histogram->TotalCount());
+  ASSERT_EQ(1, all_metrics[1].queue_length_stats->TotalCount());
+  ASSERT_EQ(1, all_metrics[1].queue_time_us_stats->TotalCount());
+  ASSERT_EQ(1, all_metrics[1].run_time_us_stats->TotalCount());
+  ASSERT_EQ(2, all_metrics[2].queue_length_stats->TotalCount());
+  ASSERT_EQ(2, all_metrics[2].queue_time_us_stats->TotalCount());
+  ASSERT_EQ(2, all_metrics[2].run_time_us_stats->TotalCount());
 
   // And the counts on the pool-wide metrics should reflect all submissions.
-  ASSERT_EQ(6, all_metrics[0].queue_length_histogram->TotalCount());
-  ASSERT_EQ(6, all_metrics[0].queue_time_us_histogram->TotalCount());
-  ASSERT_EQ(6, all_metrics[0].run_time_us_histogram->TotalCount());
+  ASSERT_EQ(6, all_metrics[0].queue_length_stats->TotalCount());
+  ASSERT_EQ(6, all_metrics[0].queue_time_us_stats->TotalCount());
+  ASSERT_EQ(6, all_metrics[0].run_time_us_stats->TotalCount());
 }
 
 // For test cases that should run with both kinds of tokens.
@@ -433,7 +435,7 @@ INSTANTIATE_TEST_CASE_P(Tokens, TestThreadPoolTokenTypes,
 
 
 TEST_P(TestThreadPoolTokenTypes, TestTokenSubmitAndWait) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .Build(&thread_pool));
   unique_ptr<ThreadPoolToken> t = thread_pool->NewToken(GetParam());
@@ -447,7 +449,7 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenSubmitAndWait) {
 }
 
 TEST_F(TestThreadPool, TestTokenSubmitsProcessedSerially) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .Build(&thread_pool));
   unique_ptr<ThreadPoolToken> t = thread_pool->NewToken(ThreadPool::ExecutionMode::SERIAL);
@@ -468,7 +470,7 @@ TEST_F(TestThreadPool, TestTokenSubmitsProcessedSerially) {
 
 TEST_P(TestThreadPoolTokenTypes, TestTokenSubmitsProcessedConcurrently) {
   const int kNumTokens = 5;
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_max_threads(kNumTokens)
                 .Build(&thread_pool));
@@ -477,9 +479,9 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenSubmitsProcessedConcurrently) {
   // A violation to the tested invariant would yield a deadlock, so let's set
   // up an alarm to bail us out.
   alarm(60);
-  BOOST_SCOPE_EXIT(void) {
-      alarm(0); // Disable alarm on test exit.
-    } BOOST_SCOPE_EXIT_END;
+  auto se = ScopeExit([] {
+    alarm(0); // Disable alarm on test exit.
+  });
   shared_ptr<Barrier> b = std::make_shared<Barrier>(kNumTokens + 1);
   for (int i = 0; i < kNumTokens; i++) {
     tokens.emplace_back(thread_pool->NewToken(GetParam()));
@@ -494,7 +496,7 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenSubmitsProcessedConcurrently) {
 
 TEST_F(TestThreadPool, TestTokenSubmitsNonSequential) {
   const int kNumSubmissions = 5;
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_max_threads(kNumSubmissions)
                 .Build(&thread_pool));
@@ -502,9 +504,9 @@ TEST_F(TestThreadPool, TestTokenSubmitsNonSequential) {
   // A violation to the tested invariant would yield a deadlock, so let's set
   // up an alarm to bail us out.
   alarm(60);
-  BOOST_SCOPE_EXIT(void) {
-                     alarm(0); // Disable alarm on test exit.
-  } BOOST_SCOPE_EXIT_END;
+  auto se = ScopeExit([] {
+    alarm(0); // Disable alarm on test exit.
+  });
   shared_ptr<Barrier> b = std::make_shared<Barrier>(kNumSubmissions + 1);
   unique_ptr<ThreadPoolToken> t = thread_pool->NewToken(ThreadPool::ExecutionMode::CONCURRENT);
   for (int i = 0; i < kNumSubmissions; i++) {
@@ -518,7 +520,7 @@ TEST_F(TestThreadPool, TestTokenSubmitsNonSequential) {
 }
 
 TEST_P(TestThreadPoolTokenTypes, TestTokenShutdown) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_max_threads(4)
                 .Build(&thread_pool));
@@ -531,9 +533,9 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenShutdown) {
   // A violation to the tested invariant would yield a deadlock, so let's set
   // up an alarm to bail us out.
   alarm(60);
-  BOOST_SCOPE_EXIT(void) {
-                     alarm(0); // Disable alarm on test exit.
-  } BOOST_SCOPE_EXIT_END;
+  auto se = ScopeExit([] {
+    alarm(0); // Disable alarm on test exit.
+  });
 
   for (int i = 0; i < 3; i++) {
     ASSERT_OK(t1->SubmitFunc([&]() {
@@ -564,7 +566,7 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenShutdown) {
 TEST_P(TestThreadPoolTokenTypes, TestTokenWaitForAll) {
   const int kNumTokens = 3;
   const int kNumSubmissions = 20;
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .Build(&thread_pool));
   Random r(SeedRandom());
@@ -599,7 +601,7 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenWaitForAll) {
 TEST_F(TestThreadPool, TestFuzz) {
   const int kNumOperations = 1000;
   Random r(SeedRandom());
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .Build(&thread_pool));
   vector<unique_ptr<ThreadPoolToken>> tokens;
@@ -679,7 +681,7 @@ TEST_F(TestThreadPool, TestFuzz) {
 }
 
 TEST_P(TestThreadPoolTokenTypes, TestTokenSubmissionsAdhereToMaxQueueSize) {
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .set_min_threads(1)
                 .set_max_threads(1)
@@ -688,9 +690,9 @@ TEST_P(TestThreadPoolTokenTypes, TestTokenSubmissionsAdhereToMaxQueueSize) {
 
   CountDownLatch latch(1);
   unique_ptr<ThreadPoolToken> t = thread_pool->NewToken(GetParam());
-  BOOST_SCOPE_EXIT(&latch) {
+  auto se = ScopeExit([&latch] {
                      latch.CountDown();
-    } BOOST_SCOPE_EXIT_END;
+    });
   // We will be able to submit two tasks: one for max_threads == 1 and one for
   // max_queue_size == 1.
   ASSERT_OK(t->Submit(SlowTask::NewSlowTask(&latch)));
@@ -707,7 +709,7 @@ TEST_F(TestThreadPool, TestTokenConcurrency) {
   const int kWaitThreads = 2;
   const int kSubmitThreads = 8;
 
-  gscoped_ptr<ThreadPool> thread_pool;
+  std::unique_ptr<ThreadPool> thread_pool;
   ASSERT_OK(ThreadPoolBuilder("test")
                 .Build(&thread_pool));
   vector<shared_ptr<ThreadPoolToken>> tokens;
@@ -718,7 +720,7 @@ TEST_F(TestThreadPool, TestTokenConcurrency) {
 
   // Fetch a token from 'tokens' at random.
   auto GetRandomToken = [&]() -> shared_ptr<ThreadPoolToken> {
-    std::lock_guard<simple_spinlock> l(lock);
+    std::lock_guard l(lock);
     int idx = rng.Uniform(kNumTokens);
     return tokens[idx];
   };
@@ -727,7 +729,7 @@ TEST_F(TestThreadPool, TestTokenConcurrency) {
   for (int i = 0; i < kNumTokens; i++) {
     ThreadPool::ExecutionMode mode;
     {
-      std::lock_guard<simple_spinlock> l(lock);
+      std::lock_guard l(lock);
       mode = rng.Next() % 2 ?
           ThreadPool::ExecutionMode::SERIAL :
           ThreadPool::ExecutionMode::CONCURRENT;
@@ -752,7 +754,7 @@ TEST_F(TestThreadPool, TestTokenConcurrency) {
       int num_tokens_cycled = 0;
       while (latch.count()) {
         {
-          std::lock_guard<simple_spinlock> l(lock);
+          std::lock_guard l(lock);
           int idx = rng.Uniform(kNumTokens);
           ThreadPool::ExecutionMode mode = rng.Next() % 2 ?
               ThreadPool::ExecutionMode::SERIAL :
@@ -826,6 +828,30 @@ TEST_F(TestThreadPool, TestTokenConcurrency) {
                           kWaitThreads, total_num_tokens_waited.load());
   LOG(INFO) << Substitute("Tokens submitted ($0 threads): $1",
                           kSubmitThreads, total_num_tokens_submitted.load());
+}
+
+TEST_F(TestThreadPool, TestTaskRunnerStopWait) {
+  TaskRunner runner;
+  ASSERT_OK(runner.Init(/* concurrency = */1));
+
+  std::atomic<int> val = 0;
+  runner.Submit([&val]() -> Status {
+    val++;
+    return STATUS(IllegalState, "first task failed");
+  });
+  runner.Submit([&val]() -> Status {
+    SleepFor(MonoDelta::FromSeconds(1));
+    val++;
+    return Status::OK();
+  });
+
+  ASSERT_NOK(runner.Wait(StopWaitIfFailed::kTrue));
+  ASSERT_NOK(runner.status());
+  ASSERT_EQ(1, val);
+
+  // Wait for second task to finish.
+  ASSERT_NOK(runner.Wait(StopWaitIfFailed::kFalse));
+  ASSERT_EQ(2, val);
 }
 
 } // namespace yb

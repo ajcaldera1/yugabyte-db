@@ -16,15 +16,13 @@
 //
 // A collection of useful (static) bit-twiddling functions.
 
-#include <glog/logging.h>
+#pragma once
 
-#include "yb/gutil/basictypes.h"
+#include "yb/util/logging.h"
+
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/logging-inl.h"
 #include "yb/gutil/macros.h"
-
-#ifndef _BITS_H_
-#define _BITS_H_
 
 class Bits {
  public:
@@ -46,19 +44,6 @@ class Bits {
             * 0x101010101010101ULL) >> 56;
 #else
     return CountOnes(n >> 32) + CountOnes(n & 0xffffffff);
-#endif
-  }
-
-  // Count bits using popcnt instruction (available on argo machines).
-  // Doesn't check if the instruction exists.
-  // Please use TestCPUFeature(POPCNT) from base/cpuid/cpuid.h before using this.
-  static inline int CountOnes64withPopcount(uint64 n) {
-#if defined(__x86_64__) && defined __GNUC__
-    int64 count = 0;
-    asm("popcnt %1,%0" : "=r"(count) : "rm"(n) : "cc");
-    return count;
-#else
-    return CountOnes64(n);
 #endif
   }
 
@@ -277,5 +262,3 @@ inline bool Bits::BytesAllInRange(T bytes, uint8 lo, uint8 hi) {
   return !Bits::BytesContainByteLessThan(bytes + (255 - hi) * l,
                                          lo + (255 - hi));
 }
-
-#endif // _BITS_H_

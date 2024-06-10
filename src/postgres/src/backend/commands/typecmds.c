@@ -49,6 +49,7 @@
 #include "catalog/pg_range.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#include "commands/extension.h"
 #include "commands/tablecmds.h"
 #include "commands/typecmds.h"
 #include "executor/executor.h"
@@ -69,6 +70,8 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+/*  YB includes. */
+#include "pg_yb_utils.h"
 
 /* result structure for get_rels_with_domain() */
 typedef struct
@@ -173,11 +176,15 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 	 * superuserness anyway.  We're just making doubly sure here.
 	 *
 	 * XXX re-enable NOT_USED code sections below if you remove this test.
+	 *
+	 * In YB mode, we allow users with the yb_extension role who are in the
+	 * midst of creating an extension to create a base type.
 	 */
-	if (!superuser())
+	if (!(IsYbExtensionUser(GetUserId()) && creating_extension) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				 errmsg("must be superuser to create a base type")));
+				 errmsg("must be superuser or a member of the yb_extension "
+				 		"role to create a base type")));
 
 	/* Convert list of names to a name and namespace */
 	typeNamespace = QualifiedNameGetCreationNamespace(names, &typeName);
@@ -631,7 +638,8 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array Dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   collation);	/* type's collation */
+				   collation,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 	Assert(typoid == address.objectId);
 
 	/*
@@ -672,7 +680,8 @@ DefineType(ParseState *pstate, List *names, List *parameters)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   collation);		/* type's collation */
+			   collation,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(array_type);
 
@@ -1066,7 +1075,8 @@ DefineDomain(CreateDomainStmt *stmt)
 				   basetypeMod, /* typeMod value */
 				   typNDims,	/* Array dimensions for base type */
 				   typNotNull,	/* Type NOT NULL */
-				   domaincoll); /* type's collation */
+				   domaincoll,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 
 	/*
 	 * Create the array type that goes with it.
@@ -1106,7 +1116,8 @@ DefineDomain(CreateDomainStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   domaincoll);		/* type's collation */
+			   domaincoll,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(domainArrayName);
 
@@ -1221,7 +1232,8 @@ DefineEnum(CreateEnumStmt *stmt)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   InvalidOid); /* type's collation */
+				   InvalidOid,	/* type's collation */
+				   false);		/* whether relation is shared (n/a here) */
 
 	/* Enter the enum's values into pg_enum */
 	EnumValuesCreate(enumTypeAddr.objectId, stmt->vals);
@@ -1261,7 +1273,8 @@ DefineEnum(CreateEnumStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   InvalidOid);		/* type's collation */
+			   InvalidOid,		/* type's collation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(enumArrayName);
 
@@ -1270,10 +1283,10 @@ DefineEnum(CreateEnumStmt *stmt)
 
 /*
  * AlterEnum
- *		ALTER TYPE on an enum.
+ *		Adds a new label to an existing enum.
  */
 ObjectAddress
-AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
+AlterEnum(AlterEnumStmt *stmt)
 {
 	Oid			enum_type_oid;
 	TypeName   *typename;
@@ -1291,6 +1304,8 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	/* Check it's an enum and check user has permission to ALTER the enum */
 	checkEnumOwner(tup);
 
+	ReleaseSysCache(tup);
+
 	if (stmt->oldVal)
 	{
 		/* Rename an existing label */
@@ -1299,27 +1314,6 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	else
 	{
 		/* Add a new label */
-
-		/*
-		 * Ordinarily we disallow adding values within transaction blocks,
-		 * because we can't cope with enum OID values getting into indexes and
-		 * then having their defining pg_enum entries go away.  However, it's
-		 * okay if the enum type was created in the current transaction, since
-		 * then there can be no such indexes that wouldn't themselves go away
-		 * on rollback.  (We support this case because pg_dump
-		 * --binary-upgrade needs it.)  We test this by seeing if the pg_type
-		 * row has xmin == current XID and is not HEAP_UPDATED.  If it is
-		 * HEAP_UPDATED, we can't be sure whether the type was created or only
-		 * modified in this xact.  So we are disallowing some cases that could
-		 * theoretically be safe; but fortunately pg_dump only needs the
-		 * simplest case.
-		 */
-		if (HeapTupleHeaderGetXmin(tup->t_data) == GetCurrentTransactionId() &&
-			!(tup->t_data->t_infomask & HEAP_UPDATED))
-			 /* safe to do inside transaction block */ ;
-		else
-			PreventInTransactionBlock(isTopLevel, "ALTER TYPE ... ADD");
-
 		AddEnumLabel(enum_type_oid, stmt->newVal,
 					 stmt->newValNeighbor, stmt->newValIsAfter,
 					 stmt->skipIfNewValExists);
@@ -1328,8 +1322,6 @@ AlterEnum(AlterEnumStmt *stmt, bool isTopLevel)
 	InvokeObjectPostAlterHook(TypeRelationId, enum_type_oid, 0);
 
 	ObjectAddressSet(address, TypeRelationId, enum_type_oid);
-
-	ReleaseSysCache(tup);
 
 	return address;
 }
@@ -1570,7 +1562,8 @@ DefineRange(CreateRangeStmt *stmt)
 				   -1,			/* typMod (Domains only) */
 				   0,			/* Array dimensions of typbasetype */
 				   false,		/* Type NOT NULL */
-				   InvalidOid); /* type's collation (ranges never have one) */
+				   InvalidOid,	/* type's collation (ranges never have one) */
+				   false);		/* whether relation is shared (n/a here) */
 	Assert(typoid == address.objectId);
 
 	/* Create the entry in pg_range */
@@ -1612,7 +1605,8 @@ DefineRange(CreateRangeStmt *stmt)
 			   -1,				/* typMod (Domains only) */
 			   0,				/* Array dimensions of typbasetype */
 			   false,			/* Type NOT NULL */
-			   InvalidOid);		/* typcollation */
+			   InvalidOid,		/* typcollation */
+			   false);			/* whether relation is shared (n/a here) */
 
 	pfree(rangeArrayName);
 
@@ -1706,7 +1700,11 @@ static Oid
 findTypeInputFunction(List *procname, Oid typeOid)
 {
 	Oid			argList[3];
+	int			nmatches = 0;
 	Oid			procOid;
+	Oid			procOid2;
+	Oid			procOid3;
+	Oid			procOid4;
 
 	/*
 	 * Input functions can take a single argument of type CSTRING, or three
@@ -1714,32 +1712,45 @@ findTypeInputFunction(List *procname, Oid typeOid)
 	 *
 	 * For backwards compatibility we allow OPAQUE in place of CSTRING; if we
 	 * see this, we issue a warning and fix up the pg_proc entry.
+	 *
+	 * Whine about ambiguity if multiple forms exist.
 	 */
 	argList[0] = CSTRINGOID;
-
-	procOid = LookupFuncName(procname, 1, argList, true);
-	if (OidIsValid(procOid))
-		return procOid;
-
 	argList[1] = OIDOID;
 	argList[2] = INT4OID;
 
-	procOid = LookupFuncName(procname, 3, argList, true);
+	procOid = LookupFuncName(procname, 1, argList, true);
 	if (OidIsValid(procOid))
-		return procOid;
+		nmatches++;
+	procOid2 = LookupFuncName(procname, 3, argList, true);
+	if (OidIsValid(procOid2))
+		nmatches++;
 
-	/* No luck, try it with OPAQUE */
 	argList[0] = OPAQUEOID;
 
-	procOid = LookupFuncName(procname, 1, argList, true);
+	procOid3 = LookupFuncName(procname, 1, argList, true);
+	if (OidIsValid(procOid3))
+		nmatches++;
+	procOid4 = LookupFuncName(procname, 3, argList, true);
+	if (OidIsValid(procOid4))
+		nmatches++;
 
-	if (!OidIsValid(procOid))
-	{
-		argList[1] = OIDOID;
-		argList[2] = INT4OID;
+	if (nmatches > 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+				 errmsg("type input function %s has multiple matches",
+						NameListToString(procname))));
 
-		procOid = LookupFuncName(procname, 3, argList, true);
-	}
+	if (OidIsValid(procOid))
+		return procOid;
+	if (OidIsValid(procOid2))
+		return procOid2;
+
+	/* Cases with OPAQUE need adjustment */
+	if (OidIsValid(procOid3))
+		procOid = procOid3;
+	else
+		procOid = procOid4;
 
 	if (OidIsValid(procOid))
 	{
@@ -1825,24 +1836,32 @@ findTypeReceiveFunction(List *procname, Oid typeOid)
 {
 	Oid			argList[3];
 	Oid			procOid;
+	Oid			procOid2;
 
 	/*
 	 * Receive functions can take a single argument of type INTERNAL, or three
-	 * arguments (internal, typioparam OID, typmod).
+	 * arguments (internal, typioparam OID, typmod).  Whine about ambiguity if
+	 * both forms exist.
 	 */
 	argList[0] = INTERNALOID;
-
-	procOid = LookupFuncName(procname, 1, argList, true);
-	if (OidIsValid(procOid))
-		return procOid;
-
 	argList[1] = OIDOID;
 	argList[2] = INT4OID;
 
-	procOid = LookupFuncName(procname, 3, argList, true);
+	procOid = LookupFuncName(procname, 1, argList, true);
+	procOid2 = LookupFuncName(procname, 3, argList, true);
 	if (OidIsValid(procOid))
+	{
+		if (OidIsValid(procOid2))
+			ereport(ERROR,
+					(errcode(ERRCODE_AMBIGUOUS_FUNCTION),
+					 errmsg("type receive function %s has multiple matches",
+							NameListToString(procname))));
 		return procOid;
+	}
+	else if (OidIsValid(procOid2))
+		return procOid2;
 
+	/* If not found, reference the 1-argument signature in error msg */
 	ereport(ERROR,
 			(errcode(ERRCODE_UNDEFINED_FUNCTION),
 			 errmsg("function %s does not exist",
@@ -1971,7 +1990,7 @@ findRangeSubOpclass(List *opcname, Oid subtype)
 
 	if (opcname != NIL)
 	{
-		opcid = get_opclass_oid(BTREE_AM_OID, opcname, false);
+		opcid = get_opclass_oid(IsYugaByteEnabled() ? LSM_AM_OID : BTREE_AM_OID, opcname, false);
 
 		/*
 		 * Verify that the operator class accepts this datatype. Note we will
@@ -1987,7 +2006,7 @@ findRangeSubOpclass(List *opcname, Oid subtype)
 	}
 	else
 	{
-		opcid = GetDefaultOpClass(subtype, BTREE_AM_OID);
+		opcid = GetDefaultOpClass(subtype, IsYugaByteEnabled() ? LSM_AM_OID : BTREE_AM_OID);
 		if (!OidIsValid(opcid))
 		{
 			/* We spell the error message identically to ResolveOpClass */
@@ -2097,7 +2116,7 @@ AssignTypeArrayOid(void)
 	Oid			type_array_oid;
 
 	/* Use binary-upgrade override for pg_type.typarray? */
-	if (IsBinaryUpgrade)
+	if (IsBinaryUpgrade || yb_binary_restore)
 	{
 		if (!OidIsValid(binary_upgrade_next_array_pg_type_oid))
 			ereport(ERROR,
@@ -2310,7 +2329,9 @@ AlterDomainDefault(List *names, Node *defaultRaw)
 							 0, /* relation kind is n/a */
 							 false, /* a domain isn't an implicit array */
 							 false, /* nor is it any kind of dependent type */
-							 true); /* We do need to rebuild dependencies */
+							 true, /* We do need to rebuild dependencies */
+							 false, /* not a system relation rowtype */
+							 false); /* not a shared relation rowtype */
 
 	InvokeObjectPostAlterHook(TypeRelationId, domainoid, 0);
 

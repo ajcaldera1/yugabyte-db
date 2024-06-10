@@ -4,11 +4,8 @@
 
 #include "yb/gutil/sysinfo.h"
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
-#include "yb/util/status.h"
-#include "yb/util/test_util.h"
 #include "yb/util/logging.h"
+#include "yb/util/test_util.h"
 
 DECLARE_int32(num_cpus);
 
@@ -36,7 +33,7 @@ TEST_F(SysInfoTest, NumCpusZeroTest) {
 
 // Test gflag value changes are reflected in NumCPUs function
 TEST_F(SysInfoTest, NumCpusChangedTest) {
-  FLAGS_num_cpus = 20;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_num_cpus) = 20;
   ASSERT_EQ(base::NumCPUs(), 20);
 }
 

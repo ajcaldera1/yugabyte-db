@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_ENV_UTIL_H
-#define YB_UTIL_ENV_UTIL_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -46,7 +45,14 @@ namespace env_util {
 // immediately returned. Otherwise, we start walking up from the directory of the current executable
 // until we are in a directory that has a subdirectory with the given name. Then we return the path
 // of that directory (not of the subdirectory).
+//
+// In cases where we fail to get the directory of the current executable, GetRootDir will return a
+// default value of "".
+// In cases where we fail to find search_for_dir, GetRootDir returns the directory of the current
+// executable.
+// In both of the above cases, GetRootDirResult will instead return a non-OK status.
 std::string GetRootDir(const std::string& search_for_dir);
+Result<std::string> GetRootDirResult(const std::string& search_for_dir);
 
 Status OpenFileForWrite(Env *env, const std::string &path,
                         std::shared_ptr<WritableFile> *file);
@@ -87,8 +93,9 @@ Status CreateDirIfMissing(Env* env, const std::string& path,
 // This is not atomic, and if there is an error while reading or writing,
 // a partial copy may be left in 'dest_path'. Does not fsync the parent
 // directory of dest_path -- if you need durability then do that yourself.
-Status CopyFile(Env* env, const std::string& source_path, const std::string& dest_path,
-                WritableFileOptions opts);
+Status CopyFile(
+    Env* env, const std::string& source_path, const std::string& dest_path,
+    WritableFileOptions opts = WritableFileOptions());
 
 // Deletes a file or directory when this object goes out of scope.
 //
@@ -99,10 +106,15 @@ class ScopedFileDeleter {
  public:
   ScopedFileDeleter(Env* env, std::string path);
   ~ScopedFileDeleter();
+  ScopedFileDeleter(ScopedFileDeleter&& other) = default;
 
   // Do not delete the file when this object goes out of scope.
   void Cancel() {
     should_delete_ = false;
+  }
+
+  const std::string& path() {
+    return path_;
   }
 
  private:
@@ -115,5 +127,3 @@ class ScopedFileDeleter {
 
 } // namespace env_util
 } // namespace yb
-
-#endif  // YB_UTIL_ENV_UTIL_H

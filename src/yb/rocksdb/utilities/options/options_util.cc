@@ -18,10 +18,8 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
 
-#include "yb/rocksdb/utilities/options_util.h"
-
+#include "yb/rocksdb/db.h"
 #include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/util/options_parser.h"
@@ -111,4 +109,3 @@ Status CheckOptionsCompatibility(
 }
 
 }  // namespace rocksdb
-#endif  // !ROCKSDB_LITE

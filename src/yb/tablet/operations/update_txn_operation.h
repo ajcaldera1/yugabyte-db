@@ -13,71 +13,32 @@
 //
 //
 
-#ifndef YB_TABLET_OPERATIONS_UPDATE_TXN_OPERATION_H
-#define YB_TABLET_OPERATIONS_UPDATE_TXN_OPERATION_H
-
-#include <yb/tserver/tserver_service.pb.h>
-#include "yb/tablet/transaction_coordinator.h"
+#pragma once
 
 #include "yb/tablet/operations/operation.h"
+
+#include "yb/tablet/operations.messages.h"
 
 namespace yb {
 namespace tablet {
 
-class TransactionCoordinator;
-
-class UpdateTxnOperationState : public OperationState {
+class UpdateTxnOperation
+    : public OperationBase<OperationType::kUpdateTransaction, LWTransactionStatePB> {
  public:
-  UpdateTxnOperationState(Tablet* tablet, const tserver::TransactionStatePB* request)
-      : OperationState(tablet), request_(request) {}
+  template <class... Args>
+  explicit UpdateTxnOperation(Args&&... args)
+      : OperationBase(std::forward<Args>(args)...) {}
 
-  explicit UpdateTxnOperationState(Tablet* tablet)
-      : UpdateTxnOperationState(tablet, nullptr) {}
-
-  const tserver::TransactionStatePB* request() const override {
-    return request_.load(std::memory_order_acquire);
-  }
-
-  void TakeRequest(tserver::TransactionStatePB* request) {
-    request_holder_.reset(new tserver::TransactionStatePB);
-    request_.store(request_holder_.get(), std::memory_order_release);
-    request_holder_->Swap(request);
-  }
-
-  std::string ToString() const override;
-
- private:
-  void UpdateRequestFromConsensusRound() override;
-
-  std::unique_ptr<tserver::TransactionStatePB> request_holder_;
-  std::atomic<const tserver::TransactionStatePB*> request_;
-};
-
-class UpdateTxnOperation : public Operation {
- public:
-  explicit UpdateTxnOperation(std::unique_ptr<UpdateTxnOperationState> state)
-      : Operation(std::move(state), OperationType::kUpdateTransaction) {}
-
-  UpdateTxnOperationState* state() override {
-    return down_cast<UpdateTxnOperationState*>(Operation::state());
-  }
-
-  const UpdateTxnOperationState* state() const override {
-    return down_cast<const UpdateTxnOperationState*>(Operation::state());
+  bool use_mvcc() const override {
+    return true;
   }
 
  private:
-  TransactionCoordinator& transaction_coordinator() const;
-
-  consensus::ReplicateMsgPtr NewReplicateMsg() override;
-  CHECKED_STATUS Prepare() override;
-  void DoStart() override;
-  CHECKED_STATUS Apply(int64_t leader_term) override;
-  std::string ToString() const override;
-  void Finish(OperationResult result) override;
+  Result<TransactionCoordinator*> transaction_coordinator() const;
+  Status Prepare(IsLeaderSide is_leader_side) override;
+  Status DoReplicated(int64_t leader_term, Status* complete_status) override;
+  Status DoAborted(const Status& status) override;
 };
 
 } // namespace tablet
 } // namespace yb
-
-#endif // YB_TABLET_OPERATIONS_UPDATE_TXN_OPERATION_H

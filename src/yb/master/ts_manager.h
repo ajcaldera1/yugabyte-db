@@ -29,26 +29,30 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_MASTER_TS_MANAGER_H
-#define YB_MASTER_TS_MANAGER_H
+#pragma once
 
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "yb/common/common.pb.h"
-#include "yb/gutil/macros.h"
+#include <boost/function.hpp>
 
+#include "yb/common/common_fwd.h"
+
+#include "yb/gutil/macros.h"
+#include "yb/gutil/thread_annotations.h"
+
+#include "yb/master/master_cluster.fwd.h"
 #include "yb/master/master_fwd.h"
 
 #include "yb/rpc/rpc_fwd.h"
 
-#include "yb/util/capabilities.h"
+#include "yb/util/status_fwd.h"
 #include "yb/util/locks.h"
 #include "yb/util/monotime.h"
 #include "yb/util/net/net_util.h"
-#include "yb/util/status.h"
 
 namespace yb {
 
@@ -56,8 +60,12 @@ class NodeInstancePB;
 
 namespace master {
 
+class TSInformationPB;
+
 typedef std::string TabletServerId;
-typedef std::unordered_set<HostPort, HostPortHash> BlacklistSet;
+
+// A callback that is called when the number of tablet servers reaches a certain number.
+typedef boost::function<void()> TSCountCallback;
 
 // Tracks the servers that the master has heard from, along with their
 // last heartbeat, etc.
@@ -78,8 +86,8 @@ class TSManager {
   // If the TS has never registered, or this instance doesn't match the
   // current instance ID for the TS, then a NotFound status is returned.
   // Otherwise, *desc is set and OK is returned.
-  CHECKED_STATUS LookupTS(const NodeInstancePB& instance,
-                          TSDescriptorPtr* desc);
+  Status LookupTS(const NodeInstancePB& instance,
+                  TSDescriptorPtr* desc);
 
   // Lookup the tablet server descriptor for the given UUID.
   // Returns false if the TS has never registered.
@@ -90,59 +98,77 @@ class TSManager {
   // Register or re-register a tablet server with the manager.
   //
   // If successful, *desc reset to the registered descriptor.
-  CHECKED_STATUS RegisterTS(const NodeInstancePB& instance,
-                            const TSRegistrationPB& registration,
-                            CloudInfoPB local_cloud_info,
-                            rpc::ProxyCache* proxy_cache);
+  Status RegisterTS(const NodeInstancePB& instance,
+                    const TSRegistrationPB& registration,
+                    CloudInfoPB local_cloud_info,
+                    rpc::ProxyCache* proxy_cache,
+                    RegisteredThroughHeartbeat registered_through_heartbeat =
+                                RegisteredThroughHeartbeat::kTrue);
 
   // Return all of the currently registered TS descriptors into the provided list.
   void GetAllDescriptors(TSDescriptorVector* descs) const;
+  TSDescriptorVector GetAllDescriptors() const;
 
   // Return all of the currently registered TS descriptors that have sent a
   // heartbeat recently, indicating that they're alive and well.
   // Optionally pass in blacklist as a set of HostPorts to return all live non-blacklisted servers.
   void GetAllLiveDescriptors(TSDescriptorVector* descs,
-                             const BlacklistSet blacklist = BlacklistSet()) const;
+                             const boost::optional<BlacklistSet>& blacklist = boost::none) const;
 
   // Return all of the currently registered TS descriptors that have sent a heartbeat
   // recently and are in the same 'cluster' with given placement uuid.
   // Optionally pass in blacklist as a set of HostPorts to return all live non-blacklisted servers.
-  void GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs, string placement_uuid,
-                                      const BlacklistSet blacklist = BlacklistSet()) const;
+  void GetAllLiveDescriptorsInCluster(TSDescriptorVector* descs, std::string placement_uuid,
+                                      const boost::optional<BlacklistSet>& blacklist = boost::none,
+                                      bool primary_cluster = true) const;
 
   // Return all of the currently registered TS descriptors that have sent a
   // heartbeat, indicating that they're alive and well, recently and have given
   // full report of their tablets as well.
   void GetAllReportedDescriptors(TSDescriptorVector* descs) const;
 
-  // Get the TS count.
-  int GetCount() const;
-
   // Return the tablet server descriptor running on the given port.
   const TSDescriptorPtr GetTSDescriptor(const HostPortPB& host_port) const;
 
-  static bool IsTSLive(const TSDescriptorPtr& ts);
-
   // Check if the placement uuid of the tserver is same as given cluster uuid.
-  static bool IsTsInCluster(const TSDescriptorPtr& ts, string cluster_uuid);
+  static bool IsTsInCluster(const TSDescriptorPtr& ts, std::string cluster_uuid);
 
   static bool IsTsBlacklisted(const TSDescriptorPtr& ts,
-                              const BlacklistSet blacklist);
+                              const boost::optional<BlacklistSet>& blacklist = boost::none);
+
+  // Register a callback to be called when the number of tablet servers reaches a certain number.
+  // The callback is removed after it is called once.
+  void SetTSCountCallback(int min_count, TSCountCallback callback);
 
  private:
-
   void GetDescriptors(std::function<bool(const TSDescriptorPtr&)> condition,
                       TSDescriptorVector* descs) const;
+
+
+  void GetAllDescriptorsUnlocked(TSDescriptorVector* descs) const REQUIRES_SHARED(lock_);
+  void GetDescriptorsUnlocked(std::function<bool(const TSDescriptorPtr&)> condition,
+                      TSDescriptorVector* descs) const REQUIRES_SHARED(lock_);
+
+  // Returns the registered ts descriptors whose hostport matches the hostport in the
+  // registration argument.
+  std::vector<std::pair<TSDescriptor*, std::shared_ptr<TSInformationPB>>> FindHostPortMatches(
+      const NodeInstancePB& instance,
+      const TSRegistrationPB& registration,
+      const CloudInfoPB& local_cloud_info) const REQUIRES_SHARED(lock_);
+
+  size_t GetCountUnlocked() const REQUIRES_SHARED(lock_);
 
   mutable rw_spinlock lock_;
 
   typedef std::unordered_map<std::string, TSDescriptorPtr> TSDescriptorMap;
-  TSDescriptorMap servers_by_id_;
+  TSDescriptorMap servers_by_id_ GUARDED_BY(lock_);
+
+  // This callback will be called when the number of tablet servers reaches the given number.
+  TSCountCallback ts_count_callback_ GUARDED_BY(lock_);
+  size_t ts_count_callback_min_count_ GUARDED_BY(lock_) = 0;
 
   DISALLOW_COPY_AND_ASSIGN(TSManager);
 };
 
 } // namespace master
 } // namespace yb
-
-#endif // YB_MASTER_TS_MANAGER_H

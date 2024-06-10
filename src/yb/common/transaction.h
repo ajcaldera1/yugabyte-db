@@ -13,38 +13,47 @@
 //
 //
 
-#ifndef YB_COMMON_TRANSACTION_H
-#define YB_COMMON_TRANSACTION_H
+#pragma once
 
-#include <boost/functional/hash.hpp>
-#include <boost/optional.hpp>
-#include <boost/uuid/uuid.hpp>
-#include <boost/uuid/nil_generator.hpp>
+#include <stdint.h>
 
-#include "yb/common/common.pb.h"
-#include "yb/common/entity_ids.h"
+#include <functional>
+#include <iterator>
+#include <string>
+#include <type_traits>
+#include <unordered_set>
+#include <utility>
+
+#include <boost/container/small_vector.hpp>
+#include <boost/functional/hash/hash.hpp>
+#include <boost/optional/optional.hpp>
+
+#include "yb/common/common_fwd.h"
+#include "yb/common/transaction.pb.h"
+#include "yb/common/entity_ids_types.h"
 #include "yb/common/hybrid_time.h"
+#include "yb/common/opid.h"
+
+#include "yb/gutil/template_util.h"
 
 #include "yb/util/enums.h"
-#include "yb/util/monotime.h"
-#include "yb/util/logging.h"
-#include "yb/util/result.h"
-#include "yb/util/strongly_typed_bool.h"
-#include "yb/util/uuid.h"
-
-namespace rocksdb {
-
-class DB;
-
-}
+#include "yb/util/math_util.h"
+#include "yb/util/metrics.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/strongly_typed_uuid.h"
+#include "yb/util/uint_set.h"
 
 namespace yb {
 
-using TransactionId = boost::uuids::uuid;
-typedef boost::hash<TransactionId> TransactionIdHash;
+YB_STRONGLY_TYPED_UUID_DECL(TransactionId);
 using TransactionIdSet = std::unordered_set<TransactionId, TransactionIdHash>;
+using TransactionIdApplyOpIdMap = std::unordered_map<TransactionId, OpId, TransactionIdHash>;
+using SubTransactionId = uint32_t;
 
-inline TransactionId GenerateTransactionId() { return Uuid::Generate(); }
+// By default, postgres SubTransactionId's propagated to DocDB start at 1, so we use this as a
+// minimum value on the DocDB side as well. All intents written without an explicit SubTransactionId
+// are assumed to belong to the subtransaction with this kMinSubTransactionId.
+constexpr SubTransactionId kMinSubTransactionId = 1;
 
 // Decodes transaction id from its binary representation.
 // Checks that slice contains only TransactionId.
@@ -53,6 +62,47 @@ Result<TransactionId> FullyDecodeTransactionId(const Slice& slice);
 // Decodes transaction id from slice which contains binary encoding. Consumes corresponding bytes
 // from slice.
 Result<TransactionId> DecodeTransactionId(Slice* slice);
+
+using SubtxnSet = UnsignedIntSet<SubTransactionId>;
+
+// SubtxnSetAndPB avoids repeated serialization of SubtxnSet, required for rpc calls, by storing
+// the serialized proto form (SubtxnSetPB). A shared_ptr to a SubtxnSetAndPB object can be obtained
+// by calling SubtxnSetAndPB::Create(const T& set_pb), where T should be some type where
+// SubtxnSet::FromPB(set_pb.set()) is well defined. for instance, SubtxnSetPB/ ::yb::LWSubtxnSetPB.
+class SubtxnSetAndPB {
+ public:
+  SubtxnSetAndPB() {}
+
+  SubtxnSetAndPB(SubtxnSet&& set, SubtxnSetPB&& pb) : set_(std::move(set)), pb_(std::move(pb)) {}
+
+  template <class T>
+  static Result<std::shared_ptr<SubtxnSetAndPB>> Create(const T& set_pb) {
+    auto res = SubtxnSet::FromPB(set_pb.set());
+    RETURN_NOT_OK(res);
+    SubtxnSetPB pb;
+    res->ToPB(pb.mutable_set());
+    std::shared_ptr<SubtxnSetAndPB>
+        subtxn_info = std::make_shared<SubtxnSetAndPB>(std::move(*res), std::move(pb));
+    return subtxn_info;
+  }
+
+  const SubtxnSet& set() const {
+    return set_;
+  }
+
+  const SubtxnSetPB& pb() const {
+    return pb_;
+  }
+
+  std::string ToString() const {
+    // Skip including the redundant string representation of the proto form.
+    return set_.ToString();
+  }
+
+ private:
+  const SubtxnSet set_;
+  const SubtxnSetPB pb_;
+};
 
 struct TransactionStatusResult {
   TransactionStatus status;
@@ -64,10 +114,54 @@ struct TransactionStatusResult {
   // ABORTED - not used.
   HybridTime status_time;
 
-  TransactionStatusResult(TransactionStatus status_, HybridTime status_time_);
+  // Set of thus-far aborted subtransactions in this transaction.
+  SubtxnSet aborted_subtxn_set;
+
+  // Populating status_tablet field is optional, except when we report transaction promotion.
+  TabletId status_tablet;
+
+  // Status containing the deadlock info if the transaction was aborted due to a deadlock.
+  // Defaults to Status::OK() in all other cases.
+  Status expected_deadlock_status = Status::OK();
+
+  TransactionStatusResult() {}
+
+  TransactionStatusResult(
+      TransactionStatus status_, HybridTime status_time_,
+      Status expected_deadlock_status_ = Status::OK());
+
+  TransactionStatusResult(
+      TransactionStatus status_, HybridTime status_time_,
+      SubtxnSet aborted_subtxn_set_, Status expected_deadlock_status_ = Status::OK());
+
+  TransactionStatusResult(
+      TransactionStatus status_, HybridTime status_time_, SubtxnSet aborted_subtxn_set_,
+      TabletId status_tablet);
 
   static TransactionStatusResult Aborted() {
     return TransactionStatusResult(TransactionStatus::ABORTED, HybridTime());
+  }
+
+  static TransactionStatusResult Deadlocked(Status deadlock_status) {
+    return TransactionStatusResult(TransactionStatus::ABORTED, HybridTime(), {}, deadlock_status);
+  }
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(status, status_time, aborted_subtxn_set, status_tablet);
+  }
+};
+
+using SubtxnHasNonLockConflict = std::unordered_map<SubTransactionId, bool>;
+
+struct BlockingTransactionData {
+  TransactionId id;
+  TabletId status_tablet;
+  std::shared_ptr<SubtxnHasNonLockConflict> subtransactions = nullptr;
+
+  std::string ToString() const {
+    return Format("{id: $0, status_tablet: $1, subtransactions_size: $2}",
+                  id, status_tablet,
+                  subtransactions ? Format("$0", subtransactions->size()) : "null");
   }
 };
 
@@ -79,7 +173,8 @@ inline std::ostream& operator<<(std::ostream& out, const TransactionStatusResult
 typedef std::function<void(Result<TransactionStatusResult>)> TransactionStatusCallback;
 struct TransactionMetadata;
 
-YB_STRONGLY_TYPED_BOOL(MustExist);
+YB_DEFINE_ENUM(TransactionLoadFlag, (kMustExist)(kCleanup));
+typedef EnumBitSet<TransactionLoadFlag> TransactionLoadFlags;
 
 // Used by RequestStatusAt.
 struct StatusRequest {
@@ -88,19 +183,36 @@ struct StatusRequest {
   HybridTime global_limit_ht;
   int64_t serial_no;
   const std::string* reason;
-  MustExist must_exist;
+  TransactionLoadFlags flags;
   TransactionStatusCallback callback;
+  // If non-null, populate status_tablet_id for known transactions in the same thread the request is
+  // initiated.
+  std::string* status_tablet_id = nullptr;
+
+  std::string ToString() const {
+    return Format("{ id: $0 read_ht: $1 global_limit_ht: $2 serial_no: $3 reason: $4 flags: $5}",
+                  *id, read_ht, global_limit_ht, serial_no, *reason, flags);
+  }
 };
 
 class RequestScope;
+
+struct TransactionLocalState {
+  HybridTime commit_ht;
+  SubtxnSet aborted_subtxn_set;
+};
 
 class TransactionStatusManager {
  public:
   virtual ~TransactionStatusManager() {}
 
-  // Checks whether this tablet knows that transaction is committed.
-  // In case of success returns commit time of transaction, otherwise returns invalid time.
+  // If this tablet is aware that this transaction has committed, returns the commit ht for the
+  // transaction. Otherwise, returns HybridTime::kInvalid.
   virtual HybridTime LocalCommitTime(const TransactionId& id) = 0;
+
+  // If this tablet is aware that this transaction has committed, returns the TransactionLocalState
+  // for the transaction. Otherwise, returns boost::none.
+  virtual boost::optional<TransactionLocalState> LocalTxnData(const TransactionId& id) = 0;
 
   // Fetches status of specified transaction at specified time from transaction coordinator.
   // Callback would be invoked in any case.
@@ -114,31 +226,46 @@ class TransactionStatusManager {
   // 4. Any kind of network/timeout errors would be reflected in error passed to callback.
   virtual void RequestStatusAt(const StatusRequest& request) = 0;
 
-  virtual boost::optional<TransactionMetadata> Metadata(const TransactionId& id) = 0;
+  // Prepares metadata for provided protobuf. Either trying to extract it from pb, or fetch
+  // from existing metadatas.
+  virtual Result<TransactionMetadata> PrepareMetadata(const LWTransactionMetadataPB& pb) = 0;
 
   virtual void Abort(const TransactionId& id, TransactionStatusCallback callback) = 0;
 
-  virtual void Cleanup(TransactionIdSet&& set) = 0;
+  virtual Status Cleanup(TransactionIdApplyOpIdMap&& set) = 0;
+
+  // For each pair fills second with priority of transaction with id equals to first.
+  virtual Status FillPriorities(
+      boost::container::small_vector_base<std::pair<TransactionId, uint64_t>>* inout) = 0;
+
+  virtual Result<boost::optional<TabletId>> FindStatusTablet(const TransactionId& id) = 0;
+
+  // Returns minimal running hybrid time of all running transactions.
+  virtual HybridTime MinRunningHybridTime() const = 0;
+
+  virtual Result<HybridTime> WaitForSafeTime(HybridTime safe_time, CoarseTimePoint deadline) = 0;
+
+  virtual const TabletId& tablet_id() const = 0;
+
+  virtual void RecordConflictResolutionKeysScanned(int64_t num_keys) = 0;
+
+  virtual void RecordConflictResolutionScanLatency(MonoDelta latency)  = 0;
 
  private:
   friend class RequestScope;
 
   // Registers new request assigning next serial no to it. So this serial no could be used
   // to check whether one request happened before another one.
-  virtual int64_t RegisterRequest() = 0;
+  virtual Result<int64_t> RegisterRequest() = 0;
 
   // request_id - is request id returned by RegisterRequest, that should be unregistered.
   virtual void UnregisterRequest(int64_t request_id) = 0;
 };
 
-// Utility class that invokes RegisterRequest on creation and UnregisterRequest on deletion.
-class RequestScope {
+// Utility class that invokes UnregisterRequest on deletion.
+class NODISCARD_CLASS RequestScope {
  public:
   RequestScope() noexcept : status_manager_(nullptr), request_id_(0) {}
-
-  explicit RequestScope(TransactionStatusManager* status_manager)
-      : status_manager_(status_manager), request_id_(status_manager->RegisterRequest()) {
-  }
 
   RequestScope(RequestScope&& rhs) noexcept
       : status_manager_(rhs.status_manager_), request_id_(rhs.request_id_) {
@@ -161,7 +288,15 @@ class RequestScope {
   RequestScope(const RequestScope&) = delete;
   void operator=(const RequestScope&) = delete;
 
+  static Result<RequestScope> Create(TransactionStatusManager* status_manager) {
+    return RequestScope(status_manager, VERIFY_RESULT(status_manager->RegisterRequest()));
+  }
+
  private:
+  RequestScope(TransactionStatusManager* status_manager, uint64_t request_id)
+      : status_manager_(status_manager), request_id_(request_id) {
+  }
+
   void Reset() {
     if (status_manager_) {
       status_manager_->UnregisterRequest(request_id_);
@@ -173,19 +308,59 @@ class RequestScope {
   int64_t request_id_;
 };
 
+// Represents all metadata tracked about subtransaction state by the client in support of postgres
+// savepoints. Can be serialized and deserialized to/from SubTransactionMetadataPB. This should be
+// sent by the client on any transactional read/write requests where a savepoint has been created,
+// and finally on transaction commit.
+struct SubTransactionMetadata {
+  SubTransactionId subtransaction_id = kMinSubTransactionId;
+  SubtxnSet aborted;
+
+  void ToPB(SubTransactionMetadataPB* dest) const;
+
+  static Result<SubTransactionMetadata> FromPB(
+      const SubTransactionMetadataPB& source);
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(subtransaction_id, aborted);
+  }
+
+  bool operator==(const SubTransactionMetadata& other) const {
+    return subtransaction_id == other.subtransaction_id &&
+      aborted == other.aborted;
+  }
+
+  // Returns true if this is the default state, i.e. default subtransaction_id. This indicates
+  // whether the client has interacted with savepoints at all in the context of a session. If true,
+  // the client could, for example, skip sending subtransaction-related metadata in RPCs.
+  // TODO(savepoints) -- update behavior and comment to track default aborted subtransaction state
+  // as well.
+  bool IsDefaultState() const;
+};
+
+std::ostream& operator<<(std::ostream& out, const SubTransactionMetadata& metadata);
+
 struct TransactionOperationContext {
+  TransactionOperationContext();
+
   TransactionOperationContext(
-      const TransactionId& transaction_id_, TransactionStatusManager* txn_status_manager_)
-      : transaction_id(transaction_id_),
-        txn_status_manager(*(DCHECK_NOTNULL(txn_status_manager_))) {}
+      const TransactionId& transaction_id_, TransactionStatusManager* txn_status_manager_);
+
+  TransactionOperationContext(
+      const TransactionId& transaction_id_,
+      SubTransactionMetadata&& subtransaction_,
+      TransactionStatusManager* txn_status_manager_);
 
   bool transactional() const;
 
-  TransactionId transaction_id;
-  TransactionStatusManager& txn_status_manager;
-};
+  explicit operator bool() const {
+    return txn_status_manager != nullptr;
+  }
 
-typedef boost::optional<TransactionOperationContext> TransactionOperationContextOpt;
+  TransactionId transaction_id;
+  SubTransactionMetadata subtransaction;
+  TransactionStatusManager* txn_status_manager;
+};
 
 inline std::ostream& operator<<(std::ostream& out, const TransactionOperationContext& context) {
   if (context.transactional()) {
@@ -197,23 +372,47 @@ inline std::ostream& operator<<(std::ostream& out, const TransactionOperationCon
 }
 
 struct TransactionMetadata {
-  TransactionId transaction_id = boost::uuids::nil_uuid();
+  TransactionId transaction_id = TransactionId::Nil();
   IsolationLevel isolation = IsolationLevel::NON_TRANSACTIONAL;
   TabletId status_tablet;
-  uint64_t priority;
+
+  // By default, a random value is picked for a newly created transaction.
+  uint64_t priority = 0;
 
   // Used for snapshot isolation (as read time and for conflict resolution).
   // start_time is used only for backward compability during rolling update.
-  HybridTime DEPRECATED_start_time;
+  HybridTime start_time;
 
+  // Used by the wait queue to determine the order in which waiting transactions are resumed.
+  // Matches the txn start time tracked by postgres.
+  int64_t pg_txn_start_us = 0;
+
+  // Indicates whether this transaction is a local transaction or global transaction.
+  TransactionLocality locality = TransactionLocality::GLOBAL;
+
+  // Former transaction status tablet that the transaction was using prior to a move.
+  TabletId old_status_tablet;
+
+  static Result<TransactionMetadata> FromPB(const LWTransactionMetadataPB& source);
   static Result<TransactionMetadata> FromPB(const TransactionMetadataPB& source);
 
+  void ToPB(LWTransactionMetadataPB* dest) const;
   void ToPB(TransactionMetadataPB* dest) const;
 
+  void TransactionIdToPB(LWTransactionMetadataPB* dest) const;
+  void TransactionIdToPB(TransactionMetadataPB* dest) const;
+
   std::string ToString() const {
-    return Format("{ transaction_id: $0 isolation: $1 status_tablet: $2 priority: $3 }",
-                  transaction_id, isolation, status_tablet, priority);
+    return Format(
+        "{ transaction_id: $0 isolation: $1 status_tablet: $2 priority: $3 start_time: $4"
+        " locality: $5 old_status_tablet: $6}",
+        transaction_id, IsolationLevel_Name(isolation), status_tablet, priority, start_time,
+        TransactionLocality_Name(locality), old_status_tablet);
   }
+
+ private:
+  template <class PB>
+  static Result<TransactionMetadata> DoFromPB(const PB& source);
 };
 
 bool operator==(const TransactionMetadata& lhs, const TransactionMetadata& rhs);
@@ -224,11 +423,70 @@ inline bool operator!=(const TransactionMetadata& lhs, const TransactionMetadata
 
 std::ostream& operator<<(std::ostream& out, const TransactionMetadata& metadata);
 
-MonoDelta TransactionRpcTimeout();
-MonoTime TransactionRpcDeadline();
+// Post-apply transaction metadata is written to intentsdb when a transactions' intents have not yet
+// been streamed by CDC but have been applied, so that we can clean the transaction from memory
+// immediately while still keeping enough information to know when it is safe to clean up its
+// intents.
+struct PostApplyTransactionMetadata {
+  TransactionId transaction_id = TransactionId::Nil();
 
-extern const std::string kTransactionsTableName;
+  OpId apply_op_id;
+  HybridTime commit_ht;
+  HybridTime log_ht;
+
+  static Result<PostApplyTransactionMetadata> FromPB(
+      const LWPostApplyTransactionMetadataPB& source);
+  static Result<PostApplyTransactionMetadata> FromPB(
+      const PostApplyTransactionMetadataPB& source);
+
+  void ToPB(LWPostApplyTransactionMetadataPB* dest) const;
+  void ToPB(PostApplyTransactionMetadataPB* dest) const;
+
+  void TransactionIdToPB(LWPostApplyTransactionMetadataPB* dest) const;
+  void TransactionIdToPB(PostApplyTransactionMetadataPB* dest) const;
+
+  std::string ToString() const {
+    return YB_STRUCT_TO_STRING(transaction_id, apply_op_id, commit_ht, log_ht);
+  }
+
+ private:
+  template <class PB>
+  static Result<PostApplyTransactionMetadata> DoFromPB(const PB& source);
+};
+
+bool operator==(const PostApplyTransactionMetadata& lhs, const PostApplyTransactionMetadata& rhs);
+
+inline bool operator!=(
+    const PostApplyTransactionMetadata& lhs, const PostApplyTransactionMetadata& rhs) {
+  return !(lhs == rhs);
+}
+
+std::ostream& operator<<(std::ostream& out, const PostApplyTransactionMetadata& metadata);
+
+MonoDelta TransactionRpcTimeout();
+CoarseTimePoint TransactionRpcDeadline();
+
+extern const char* kGlobalTransactionsTableName;
+extern const std::string kMetricsSnapshotsTableName;
+extern const std::string kTransactionTablePrefix;
+
+YB_DEFINE_ENUM(CleanupType, (kGraceful)(kImmediate))
+
+// Provides a unified efficient interface for accessing lock info in a TabletLockInfoPB message.
+// Single-shard waiter info is created and returned, and TransactionLockInfoPB instances are made
+// accessible by TransactionId.
+class TransactionLockInfoManager {
+ public:
+  explicit TransactionLockInfoManager(TabletLockInfoPB* tablet_lock_info);
+
+  TabletLockInfoPB::TransactionLockInfoPB* GetOrAddTransactionLockInfo(const TransactionId& id);
+
+  TabletLockInfoPB::WaiterInfoPB* GetSingleShardLockInfo();
+
+ private:
+  TabletLockInfoPB* tablet_lock_info_;
+  std::unordered_map<
+      TransactionId, TabletLockInfoPB::TransactionLockInfoPB*> transaction_lock_infos_;
+};
 
 } // namespace yb
-
-#endif // YB_COMMON_TRANSACTION_H

@@ -22,7 +22,7 @@
 #include "storage/predicate.h"
 #include "pgstat.h"
 #include "lib/pairingheap.h"
-#include "utils/builtins.h"
+#include "utils/float.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
 
@@ -699,7 +699,7 @@ gistgettuple(IndexScanDesc scan, ScanDirection dir)
 			}
 
 			/*
-			 * Check the last returned tuple and add it to killitems if
+			 * Check the last returned tuple and add it to killedItems if
 			 * necessary
 			 */
 			if (scan->kill_prior_tuple

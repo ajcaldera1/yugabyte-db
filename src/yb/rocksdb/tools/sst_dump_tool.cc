@@ -17,7 +17,6 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef ROCKSDB_LITE
 
 #include "yb/rocksdb/tools/sst_dump_tool_imp.h"
 
@@ -30,6 +29,7 @@
 #include <sstream>
 #include <vector>
 
+#include "yb/rocksdb/db/filename.h"
 #include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/db/write_batch_internal.h"
 #include "yb/rocksdb/db.h"
@@ -51,18 +51,39 @@
 
 #include "yb/rocksdb/port/port.h"
 
+#include "yb/docdb/docdb_debug.h"
+
+#include "yb/util/status_log.h"
+
+using yb::docdb::StorageDbType;
+
 namespace rocksdb {
 
 using std::dynamic_pointer_cast;
+using std::unique_ptr;
+using std::shared_ptr;
 
-SstFileReader::SstFileReader(const std::string& file_path,
-                             bool verify_checksum,
-                             bool output_hex)
-    :file_name_(file_path), read_num_(0), verify_checksum_(verify_checksum),
-    output_hex_(output_hex), ioptions_(options_),
-    internal_comparator_(std::make_shared<InternalKeyComparator>(BytewiseComparator())) {
+std::string DocDBKVFormatter::Format(
+    const yb::Slice&, const yb::Slice&, yb::docdb::StorageDbType) const {
+  CHECK(false) << "unimplemented";
+  return "";
+}
+
+SstFileReader::SstFileReader(
+    const std::string& file_path, bool verify_checksum, OutputFormat output_format,
+    const DocDBKVFormatter* formatter)
+    : file_name_(file_path),
+      read_num_(0),
+      verify_checksum_(verify_checksum),
+      output_format_(output_format),
+      docdb_kv_formatter_(formatter),
+      ioptions_(options_),
+      internal_comparator_(std::make_shared<InternalKeyComparator>(BytewiseComparator())) {
   fprintf(stdout, "Process %s\n", file_path.c_str());
   init_result_ = GetTableReader(file_name_);
+}
+
+SstFileReader::~SstFileReader() {
 }
 
 extern const uint64_t kBlockBasedTableMagicNumber;
@@ -98,15 +119,15 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
     if (magic_number == kPlainTableMagicNumber ||
         magic_number == kLegacyPlainTableMagicNumber) {
       soptions_.use_mmap_reads = true;
-      options_.env->NewRandomAccessFile(file_path, &file, soptions_);
+      RETURN_NOT_OK(options_.env->NewRandomAccessFile(file_path, &file, soptions_));
       file_.reset(new RandomAccessFileReader(std::move(file)));
     }
     options_.comparator = internal_comparator_.get();
     // For old sst format, ReadTableProperties might fail but file can be read
     if (ReadTableProperties(magic_number, file_.get(), file_size).ok()) {
-      SetTableOptionsByMagicNumber(magic_number);
+      RETURN_NOT_OK(SetTableOptionsByMagicNumber(magic_number));
     } else {
-      SetOldTableOptions();
+      RETURN_NOT_OK(SetOldTableOptions());
     }
   }
 
@@ -115,7 +136,8 @@ Status SstFileReader::GetTableReader(const std::string& file_path) {
                        &table_reader_);
     if (s.ok() && table_reader_->IsSplitSst()) {
       unique_ptr<RandomAccessFile> data_file;
-      options_.env->NewRandomAccessFile(TableBaseToDataFileName(file_path), &data_file, soptions_);
+      RETURN_NOT_OK(options_.env->NewRandomAccessFile(
+          TableBaseToDataFileName(file_path), &data_file, soptions_));
       unique_ptr<RandomAccessFileReader> data_file_reader(
           new RandomAccessFileReader(std::move(data_file)));
       table_reader_->SetDataFileReader(std::move(data_file_reader));
@@ -152,9 +174,9 @@ Status SstFileReader::NewTableReader(
 Status SstFileReader::DumpTable(const std::string& out_filename) {
   unique_ptr<WritableFile> out_file;
   Env* env = Env::Default();
-  env->NewWritableFile(out_filename, &out_file, soptions_);
+  RETURN_NOT_OK(env->NewWritableFile(out_filename, &out_file, soptions_));
   Status s = table_reader_->DumpTable(out_file.get());
-  out_file->Close();
+  RETURN_NOT_OK(out_file->Close());
   return s;
 }
 
@@ -162,17 +184,17 @@ uint64_t SstFileReader::CalculateCompressedTableSize(
     const TableBuilderOptions& tb_options, size_t block_size) {
   unique_ptr<WritableFile> out_file;
   unique_ptr<Env> env(NewMemEnv(Env::Default()));
-  env->NewWritableFile(testFileName, &out_file, soptions_);
+  CHECK_OK(env->NewWritableFile(testFileName, &out_file, soptions_));
   unique_ptr<WritableFileWriter> dest_writer;
   dest_writer.reset(new WritableFileWriter(std::move(out_file), soptions_));
   BlockBasedTableOptions table_options;
   table_options.block_size = block_size;
   BlockBasedTableFactory block_based_tf(table_options);
   unique_ptr<TableBuilder> table_builder;
-  table_builder.reset(block_based_tf.NewTableBuilder(
+  table_builder = block_based_tf.NewTableBuilder(
       tb_options,
       TablePropertiesCollectorFactory::Context::kUnknownColumnFamily,
-      dest_writer.get()));
+      dest_writer.get());
   unique_ptr<InternalIterator> iter(table_reader_->NewIterator(ReadOptions()));
   for (iter->SeekToFirst(); iter->Valid(); iter->Next()) {
     if (!iter->status().ok()) {
@@ -187,7 +209,7 @@ uint64_t SstFileReader::CalculateCompressedTableSize(
     exit(1);
   }
   uint64_t size = table_builder->TotalFileSize();
-  env->DeleteFile(testFileName);
+  CHECK_OK(env->DeleteFile(testFileName));
   return size;
 }
 
@@ -338,9 +360,23 @@ Status SstFileReader::ReadSequential(bool print_kv,
     }
 
     if (print_kv) {
-      fprintf(stdout, "%s => %s\n",
-          ikey.DebugString(output_hex_).c_str(),
-          value.ToString(output_hex_).c_str());
+      switch (output_format_) {
+        case OutputFormat::kRaw:
+        case OutputFormat::kHex: {
+          bool output_hex = (output_format_ == OutputFormat::kHex);
+          fprintf(
+              stdout, "%s => %s\n", ikey.DebugString(output_hex).c_str(),
+              value.ToString(output_hex).c_str());
+          break;
+        }
+        case OutputFormat::kDecodedRegularDB:
+        case OutputFormat::kDecodedIntentsDB:
+          auto storage_type =
+              (output_format_ == OutputFormat::kDecodedRegularDB ? StorageDbType::kRegular
+                                                                 : StorageDbType::kIntents);
+          fprintf(stdout, "%s\n", docdb_kv_formatter_->Format(key, value, storage_type).c_str());
+          break;
+      }
     }
   }
 
@@ -367,7 +403,8 @@ void print_help() {
   fprintf(stderr,
           "sst_dump [--command=check|scan|none|raw] [--verify_checksum] "
           "--file=data_dir_OR_sst_file"
-          " [--output_hex]"
+          " [--output_format=raw|hex|decoded_regulardb|decoded_intentsdb]"
+          " [--formatter_tablet_metadata=<path_to_tablet_metadata>"
           " [--input_key_hex]"
           " [--from=<user_key>]"
           " [--to=<user_key>]"
@@ -387,7 +424,7 @@ int SSTDumpTool::Run(int argc, char** argv) {
   char junk;
   uint64_t n;
   bool verify_checksum = false;
-  bool output_hex = false;
+  OutputFormat output_format = OutputFormat::kRaw;
   bool input_key_hex = false;
   bool has_from = false;
   bool has_to = false;
@@ -401,12 +438,23 @@ int SSTDumpTool::Run(int argc, char** argv) {
   for (int i = 1; i < argc; i++) {
     if (strncmp(argv[i], "--file=", 7) == 0) {
       dir_or_file = argv[i] + 7;
-    } else if (strcmp(argv[i], "--output_hex") == 0) {
-      output_hex = true;
+    } else if (strncmp(argv[i], "--output_format=", 16) == 0) {
+      auto option = argv[i] + 16;
+      if (strcmp(option, "raw") == 0) {
+        output_format = OutputFormat::kRaw;
+      } else if (strcmp(option, "hex") == 0) {
+        output_format = OutputFormat::kHex;
+      } else if (strcmp(option, "decoded_regulardb") == 0) {
+        output_format = OutputFormat::kDecodedRegularDB;
+      } else if (strcmp(option, "decoded_intentsdb") == 0) {
+        output_format = OutputFormat::kDecodedIntentsDB;
+      } else {
+        print_help();
+        exit(1);
+      }
     } else if (strcmp(argv[i], "--input_key_hex") == 0) {
       input_key_hex = true;
-    } else if (sscanf(argv[i],
-               "--read_num=%" PRIu64 "%c", &n, &junk) == 1) {
+    } else if (sscanf(argv[i], "--read_num=%" PRIu64 "%c", &n, &junk) == 1) {
       read_num = n;
     } else if (strcmp(argv[i], "--verify_checksum") == 0) {
       verify_checksum = true;
@@ -427,10 +475,16 @@ int SSTDumpTool::Run(int argc, char** argv) {
       block_size_str = argv[i] + 17;
       std::istringstream iss(block_size_str);
       if (iss.fail()) {
-        fprintf(stderr, "block size must be numeric");
+        fprintf(stderr, "block size must be numeric\n");
         exit(1);
       }
       iss >> block_size;
+    } else if (strncmp(argv[i], "--formatter_", 12) == 0) {
+      auto status = formatter_->ProcessArgument(argv[i] + 12);
+      if (!status.ok()) {
+        fprintf(stderr, "%s\n", status.ToString().c_str());
+        exit(1);
+      }
     } else {
       print_help();
       exit(1);
@@ -477,8 +531,7 @@ int SSTDumpTool::Run(int argc, char** argv) {
       filename = std::string(dir_or_file) + "/" + filename;
     }
 
-    rocksdb::SstFileReader reader(filename, verify_checksum,
-                                  output_hex);
+    rocksdb::SstFileReader reader(filename, verify_checksum, output_format, formatter_);
     if (!reader.getStatus().ok()) {
       fprintf(stderr, "%s: %s\n", filename.c_str(),
               reader.getStatus().ToString().c_str());
@@ -545,11 +598,16 @@ int SSTDumpTool::Run(int argc, char** argv) {
         fprintf(stdout, "# deleted keys: %" PRIu64 "\n",
                 rocksdb::GetDeletedKeys(
                     table_properties->user_collected_properties));
+        fprintf(stdout,
+                "  User collected properties:\n"
+                "  ------------------------------\n");
+        for (const auto& prop : table_properties->user_collected_properties) {
+          fprintf(
+              stdout, "  %s: %s\n", prop.first.c_str(), Slice(prop.second).ToDebugString().c_str());
+        }
       }
     }
   }
   return 0;
 }
 }  // namespace rocksdb
-
-#endif  // ROCKSDB_LITE

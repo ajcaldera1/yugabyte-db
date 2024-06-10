@@ -29,46 +29,111 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_CLIENT_BATCHER_H_
-#define YB_CLIENT_BATCHER_H_
+#pragma once
 
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
 #include "yb/client/async_rpc.h"
+#include "yb/client/client-internal.h"
+#include "yb/client/error_collector.h"
 #include "yb/client/transaction.h"
 
 #include "yb/common/consistent_read_point.h"
+#include "yb/common/opid.h"
+#include "yb/common/retryable_request.h"
 #include "yb/common/transaction.h"
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
 #include "yb/gutil/ref_counted.h"
 
 #include "yb/util/async_util.h"
 #include "yb/util/atomic.h"
-#include "yb/util/debug-util.h"
 #include "yb/util/locks.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
+#include "yb/util/threadpool.h"
 
 namespace yb {
-
 namespace client {
-
-class YBClient;
-class YBSession;
-class YBStatusCallback;
-class YBOperation;
-
 namespace internal {
 
-struct InFlightOp;
+struct InFlightOpsGroup {
+  using Iterator = InFlightOps::const_iterator;
 
-class Batcher;
-class ErrorCollector;
-class RemoteTablet;
-class AsyncRpc;
+  bool need_metadata = false;
+  const Iterator begin;
+  const Iterator end;
+
+  InFlightOpsGroup(const Iterator& group_begin, const Iterator& group_end);
+  std::string ToString() const;
+};
+
+struct InFlightOpsTransactionMetadata {
+  TransactionMetadata transaction;
+  boost::optional<SubTransactionMetadataPB> subtransaction_pb;
+};
+
+struct InFlightOpsGroupsWithMetadata {
+  static const size_t kPreallocatedCapacity = 40;
+
+  boost::container::small_vector<InFlightOpsGroup, kPreallocatedCapacity> groups;
+  InFlightOpsTransactionMetadata metadata;
+};
+
+struct RequestDetails {
+  RetryableRequestId min_running_request_id;
+
+  explicit RequestDetails(RetryableRequestId min_running_request_id_) :
+      min_running_request_id(min_running_request_id_) {}
+};
+
+using BatcherRequestsMap = std::unordered_map<RetryableRequestId, RequestDetails>;
+
+class TxnBatcherIf {
+ public:
+  // Ask transaction to expect `count` operations in future. I.e. Prepare will be called with such
+  // number of ops.
+  virtual void ExpectOperations(size_t count) = 0;
+
+  // Notifies transaction that specified ops were flushed with some status.
+  virtual void Flushed(
+      const internal::InFlightOps& ops,
+      const boost::optional<SubTransactionMetadataPB>& subtransaction_pb,
+      const ReadHybridTime& used_read_time, const Status& status) = 0;
+
+  // This function is used to init metadata of Write/Read request.
+  // If we don't have enough information, then the function returns false and stores
+  // the waiter, which will be invoked when we obtain such information.
+  virtual bool Prepare(
+      internal::InFlightOpsGroupsWithMetadata* ops_info,
+      ForceConsistentRead force_consistent_read,
+      CoarseTimePoint deadline,
+      Initial initial,
+      Waiter waiter) = 0;
+
+  virtual ~TxnBatcherIf() = default;
+};
+
+// Batcher state changes sequentially in the order listed below, with the exception that kAborted
+// could be reached from any state.
+YB_DEFINE_ENUM(
+    BatcherState,
+    (kGatheringOps)       // Initial state, while we adding operations to the batcher.
+    (kResolvingTablets)   // Flush was invoked on batcher, waiting until tablets for all operations
+                          // are resolved and move to the next state.
+                          // Could change to kComplete in case of failure.
+    (kTransactionPrepare) // Preparing associated transaction for flushing operations of this
+                          // batcher, for instance it picks status tablet and fills
+                          // transaction metadata for this batcher.
+                          // When there is no associated transaction or no operations moves to the
+                          // next state immediately.
+    (kTransactionReady)   // Transaction is ready, sending operations to appropriate tablets and
+                          // wait for response. When there is no transaction - we still sending
+                          // operations marking transaction as auto ready.
+    (kComplete)           // Batcher complete.
+    (kAborted)            // Batcher was aborted.
+    );
 
 // A Batcher is the class responsible for collecting row operations, routing them to the
 // correct tablet server, and possibly batching them together for better efficiency.
@@ -77,39 +142,49 @@ class AsyncRpc;
 // reference, and all of the in-flight operations hold others. This allows the client
 // session to be destructed while ops are still in-flight, without the async callbacks
 // attempting to access a destructed Batcher.
-class Batcher : public RefCountedThreadSafe<Batcher> {
+//
+// This class is not thread safe, i.e. it could be filled only from one thread, then flushed.
+//
+// The batcher changes state step by step, with appropriate operation done in the current step.
+// For instance on gathering step it does NOT lookup tablets, and on transaction prepare state
+// it only waits for transaction to be ready.
+//
+// Before calling FlushAsync all Batcher functions should be called sequentially, so no concurrent
+// access to Batcher state is happening. FlushAsync is doing all tablets lookups and this doesn't
+// modify Batcher state (only updates individual operations independently) until all lookups are
+// done. After all tablets lookups are completed, Batcher changes its state and calls
+// ExecuteOperations. This results in asynchronous calls to ProcessReadResponse/ProcessWriteResponse
+// as operations are completed, but these functions only read Batcher state and update individual
+// operations independently.
+class Batcher : public Runnable, public std::enable_shared_from_this<Batcher> {
  public:
   // Create a new batcher associated with the given session.
   //
-  // Any errors which come back from operations performed by this batcher are posted to
-  // the provided ErrorCollector.
-  //
-  // Takes a reference on error_collector. Creates a weak_ptr to 'session'.
-  Batcher(YBClient* client,
-          ErrorCollector* error_collector,
-          const YBSessionPtr& session,
-          YBTransactionPtr transaction,
-          ConsistentReadPoint* read_point,
-          bool force_consistent_read);
-
-  // Abort the current batch. Any writes that were buffered and not yet sent are
-  // discarded. Those that were sent may still be delivered.  If there is a pending Flush
-  // callback, it will be called immediately with an error status.
-  void Abort(const Status& status);
+  // Creates a weak_ptr to 'session'.
+  Batcher(
+      YBClient* client,
+      const YBSessionPtr& session,
+      YBTransactionPtr transaction,
+      ConsistentReadPoint* read_point,
+      bool force_consistent_read,
+      int64_t leader_term_);
+  ~Batcher();
 
   // Set the timeout for this batcher.
   //
   // The timeout is currently set on all of the RPCs, but in the future will be relative
   // to when the Flush call is made (eg even if the lookup of the TS takes a long time, it
   // may time out before even sending an op). TODO: implement that
-  void SetTimeout(MonoDelta timeout);
+  void SetDeadline(CoarseTimePoint deadline);
 
   // Add a new operation to the batch. Requires that the batch has not yet been flushed.
   // TODO: in other flush modes, this may not be the case -- need to
   // update this when they're implemented.
   //
   // NOTE: If this returns not-OK, does not take ownership of 'write_op'.
-  CHECKED_STATUS Add(std::shared_ptr<YBOperation> yb_op) WARN_UNUSED_RESULT;
+  void Add(YBOperationPtr yb_op);
+
+  bool Has(const YBOperationPtr& yb_op) const;
 
   // Return true if any operations are still pending. An operation is no longer considered
   // pending once it has either errored or succeeded.  Operations are considering pending
@@ -118,20 +193,23 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   // Return the number of buffered operations. These are only those operations which are
   // "corked" (i.e not yet flushed). Once Flush has been called, this returns 0.
-  int CountBufferedOperations() const;
+  size_t CountBufferedOperations() const;
 
   // Flush any buffered operations. The callback will be called once there are no
   // more pending operations from this Batcher. If all of the operations succeeded,
-  // then the callback will receive Status::OK. Otherwise, it will receive IOError,
+  // then the callback will receive Status::OK. Otherwise, it will receive failed status,
   // and the caller must inspect the ErrorCollector to retrieve more detailed
   // information on which operations failed.
-  void FlushAsync(StatusFunctor callback);
+  // If is_within_transaction_retry is true, all operations to be flushed by this batcher have
+  // been already flushed, meaning we are now retrying them within the same session and the
+  // associated transaction (if any) already expects them.
+  void FlushAsync(StatusFunctor callback, IsWithinTransactionRetry is_within_transaction_retry);
 
-  MonoTime deadline() const {
+  CoarseTimePoint deadline() const {
     return deadline_;
   }
 
-  const std::shared_ptr<rpc::Messenger>& messenger() const;
+  rpc::Messenger* messenger() const;
 
   rpc::ProxyCache& proxy_cache() const;
 
@@ -149,13 +227,7 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   YBTransactionPtr transaction() const;
 
-  const TransactionMetadata& transaction_metadata() const {
-    return transaction_metadata_;
-  }
-
-  bool may_have_metadata() const {
-    return may_have_metadata_;
-  }
+  const InFlightOpsGroupsWithMetadata& in_flight_ops() const { return ops_info_; }
 
   void set_allow_local_calls_in_curr_thread(bool flag) { allow_local_calls_in_curr_thread_ = flag; }
 
@@ -165,13 +237,62 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   const ClientId& client_id() const;
 
-  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId(
-      const TabletId& tablet_id);
-  void RequestFinished(const TabletId& tablet_id, RetryableRequestId request_id);
+  MicrosTime rpcs_start_time_micros() const { return rpcs_start_time_micros_; }
+
+  server::Clock* Clock() const;
+
+  std::pair<RetryableRequestId, RetryableRequestId> NextRequestIdAndMinRunningRequestId();
+
+  void RequestsFinished();
+
+  void RegisterRequest(
+      RetryableRequestId id, RetryableRequestId min_running_id) {
+    retryable_requests_.emplace(id, RequestDetails(min_running_id));
+  }
+
+  void MoveRequestDetailsFrom(const BatcherPtr& other, RetryableRequestId id);
+
+  const RequestDetails& GetRequestDetails(RetryableRequestId id) {
+    const auto it = retryable_requests_.find(id);
+    if (PREDICT_FALSE(it == retryable_requests_.end())) {
+      LOG(FATAL) << "Cannot find retryable request detail of id " << id;
+    }
+    return it->second;
+  }
+
+  void SetRejectionScoreSource(RejectionScoreSourcePtr rejection_score_source) {
+    rejection_score_source_ = rejection_score_source;
+  }
+
+  double RejectionScore(int attempt_num);
+
+  // Returns errors occurred due tablet resolution or flushing operations to tablet server(s).
+  // Caller takes ownership of the returned errors.
+  CollectedErrors GetAndClearPendingErrors();
+
+  std::string LogPrefix() const;
+
+  int64_t GetLeaderTerm() const { return leader_term_; }
 
   // This is a status error string used when there are multiple errors that need to be fetched
   // from the error collector.
   static const std::string kErrorReachingOutToTServersMsg;
+
+  void SetRpcStartTime(MicrosTime rpcs_start_time_micros);
+
+  // When there are retryable failures for a set of ops in a batcher, a 'retry_batcher' is created.
+  // InitFromFailedBatcher is called on the retry batcher to initialize the retry batcher before
+  // executing ::FlushAsync.
+  void InitFromFailedBatcher(const BatcherPtr& failed_batcher, const CollectedErrors& errors);
+
+  void SetSubTransactionMetadataPB(
+      const boost::optional<SubTransactionMetadataPB>& subtransaction_pb) {
+    ops_info_.metadata.subtransaction_pb = subtransaction_pb;
+  }
+
+  const boost::optional<SubTransactionMetadataPB>& GetSubTransactionMetadataPB() const {
+    return ops_info_.metadata.subtransaction_pb;
+  }
 
  private:
   friend class RefCountedThreadSafe<Batcher>;
@@ -179,36 +300,19 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   friend class WriteRpc;
   friend class ReadRpc;
 
-  ~Batcher();
-
-  // Add an op to the in-flight set and increment the ref-count.
-  void AddInFlightOp(const InFlightOpPtr& op);
-
-  void RemoveInFlightOpsAfterFlushing(
-      const InFlightOps& ops, const Status& status, FlushExtraResult flush_extra_result);
-
-    // Return true if the batch has been aborted, and any in-flight ops should stop
-  // processing wherever they are.
-  bool IsAbortedUnlocked() const;
+  void Flushed(const InFlightOps& ops, const Status& status, FlushExtraResult flush_extra_result);
 
   // Combines new error to existing ones. I.e. updates combined error with new status.
-  void CombineErrorUnlocked(const InFlightOpPtr& in_flight_op, const Status& status)
-      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
+  void CombineError(const InFlightOp& in_flight_op);
 
-  // Remove an op from the in-flight op list, and delete the op itself.
-  // The operation is reported to the ErrorReporter as having failed with the
-  // given status.
-  void MarkInFlightOpFailedUnlocked(const InFlightOpPtr& in_flight_op, const Status& s)
-      EXCLUSIVE_LOCKS_REQUIRED(mutex_);
-
-  void CheckForFinishedFlush();
-  void FlushBuffersIfReady();
-  void FlushBuffer(
-      RemoteTablet* tablet, InFlightOps::const_iterator begin, InFlightOps::const_iterator end,
+  void FlushFinished();
+  void AllLookupsDone();
+  std::shared_ptr<AsyncRpc> CreateRpc(
+      const BatcherPtr& self, RemoteTablet* tablet, const InFlightOpsGroup& group,
       bool allow_local_calls_in_curr_thread, bool need_consistent_read);
 
   // Calls/Schedules flush_callback_ and resets it to free resources.
-  void RunCallback(const Status& s);
+  void RunCallback();
 
   // Log an error where an Rpc callback has response count mismatch.
   void AddOpCountMismatchError();
@@ -221,34 +325,29 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   // Process RPC status.
   void ProcessRpcStatus(const AsyncRpc &rpc, const Status &s);
 
-  // Async Callbacks.
-  void TabletLookupFinished(InFlightOpPtr op, const Result<internal::RemoteTabletPtr>& result);
+  // Tablet lookup and its async callbacks.
+  void LookupTabletFor(InFlightOp* op);
+  void TabletLookupFinished(InFlightOp* op, Result<internal::RemoteTabletPtr> result);
 
-  // Compute a new deadline based on timeout_. If no timeout_ has been set,
-  // uses a hard-coded default and issues periodic warnings.
-  MonoTime ComputeDeadlineUnlocked() const;
+  void TransactionReady(const Status& status);
 
-  void TransactionReady(const Status& status, const BatcherPtr& self);
+  // initial - whether this method is called first time for this batch.
+  void ExecuteOperations(Initial initial);
 
-  // See note about lock ordering in batcher.cc
-  mutable simple_spinlock mutex_;
+  void Abort(const Status& status);
 
-  enum State {
-    kGatheringOps,
-    kFlushing,
-    kFlushed,
-    kAborted
-  };
-  State state_;
+  void Run() override;
+
+  std::pair<std::map<PartitionKey, Status>, std::map<RetryableRequestId, Status>>
+      CollectOpsErrors();
+
+  BatcherState state_ = BatcherState::kGatheringOps;
 
   YBClient* const client_;
   std::weak_ptr<YBSession> weak_session_;
 
   // Errors are reported into this error collector.
-  scoped_refptr<ErrorCollector> const error_collector_;
-
-  // Set to true if there was at least one error from this Batcher.
-  std::atomic<bool> had_errors_{false};
+  ErrorCollector error_collector_;
 
   Status combined_error_;
 
@@ -259,43 +358,23 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
 
   // All buffered or in-flight ops.
   // Added to this set during apply, removed during Finished of AsyncRpc.
-  std::unordered_set<InFlightOpPtr> ops_;
-  InFlightOps ops_queue_;
+  std::vector<YBOperationPtr> ops_;
+  std::vector<InFlightOp> ops_queue_;
+  InFlightOpsGroupsWithMetadata ops_info_;
 
-  // When each operation is added to the batcher, it is assigned a sequence number
-  // which preserves the user's intended order. Preserving order is critical when
-  // a batch contains multiple operations against the same row key. This member
-  // assigns the sequence numbers.
-  int next_op_sequence_number_ GUARDED_BY(mutex_);
-
-  // Amount of time to wait for a given op, from start to finish.
-  //
-  // Set by SetTimeout.
-  MonoDelta timeout_;
-
-  // After flushing, the absolute deadline for all in-flight ops.
-  MonoTime deadline_;
+  // The absolute deadline for all in-flight ops.
+  CoarseTimePoint deadline_;
 
   // Number of outstanding lookups across all in-flight ops.
-  int outstanding_lookups_ = 0;
-
-  // The maximum number of bytes of encoded operations which will be allowed to
-  // be buffered.
-  int64_t max_buffer_size_;
+  std::atomic<size_t> outstanding_lookups_{0};
+  std::atomic<size_t> outstanding_rpcs_{0};
 
   // If true, we might allow the local calls to be run in the same IPC thread.
   bool allow_local_calls_in_curr_thread_ = true;
 
-  // The number of bytes used in the buffer for pending operations.
-  AtomicInt<int64_t> buffer_bytes_used_;
-
   std::shared_ptr<yb::client::internal::AsyncRpcMetrics> async_rpc_metrics_;
 
   YBTransactionPtr transaction_;
-
-  TransactionMetadata transaction_metadata_;
-
-  bool may_have_metadata_ = false;
 
   // The consistent read point for this batch if it is specified.
   ConsistentReadPoint* read_point_ = nullptr;
@@ -303,10 +382,28 @@ class Batcher : public RefCountedThreadSafe<Batcher> {
   // Force consistent read on transactional table, even we have only single shard commands.
   ForceConsistentRead force_consistent_read_;
 
+  RejectionScoreSourcePtr rejection_score_source_;
+
+  // Map to store retryable request ids used in current batcher.
+  // retryable_request_id => { min_running_request_id }
+  // When creating WriteRpc, new ids will be registered into this map.
+  // If the batcher has requests to be retried, request id is removed from current batcher
+  // and transmit to the retry batcher.
+  // At destruction of the batcher, all request ids in the map will be removed from the client
+  // running requests.
+  BatcherRequestsMap retryable_requests_;
+
+  // Stores the time at which the read/write rpcs of this batcher are created. 'start_time_micros'
+  // of launched WriteRpc/ReadRpc requests is set to this batcher's 'rpcs_start_time_micros_'.
+  // If the batcher has requests to be retried, this field is copied to the retry batcher, hence
+  // preserving rpc start times across retries.
+  MicrosTime rpcs_start_time_micros_ = 0;
+
+  const int64_t leader_term_;
+
   DISALLOW_COPY_AND_ASSIGN(Batcher);
 };
 
 }  // namespace internal
 }  // namespace client
 }  // namespace yb
-#endif  // YB_CLIENT_BATCHER_H_

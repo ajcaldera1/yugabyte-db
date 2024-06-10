@@ -30,8 +30,7 @@
 // under the License.
 //
 
-#ifndef YB_TABLET_TABLET_PEER_H_
-#define YB_TABLET_TABLET_PEER_H_
+#pragma once
 
 #include <atomic>
 #include <future>
@@ -42,37 +41,31 @@
 #include <vector>
 
 #include "yb/consensus/consensus_fwd.h"
+#include "yb/consensus/consensus_context.h"
 #include "yb/consensus/consensus_meta.h"
 #include "yb/consensus/consensus_types.h"
-#include "yb/consensus/log.h"
 #include "yb/gutil/callback.h"
 #include "yb/gutil/ref_counted.h"
-#include "yb/gutil/strings/substitute.h"
+#include "yb/gutil/thread_annotations.h"
 #include "yb/rpc/rpc_fwd.h"
 
+#include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/metadata.pb.h"
+#include "yb/tablet/mvcc.h"
+#include "yb/tablet/retryable_requests_flusher.h"
 #include "yb/tablet/transaction_coordinator.h"
-#include "yb/tablet/transaction_participant.h"
-#include "yb/tablet/operation_order_verifier.h"
+#include "yb/tablet/transaction_participant_context.h"
 #include "yb/tablet/operations/operation_tracker.h"
-#include "yb/tablet/operations/write_operation.h"
 #include "yb/tablet/preparer.h"
 #include "yb/tablet/tablet_options.h"
-#include "yb/tablet/tablet_fwd.h"
+#include "yb/tablet/write_query_context.h"
 
-#include "yb/util/metrics.h"
+#include "yb/util/atomic.h"
 #include "yb/util/semaphore.h"
 
 using yb::consensus::StateChangeContext;
 
 namespace yb {
-
-namespace consensus {
-class RaftConsensus;
-}
-
-namespace log {
-class LogAnchorRegistry;
-}
 
 namespace tserver {
 class CatchUpServiceTest;
@@ -85,137 +78,221 @@ class ThreadPool;
 
 namespace tablet {
 
-class Operation;
+struct TabletOnDiskSizeInfo {
+  int64_t consensus_metadata_disk_size = 0;
+  int64_t wal_files_disk_size = 0;
+  int64_t sst_files_disk_size = 0;
+  int64_t uncompressed_sst_files_disk_size = 0;
+  int64_t sum_on_disk_size = 0;
 
-// A peer in a tablet consensus configuration, which coordinates writes to tablets.
+  template <class PB>
+  static TabletOnDiskSizeInfo FromPB(const PB& pb) {
+    return {
+      .consensus_metadata_disk_size = pb.consensus_metadata_disk_size(),
+      .wal_files_disk_size = pb.wal_files_disk_size(),
+      .sst_files_disk_size = pb.sst_files_disk_size(),
+      .uncompressed_sst_files_disk_size = pb.uncompressed_sst_files_disk_size(),
+      .sum_on_disk_size = pb.estimated_on_disk_size()
+    };
+  }
+
+  template <class PB>
+  void ToPB(PB* pb) const {
+    pb->set_consensus_metadata_disk_size(consensus_metadata_disk_size);
+    pb->set_wal_files_disk_size(wal_files_disk_size);
+    pb->set_sst_files_disk_size(sst_files_disk_size);
+    pb->set_uncompressed_sst_files_disk_size(uncompressed_sst_files_disk_size);
+    pb->set_estimated_on_disk_size(sum_on_disk_size);
+  }
+
+  void operator+=(const TabletOnDiskSizeInfo& other) {
+    consensus_metadata_disk_size += other.consensus_metadata_disk_size;
+    wal_files_disk_size += other.wal_files_disk_size;
+    sst_files_disk_size += other.sst_files_disk_size;
+    uncompressed_sst_files_disk_size += other.uncompressed_sst_files_disk_size;
+    sum_on_disk_size += other.sum_on_disk_size;
+  }
+
+  void RecomputeTotalSize() {
+    sum_on_disk_size =
+        consensus_metadata_disk_size +
+        sst_files_disk_size +
+        wal_files_disk_size;
+  }
+};
+
+YB_DEFINE_ENUM(
+    TabletObjectState,
+    (kUninitialized)
+    (kAvailable)
+    (kDestroyed));
+
+// A peer is a tablet consensus configuration, which coordinates writes to tablets.
 // Each time Write() is called this class appends a new entry to a replicated
 // state machine through a consensus algorithm, which makes sure that other
 // peers see the same updates in the same order. In addition to this, this
 // class also splits the work and coordinates multi-threaded execution.
-class TabletPeer : public consensus::ReplicaOperationFactory,
+class TabletPeer : public std::enable_shared_from_this<TabletPeer>,
+                   public consensus::ConsensusContext,
                    public TransactionParticipantContext,
                    public TransactionCoordinatorContext,
-                   public WriteOperationContext {
+                   public WriteQueryContext {
  public:
   typedef std::map<int64_t, int64_t> MaxIdxToSegmentSizeMap;
 
-  TabletPeer(const scoped_refptr<TabletMetadata>& meta,
-             const consensus::RaftPeerPB& local_peer_pb,
-             const scoped_refptr<server::Clock> &clock,
-             const std::string& permanent_uuid,
-             Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk);
+  // Creates TabletPeer.
+  // `tablet_splitter` will be used for applying split tablet Raft operation.
+  TabletPeer(
+      const RaftGroupMetadataPtr& meta,
+      const consensus::RaftPeerPB& local_peer_pb,
+      const scoped_refptr<server::Clock>& clock,
+      const std::string& permanent_uuid,
+      Callback<void(std::shared_ptr<StateChangeContext> context)> mark_dirty_clbk,
+      MetricRegistry* metric_registry,
+      TabletSplitter* tablet_splitter,
+      const std::shared_future<client::YBClient*>& client_future);
 
   ~TabletPeer();
 
   // Initializes the TabletPeer, namely creating the Log and initializing
   // Consensus.
-  CHECKED_STATUS InitTabletPeer(const std::shared_ptr<TabletClass> &tablet,
-                                const std::shared_future<client::YBClientPtr> &client_future,
-                                const std::shared_ptr<rpc::Messenger> &messenger,
-                                rpc::ProxyCache* proxy_cache,
-                                const scoped_refptr<log::Log> &log,
-                                const scoped_refptr<MetricEntity> &metric_entity,
-                                ThreadPool* raft_pool,
-                                ThreadPool* tablet_prepare_pool,
-                                consensus::RetryableRequests* retryable_requests);
+  // split_op_id is the ID of split tablet Raft operation requesting split of this tablet or unset.
+  Status InitTabletPeer(
+      const TabletPtr& tablet,
+      const std::shared_ptr<MemTracker>& server_mem_tracker,
+      rpc::Messenger* messenger,
+      rpc::ProxyCache* proxy_cache,
+      const scoped_refptr<log::Log>& log,
+      const scoped_refptr<MetricEntity>& table_metric_entity,
+      const scoped_refptr<MetricEntity>& tablet_metric_entity,
+      ThreadPool* raft_pool,
+      rpc::ThreadPool* raft_notifications_pool,
+      ThreadPool* tablet_prepare_pool,
+      consensus::RetryableRequestsManager* retryable_requests_manager,
+      std::unique_ptr<consensus::ConsensusMetadata> consensus_meta,
+      consensus::MultiRaftManager* multi_raft_manager,
+      ThreadPool* flush_retryable_requests_pool);
 
   // Starts the TabletPeer, making it available for Write()s. If this
   // TabletPeer is part of a consensus configuration this will connect it to other peers
   // in the consensus configuration.
-  CHECKED_STATUS Start(const consensus::ConsensusBootstrapInfo& info);
+  Status Start(const consensus::ConsensusBootstrapInfo& info);
 
   // Starts shutdown process.
   // Returns true if shutdown was just initiated, false if shutdown was already running.
   MUST_USE_RESULT bool StartShutdown();
   // Completes shutdown process and waits for it's completeness.
-  void CompleteShutdown();
+  void CompleteShutdown(DisableFlushOnShutdown disable_flush_on_shutdown, AbortOps abort_ops);
 
-  void Shutdown();
+  // Abort active transactions on the tablet after shutdown is initiated.
+  void AbortSQLTransactions() const;
+
+  Status Shutdown(
+      ShouldAbortActiveTransactions should_abort_active_txns,
+      DisableFlushOnShutdown disable_flush_on_shutdown);
 
   // Check that the tablet is in a RUNNING state.
-  CHECKED_STATUS CheckRunning() const;
+  Status CheckRunning() const;
+
+  // Returns whether shutdown started. If shutdown already completed returns true as well.
+  bool IsShutdownStarted() const;
 
   // Check that the tablet is in a SHUTDOWN/NOT_STARTED state.
-  CHECKED_STATUS CheckShutdownOrNotStarted() const;
+  Status CheckShutdownOrNotStarted() const;
 
   // Wait until the tablet is in a RUNNING state or if there's a timeout.
   // TODO have a way to wait for any state?
-  CHECKED_STATUS WaitUntilConsensusRunning(const MonoDelta& timeout);
+  Status WaitUntilConsensusRunning(const MonoDelta& timeout);
 
   // Submits a write to a tablet and executes it asynchronously.
-  // The caller is expected to build and pass a WriteOperationState that points
+  // The caller is expected to build and pass a WriteOperation that points
   // to the RPC WriteRequest, WriteResponse, RpcContext and to the tablet's
   // MvccManager.
   // The operation_state is deallocated after use by this function.
-  void WriteAsync(
-      std::unique_ptr<WriteOperationState> operation_state, int64_t term, CoarseTimePoint deadline);
+  void WriteAsync(std::unique_ptr<WriteQuery> query);
 
   void Submit(std::unique_ptr<Operation> operation, int64_t term) override;
 
-  void Aborted(Operation* operation) override;
-
-  HybridTime Now() override;
-
   void UpdateClock(HybridTime hybrid_time) override;
 
-  std::unique_ptr<UpdateTxnOperationState> CreateUpdateTransactionState(
-      tserver::TransactionStatePB* request) override;
+  std::unique_ptr<UpdateTxnOperation> CreateUpdateTransaction(
+      std::shared_ptr<LWTransactionStatePB> request) override;
 
-  void SubmitUpdateTransaction(
-      std::unique_ptr<UpdateTxnOperationState> state, int64_t term) override;
+  Status SubmitUpdateTransaction(
+      std::unique_ptr<UpdateTxnOperation> operation, int64_t term) override;
 
-  void GetTabletStatusPB(TabletStatusPB* status_pb_out) const;
+  HybridTime SafeTimeForTransactionParticipant() override;
+  Result<HybridTime> WaitForSafeTime(HybridTime safe_time, CoarseTimePoint deadline) override;
+
+  Status GetLastReplicatedData(RemoveIntentsData* data) override;
+
+  void GetTabletStatusPB(TabletStatusPB* status_pb_out);
 
   // Used by consensus to create and start a new ReplicaOperation.
-  CHECKED_STATUS StartReplicaOperation(
+  Status StartReplicaOperation(
       const scoped_refptr<consensus::ConsensusRound>& round,
       HybridTime propagated_safe_time) override;
 
-  // This is an override of a ReplicaOperationFactory method. This is called from
+  // This is an override of a ConsensusContext method. This is called from
   // UpdateReplica -> EnqueuePreparesUnlocked on Raft heartbeats.
   void SetPropagatedSafeTime(HybridTime ht) override;
 
-  consensus::Consensus* consensus() const;
+  // Returns false if it is preferable to don't apply write operation.
+  bool ShouldApplyWrite() override;
 
-  std::shared_ptr<consensus::Consensus> shared_consensus() const;
+  // Returns valid shared pointer to the consensus. Returns a not OK status if the consensus is not
+  // in a valid state or a peer is not running (shutting down or shut down).
+  Result<std::shared_ptr<consensus::Consensus>> GetConsensus() const EXCLUDES(lock_);
+  Result<std::shared_ptr<consensus::RaftConsensus>> GetRaftConsensus() const EXCLUDES(lock_);
 
-  TabletClass* tablet() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return tablet_.get();
+  std::shared_ptr<RetryableRequestsFlusher> shared_retryable_requests_flusher() const;
+
+  // ----------------------------------------------------------------------------------------------
+  // Functions for accessing the tablet. We need to gradually improve the safety so that all callers
+  // obtain the tablet as a shared pointer (TabletPtr) and hold a refcount to it throughout the
+  // entire time period they are using it. In the meantime, we provide functions that perform some
+  // checking and return a raw pointer.
+  // ----------------------------------------------------------------------------------------------
+
+  // Returns the tablet associated with this TabletPeer as a raw pointer.
+  [[deprecated]] Tablet* tablet() const {
+    return shared_tablet().get();
   }
 
-  std::shared_ptr<TabletClass> shared_tablet() const {
-    std::lock_guard<simple_spinlock> lock(lock_);
-    return tablet_;
+  TabletPtr shared_tablet() const {
+    auto tablet_result = shared_tablet_safe();
+    if (tablet_result.ok()) {
+      return *tablet_result;
+    }
+    return nullptr;
   }
 
-  const TabletStatePB state() const {
+  Result<TabletPtr> shared_tablet_safe() const;
+
+  RaftGroupStatePB state() const {
     return state_.load(std::memory_order_acquire);
   }
 
-  const TabletDataState data_state() const;
-
-  // Returns the current Raft configuration.
-  const consensus::RaftConfigPB RaftConfig() const;
+  TabletDataState data_state() const;
 
   TabletStatusListener* status_listener() const {
     return status_listener_.get();
   }
 
   // Sets the tablet to a BOOTSTRAPPING state, indicating it is starting up.
-  CHECKED_STATUS SetBootstrapping() {
-    return UpdateState(TabletStatePB::NOT_STARTED, TabletStatePB::BOOTSTRAPPING, "");
+  Status SetBootstrapping() {
+    return UpdateState(RaftGroupStatePB::NOT_STARTED, RaftGroupStatePB::BOOTSTRAPPING, "");
   }
 
-  CHECKED_STATUS UpdateState(TabletStatePB expected, TabletStatePB new_state,
-                             const std::string& error_message);
+  Status UpdateState(RaftGroupStatePB expected, RaftGroupStatePB new_state,
+                     const std::string& error_message);
 
   // sets the tablet state to FAILED additionally setting the error to the provided
   // one.
   void SetFailed(const Status& error);
 
   // Returns the error that occurred, when state is FAILED.
-  CHECKED_STATUS error() const {
+  Status error() const {
     Status *error;
     if ((error = error_.get(std::memory_order_acquire)) != nullptr) {
       // Once the error_ is set, we do not reset it to nullptr
@@ -237,18 +314,20 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
 
   // Returns the minimum known log index that is in-memory or in-flight.
   // Used for selection of log segments to delete during Log GC.
-  CHECKED_STATUS GetEarliestNeededLogIndex(int64_t* log_index) const;
+  // If details is specified then this function appends explanation of how index was calculated
+  // to it.
+  Result<int64_t> GetEarliestNeededLogIndex(std::string* details = nullptr) const;
 
-  // Returns a map of log index -> segment size, of all the segments that currently cannot be GCed
-  // because in-memory structures have anchors in them.
-  //
-  // Returns a non-ok status if the tablet isn't running.
-  CHECKED_STATUS GetMaxIndexesToSegmentSizeMap(MaxIdxToSegmentSizeMap* idx_size_map) const;
+  // Returns the the minimum log index for transaction tables and latest log index for other tables.
+  // Returns the bootstrap_time which is safe_time higher than the time of the returned OpId.
+  // If FLAGS_abort_active_txns_during_cdc_bootstrap is set then all active transactions are
+  // aborted.
+  Result<std::pair<OpId, HybridTime>> GetOpIdAndSafeTimeForXReplBootstrap() const;
 
   // Returns the amount of bytes that would be GC'd if RunLogGC() was called.
   //
   // Returns a non-ok status if the tablet isn't running.
-  CHECKED_STATUS GetGCableDataSize(int64_t* retention_size) const;
+  Status GetGCableDataSize(int64_t* retention_size) const;
 
   // Returns true if it is safe to retrieve the log pointer using the log() function from this
   // tablet peer. Once the log pointer is initialized, it will stay valid for the lifetime of the
@@ -265,24 +344,27 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   // initialized.
   yb::OpId GetLatestLogEntryOpId() const;
 
-  server::Clock& clock() const override {
-    return *clock_;
-  }
-
   const server::ClockPtr& clock_ptr() const override {
     return clock_;
   }
 
-  bool Enqueue(rpc::ThreadPoolTask* task) override;
+  void Enqueue(rpc::ThreadPoolTask* task);
+  void StrandEnqueue(rpc::StrandTask* task) override;
 
-  const std::shared_future<client::YBClientPtr>& client_future() const override {
+  const std::shared_future<client::YBClient*>& client_future() const override {
     return client_future_;
   }
 
-  int64_t LeaderTerm() const override;
-  consensus::LeaderStatus LeaderStatus() const;
+  Result<client::YBClient*> client() const override;
 
-  HybridTime HtLeaseExpiration() const override;
+  int64_t LeaderTerm() const override;
+  consensus::LeaderStatus LeaderStatus(bool allow_stale = false) const;
+  Result<HybridTime> LeaderSafeTime() const override;
+
+  bool IsLeaderAndReady() const;
+  bool IsNotLeader() const;
+
+  Result<HybridTime> HtLeaseExpiration() const override;
 
   const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry() const {
     return log_anchor_registry_;
@@ -306,7 +388,7 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   Result<OperationDriverPtr> NewReplicaOperationDriver(std::unique_ptr<Operation>* operation);
 
   // Tells the tablet's log to garbage collect.
-  CHECKED_STATUS RunLogGC();
+  Status RunLogGC();
 
   // Register the maintenance ops associated with this peer's tablet, also invokes
   // Tablet::RegisterMaintenanceOps().
@@ -319,17 +401,89 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   // Return pointer to the transaction tracker for this peer.
   const OperationTracker* operation_tracker() const { return &operation_tracker_; }
 
-  const scoped_refptr<TabletMetadata>& tablet_metadata() const {
+  const RaftGroupMetadataPtr& tablet_metadata() const {
     return meta_;
   }
 
-  TableType table_type();
+  //------------------------------------------------------------------------------------------------
+  // CDC Related
 
-  // Return the total on-disk size of this tablet replica, in bytes.
-  // Caller should hold the lock_.
-  uint64_t OnDiskSize() const;
+  Status set_cdc_min_replicated_index(int64_t cdc_min_replicated_index);
+
+  Status set_cdc_min_replicated_index_unlocked(int64_t cdc_min_replicated_index);
+
+  Status reset_cdc_min_replicated_index_if_stale();
+
+  int64_t get_cdc_min_replicated_index();
+
+  Status set_cdc_sdk_min_checkpoint_op_id(const OpId& cdc_sdk_min_checkpoint_op_id);
+
+  Status set_cdc_sdk_safe_time(const HybridTime& cdc_sdk_safe_time = HybridTime::kInvalid);
+
+  HybridTime get_cdc_sdk_safe_time();
+
+  OpId cdc_sdk_min_checkpoint_op_id();
+
+  CoarseTimePoint cdc_sdk_min_checkpoint_op_id_expiration();
+
+  bool is_under_cdc_sdk_replication();
+
+  Status SetCDCSDKRetainOpIdAndTime(
+      const OpId& cdc_sdk_op_id, const MonoDelta& cdc_sdk_op_id_expiration,
+      const HybridTime& cdc_sdk_safe_time = HybridTime::kInvalid);
+
+  Result<MonoDelta> GetCDCSDKIntentRetainTime(const int64_t& cdc_sdk_latest_active_time);
+
+  Result<bool> SetAllCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, MonoDelta cdc_sdk_op_id_expiration,
+      HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff,
+      bool initial_retention_barrier);
+
+  Result<bool> SetAllInitialCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, HybridTime cdc_sdk_history_cutoff,
+      bool require_history_cutoff);
+
+  Result<bool> SetAllInitialCDCSDKRetentionBarriers(
+      OpId cdc_sdk_op_id, HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff);
+
+  Result<bool> MoveForwardAllCDCRetentionBarriers(
+      int64 cdc_wal_index, OpId cdc_sdk_intents_op_id, MonoDelta cdc_sdk_op_id_expiration,
+      HybridTime cdc_sdk_history_cutoff, bool require_history_cutoff);
+  //------------------------------------------------------------------------------------------------
+
+  OpId GetLatestCheckPoint();
+
+  Result<NamespaceId> GetNamespaceId();
+
+  TableType TEST_table_type();
+
+  // Returns the number of segments in log_.
+  size_t GetNumLogSegments() const;
+
+  // Might update the can_be_deleted_.
+  bool CanBeDeleted();
 
   std::string LogPrefix() const;
+
+  // Called from RemoteBootstrapSession and RemoteBootstrapAnchorSession to change role of the
+  // new peer post RBS.
+  Status ChangeRole(const std::string& requestor_uuid);
+
+  Result<consensus::RetryableRequests> GetRetryableRequests();
+  Status FlushRetryableRequests();
+  Result<OpId> CopyRetryableRequestsTo(const std::string& dest_path);
+  Status SubmitFlushRetryableRequestsTask();
+
+  void EnableFlushRetryableRequests();
+
+  bool TEST_HasRetryableRequestsOnDisk();
+  RetryableRequestsFlushState TEST_RetryableRequestsFlusherState() const;
+
+  Preparer* DEBUG_GetPreparer();
+
+  std::string Tserver_uuid() {
+    return local_peer_pb_.permanent_uuid();
+  }
 
  protected:
   friend class RefCountedThreadSafe<TabletPeer>;
@@ -343,14 +497,14 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   // After bootstrap is complete and consensus is setup this initiates the transactions
   // that were not complete on bootstrap.
   // Not implemented yet. See .cc file.
-  CHECKED_STATUS StartPendingOperations(consensus::RaftPeerPB::Role my_role,
-                                        const consensus::ConsensusBootstrapInfo& bootstrap_info);
+  Status StartPendingOperations(PeerRole my_role,
+                                const consensus::ConsensusBootstrapInfo& bootstrap_info);
 
   scoped_refptr<OperationDriver> CreateOperationDriver();
 
-  virtual std::unique_ptr<Operation> CreateOperation(consensus::ReplicateMsg* replicate_msg);
+  virtual std::unique_ptr<Operation> CreateOperation(consensus::LWReplicateMsg* replicate_msg);
 
-  const scoped_refptr<TabletMetadata> meta_;
+  const RaftGroupMetadataPtr meta_;
 
   const std::string tablet_id_;
 
@@ -359,20 +513,21 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   // The atomics state_, error_ and has_consensus_ maintain information about the tablet peer.
   // While modifying the other fields in tablet peer, state_ is modified last.
   // error_ is set before state_ is set to an error state.
-  std::atomic<enum TabletStatePB> state_;
+  std::atomic<enum RaftGroupStatePB> state_;
   AtomicUniquePtr<Status> error_;
   std::atomic<bool> has_consensus_ = {false};
 
   OperationTracker operation_tracker_;
-  OperationOrderVerifier operation_order_verifier_;
 
   scoped_refptr<log::Log> log_;
   std::atomic<log::Log*> log_atomic_{nullptr};
 
-  std::shared_ptr<TabletClass> tablet_;
-  rpc::ProxyCache* proxy_cache_;
-  std::shared_ptr<consensus::RaftConsensus> consensus_;
-  gscoped_ptr<TabletStatusListener> status_listener_;
+  TabletPtr tablet_;
+  TabletWeakPtr tablet_weak_;
+  std::atomic<TabletObjectState> tablet_obj_state_{TabletObjectState::kUninitialized};
+
+  std::shared_ptr<consensus::RaftConsensus> consensus_ GUARDED_BY(lock_);
+  std::unique_ptr<TabletStatusListener> status_listener_;
   simple_spinlock prepare_replicate_lock_;
 
   // Lock protecting state_ as well as smart pointers to collaborating
@@ -396,35 +551,68 @@ class TabletPeer : public consensus::ReplicaOperationFactory,
   // Function to mark this TabletPeer's tablet as dirty in the TSTabletManager.
   // This function must be called any time the cluster membership or cluster
   // leadership changes. Note that this function is called synchronously on the followers
-  // or leader via the consensus round completion callback of NonTxRoundReplicationFinished.
+  // or leader via the consensus round completion callback of NonTrackedRoundReplicationFinished.
   // Hence this should be a relatively lightweight function - e.g., update in-memory only state
   // and defer any other heavy duty operations to a thread pool.
   Callback<void(std::shared_ptr<consensus::StateChangeContext> context)> mark_dirty_clbk_;
 
   // List of maintenance operations for the tablet that need information that only the peer
   // can provide.
-  std::vector<MaintenanceOp*> maintenance_ops_;
+  std::vector<std::unique_ptr<MaintenanceOp>> maintenance_ops_;
 
   // Cache the permanent of the tablet UUID to retrieve it without a lock in the common case.
   const std::string permanent_uuid_;
 
   std::atomic<rpc::ThreadPool*> service_thread_pool_{nullptr};
+  AtomicUniquePtr<rpc::Strand> strand_;
 
-  std::atomic<size_t> preparing_operations_{0};
+  std::shared_ptr<rpc::PeriodicTimer> wait_queue_heartbeater_;
+
+  OperationCounter preparing_operations_counter_;
+
+  // Serializes access to set_cdc_min_replicated_index and reset_cdc_min_replicated_index_if_stale
+  // and protects cdc_min_replicated_index_refresh_time_ for reads and writes.
+  mutable simple_spinlock cdc_min_replicated_index_lock_;
+  MonoTime cdc_min_replicated_index_refresh_time_ = MonoTime::Min();
 
  private:
-  HybridTime ReportReadRestart() override;
+  Result<HybridTime> ReportReadRestart() override;
+
+  Result<FixedHybridTimeLease> HybridTimeLease(HybridTime min_allowed, CoarseTimePoint deadline);
+  Result<HybridTime> PreparePeerRequest() override;
+  Status MajorityReplicated() override;
+  void ChangeConfigReplicated(const consensus::RaftConfigPB& config) override;
+  uint64_t NumSSTFiles() override;
+  void ListenNumSSTFilesChanged(std::function<void()> listener) override;
+  rpc::Scheduler& scheduler() const override;
+  Status CheckOperationAllowed(
+      const OpId& op_id, consensus::OperationType op_type) override;
+  // Return granular types of on-disk size of this tablet replica, in bytes.
+  TabletOnDiskSizeInfo GetOnDiskSizeInfo() const REQUIRES(lock_);
+
+  bool FlushRetryableRequestsEnabled() const;
+
+  MetricRegistry* metric_registry_;
 
   bool IsLeader() override {
     return LeaderTerm() != OpId::kUnknownTerm;
   }
 
-  std::shared_future<client::YBClientPtr> client_future_;
+  // Returns the consensus. Can be nullptr.
+  std::shared_ptr<consensus::RaftConsensus> GetRaftConsensusUnsafe() const EXCLUDES(lock_);
+
+  TabletSplitter* tablet_splitter_;
+
+  std::shared_future<client::YBClient*> client_future_;
+  mutable std::atomic<client::YBClient*> client_cache_{nullptr};
+
+  rpc::Messenger* messenger_;
+
+  std::atomic<bool> flush_retryable_requests_enabled_{false};
+  std::shared_ptr<RetryableRequestsFlusher> retryable_requests_flusher_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletPeer);
 };
 
 }  // namespace tablet
 }  // namespace yb
-
-#endif /* YB_TABLET_TABLET_PEER_H_ */

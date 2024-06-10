@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TEST_GRAPH_COLLECTOR_H
-#define YB_TEST_GRAPH_COLLECTOR_H
+#pragma once
 
 #include <memory>
 #include <string>
@@ -42,9 +41,10 @@
 #include "yb/util/countdown_latch.h"
 #include "yb/util/faststring.h"
 #include "yb/util/locks.h"
-#include "yb/util/thread.h"
 
 namespace yb {
+
+class Thread;
 
 class TimeSeries {
  public:
@@ -56,20 +56,19 @@ class TimeSeries {
  private:
   friend class TimeSeriesCollector;
 
-  DISALLOW_COPY_AND_ASSIGN(TimeSeries);
-
   TimeSeries() :
     val_(0)
   {}
 
   mutable simple_spinlock lock_;
   double val_;
+
+  DISALLOW_COPY_AND_ASSIGN(TimeSeries);
 };
 
 class TimeSeriesCollector {
  public:
-  explicit TimeSeriesCollector(std::string scope)
-      : scope_(std::move(scope)), exit_latch_(0), started_(false) {}
+  explicit TimeSeriesCollector(std::string scope);
 
   ~TimeSeriesCollector();
 
@@ -78,8 +77,6 @@ class TimeSeriesCollector {
   void StopDumperThread();
 
  private:
-  DISALLOW_COPY_AND_ASSIGN(TimeSeriesCollector);
-
   void DumperThread();
   void BuildMetricsString(WallTime time_since_start, faststring *dst_buf) const;
 
@@ -96,7 +93,8 @@ class TimeSeriesCollector {
   CountDownLatch exit_latch_;
 
   bool started_;
+
+  DISALLOW_COPY_AND_ASSIGN(TimeSeriesCollector);
 };
 
 } // namespace yb
-#endif

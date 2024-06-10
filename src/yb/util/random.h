@@ -17,8 +17,7 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_RANDOM_H_
-#define YB_UTIL_RANDOM_H_
+#pragma once
 
 #include <stdint.h>
 
@@ -26,7 +25,7 @@
 #include <mutex>
 #include <vector>
 
-#include "yb/gutil/map-util.h"
+#include "yb/gutil/map-util.h" // For ContainsKey
 #include "yb/util/locks.h"
 
 namespace yb {
@@ -148,7 +147,7 @@ class Random {
   // The results are not stored in a randomized order: the order of results will
   // match their order in the input collection.
   template<class Collection, class Set, class T>
-  void ReservoirSample(const Collection& c, int k, const Set& avoid,
+  void ReservoirSample(const Collection& c, size_t k, const Set& avoid,
                        std::vector<T>* result) {
     result->clear();
     result->reserve(k);
@@ -164,7 +163,7 @@ class Random {
         continue;
       }
       // Otherwise replace existing elements with decreasing probability.
-      int j = Uniform(i);
+      auto j = Uniform(i);
       if (j < k) {
         (*result)[j] = elem;
       }
@@ -180,59 +179,59 @@ class ThreadSafeRandom {
   }
 
   void Reset(uint32_t s) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     random_.Reset(s);
   }
 
   uint32_t Next() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next();
   }
 
   uint32_t Next32() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next32();
   }
 
   uint64_t Next64() {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Next64();
   }
 
   uint32_t Uniform(uint32_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform(n);
   }
 
   uint32_t Uniform32(uint32_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform32(n);
   }
 
   uint64_t Uniform64(uint64_t n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Uniform64(n);
   }
 
   bool OneIn(int n) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.OneIn(n);
   }
 
   uint32_t Skewed(int max_log) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Skewed(max_log);
   }
 
   double Normal(double mean, double std_dev) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     return random_.Normal(mean, std_dev);
   }
 
   template<class Collection, class Set, class T>
   void ReservoirSample(const Collection& c, int k, const Set& avoid,
                        std::vector<T>* result) {
-    std::lock_guard<simple_spinlock> l(lock_);
+    std::lock_guard l(lock_);
     random_.ReservoirSample(c, k, avoid, result);
   }
 
@@ -244,5 +243,3 @@ class ThreadSafeRandom {
 
 
 }  // namespace yb
-
-#endif // YB_UTIL_RANDOM_H_

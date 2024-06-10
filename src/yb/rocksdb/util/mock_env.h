@@ -26,10 +26,9 @@
 #include <map>
 #include <string>
 #include <vector>
+
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/status.h"
 #include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/util/mutexlock.h"
 
 namespace rocksdb {
 
@@ -42,19 +41,19 @@ class MockEnv : public EnvWrapper {
 
   // Partial implementation of the Env interface.
   virtual Status NewSequentialFile(const std::string& fname,
-                                   unique_ptr<SequentialFile>* result,
+                                   std::unique_ptr<SequentialFile>* result,
                                    const EnvOptions& soptions) override;
 
   virtual Status NewRandomAccessFile(const std::string& fname,
-                                     unique_ptr<RandomAccessFile>* result,
+                                     std::unique_ptr<RandomAccessFile>* result,
                                      const EnvOptions& soptions) override;
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 unique_ptr<WritableFile>* result,
+                                 std::unique_ptr<WritableFile>* result,
                                  const EnvOptions& env_options) override;
 
   virtual Status NewDirectory(const std::string& name,
-                              unique_ptr<Directory>* result) override;
+                              std::unique_ptr<Directory>* result) override;
 
   virtual Status FileExists(const std::string& fname) override;
 
@@ -84,7 +83,7 @@ class MockEnv : public EnvWrapper {
                           const std::string& target) override;
 
   virtual Status NewLogger(const std::string& fname,
-                           shared_ptr<Logger>* result) override;
+                           std::shared_ptr<Logger>* result) override;
 
   virtual Status LockFile(const std::string& fname, FileLock** flock) override;
 

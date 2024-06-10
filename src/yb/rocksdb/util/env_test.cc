@@ -26,12 +26,10 @@
 #endif
 #include <sys/types.h>
 
-#include <iostream>
-#include <unordered_set>
 #include <atomic>
 #include <list>
 
-#ifdef OS_LINUX
+#ifdef __linux__
 #include <fcntl.h>
 #include <linux/fs.h>
 #include <stdlib.h>
@@ -48,9 +46,13 @@
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/log_buffer.h"
 #include "yb/rocksdb/util/mutexlock.h"
-#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/string_util.h"
+#include "yb/util/test_util.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
@@ -66,7 +68,7 @@ std::atomic<bool> called;
 
 static const int kDelayMicros = 100000;
 
-class EnvPosixTest : public testing::Test {
+class EnvPosixTest : public RocksDBTest {
  private:
   port::Mutex mu_;
   std::string events_;
@@ -457,7 +459,7 @@ TEST_F(EnvPosixTest, DecreaseNumBgThreads) {
   ASSERT_TRUE(!tasks[5].IsSleeping());
 }
 
-#ifdef OS_LINUX
+#ifdef __linux__
 // Travis doesn't support fallocate or getting unique ID from files for whatever
 // reason.
 #ifndef TRAVIS
@@ -582,14 +584,14 @@ TEST_F(EnvPosixTest, RandomAccessUniqueID) {
 
   // Get Unique ID
   ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
-  size_t id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
+  size_t id_size = file->GetUniqueId(temp_id);
   ASSERT_GT(id_size, 0);
   std::string unique_id1(temp_id, id_size);
   ASSERT_TRUE(IsUniqueIDValid(unique_id1));
 
   // Get Unique ID again
   ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
-  id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
+  id_size = file->GetUniqueId(temp_id);
   ASSERT_GT(id_size, 0);
   std::string unique_id2(temp_id, id_size);
   ASSERT_TRUE(IsUniqueIDValid(unique_id2));
@@ -597,7 +599,7 @@ TEST_F(EnvPosixTest, RandomAccessUniqueID) {
   // Get Unique ID again after waiting some time.
   env_->SleepForMicroseconds(1000000);
   ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
-  id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
+  id_size = file->GetUniqueId(temp_id);
   ASSERT_GT(id_size, 0);
   std::string unique_id3(temp_id, id_size);
   ASSERT_TRUE(IsUniqueIDValid(unique_id3));
@@ -607,7 +609,7 @@ TEST_F(EnvPosixTest, RandomAccessUniqueID) {
   ASSERT_EQ(unique_id2, unique_id3);
 
   // Delete the file
-  env_->DeleteFile(fname);
+  ASSERT_OK(env_->DeleteFile(fname));
 }
 
 // only works in linux platforms
@@ -710,11 +712,11 @@ TEST_F(EnvPosixTest, RandomAccessUniqueIDConcurrent) {
 
   // Collect and check whether the IDs are unique.
   std::unordered_set<std::string> ids;
-  for (const std::string fname : fnames) {
+  for (const std::string& fname : fnames) {
     unique_ptr<RandomAccessFile> file;
     std::string unique_id;
     ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
-    size_t id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
+    size_t id_size = file->GetUniqueId(temp_id);
     ASSERT_GT(id_size, 0);
     unique_id = std::string(temp_id, id_size);
     ASSERT_TRUE(IsUniqueIDValid(unique_id));
@@ -724,7 +726,7 @@ TEST_F(EnvPosixTest, RandomAccessUniqueIDConcurrent) {
   }
 
   // Delete the files
-  for (const std::string fname : fnames) {
+  for (const std::string& fname : fnames) {
     ASSERT_OK(env_->DeleteFile(fname));
   }
 
@@ -752,7 +754,7 @@ TEST_F(EnvPosixTest, RandomAccessUniqueIDDeletes) {
     {
       unique_ptr<RandomAccessFile> file;
       ASSERT_OK(env_->NewRandomAccessFile(fname, &file, soptions));
-      size_t id_size = file->GetUniqueId(temp_id, MAX_ID_SIZE);
+      size_t id_size = file->GetUniqueId(temp_id);
       ASSERT_GT(id_size, 0);
       unique_id = std::string(temp_id, id_size);
     }
@@ -797,7 +799,7 @@ TEST_F(EnvPosixTest, InvalidateCache) {
   // Sequential Read
   {
     unique_ptr<SequentialFile> file;
-    char scratch[100];
+    uint8_t scratch[100];
     Slice result;
     ASSERT_OK(env_->NewSequentialFile(fname, &file, soptions));
     ASSERT_OK(file.get()->Read(11, &result, scratch));
@@ -809,7 +811,7 @@ TEST_F(EnvPosixTest, InvalidateCache) {
   ASSERT_OK(env_->DeleteFile(fname));
 }
 #endif  // not TRAVIS
-#endif  // OS_LINUX
+#endif  // __linux__
 
 class TestLogger : public Logger {
  public:
@@ -948,21 +950,21 @@ TEST_F(EnvPosixTest, Preallocation) {
   // Small write should preallocate one block
   std::string str = "test";
   srcfile->PrepareWrite(srcfile->GetFileSize(), str.size());
-  srcfile->Append(str);
+  ASSERT_OK(srcfile->Append(str));
   srcfile->GetPreallocationStatus(&block_size, &last_allocated_block);
   ASSERT_EQ(last_allocated_block, 1UL);
 
   // Write an entire preallocation block, make sure we increased by two.
   std::string buf(block_size, ' ');
   srcfile->PrepareWrite(srcfile->GetFileSize(), buf.size());
-  srcfile->Append(buf);
+  ASSERT_OK(srcfile->Append(buf));
   srcfile->GetPreallocationStatus(&block_size, &last_allocated_block);
   ASSERT_EQ(last_allocated_block, 2UL);
 
   // Write five more blocks at once, ensure we're where we need to be.
   buf = std::string(block_size * 5, ' ');
   srcfile->PrepareWrite(srcfile->GetFileSize(), buf.size());
-  srcfile->Append(buf);
+  ASSERT_OK(srcfile->Append(buf));
   srcfile->GetPreallocationStatus(&block_size, &last_allocated_block);
   ASSERT_EQ(last_allocated_block, 7UL);
 }
@@ -980,7 +982,7 @@ TEST_F(EnvPosixTest, ConsistentChildrenAttributes) {
     const std::string path = oss.str();
     unique_ptr<WritableFile> file;
     ASSERT_OK(env_->NewWritableFile(path, &file, soptions));
-    file->Append(data);
+    ASSERT_OK(file->Append(data));
     data.append("test");
   }
 
@@ -1023,13 +1025,13 @@ TEST_F(EnvPosixTest, WritableFileWrapper) {
     Status Flush() override { inc(3); return Status::OK(); }
     Status Sync() override { inc(4); return Status::OK(); }
     Status Fsync() override { inc(5); return Status::OK(); }
-    void SetIOPriority(Env::IOPriority pri) override { inc(6); }
+    void SetIOPriority(yb::IOPriority pri) override { inc(6); }
     uint64_t GetFileSize() override { inc(7); return 0; }
     void GetPreallocationStatus(size_t* block_size,
                                 size_t* last_allocated_block) override {
       inc(8);
     }
-    size_t GetUniqueId(char* id, size_t max_size) const override {
+    size_t GetUniqueId(char* id) const override {
       inc(9);
       return 0;
     }
@@ -1037,20 +1039,25 @@ TEST_F(EnvPosixTest, WritableFileWrapper) {
       inc(10);
       return Status::OK();
     }
+    const std::string& filename() const override {
+      inc(11);
+      static std::string kFilename = "Base";
+      return kFilename;
+    }
 
    protected:
     Status Allocate(uint64_t offset, uint64_t len) override {
-      inc(11);
+      inc(12);
       return Status::OK();
     }
     Status RangeSync(uint64_t offset, uint64_t nbytes) override {
-      inc(12);
+      inc(13);
       return Status::OK();
     }
 
    public:
     ~Base() {
-      inc(13);
+      inc(14);
     }
   };
 
@@ -1060,8 +1067,8 @@ TEST_F(EnvPosixTest, WritableFileWrapper) {
     WritableFileWrapper(std::move(target)) {}
 
     void CallProtectedMethods() {
-      Allocate(0, 0);
-      RangeSync(0, 0);
+      CHECK_OK(Allocate(0, 0));
+      CHECK_OK(RangeSync(0, 0));
     }
   };
 
@@ -1070,20 +1077,21 @@ TEST_F(EnvPosixTest, WritableFileWrapper) {
   {
     auto b = std::make_unique<Base>(&step);
     Wrapper w(std::move(b));
-    w.Append(Slice());
-    w.Close();
-    w.Flush();
-    w.Sync();
-    w.Fsync();
-    w.SetIOPriority(Env::IOPriority::IO_HIGH);
+    ASSERT_OK(w.Append(Slice()));
+    ASSERT_OK(w.Close());
+    ASSERT_OK(w.Flush());
+    ASSERT_OK(w.Sync());
+    ASSERT_OK(w.Fsync());
+    w.SetIOPriority(yb::IOPriority::kHigh);
     w.GetFileSize();
     w.GetPreallocationStatus(nullptr, nullptr);
-    w.GetUniqueId(nullptr, 0);
-    w.InvalidateCache(0, 0);
+    w.GetUniqueId(nullptr);
+    ASSERT_OK(w.InvalidateCache(0, 0));
+    w.filename();
     w.CallProtectedMethods();
   }
 
-  EXPECT_EQ(14, step);
+  EXPECT_EQ(15, step);
 }
 
 }  // namespace rocksdb

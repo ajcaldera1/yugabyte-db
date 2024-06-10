@@ -31,8 +31,7 @@
 // Most people will want to use the builtin bloom filter support (see
 // NewBloomFilterPolicy() below).
 
-#ifndef YB_ROCKSDB_FILTER_POLICY_H
-#define YB_ROCKSDB_FILTER_POLICY_H
+#pragma once
 
 #include <string>
 #include <memory>
@@ -153,7 +152,18 @@ class FilterPolicy {
   // Filter policy can optionally return key transformer to be used before writing key to filter or
   // testing key against filter and building/reading filter index based on keys (used for fixed-size
   // bloom filter). This method is used by BlockBasedTable(Reader)/BlockBasedTableBuilder.
-  // Requires: order of keys defined by BytewiseComparator shouldn't be broken by key transformer.
+  // If KeyTransformer returns empty filter key - this is treated as matching the filter by
+  // BlockBasedTableReader. This allows us to support disabling bloom filters for old versions
+  // of filter policies if they have bugs.
+  // Because of this when BlockBasedTableBuilder is getting empty filter key - there is no need to
+  // add it into the filter block.
+  //
+  // Requires: order of keys defined by BytewiseComparator shouldn't be broken by key transformer,
+  // which means if `BytewiseComparator::Compare(a, b) <= 0` then for non-empty a_transformed and
+  // b_transformed `BytewiseComparator::Compare(a_tranformed, b_transformed) <= 0` must hold.
+  // Returning empty keys affecting the order is acceptable, for example: "AAA123" <= "BBB456",
+  // but it is acceptable to transform it to: "AAA" > "", because we treat empty filter keys
+  // specifically (see previous section).
   //
   // Actually we can use ColumnFamilyOptions::prefix_extractor instead and switch off whole key
   // filtering by setting BlockBasedTableOptions::whole_key_filtering to false. But we want
@@ -201,9 +211,7 @@ extern const FilterPolicy* NewBloomFilterPolicy(int bits_per_key,
 //
 // Callers must delete the result after any database that is using the filter policy has been
 // closed.
-extern const FilterPolicy* NewFixedSizeFilterPolicy(uint32_t total_bits,
+extern const FilterPolicy* NewFixedSizeFilterPolicy(size_t total_bits,
                                                     double error_rate,
                                                     Logger* logger);
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_FILTER_POLICY_H

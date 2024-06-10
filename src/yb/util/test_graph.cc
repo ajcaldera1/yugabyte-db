@@ -34,13 +34,14 @@
 
 #include <mutex>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/ref_counted.h"
 #include "yb/gutil/stringprintf.h"
 #include "yb/gutil/walltime.h"
 #include "yb/util/locks.h"
 #include "yb/util/status.h"
+#include "yb/util/status_log.h"
 #include "yb/util/thread.h"
 
 using std::shared_ptr;
@@ -49,19 +50,22 @@ using std::string;
 namespace yb {
 
 void TimeSeries::AddValue(double val) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   val_ += val;
 }
 
 void TimeSeries::SetValue(double val) {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   val_ = val;
 }
 
 double TimeSeries::value() const {
-  std::lock_guard<simple_spinlock> l(lock_);
+  std::lock_guard l(lock_);
   return val_;
 }
+
+TimeSeriesCollector::TimeSeriesCollector(std::string scope)
+    : scope_(std::move(scope)), exit_latch_(0), started_(false) {}
 
 TimeSeriesCollector::~TimeSeriesCollector() {
   if (started_) {

@@ -30,16 +30,12 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_RANDOM_UTIL_H
-#define YB_UTIL_RANDOM_UTIL_H
+#pragma once
 
 #include <algorithm>
-#include <cstdint>
-#include <cstdlib>
 #include <random>
-#include <string>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"  // For CHECK
 
 namespace yb {
 
@@ -55,11 +51,16 @@ void RandomString(void* dest, size_t n, Random* rng);
 uint32_t GetRandomSeed32();
 
 std::vector<uint8_t> RandomBytes(size_t len, std::mt19937_64* rng = nullptr);
+std::string RandomString(size_t len, std::mt19937_64* rng = nullptr);
 
-std::string RandomHumanReadableString(int len, Random* rnd);
+std::string RandomHumanReadableString(size_t len, Random* rnd);
+
+bool IsRandomInitializingInThisThread();
 
 class RandomDeviceSequence {
  public:
+  typedef std::random_device::result_type result_type;
+
   template<class It>
   void generate(It begin, const It& end) {
     std::generate(begin, end, [this] { return device_(); });
@@ -85,6 +86,8 @@ Int RandomUniformInt(Int min, Int max, std::mt19937_64* rng = nullptr) {
   }
   return std::uniform_int_distribution<Int>(min, max)(*rng);
 }
+
+bool RandomUniformBool(std::mt19937_64* rng = nullptr);
 
 template <class Int>
 std::vector<Int> RandomUniformVector(Int min, Int max, uint32_t size,
@@ -122,19 +125,27 @@ Real RandomUniformReal(std::mt19937_64* rng = nullptr) {
 }
 
 inline bool RandomActWithProbability(double probability, std::mt19937_64* rng = nullptr) {
-  return probability <= 0 ? false : RandomUniformReal<double>(rng) < probability;
+  return probability <= 0 ? false
+                          : probability >= 1.0 ? true
+                                               : RandomUniformReal<double>(rng) < probability;
+}
+
+template <class Collection>
+typename Collection::const_iterator RandomIterator(const Collection& collection,
+                                                    std::mt19937_64* rng = nullptr) {
+  CHECK(!collection.empty());
+  size_t index = RandomUniformInt<size_t>(0, collection.size() - 1, rng);
+  auto it = collection.begin();
+  std::advance(it, index);
+  return it;
 }
 
 template <class Collection>
 typename Collection::const_reference RandomElement(const Collection& collection,
                                                    std::mt19937_64* rng = nullptr) {
-  CHECK(!collection.empty());
-  size_t index = RandomUniformInt<size_t>(0, collection.size() - 1, rng);
-  return collection[index];
+  return *RandomIterator(collection, rng);
 }
 
 std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng = nullptr);
 
 } // namespace yb
-
-#endif // YB_UTIL_RANDOM_UTIL_H

@@ -13,24 +13,29 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_PGGATE_TEST_PGGATE_TEST_H_
-#define YB_YQL_PGGATE_TEST_PGGATE_TEST_H_
+#pragma once
 
 #include <dirent.h>
+#include <stdint.h>
 
-#include "yb/client/client.h"
+#include "pg_type_d.h" // NOLINT
+
+#include "yb/common/common_fwd.h"
+#include "yb/common/value.messages.h"
+
 #include "yb/integration-tests/external_mini_cluster.h"
-#include "yb/master/mini_master.h"
 
+#include "yb/tserver/tserver_util_fwd.h"
+
+#include "yb/util/shared_mem.h"
 #include "yb/util/test_util.h"
-#include "yb/util/memory/mc_types.h"
 
-#include "yb/yql/pggate/ybc_pggate.h"
+#include "yb/yql/pggate/util/ybc_util.h"
+#include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 // This file comes from this directory:
 // postgres_build/src/include/catalog
 // We add a special include path to CMakeLists.txt.
-#include "pg_type_d.h"
 
 namespace yb {
 namespace pggate {
@@ -38,7 +43,8 @@ namespace pggate {
 //--------------------------------------------------------------------------------------------------
 // Test base class.
 //--------------------------------------------------------------------------------------------------
-#define CHECK_YBC_STATUS(s) CheckYBCStatus((s), __FILE__, __LINE__)
+#define CHECK_YBC_STATUS(s) \
+    ::yb::pggate::PggateTest::CheckYBCStatus((s), __FILE__, __LINE__)
 
 class PggateTest : public YBTest {
  public:
@@ -46,39 +52,51 @@ class PggateTest : public YBTest {
   static constexpr const char* kDefaultDatabase = "pggate_test_database";
   static constexpr const char* kDefaultSchema = "pggate_test_schema";
   static constexpr YBCPgOid kDefaultDatabaseOid = 1;
+  static constexpr const char* kDefaultTemplateDatabaseName = "template1";
 
   PggateTest();
   virtual ~PggateTest();
 
   //------------------------------------------------------------------------------------------------
-  void CheckYBCStatus(YBCStatus status, const char* file_name, int line_number);
+  static void CheckYBCStatus(YBCStatus status, const char* file_name, int line_number);
 
   //------------------------------------------------------------------------------------------------
   // Test start and cleanup functions.
-  virtual void SetUp() override;
-  virtual void TearDown() override;
+  void SetUp() override;
+  void TearDown() override;
 
-  // Init cluster for each test case.
-  CHECKED_STATUS Init(const char *test_name, int num_tablet_servers = kNumOfTablets);
+  // Init cluster for each test case. If 'replication_factor' is not explicitly passed in, it
+  // defaults to the number of master nodes.
+  Status Init(const char* test_name,
+              int num_tablet_servers = kNumOfTablets,
+              int replication_factor = 0,
+              const std::string& use_existing_db = "");
 
-  // Create simulated cluster.
-  CHECKED_STATUS CreateCluster(int num_tablet_servers);
+  // Create simulated cluster. If 'replication_factor' is not explicitly passed in, it defaults to
+  // the number of master nodes.
+  Status CreateCluster(int num_tablet_servers, int replication_factor = 0);
 
   //------------------------------------------------------------------------------------------------
   // Setup the database for testing.
-  void SetupDB(const string& db_name = kDefaultDatabase, YBCPgOid db_oid = kDefaultDatabaseOid);
-  void CreateDB(const string& db_name = kDefaultDatabase, YBCPgOid db_oid = kDefaultDatabaseOid);
-  void ConnectDB(const string& db_name = kDefaultDatabase);
+  void SetupDB(const std::string& db_name = kDefaultDatabase,
+               YBCPgOid db_oid = kDefaultDatabaseOid);
+  void CreateDB(const std::string& db_name = kDefaultDatabase,
+                YBCPgOid db_oid = kDefaultDatabaseOid);
+  void ConnectDB(const std::string& db_name = kDefaultDatabase);
+
+  virtual void CustomizeExternalMiniCluster(ExternalMiniClusterOptions* opts) {}
 
  protected:
+  void BeginDDLTransaction();
+  void CommitDDLTransaction();
+  void BeginTransaction();
   void CommitTransaction();
+  void ExecCreateTableTransaction(YBCPgStatement pg_stmt);
 
   //------------------------------------------------------------------------------------------------
   // Simulated cluster.
   std::shared_ptr<ExternalMiniCluster> cluster_;
-
-  // Session.
-  YBCPgSession pg_session_;
+  tserver::TServerSharedObject tserver_shared_object_;
 };
 
 //--------------------------------------------------------------------------------------------------
@@ -113,6 +131,8 @@ YBCStatus YBCTestNewConstantInt4(YBCPgStatement stmt, int32_t value, bool is_nul
                                  YBCPgExpr *expr_handle);
 YBCStatus YBCTestNewConstantInt8(YBCPgStatement stmt, int64_t value, bool is_null,
                                  YBCPgExpr *expr_handle);
+YBCStatus YBCTestNewConstantInt8Op(YBCPgStatement stmt, int64_t value, bool is_null,
+                                 YBCPgExpr *expr_handle, bool is_gt);
 YBCStatus YBCTestNewConstantFloat4(YBCPgStatement stmt, float value, bool is_null,
                                    YBCPgExpr *expr_handle);
 YBCStatus YBCTestNewConstantFloat8(YBCPgStatement stmt, double value, bool is_null,
@@ -122,5 +142,3 @@ YBCStatus YBCTestNewConstantText(YBCPgStatement stmt, const char *value, bool is
 
 }  // namespace pggate
 }  // namespace yb
-
-#endif // YB_YQL_PGGATE_TEST_PGGATE_TEST_H_

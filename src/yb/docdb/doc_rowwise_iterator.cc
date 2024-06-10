@@ -13,768 +13,428 @@
 
 #include "yb/docdb/doc_rowwise_iterator.h"
 
-#include "yb/common/partition.h"
-#include "yb/common/transaction.h"
-#include "yb/common/ql_scanspec.h"
-#include "yb/docdb/docdb.h"
-#include "yb/docdb/docdb-internal.h"
-#include "yb/docdb/docdb_rocksdb_util.h"
-#include "yb/docdb/doc_key.h"
-#include "yb/docdb/doc_ql_scanspec.h"
-#include "yb/docdb/intent_aware_iterator.h"
-#include "yb/docdb/subdocument.h"
-#include "yb/gutil/strings/substitute.h"
-#include "yb/rocksdb/db/compaction.h"
-#include "yb/rocksutil/yb_rocksdb.h"
+#include <cstdint>
+#include <iterator>
+#include <ostream>
+#include <string>
+#include <vector>
 
-#include "yb/yql/pggate/util/pg_doc_data.h"
+#include "yb/docdb/doc_rowwise_iterator_base.h"
+#include "yb/docdb/docdb_fwd.h"
+#include "yb/docdb/docdb_statistics.h"
+#include "yb/docdb/intent_aware_iterator.h"
+#include "yb/docdb/scan_choices.h"
+
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/doc_path.h"
+#include "yb/dockv/expiration.h"
+#include "yb/dockv/pg_row.h"
+
+#include "yb/qlexpr/ql_expr.h"
+
+#include "yb/util/debug-util.h"
+#include "yb/util/flags.h"
+#include "yb/util/logging.h"
+#include "yb/util/metrics.h"
+#include "yb/util/result.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/strongly_typed_bool.h"
 
 using std::string;
 
-using yb::FormatRocksDBSliceAsStr;
-using yb::docdb::DocKey;
+DEFINE_RUNTIME_bool(ysql_use_flat_doc_reader, true,
+    "Use DocDBTableReader optimization that relies on having at most 1 subkey for YSQL.");
 
-namespace yb {
-namespace docdb {
+DEFINE_RUNTIME_PREVIEW_bool(use_fast_backward_scan, false,
+    "Use backward scan optimization to build a row in the reverse order. "
+    "Applicable for YSQL flat doc reader only.");
 
-class ScanChoices {
- public:
-  explicit ScanChoices(bool is_forward_scan) : is_forward_scan_(is_forward_scan) {}
-  virtual ~ScanChoices() {}
-  virtual bool CurrentIteratorPositionMatchesCurrentTarget(DocKey curr) {
-    VLOG(3) << __PRETTY_FUNCTION__ << " checking if acceptable ? "
-            << (curr == current_scan_target_ ? "YES" : "NOPE");
-    return curr == current_scan_target_;
-  }
+// TODO(#22556): Remove when fast backward scan will be supported for packed row V2.
+DECLARE_bool(ysql_use_packed_row_v2);
 
-  // Returns false if there are still target keys we need to scan, and true if we are done.
-  virtual bool FinishedWithScanChoices() const { return finished_; }
+DEFINE_test_flag(int32, fetch_next_delay_ms, 0, "Amount of time to delay inside FetchNext");
+DEFINE_test_flag(string, fetch_next_delay_column, "", "Only delay when schema has specific column");
 
-  // Go to the next scan target if any.
-  virtual void DoneWithCurrentTarget() = 0;
+using namespace std::chrono_literals;
 
-  // Go (directly) to the new target (or the one after if new_target does not
-  // exist in the desired list/range). If the new_target is larger than all scan target options it
-  // means we are done.
-  virtual void SkipTargetsUpTo(const DocKey& new_target) = 0;
+namespace yb::docdb {
 
-  // If the given doc_key isn't already at the desired target, seek appropriately to go to the
-  // current target.
-  virtual Status SeekToCurrentTarget(IntentAwareIterator* db_iter) = 0;
-
- protected:
-  const bool is_forward_scan_;
-  DocKey current_scan_target_;
-  bool finished_ = false;
-};
-
-class DiscreteScanChoices : public ScanChoices {
- public:
-  DiscreteScanChoices(const DocQLScanSpec& doc_spec, DocKey lower_doc_key, DocKey upper_doc_key)
-      : ScanChoices(doc_spec.is_forward_scan()) {
-    range_cols_scan_options_ = doc_spec.range_options();
-    current_scan_target_idxs_.resize(range_cols_scan_options_->size());
-    for (int i = 0; i < range_cols_scan_options_->size(); i++) {
-      current_scan_target_idxs_[i] = range_cols_scan_options_->at(i).begin();
-    }
-
-    // Initialize target doc key.
-    if (is_forward_scan_) {
-      current_scan_target_ = lower_doc_key;
-      if (!current_scan_target_.range_group().empty()) {
-        current_scan_target_.ClearRangeComponents();
-        SkipTargetsUpTo(lower_doc_key);
-      }
-    } else {
-      current_scan_target_ = upper_doc_key;
-      if (!current_scan_target_.range_group().empty()) {
-        current_scan_target_.ClearRangeComponents();
-        SkipTargetsUpTo(upper_doc_key);
-      }
-    }
-  }
-
-  void DoneWithCurrentTarget() override;
-  void SkipTargetsUpTo(const DocKey& new_target) override;
-  Status SeekToCurrentTarget(IntentAwareIterator* db_iter) override;
-
- protected:
-  // Utility function for (multi)key scans. Updates the target scan key by incrementing the option
-  // index for one column. Will handle overflow by setting current column index to 0 and
-  // incrementing the previous column instead. If it overflows at first column it means we are done,
-  // so it clears the scan target idxs array.
-  void IncrementScanTargetAtColumn(size_t start_col);
-
-  // Utility function for (multi)key scans to initialize the range portion of the current scan
-  // target, scan target with the first option.
-  // Only needed for scans that include the static row, otherwise Init will take care of this.
-  bool InitScanTargetRangeGroupIfNeeded();
-
- private:
-  // For (multi)key scans (e.g. selects with 'IN' condition on the range columns) we hold the
-  // options for each range column as we iteratively seek to each target key.
-  // e.g. for a query "h = 1 and r1 in (2,3) and r2 in (4,5) and r3 = 6":
-  //  range_cols_scan_options_   [[2, 3], [4, 5], [6]] -- value options for each column.
-  //  current_scan_target_idxs_  goes from [0, 0, 0] up to [1, 1, 0] -- except when including the
-  //                             static row when it starts from [0, 0, -1] instead.
-  //  current_scan_target_       goes from [1][2,4,6] up to [1][3,5,6] -- is the doc key containing,
-  //                             for each range column, the value (option) referenced by the
-  //                             corresponding index (updated along with current_scan_target_idxs_).
-  std::shared_ptr<std::vector<std::vector<PrimitiveValue>>> range_cols_scan_options_;
-  mutable std::vector<std::vector<PrimitiveValue>::const_iterator> current_scan_target_idxs_;
-};
-
-void DiscreteScanChoices::IncrementScanTargetAtColumn(size_t start_col) {
-  DCHECK_LE(start_col, current_scan_target_idxs_.size());
-
-  // Increment start col, move backwards in case of overflow.
-  for (int col_idx = start_col; col_idx >= 0; col_idx--) {
-    const auto& choices = range_cols_scan_options_->at(col_idx);
-    auto& it = current_scan_target_idxs_[col_idx];
-
-    if (it < --choices.end()) {
-      it++;
-      current_scan_target_.SetRangeComponent(*it, col_idx);
-      return;
-    }
-    it = choices.begin();
-    current_scan_target_.SetRangeComponent(*it, col_idx);
-  }
-
-  // If we got here we finished all the options and are done.
-  finished_ = true;
-}
-
-bool DiscreteScanChoices::InitScanTargetRangeGroupIfNeeded() {
-  // Initialize the range key values if needed (i.e. we scanned the static row until now).
-  if (current_scan_target_.range_group().empty()) {
-    for (size_t col_idx = 0; col_idx < range_cols_scan_options_->size(); col_idx++) {
-      current_scan_target_.AddRangeComponent(*current_scan_target_idxs_[col_idx]);
-    }
-    return true;
-  }
-  return false;
-}
-
-void DiscreteScanChoices::DoneWithCurrentTarget() {
-  VLOG(2) << __PRETTY_FUNCTION__ << " moving on to next target";
-  DCHECK(!FinishedWithScanChoices());
-
-  // Initialize the first target/option if not done already, otherwise go to the next one.
-  if (!InitScanTargetRangeGroupIfNeeded()) {
-    IncrementScanTargetAtColumn(range_cols_scan_options_->size() - 1);
-  }
-}
-
-void DiscreteScanChoices::SkipTargetsUpTo(const DocKey& new_target) {
-  VLOG(2) << __PRETTY_FUNCTION__ << " Updating current target to be >= " << new_target;
-  DCHECK(!FinishedWithScanChoices());
-  InitScanTargetRangeGroupIfNeeded();
-
-  size_t col_idx = 0;
-  while (col_idx < range_cols_scan_options_->size()) {
-    const PrimitiveValue& target_value = new_target.range_group()[col_idx];
-    const auto& choices = range_cols_scan_options_->at(col_idx);
-    auto& it = current_scan_target_idxs_[col_idx];
-
-    // Fast-path in case the existing value for this column already matches the new target.
-    if (target_value == *it) {
-      col_idx++;
-      continue;
-    }
-
-    // Search for the option that matches new target value (for the current column).
-    if (is_forward_scan_) {
-      it = std::lower_bound(choices.begin(), choices.end(), target_value);
-    } else {
-      it = std::lower_bound(choices.begin(), choices.end(), target_value, std::greater<>());
-    }
-
-    // If we overflowed, the new target value for this column is larger than all our options, so
-    // we go back and increment the previous column instead.
-    if (it == choices.end()) {
-      IncrementScanTargetAtColumn(col_idx - 1);
-      break;
-    }
-
-    // Else, update the current target value for this column.
-    current_scan_target_.SetRangeComponent(*it, col_idx);
-
-    // If we did not find an exact match we are already beyond the new target so we can stop.
-    if (target_value != *it) {
-      col_idx++;
-      break;
-    }
-
-    col_idx++;
-  }
-
-  // If there are any columns left (i.e. we stopped early), it means we did not find an exact
-  // match and we reached beyond the new target key. So we need to include all options for the
-  // leftover columns (i.e. set all following indexes to 0).
-  for (size_t i = col_idx; i < current_scan_target_idxs_.size(); i++) {
-    current_scan_target_idxs_[i] = range_cols_scan_options_->at(i).begin();
-    current_scan_target_.SetRangeComponent(*current_scan_target_idxs_[i], i);
-  }
-}
-
-Status DiscreteScanChoices::SeekToCurrentTarget(IntentAwareIterator* db_iter) {
-  VLOG(2) << __PRETTY_FUNCTION__ << " Advancing iterator towards target";
-  // Seek to the current target doc key if needed.
-  if (!FinishedWithScanChoices()) {
-    if (is_forward_scan_) {
-      VLOG(2) << __PRETTY_FUNCTION__ << " Seeking to " << current_scan_target_;
-      db_iter->Seek(current_scan_target_);
-    } else {
-      DocKey tmp = current_scan_target_;
-      tmp.AddRangeComponent(PrimitiveValue(ValueType::kHighest));
-      VLOG(2) << __PRETTY_FUNCTION__ << " Going to PrevDocKey " << tmp;
-      db_iter->PrevDocKey(tmp);
-    }
-  }
-  return Status::OK();
-}
-
-class RangeBasedScanChoices : public ScanChoices {
- public:
-  RangeBasedScanChoices(
-      const Schema& schema, const DocQLScanSpec& doc_spec, DocKey lower_doc_key,
-      DocKey upper_doc_key)
-      : ScanChoices(doc_spec.is_forward_scan()) {
-    DCHECK(doc_spec.range_bounds());
-    lower_.reserve(schema.num_range_key_columns());
-    upper_.reserve(schema.num_range_key_columns());
-    int idx = 0;
-    for (idx = schema.num_hash_key_columns(); idx < schema.num_key_columns(); idx++) {
-      const ColumnId col_idx = schema.column_id(idx);
-      const auto col_sort_type = schema.column(idx).sorting_type();
-      const common::QLScanRange::QLRange range = doc_spec.range_bounds()->rangeFor(col_idx);
-      const bool desc_col = col_sort_type == ColumnSchema::kDescending;
-      // for ASC col: lower -> min_value; upper -> max_value
-      // for DESC   :       -> max_value;       -> min_value
-      const auto& lower = (desc_col ? range.max_value : range.min_value);
-      lower_.emplace_back(
-          IsNull(lower) ? PrimitiveValue(ValueType::kLowest)
-                        : PrimitiveValue::FromQLValuePB(lower, col_sort_type));
-      const auto& upper = (desc_col ? range.min_value : range.max_value);
-      upper_.emplace_back(
-          IsNull(upper) ? PrimitiveValue(ValueType::kHighest)
-                        : PrimitiveValue::FromQLValuePB(upper, schema.column(idx).sorting_type()));
-    }
-  }
-
-  void SkipTargetsUpTo(const DocKey& new_target) override;
-  void DoneWithCurrentTarget() override;
-  Status SeekToCurrentTarget(IntentAwareIterator* db_iter) override;
-
- private:
-  std::vector<PrimitiveValue> lower_, upper_;
-  DocKey prev_scan_target_;
-};
-
-void RangeBasedScanChoices::SkipTargetsUpTo(const DocKey& new_target) {
-  VLOG(2) << __PRETTY_FUNCTION__ << " Updating current target to be >= " << new_target;
-  DCHECK(!FinishedWithScanChoices());
-
-  /*
-   Let's say we have a row key with (A B) as the hash part and C, D as the range part:
-   ((A B) C D) E F
-
-   Let's say we have a range constraint :
-    l_c < C < u_c
-     4        6
-
-    a b  0 d  -> a  b l_c  l_d
-
-    a b  5 d  -> a  b  5    d
-                  [ Will subsequently week out of document on reading the subdoc]
-
-    a b  7 d  -> a <b> MAX
-                [ This will seek to <b_next> and on the next invocation update:
-                   a <b_next> ? ? -> a <b_next> l_c l_d ]
-  */
-  current_scan_target_ = new_target;
-
-  int col_idx = 0;
-  for (col_idx = 0; col_idx < current_scan_target_.range_group().size(); col_idx++) {
-    const PrimitiveValue& target_value = new_target.range_group()[col_idx];
-    VLOG(3) << "col_idx " << col_idx << " is " << target_value << " in ["
-            << yb::ToString(lower_[col_idx]) << " , " << yb::ToString(upper_[col_idx]) << " ] ?";
-
-    const auto lower = lower_[col_idx];
-    if (target_value < lower) {
-      const auto tgt = (is_forward_scan_ ? lower_[col_idx] : PrimitiveValue(ValueType::kLowest));
-      current_scan_target_.SetRangeComponent(tgt, col_idx);
-      VLOG(3) << " Updating idx " << col_idx << " from " << target_value << " to " << tgt;
-      break;
-    }
-    const auto upper = upper_[col_idx];
-    if (target_value > upper) {
-      const auto tgt = (!is_forward_scan_ ? upper_[col_idx] : PrimitiveValue(ValueType::kHighest));
-      VLOG(3) << " Updating idx " << col_idx << " from " << target_value << " to " << tgt;
-      current_scan_target_.SetRangeComponent(tgt, col_idx);
-      break;
-    }
-  }
-
-  // Reset the remaining range columns to kHighest/lower for forward scans
-  // or kLowest/upper for backward scans.
-  while (++col_idx < lower_.size()) {
-    if (current_scan_target_.range_group()[col_idx - 1].IsInfinity()) {
-      // No point having more components after +/- Inf.
-      // Nuke the remaining components.
-      current_scan_target_.ResizeRangeComponents(col_idx);
-      break;
-    }
-    if (is_forward_scan_) {
-      VLOG(3) << " Updating col_idx " << col_idx << " to " << lower_[col_idx];
-      current_scan_target_.SetRangeComponent(lower_[col_idx], col_idx);
-    } else {
-      current_scan_target_.SetRangeComponent(upper_[col_idx], col_idx);
-      VLOG(3) << " Updating col_idx " << col_idx << " to " << upper_[col_idx];
-    }
-  }
-  VLOG(2) << "After " << __PRETTY_FUNCTION__ << " current_scan_target_ is " << current_scan_target_;
-}
-
-void RangeBasedScanChoices::DoneWithCurrentTarget() {
-  prev_scan_target_ = current_scan_target_;
-  current_scan_target_.Clear();
-}
-
-Status RangeBasedScanChoices::SeekToCurrentTarget(IntentAwareIterator* db_iter) {
-  VLOG(2) << __PRETTY_FUNCTION__ << " Advancing iterator towards target";
-  if (!FinishedWithScanChoices()) {
-    if (!current_scan_target_.empty()) {
-      VLOG(3) << __PRETTY_FUNCTION__ << " current_scan_target_ is non-empty. "
-              << current_scan_target_;
-      if (is_forward_scan_) {
-        VLOG(3) << __PRETTY_FUNCTION__ << " Seeking to " << current_scan_target_;
-        db_iter->Seek(current_scan_target_);
-      } else {
-        DocKey tmp = current_scan_target_;
-        tmp.AddRangeComponent(PrimitiveValue(ValueType::kHighest));
-        VLOG(3) << __PRETTY_FUNCTION__ << " Going to PrevDocKey " << tmp;  // Never seen.
-        db_iter->PrevDocKey(tmp);
-      }
-    } else {
-      if (!is_forward_scan_ && !prev_scan_target_.empty()) {
-        db_iter->PrevDocKey(prev_scan_target_);
-      }
-    }
-  }
-  return Status::OK();
+DocRowwiseIterator::DocRowwiseIterator(
+    const dockv::ReaderProjection& projection,
+    std::reference_wrapper<const DocReadContext> doc_read_context,
+    const TransactionOperationContext& txn_op_context,
+    const DocDB& doc_db,
+    const ReadOperationData& read_operation_data,
+    std::reference_wrapper<const ScopedRWOperation> pending_op,
+    const DocDBStatistics* statistics)
+    : DocRowwiseIteratorBase(
+          projection, doc_read_context, txn_op_context, doc_db, read_operation_data, pending_op),
+      statistics_(statistics) {
 }
 
 DocRowwiseIterator::DocRowwiseIterator(
-    const Schema &projection,
-    const Schema &schema,
-    const TransactionOperationContextOpt& txn_op_context,
+    const dockv::ReaderProjection& projection,
+    std::shared_ptr<DocReadContext> doc_read_context,
+    const TransactionOperationContext& txn_op_context,
     const DocDB& doc_db,
-    CoarseTimePoint deadline,
-    const ReadHybridTime& read_time,
-    yb::util::PendingOperationCounter* pending_op_counter)
-    : projection_(projection),
-      schema_(schema),
-      txn_op_context_(txn_op_context),
-      deadline_(deadline),
-      read_time_(read_time),
-      doc_db_(doc_db),
-      has_bound_key_(false),
-      pending_op_(pending_op_counter),
-      done_(false) {
-  projection_subkeys_.reserve(projection.num_columns() + 1);
-  projection_subkeys_.push_back(PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn));
-  for (size_t i = projection_.num_key_columns(); i < projection.num_columns(); i++) {
-    projection_subkeys_.emplace_back(projection.column_id(i));
+    const ReadOperationData& read_operation_data,
+    ScopedRWOperation&& pending_op,
+    const DocDBStatistics* statistics)
+    : DocRowwiseIteratorBase(
+          projection, doc_read_context, txn_op_context, doc_db, read_operation_data,
+          std::move(pending_op)),
+      statistics_(statistics) {
+}
+
+DocRowwiseIterator::~DocRowwiseIterator() = default;
+
+void DocRowwiseIterator::InitIterator(
+    BloomFilterMode bloom_filter_mode,
+    const boost::optional<const Slice>& user_key_for_filter,
+    const rocksdb::QueryId query_id,
+    std::shared_ptr<rocksdb::ReadFileFilter> file_filter) {
+  if (table_type_ == TableType::PGSQL_TABLE_TYPE) {
+    ConfigureForYsql();
   }
-  std::sort(projection_subkeys_.begin(), projection_subkeys_.end());
-  deadline_info_.emplace(deadline);
-}
 
-DocRowwiseIterator::~DocRowwiseIterator() {
-}
+  // Configure usage of fast backward scan. This must be done before creating of the intent
+  // aware iterator and when doc_mode_ is already set.
+  // TODO(#22371, #22556): Fast backward scan is supported for flat doc reader and packed row V2.
+  if (FLAGS_use_fast_backward_scan && !is_forward_scan_ &&
+      doc_mode_ == DocMode::kFlat && !FLAGS_ysql_use_packed_row_v2) {
+    use_fast_backward_scan_ = true;
+    VLOG_WITH_FUNC(1) << "Using FAST BACKWARD scan";
+  }
 
-Status DocRowwiseIterator::Init() {
-  auto query_id = rocksdb::kDefaultQueryId;
+  DCHECK(!db_iter_) << "InitIterator should be called only once";
 
   db_iter_ = CreateIntentAwareIterator(
-      doc_db_, BloomFilterMode::DONT_USE_BLOOM_FILTER,
-      boost::none /* user_key_for_filter */, query_id, txn_op_context_, deadline_, read_time_);
+      doc_db_,
+      bloom_filter_mode,
+      user_key_for_filter,
+      query_id,
+      txn_op_context_,
+      read_operation_data_,
+      file_filter,
+      nullptr /* iterate_upper_bound */,
+      FastBackwardScan{use_fast_backward_scan_},
+      statistics_);
+  InitResult();
 
-  row_key_ = DocKey(schema_);
-  VLOG(3) << __PRETTY_FUNCTION__ << " Seeking to " << row_key_;
-  db_iter_->Seek(row_key_);
-  row_ready_ = false;
-  has_bound_key_ = false;
+  auto prefix = shared_key_prefix();
+  if (is_forward_scan_ && has_bound_key_ &&
+      bound_key_.data().data()[0] != dockv::KeyEntryTypeAsChar::kHighest) {
+    DCHECK(bound_key_.AsSlice().starts_with(prefix))
+        << "Bound key: " << bound_key_.AsSlice().ToDebugHexString()
+        << ", prefix: " << prefix.ToDebugHexString();
+    upperbound_scope_.emplace(bound_key_, db_iter_.get());
+  } else {
+    DCHECK(!upperbound().empty());
+    upperbound_scope_.emplace(upperbound(), db_iter_.get());
+  }
 
-  return Status::OK();
+  if (use_fast_backward_scan_) {
+    auto lower_bound = shared_key_prefix();
+    // TODO(#22373): Do we need to consider bound_key_ here?
+    if (lower_bound.empty()) {
+      static const auto kMinByte = dockv::KeyEntryTypeAsChar::kLowest;
+      lower_bound = Slice(&kMinByte, 1);
+    }
+    lowerbound_scope_.emplace(lower_bound, db_iter_.get());
+  }
+
+  VLOG_WITH_FUNC(4) << "Initialization done";
 }
 
-Status DocRowwiseIterator::Init(const common::QLScanSpec& spec) {
-  const DocQLScanSpec& doc_spec = dynamic_cast<const DocQLScanSpec&>(spec);
-  is_forward_scan_ = doc_spec.is_forward_scan();
-
-  VLOG(4) << "Initializing iterator direction: " << (is_forward_scan_ ? "FORWARD" : "BACKWARD");
-
-  DocKey lower_doc_key;
-  DocKey upper_doc_key;
-  RETURN_NOT_OK(doc_spec.lower_bound(&lower_doc_key));
-  RETURN_NOT_OK(doc_spec.upper_bound(&upper_doc_key));
-  VLOG(4) << "DocKey Bounds " << lower_doc_key.ToString() << ", " << upper_doc_key.ToString();
-
-  // TODO(bogdan): decide if this is a good enough heuristic for using blooms for scans.
-  const bool is_fixed_point_get = !lower_doc_key.empty() &&
-      upper_doc_key.HashedComponentsEqual(lower_doc_key);
-  const auto mode = is_fixed_point_get ? BloomFilterMode::USE_BLOOM_FILTER :
-      BloomFilterMode::DONT_USE_BLOOM_FILTER;
-
-  const KeyBytes row_key_encoded = lower_doc_key.Encode();
-  const Slice row_key_encoded_as_slice = row_key_encoded.AsSlice();
-
-  db_iter_ = CreateIntentAwareIterator(
-      doc_db_, mode, row_key_encoded_as_slice, doc_spec.QueryId(), txn_op_context_,
-      deadline_, read_time_, doc_spec.CreateFileFilter());
-
-  row_ready_ = false;
-
-  if (is_forward_scan_) {
-    has_bound_key_ = !upper_doc_key.empty();
-    if (has_bound_key_) {
-      bound_key_ = upper_doc_key;
-    }
-  } else {
-    has_bound_key_ = !lower_doc_key.empty();
-    if (has_bound_key_) {
-      bound_key_ = lower_doc_key;
-    }
+void DocRowwiseIterator::ConfigureForYsql() {
+  ignore_ttl_ = true;
+  if (FLAGS_ysql_use_flat_doc_reader) {
+    doc_mode_ = DocMode::kFlat;
   }
-
-  if (doc_spec.range_options()) {
-    scan_choices_.reset(new DiscreteScanChoices(doc_spec, lower_doc_key, upper_doc_key));
-    // Let's not seek to the lower doc key or upper doc key. We know exactly what we want.
-    return AdvanceIteratorToNextDesiredRow();
-  }
-
-  if (doc_spec.range_bounds()) {
-    scan_choices_.reset(new RangeBasedScanChoices(schema_, doc_spec, lower_doc_key, upper_doc_key));
-  }
-
-  if (is_forward_scan_) {
-    VLOG(3) << __PRETTY_FUNCTION__ << " Seeking to " << row_key_;
-    db_iter_->Seek(lower_doc_key);
-  } else {
-    // TODO consider adding an operator bool to DocKey to use instead of empty() here.
-    if (!upper_doc_key.empty()) {
-      db_iter_->PrevDocKey(upper_doc_key);
-    } else {
-      db_iter_->SeekToLastDocKey();
-    }
-  }
-  return Status::OK();
 }
 
-Status DocRowwiseIterator::Init(const common::PgsqlScanSpec& spec) {
-  const DocPgsqlScanSpec& doc_spec = dynamic_cast<const DocPgsqlScanSpec&>(spec);
-  is_forward_scan_ = doc_spec.is_forward_scan();
-
-  VLOG(4) << "Initializing iterator direction: " << (is_forward_scan_ ? "FORWARD" : "BACKWARD");
-
-  DocKey lower_doc_key;
-  DocKey upper_doc_key;
-  RETURN_NOT_OK(doc_spec.lower_bound(&lower_doc_key));
-  RETURN_NOT_OK(doc_spec.upper_bound(&upper_doc_key));
-  VLOG(4) << "DocKey Bounds " << lower_doc_key.ToString() << ", " << upper_doc_key.ToString();
-
-  // TODO(bogdan): decide if this is a good enough heuristic for using blooms for scans.
-  const bool is_fixed_point_get = !lower_doc_key.empty() &&
-      upper_doc_key.HashedComponentsEqual(lower_doc_key);
-  const auto mode = is_fixed_point_get ? BloomFilterMode::USE_BLOOM_FILTER :
-      BloomFilterMode::DONT_USE_BLOOM_FILTER;
-
-  const KeyBytes row_key_encoded = lower_doc_key.Encode();
-  const Slice row_key_encoded_as_slice = row_key_encoded.AsSlice();
-
-  db_iter_ = CreateIntentAwareIterator(
-      doc_db_, mode, row_key_encoded_as_slice, doc_spec.QueryId(), txn_op_context_,
-      deadline_, read_time_, doc_spec.CreateFileFilter());
-
-  row_ready_ = false;
-
-  if (is_forward_scan_) {
-    has_bound_key_ = !upper_doc_key.empty();
-    if (has_bound_key_) {
-      bound_key_ = upper_doc_key;
-    }
+void DocRowwiseIterator::InitResult() {
+  if (doc_mode_ == DocMode::kFlat) {
+    row_ = std::nullopt;
   } else {
-    has_bound_key_ = !lower_doc_key.empty();
-    if (has_bound_key_) {
-      bound_key_ = lower_doc_key;
-    }
+    row_.emplace();
+  }
+}
+
+inline void DocRowwiseIterator::Seek(Slice key) {
+  VLOG_WITH_FUNC(3) << " Seeking to " << key << "/" << dockv::DocKey::DebugSliceToString(key);
+
+  prev_doc_found_ = DocReaderResult::kNotFound;
+
+  // We do not have values before dockv::KeyEntryTypeAsChar::kNullLow, but there is
+  // kLowest = 0 that is used to mark -Inf bound.
+  // Here we could safely interpret any key before kNullLow as empty.
+  // Another option would be changing kLowest value to kNullLow. But there are much more scenarios
+  // that could be affected and should be tested.
+  if (!key.empty() && key[0] >= dockv::KeyEntryTypeAsChar::kNullLow) {
+    db_iter_->Seek(key, Full::kTrue);
+    return;
   }
 
-  if (is_forward_scan_) {
-    db_iter_->Seek(lower_doc_key);
+  auto shared_prefix = shared_key_prefix();
+  if (!shared_prefix.empty()) {
+    db_iter_->Seek(shared_prefix, Full::kFalse);
+    return;
+  }
+
+  const auto null_low = dockv::KeyEntryTypeAsChar::kNullLow;
+  db_iter_->Seek(Slice(&null_low, 1), Full::kFalse);
+}
+
+inline void DocRowwiseIterator::SeekPrevDocKey(Slice key) {
+  // TODO consider adding an operator bool to DocKey to use instead of empty() here.
+  // TODO(#22373): Do we need to play with prev_doc_found_?
+  if (!key.empty()) {
+    db_iter_->SeekPrevDocKey(key);
   } else {
-    if (!upper_doc_key.empty()) {
-      db_iter_->PrevDocKey(upper_doc_key);
-    } else {
-      db_iter_->SeekToLastDocKey();
-    }
+    db_iter_->SeekToLastDocKey();
+  }
+}
+
+Status DocRowwiseIterator::AdvanceIteratorToNextDesiredRow(bool row_finished,
+                                                           bool current_fetched_row_skipped) {
+  if (!IsFetchedRowStatic() &&
+      VERIFY_RESULT(scan_choices_->AdvanceToNextRow(&row_key_, db_iter_.get(),
+                                                    current_fetched_row_skipped))) {
+    return Status::OK();
+  }
+  if (!is_forward_scan_) {
+    VLOG(4) << __PRETTY_FUNCTION__ << " setting as PrevDocKey";
+    db_iter_->PrevDocKey(row_key_);
+  } else if (row_finished) {
+    db_iter_->Revalidate();
+  } else {
+    db_iter_->SeekOutOfSubDoc(&row_key_);
   }
 
   return Status::OK();
 }
 
-Status DocRowwiseIterator::AdvanceIteratorToNextDesiredRow() const {
-  if (scan_choices_) {
-    if (!IsNextStaticColumn()
-        && !scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
-      return scan_choices_->SeekToCurrentTarget(db_iter_.get());
-    }
-  } else {
-    if (!is_forward_scan_) {
-      VLOG(4) << __PRETTY_FUNCTION__ << " setting as PrevDocKey";
-      db_iter_->PrevDocKey(row_key_);
-    }
+Result<bool> DocRowwiseIterator::PgFetchNext(dockv::PgTableRow* table_row) {
+  if (table_row) {
+    table_row->Reset();
   }
-
-  return Status::OK();
+  return FetchNextImpl(table_row);
 }
 
-Result<bool> DocRowwiseIterator::HasNext() const {
-  VLOG(4) << __PRETTY_FUNCTION__;
+Result<bool> DocRowwiseIterator::DoFetchNext(
+    qlexpr::QLTableRow* table_row,
+    const dockv::ReaderProjection* projection,
+    qlexpr::QLTableRow* static_row,
+    const dockv::ReaderProjection* static_projection) {
+  return FetchNextImpl(QLTableRowPair{table_row, projection, static_row, static_projection});
+}
 
-  // Repeated HasNext calls (without Skip/NextRow in between) should be idempotent:
-  // 1. If a previous call failed we returned the same status.
-  // 2. If a row is already available (row_ready_), return true directly.
-  // 3. If we finished all target rows for the scan (done_), return false directly.
-  RETURN_NOT_OK(has_next_status_);
-  if (row_ready_) {
-    // If row is ready, then HasNext returns true.
-    return true;
-  }
+template <class TableRow>
+Result<bool> DocRowwiseIterator::FetchNextImpl(TableRow table_row) {
+  VLOG_WITH_FUNC(4) << "done_: " << done_;
+
   if (done_) {
     return false;
   }
 
-  bool doc_found = false;
-  while (!doc_found) {
-    if (!db_iter_->valid() || (scan_choices_ && scan_choices_->FinishedWithScanChoices())) {
+  if (prev_doc_found_ != DocReaderResult::kNotFound) {
+    RETURN_NOT_OK(AdvanceIteratorToNextDesiredRow(
+        prev_doc_found_ == DocReaderResult::kFoundAndFinished, false));
+    prev_doc_found_ = DocReaderResult::kNotFound;
+  }
+
+  RETURN_NOT_OK(pending_op_ref_.GetAbortedStatus());
+
+  if (PREDICT_FALSE(FLAGS_TEST_fetch_next_delay_ms > 0)) {
+    const auto column_names = schema().column_names();
+    if (FLAGS_TEST_fetch_next_delay_column.empty() ||
+        std::find(column_names.begin(), column_names.end(), FLAGS_TEST_fetch_next_delay_column) !=
+            column_names.end()) {
+      YB_LOG_EVERY_N_SECS(INFO, 1)
+          << "Delaying read for " << FLAGS_TEST_fetch_next_delay_ms << " ms"
+          << ", schema column names: " << AsString(column_names);
+      SleepFor(FLAGS_TEST_fetch_next_delay_ms * 1ms);
+    }
+  }
+
+  bool first_iteration = true;
+  for (;;) {
+    if (scan_choices_->Finished()) {
       done_ = true;
       return false;
     }
 
-    const auto fetched_key = db_iter_->FetchKey();
-    if (!fetched_key.ok()) {
-      has_next_status_ = fetched_key.status();
-      return has_next_status_;
+    const auto& key_data = VERIFY_RESULT_REF(db_iter_->Fetch());
+    if (!key_data) {
+      done_ = true;
+      return false;
     }
 
-    VLOG(4) << "*fetched_key is " << *fetched_key;
+    VLOG(4) << "*fetched_key is " << dockv::SubDocKey::DebugSliceToString(key_data.key);
+    if (debug_dump_) {
+      LOG(INFO)
+          << __func__ << ", fetched key: " << dockv::SubDocKey::DebugSliceToString(key_data.key)
+          << ", " << key_data.key.ToDebugHexString();
+    }
 
     // The iterator is positioned by the previous GetSubDocument call (which places the iterator
     // outside the previous doc_key). Ensure the iterator is pushed forward/backward indeed. We
     // check it here instead of after GetSubDocument() below because we want to avoid the extra
     // expensive FetchKey() call just to fetch and validate the key.
-    if (!iter_key_.data().empty() &&
-        (is_forward_scan_ ? iter_key_.CompareTo(*fetched_key) >= 0
-                          : iter_key_.CompareTo(*fetched_key) <= 0)) {
-      has_next_status_ = STATUS_SUBSTITUTE(Corruption, "Infinite loop detected at $0",
-                                           FormatRocksDBSliceAsStr(*fetched_key));
-      return has_next_status_;
+    auto row_key = row_key_.AsSlice();
+    if (!first_iteration &&
+        (is_forward_scan_ ? row_key.compare(key_data.key) >= 0
+                          : row_key.compare(key_data.key) <= 0)) {
+      // TODO -- could turn this check off in TPCC?
+      auto status = STATUS_FORMAT(
+          Corruption, "Infinite loop detected at $0, row key: $1",
+          key_data.key.ToDebugString(), row_key.ToDebugString());
+      LOG(DFATAL) << status;
+      return status;
     }
-    iter_key_.Reset(*fetched_key);
-    VLOG(4) << " Current iter_key_ is " << iter_key_;
+    first_iteration = false;
 
-    const Result<size_t> dockey_size = row_key_.DecodeFrom(iter_key_);
-    if (!dockey_size.ok()) {
-      has_next_status_ = dockey_size.status();
-      return has_next_status_;
-    }
+    RETURN_NOT_OK(InitIterKey(key_data.key, dockv::IsFullRowValue(key_data.value)));
+    row_key = row_key_.AsSlice();
 
-    if (!row_key_.BelongsTo(schema_) ||
-        (has_bound_key_ && is_forward_scan_ == (row_key_ >= bound_key_))) {
+    if (has_bound_key_ && is_forward_scan_ == (row_key.compare(bound_key_) >= 0)) {
       done_ = true;
       return false;
     }
 
-    // Prepare the DocKey to get the SubDocument. Trim the DocKey to contain just the primary key.
-    Slice sub_doc_key(iter_key_.data().data(), *dockey_size);
-    VLOG(4) << " sub_doc_key part of iter_key_ is " << sub_doc_key;
+    VLOG(4) << " sub_doc_key part of iter_key_ is " << dockv::DocKey::DebugSliceToString(row_key);
 
-    bool is_static_column = IsNextStaticColumn();
-    if (scan_choices_ && !is_static_column) {
-      if (!scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
-        // We must have seeked past the target key we are looking for (no result) so we can safely
-        // skip all scan targets between the current target and row key (excluding row_key_ itself).
-        // Update the target key and iterator and call HasNext again to try the next target.
-        scan_choices_->SkipTargetsUpTo(row_key_);
+    bool is_static_column = IsFetchedRowStatic();
+    if (!is_static_column &&
+        !VERIFY_RESULT(scan_choices_->InterestedInRow(&row_key_, db_iter_.get()))) {
+      continue;
+    }
 
-        // We updated scan target above, if it goes past the row_key_ we will seek again, and
-        // process the found key in the next loop.
-        if (!scan_choices_->CurrentIteratorPositionMatchesCurrentTarget(row_key_)) {
-          scan_choices_->SeekToCurrentTarget(db_iter_.get());
-          continue;
-        }
+    if (doc_reader_ == nullptr) {
+      doc_reader_ = std::make_unique<DocDBTableReader>(
+          db_iter_.get(), read_operation_data_.deadline, &projection_, table_type_,
+          schema_packing_storage(), schema(), use_fast_backward_scan_);
+      RETURN_NOT_OK(doc_reader_->UpdateTableTombstoneTime(
+          VERIFY_RESULT(GetTableTombstoneTime(row_key))));
+      if (!ignore_ttl_) {
+        doc_reader_->SetTableTtl(schema());
       }
-      // We found a match for the target key or a static column, so we move on to getting the
-      // SubDocument.
     }
 
-    GetSubDocumentData data = { sub_doc_key, &row_, &doc_found, TableTTL(schema_) };
-    data.deadline_info = deadline_info_.get_ptr();
-    has_next_status_ = GetSubDocument(db_iter_.get(), data, &projection_subkeys_);
-    RETURN_NOT_OK(has_next_status_);
-    // After this, the iter should be positioned right after the subdocument.
+    if (doc_mode_ == DocMode::kGeneric) {
+      DCHECK_EQ(row_->type(), dockv::ValueEntryType::kObject);
+      row_->object_container().clear();
+    }
 
-    if (!doc_found) {
-      SubDocument full_row;
-      // If doc is not found, decide if some non-projection column exists.
-      // Currently we read the whole doc here,
-      // may be optimized by exiting on the first column in future.
-      db_iter_->Seek(row_key_);  // Position it for GetSubDocument.
-      data.result = &full_row;
-      has_next_status_ = GetSubDocument(db_iter_.get(), data);
-      RETURN_NOT_OK(has_next_status_);
+    const auto write_time = key_data.write_time;
+    const auto doc_found = VERIFY_RESULT(FetchRow(key_data, table_row));
+    // Use the write_time of the entire row.
+    // May lose some precision by not examining write time of every column.
+    IncrementKeyFoundStats(doc_found == DocReaderResult::kNotFound, write_time);
+
+    if (doc_found != DocReaderResult::kNotFound) {
+      RETURN_NOT_OK(FillRow(table_row));
+      prev_doc_found_ = doc_found;
+      break;
     }
-    if (scan_choices_ && !is_static_column) {
-      scan_choices_->DoneWithCurrentTarget();
-    }
-    has_next_status_ = AdvanceIteratorToNextDesiredRow();
-    RETURN_NOT_OK(has_next_status_);
+
+    RETURN_NOT_OK(AdvanceIteratorToNextDesiredRow(/* row_finished= */ false,
+                                                  /* current_fetched_row_skipped */ true));
   }
-  row_ready_ = true;
   return true;
+}
+
+Result<DocReaderResult> DocRowwiseIterator::FetchRow(
+    const FetchedEntry& fetched_entry, dockv::PgTableRow* table_row) {
+  CHECK_NE(doc_mode_, DocMode::kGeneric) << "Table type: " << table_type_;
+  return doc_reader_->GetFlat(row_key_.mutable_data(), fetched_entry, table_row);
+}
+
+Result<DocReaderResult> DocRowwiseIterator::FetchRow(
+    const FetchedEntry& fetched_entry, QLTableRowPair table_row) {
+  return doc_mode_ == DocMode::kFlat
+      ? doc_reader_->GetFlat(row_key_.mutable_data(), fetched_entry, table_row.table_row)
+      : doc_reader_->Get(row_key_.mutable_data(), fetched_entry, &*row_);
+}
+
+Status DocRowwiseIterator::FillRow(dockv::PgTableRow* out) {
+  return CopyKeyColumnsToRow(projection_, out);
+}
+
+Status DocRowwiseIterator::FillRow(QLTableRowPair out) {
+  if (!out.table_row) {
+    return Status::OK();
+  }
+
+  if (!out.static_row) {
+    return FillRow(out.table_row, out.projection);
+  }
+  if (IsFetchedRowStatic()) {
+    return FillRow(out.static_row, out.static_projection);
+  }
+
+  out.table_row->Clear();
+  return FillRow(out.table_row, out.projection);
 }
 
 string DocRowwiseIterator::ToString() const {
   return "DocRowwiseIterator";
 }
 
-namespace {
-
-// Set primary key column values (hashed or range columns) in a QL row value map.
-CHECKED_STATUS SetQLPrimaryKeyColumnValues(const Schema& schema,
-                                           const size_t begin_index,
-                                           const size_t column_count,
-                                           const char* column_type,
-                                           const vector<PrimitiveValue>& values,
-                                           QLTableRow* table_row) {
-  if (values.size() != column_count) {
-    return STATUS_SUBSTITUTE(Corruption, "$0 $1 primary key columns found but $2 expected",
-                             values.size(), column_type, column_count);
-  }
-  if (begin_index + column_count > schema.num_columns()) {
-    return STATUS_SUBSTITUTE(
-        Corruption,
-        "$0 primary key columns between positions $1 and $2 go beyond table columns $3",
-        column_type, begin_index, begin_index + column_count - 1, schema.num_columns());
-  }
-  for (size_t i = 0, j = begin_index; i < column_count; i++, j++) {
-    const auto ql_type = schema.column(j).type();
-    QLTableColumn& column = table_row->AllocColumn(schema.column_id(j));
-    PrimitiveValue::ToQLValuePB(values[i], ql_type, &column.value);
-  }
-  return Status::OK();
+Result<HybridTime> DocRowwiseIterator::RestartReadHt() {
+  return db_iter_->RestartReadHt();
 }
 
-} // namespace
-
-void DocRowwiseIterator::SkipRow() {
-  row_ready_ = false;
+HybridTime DocRowwiseIterator::TEST_MaxSeenHt() {
+  return db_iter_->TEST_MaxSeenHt();
 }
 
-HybridTime DocRowwiseIterator::RestartReadHt() {
-  auto max_seen_ht = db_iter_->max_seen_ht();
-  if (max_seen_ht.is_valid() && max_seen_ht > db_iter_->read_time().read) {
-    VLOG(4) << "Restart read: " << max_seen_ht << ", original: " << db_iter_->read_time();
-    return max_seen_ht;
-  }
-  return HybridTime::kInvalid;
-}
-
-bool DocRowwiseIterator::IsNextStaticColumn() const {
-  return schema_.has_statics() && row_key_.range_group().empty();
-}
-
-Status DocRowwiseIterator::DoNextRow(const Schema& projection, QLTableRow* table_row) {
+Status DocRowwiseIterator::FillRow(
+    qlexpr::QLTableRow* table_row, const dockv::ReaderProjection* projection_opt) {
   VLOG(4) << __PRETTY_FUNCTION__;
 
-  if (PREDICT_FALSE(done_)) {
-    return STATUS(NotFound, "end of iter");
+  const auto& projection = projection_opt ? *projection_opt : projection_;
+
+  if (projection.columns.empty()) {
+    return Status::OK();
   }
 
-  // Ensure row is ready to be read. HasNext() must be called before reading the first row, or
-  // again after the previous row has been read or skipped.
-  if (!row_ready_) {
-    return STATUS(InternalError, "next row has not be prepared for reading");
+  // Copy required key columns to table_row.
+  RETURN_NOT_OK(CopyKeyColumnsToRow(projection, table_row));
+
+  if (doc_mode_ == DocMode::kFlat) {
+    return Status::OK();
   }
 
-  // Populate the key column values from the doc key. The key column values in doc key were
-  // written in the same order as in the table schema (see DocKeyFromQLKey). If the range columns
-  // are present, read them also.
-  RETURN_NOT_OK(SetQLPrimaryKeyColumnValues(
-      schema_, 0, schema_.num_hash_key_columns(),
-      "hash", row_key_.hashed_group(), table_row));
-  if (!row_key_.range_group().empty()) {
-    RETURN_NOT_OK(SetQLPrimaryKeyColumnValues(
-        schema_, schema_.num_hash_key_columns(), schema_.num_range_key_columns(),
-        "range", row_key_.range_group(), table_row));
-  }
-
-  for (size_t i = projection.num_key_columns(); i < projection.num_columns(); i++) {
-    const auto& column_id = projection.column_id(i);
-    const auto ql_type = projection.column(i).type();
-    const SubDocument* column_value = row_.GetChild(PrimitiveValue(column_id));
-    if (column_value != nullptr) {
-      QLTableColumn& column = table_row->AllocColumn(column_id);
-      SubDocument::ToQLValuePB(*column_value, ql_type, &column.value);
-      column.ttl_seconds = column_value->GetTtl();
-      if (column_value->IsWriteTimeSet()) {
-        column.write_time = column_value->GetWriteTime();
-      }
+  DVLOG_WITH_FUNC(4) << "subdocument: " << AsString(*row_);
+  const auto& schema = this->schema();
+  for (const auto& column : projection.value_columns()) {
+    const auto* source = row_->GetChild(column.subkey);
+    auto& dest = table_row->AllocColumn(column.id);
+    if (!source) {
+      dest.value.Clear();
+      continue;
+    }
+    source->ToQLValuePB(VERIFY_RESULT_REF(schema.column_by_id(column.id)).type(), &dest.value);
+    dest.ttl_seconds = source->GetTtl();
+    if (source->IsWriteTimeSet()) {
+      dest.write_time = source->GetWriteTime();
     }
   }
 
-  row_ready_ = false;
+  VLOG_WITH_FUNC(4) << "Returning row: " << table_row->ToString();
+
   return Status::OK();
 }
 
 bool DocRowwiseIterator::LivenessColumnExists() const {
-  const SubDocument* subdoc = row_.GetChild(
-      PrimitiveValue::SystemColumnId(SystemColumnIds::kLivenessColumn));
-  return subdoc != nullptr && subdoc->value_type() != ValueType::kInvalid;
+  CHECK_NE(doc_mode_, DocMode::kFlat) << "Flat doc mode not supported yet";
+  const auto* subdoc = row_->GetChild(dockv::KeyEntryValue::kLivenessColumn);
+  return subdoc != nullptr && subdoc->value_type() != dockv::ValueEntryType::kInvalid;
 }
 
-CHECKED_STATUS DocRowwiseIterator::GetNextReadSubDocKey(SubDocKey* sub_doc_key) const {
-  if (db_iter_ == nullptr) {
-    return STATUS(Corruption, "Iterator not initialized.");
-  }
-
-  // There are no more rows to fetch, so no next SubDocKey to read.
-  if (!VERIFY_RESULT(HasNext())) {
-    DVLOG(3) << "No Next SubDocKey";
-    return Status::OK();
-  }
-
-  *sub_doc_key = SubDocKey(row_key_, read_time_.read);
-  DVLOG(3) << "Next SubDocKey: " << sub_doc_key->ToString();
-  return Status::OK();
-}
-
-Result<string> DocRowwiseIterator::GetRowKey() const {
-  return std::move(*row_key_.Encode().mutable_data());
-}
-
-Status DocRowwiseIterator::Seek(const std::string& row_key) {
-  DocKey doc_key;
-  RETURN_NOT_OK(doc_key.DecodeFrom(Slice(row_key)));
-  db_iter_->Seek(doc_key);
-  iter_key_.Clear();
-  row_ready_ = false;
-  return Status::OK();
-}
-
-}  // namespace docdb
-}  // namespace yb
+}  // namespace yb::docdb

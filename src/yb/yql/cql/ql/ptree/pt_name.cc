@@ -16,7 +16,14 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/pt_name.h"
+
+#include "yb/common/redis_constants_common.h"
+
+#include "yb/yql/cql/ql/ptree/pt_create_table.h"
+#include "yb/yql/cql/ql/ptree/pt_option.h"
 #include "yb/yql/cql/ql/ptree/sem_context.h"
+
+using std::string;
 
 namespace yb {
 namespace ql {
@@ -24,7 +31,7 @@ namespace ql {
 //--------------------------------------------------------------------------------------------------
 
 PTName::PTName(MemoryContext *memctx,
-               YBLocation::SharedPtr loc,
+               YBLocationPtr loc,
                const MCSharedPtr<MCString>& name)
     : TreeNode(memctx, loc),
       name_(name) {
@@ -33,83 +40,9 @@ PTName::PTName(MemoryContext *memctx,
 PTName::~PTName() {
 }
 
-CHECKED_STATUS PTName::SetupPrimaryKey(SemContext *sem_context) const {
-  PTColumnDefinition* const column = sem_context->GetColumnDefinition(*name_);
-  if (column == nullptr) {
-    return sem_context->Error(this, "Column does not exist", ErrorCode::UNDEFINED_COLUMN);
-  }
-  if (column->is_primary_key()) {
-    return sem_context->Error(this, ErrorCode::DUPLICATE_COLUMN);
-  }
-
-  // Add the analyzed column to table. For CREATE INDEX, need to check for proper datatype and set
-  // column location because column definition is loaded from the indexed table definition actually.
-  PTCreateTable* const table = sem_context->current_create_table_stmt();
-  if (table->opcode() == TreeNodeOpcode::kPTCreateIndex) {
-    if (column->datatype() == nullptr) {
-      return sem_context->Error(this, "Unsupported index datatype",
-                                ErrorCode::SQL_STATEMENT_INVALID);
-    }
-    column->set_loc(*this);
-    column->datatype()->set_loc(*this);
-  }
-
-  return table->AppendPrimaryColumn(sem_context, column);
-}
-
-CHECKED_STATUS PTName::SetupHashAndPrimaryKey(SemContext *sem_context) const {
-  PTColumnDefinition* const column = sem_context->GetColumnDefinition(*name_);
-  if (column == nullptr) {
-    return sem_context->Error(this, "Column does not exist", ErrorCode::UNDEFINED_COLUMN);
-  }
-  if (column->is_primary_key()) {
-    return sem_context->Error(this, ErrorCode::DUPLICATE_COLUMN);
-  }
-
-  // Add the analyzed column to table. For CREATE INDEX, need to check for proper datatype and set
-  // column location because column definition is loaded from the indexed table definition actually.
-  PTCreateTable* const table = sem_context->current_create_table_stmt();
-  if (table->opcode() == TreeNodeOpcode::kPTCreateIndex) {
-    if (column->datatype() == nullptr) {
-      return sem_context->Error(this, "Unsupported index datatype",
-                                ErrorCode::SQL_STATEMENT_INVALID);
-    }
-    column->set_loc(*this);
-    column->datatype()->set_loc(*this);
-  }
-
-  return table->AppendHashColumn(sem_context, column);
-}
-
-CHECKED_STATUS PTName::SetupCoveringIndexColumn(SemContext *sem_context) const {
-  PTColumnDefinition* const column = sem_context->GetColumnDefinition(*name_);
-  if (column == nullptr) {
-    return sem_context->Error(this, "Column does not exist", ErrorCode::UNDEFINED_COLUMN);
-  }
-  if (column->is_primary_key()) {
-    // Covering column is already included in primary key, do nothing
-    return Status::OK();
-  }
-  if (column->is_static()) {
-    return sem_context->Error(this, "Static column not supported as a covering index column",
-                              ErrorCode::SQL_STATEMENT_INVALID);
-  }
-
-  // Add the analyzed covering index column to table. Need to check for proper datatype and set
-  // column location because column definition is loaded from the indexed table definition actually.
-  PTCreateTable* const table = sem_context->current_create_table_stmt();
-  DCHECK(table->opcode() == TreeNodeOpcode::kPTCreateIndex);
-  if (column->datatype() == nullptr) {
-    return sem_context->Error(this, "Unsupported index datatype", ErrorCode::SQL_STATEMENT_INVALID);
-  }
-  column->set_loc(*this);
-  column->datatype()->set_loc(*this);
-  return table->AppendColumnIfNotPresent(sem_context, column);
-}
-
 //--------------------------------------------------------------------------------------------------
 
-PTNameAll::PTNameAll(MemoryContext *memctx, YBLocation::SharedPtr loc)
+PTNameAll::PTNameAll(MemoryContext *memctx, YBLocationPtr loc)
     : PTName(memctx, loc, MCMakeShared<MCString>(memctx, "*")) {
 }
 
@@ -119,7 +52,7 @@ PTNameAll::~PTNameAll() {
 //--------------------------------------------------------------------------------------------------
 
 PTQualifiedName::PTQualifiedName(MemoryContext *memctx,
-                                 YBLocation::SharedPtr loc,
+                                 YBLocationPtr loc,
                                  const PTName::SharedPtr& ptname)
     : PTName(memctx, loc),
       ptnames_(memctx) {
@@ -127,7 +60,7 @@ PTQualifiedName::PTQualifiedName(MemoryContext *memctx,
 }
 
 PTQualifiedName::PTQualifiedName(MemoryContext *memctx,
-                                 YBLocation::SharedPtr loc,
+                                 YBLocationPtr loc,
                                  const MCSharedPtr<MCString>& name)
     : PTName(memctx, loc),
       ptnames_(memctx) {
@@ -145,7 +78,7 @@ void PTQualifiedName::Prepend(const PTName::SharedPtr& ptname) {
   ptnames_.push_front(ptname);
 }
 
-CHECKED_STATUS PTQualifiedName::Analyze(SemContext *sem_context) {
+Status PTQualifiedName::Analyze(SemContext *sem_context) {
   // We don't support qualified name yet except for a keyspace.
   // Support only the names like: '<keyspace_name>.<table_name>'.
   if (ptnames_.size() >= 3) {
@@ -155,9 +88,9 @@ CHECKED_STATUS PTQualifiedName::Analyze(SemContext *sem_context) {
   return Status::OK();
 }
 
-CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const ObjectType object_type) {
+Status PTQualifiedName::AnalyzeName(SemContext *sem_context, const ObjectType object_type) {
   switch (object_type) {
-    case OBJECT_SCHEMA:
+    case ObjectType::SCHEMA:
       if (ptnames_.size() != 1) {
         return sem_context->Error(this, "Invalid keyspace name", ErrorCode::INVALID_ARGUMENTS);
       }
@@ -168,7 +101,7 @@ CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const Objec
                                   ErrorCode::INVALID_ARGUMENTS);
       }
       return Status::OK();
-    case OBJECT_ROLE:
+    case ObjectType::ROLE:
       if (ptnames_.size() != 1) {
         return sem_context->Error(this,
                                   strings::Substitute("Invalid $0 name",
@@ -176,9 +109,9 @@ CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const Objec
                                   ErrorCode::SQL_STATEMENT_INVALID);
       }
       return Status::OK();
-    case OBJECT_TABLE: FALLTHROUGH_INTENDED;
-    case OBJECT_TYPE: FALLTHROUGH_INTENDED;
-    case OBJECT_INDEX:
+    case ObjectType::TABLE: FALLTHROUGH_INTENDED;
+    case ObjectType::TYPE: FALLTHROUGH_INTENDED;
+    case ObjectType::INDEX:
       if (ptnames_.size() > 2) {
         return sem_context->Error(this,
                                   strings::Substitute("Invalid $0 name",
@@ -187,7 +120,7 @@ CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const Objec
       }
       if (ptnames_.size() == 2) {
         auto* create_table_stmt = sem_context->current_create_table_stmt();
-        if (object_type == OBJECT_TYPE &&
+        if (object_type == ObjectType::TYPE &&
             create_table_stmt != nullptr &&
             create_table_stmt->yb_table_name().namespace_name() != ptnames_.front()->name()) {
           return sem_context->Error(this,
@@ -200,7 +133,7 @@ CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const Objec
         string keyspace_name = sem_context->CurrentKeyspace();
         // For user-defined types we prioritize using the table keyspace if available.
         auto* create_table_stmt = sem_context->current_create_table_stmt();
-        if (object_type == OBJECT_TYPE &&
+        if (object_type == ObjectType::TYPE &&
             create_table_stmt != nullptr &&
             create_table_stmt->yb_table_name().has_namespace()) {
           keyspace_name = create_table_stmt->yb_table_name().namespace_name();
@@ -222,44 +155,44 @@ CHECKED_STATUS PTQualifiedName::AnalyzeName(SemContext *sem_context, const Objec
 
       return Status::OK();
 
-    case OBJECT_AGGREGATE: FALLTHROUGH_INTENDED;
-    case OBJECT_AMOP: FALLTHROUGH_INTENDED;
-    case OBJECT_AMPROC: FALLTHROUGH_INTENDED;
-    case OBJECT_ATTRIBUTE: FALLTHROUGH_INTENDED;
-    case OBJECT_CAST: FALLTHROUGH_INTENDED;
-    case OBJECT_COLUMN: FALLTHROUGH_INTENDED;
-    case OBJECT_COLLATION: FALLTHROUGH_INTENDED;
-    case OBJECT_CONVERSION: FALLTHROUGH_INTENDED;
-    case OBJECT_DATABASE: FALLTHROUGH_INTENDED;
-    case OBJECT_DEFAULT: FALLTHROUGH_INTENDED;
-    case OBJECT_DEFACL: FALLTHROUGH_INTENDED;
-    case OBJECT_DOMAIN: FALLTHROUGH_INTENDED;
-    case OBJECT_DOMCONSTRAINT: FALLTHROUGH_INTENDED;
-    case OBJECT_EVENT_TRIGGER: FALLTHROUGH_INTENDED;
-    case OBJECT_EXTENSION: FALLTHROUGH_INTENDED;
-    case OBJECT_FDW: FALLTHROUGH_INTENDED;
-    case OBJECT_FOREIGN_SERVER: FALLTHROUGH_INTENDED;
-    case OBJECT_FOREIGN_TABLE: FALLTHROUGH_INTENDED;
-    case OBJECT_FUNCTION: FALLTHROUGH_INTENDED;
-    case OBJECT_LANGUAGE: FALLTHROUGH_INTENDED;
-    case OBJECT_LARGEOBJECT: FALLTHROUGH_INTENDED;
-    case OBJECT_MATVIEW: FALLTHROUGH_INTENDED;
-    case OBJECT_OPCLASS: FALLTHROUGH_INTENDED;
-    case OBJECT_OPERATOR: FALLTHROUGH_INTENDED;
-    case OBJECT_OPFAMILY: FALLTHROUGH_INTENDED;
-    case OBJECT_POLICY: FALLTHROUGH_INTENDED;
-    case OBJECT_RULE: FALLTHROUGH_INTENDED;
-    case OBJECT_SEQUENCE: FALLTHROUGH_INTENDED;
-    case OBJECT_TABCONSTRAINT: FALLTHROUGH_INTENDED;
-    case OBJECT_TABLESPACE: FALLTHROUGH_INTENDED;
-    case OBJECT_TRANSFORM: FALLTHROUGH_INTENDED;
-    case OBJECT_TRIGGER: FALLTHROUGH_INTENDED;
-    case OBJECT_TSCONFIGURATION: FALLTHROUGH_INTENDED;
-    case OBJECT_TSDICTIONARY: FALLTHROUGH_INTENDED;
-    case OBJECT_TSPARSER: FALLTHROUGH_INTENDED;
-    case OBJECT_TSTEMPLATE: FALLTHROUGH_INTENDED;
-    case OBJECT_USER_MAPPING: FALLTHROUGH_INTENDED;
-    case OBJECT_VIEW:
+    case ObjectType::AGGREGATE: FALLTHROUGH_INTENDED;
+    case ObjectType::AMOP: FALLTHROUGH_INTENDED;
+    case ObjectType::AMPROC: FALLTHROUGH_INTENDED;
+    case ObjectType::ATTRIBUTE: FALLTHROUGH_INTENDED;
+    case ObjectType::CAST: FALLTHROUGH_INTENDED;
+    case ObjectType::COLUMN: FALLTHROUGH_INTENDED;
+    case ObjectType::COLLATION: FALLTHROUGH_INTENDED;
+    case ObjectType::CONVERSION: FALLTHROUGH_INTENDED;
+    case ObjectType::DATABASE: FALLTHROUGH_INTENDED;
+    case ObjectType::DEFAULT: FALLTHROUGH_INTENDED;
+    case ObjectType::DEFACL: FALLTHROUGH_INTENDED;
+    case ObjectType::DOMAIN: FALLTHROUGH_INTENDED;
+    case ObjectType::DOMCONSTRAINT: FALLTHROUGH_INTENDED;
+    case ObjectType::EVENT_TRIGGER: FALLTHROUGH_INTENDED;
+    case ObjectType::EXTENSION: FALLTHROUGH_INTENDED;
+    case ObjectType::FDW: FALLTHROUGH_INTENDED;
+    case ObjectType::FOREIGN_SERVER: FALLTHROUGH_INTENDED;
+    case ObjectType::FOREIGN_TABLE: FALLTHROUGH_INTENDED;
+    case ObjectType::FUNCTION: FALLTHROUGH_INTENDED;
+    case ObjectType::LANGUAGE: FALLTHROUGH_INTENDED;
+    case ObjectType::LARGEOBJECT: FALLTHROUGH_INTENDED;
+    case ObjectType::MATVIEW: FALLTHROUGH_INTENDED;
+    case ObjectType::OPCLASS: FALLTHROUGH_INTENDED;
+    case ObjectType::OPERATOR: FALLTHROUGH_INTENDED;
+    case ObjectType::OPFAMILY: FALLTHROUGH_INTENDED;
+    case ObjectType::POLICY: FALLTHROUGH_INTENDED;
+    case ObjectType::RULE: FALLTHROUGH_INTENDED;
+    case ObjectType::SEQUENCE: FALLTHROUGH_INTENDED;
+    case ObjectType::TABCONSTRAINT: FALLTHROUGH_INTENDED;
+    case ObjectType::TABLESPACE: FALLTHROUGH_INTENDED;
+    case ObjectType::TRANSFORM: FALLTHROUGH_INTENDED;
+    case ObjectType::TRIGGER: FALLTHROUGH_INTENDED;
+    case ObjectType::TSCONFIGURATION: FALLTHROUGH_INTENDED;
+    case ObjectType::TSDICTIONARY: FALLTHROUGH_INTENDED;
+    case ObjectType::TSPARSER: FALLTHROUGH_INTENDED;
+    case ObjectType::TSTEMPLATE: FALLTHROUGH_INTENDED;
+    case ObjectType::USER_MAPPING: FALLTHROUGH_INTENDED;
+    case ObjectType::VIEW:
       return sem_context->Error(this, ErrorCode::FEATURE_NOT_SUPPORTED);
   }
   return Status::OK();

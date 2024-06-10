@@ -22,8 +22,6 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 //
 
-#ifndef YB_ROCKSDB_DB_INTERNAL_STATS_H
-#define YB_ROCKSDB_DB_INTERNAL_STATS_H
 
 #pragma once
 #include <vector>
@@ -62,7 +60,18 @@ struct DBPropertyInfo {
 
 extern const DBPropertyInfo* GetPropertyInfo(const Slice& property);
 
-#ifndef ROCKSDB_LITE
+enum class InternalDBStatsType {
+  WAL_FILE_BYTES,
+  WAL_FILE_SYNCED,
+  BYTES_WRITTEN,
+  NUMBER_KEYS_WRITTEN,
+  WRITE_DONE_BY_OTHER,
+  WRITE_DONE_BY_SELF,
+  WRITE_WITH_WAL,
+  WRITE_STALL_MICROS,
+  INTERNAL_DB_STATS_ENUM_MAX,
+};
+
 class InternalStats {
  public:
   enum InternalCFStatsType {
@@ -79,29 +88,8 @@ class InternalStats {
     INTERNAL_CF_STATS_ENUM_MAX,
   };
 
-  enum InternalDBStatsType {
-    WAL_FILE_BYTES,
-    WAL_FILE_SYNCED,
-    BYTES_WRITTEN,
-    NUMBER_KEYS_WRITTEN,
-    WRITE_DONE_BY_OTHER,
-    WRITE_DONE_BY_SELF,
-    WRITE_WITH_WAL,
-    WRITE_STALL_MICROS,
-    INTERNAL_DB_STATS_ENUM_MAX,
-  };
-
-  InternalStats(int num_levels, Env* env, ColumnFamilyData* cfd)
-      : db_stats_{},
-        cf_stats_value_{},
-        cf_stats_count_{},
-        comp_stats_(num_levels),
-        file_read_latency_(num_levels),
-        bg_error_count_(0),
-        number_levels_(num_levels),
-        env_(env),
-        cfd_(cfd),
-        started_at_(env->NowMicros()) {}
+  InternalStats(int num_levels, Env* env, ColumnFamilyData* cfd);
+  ~InternalStats();
 
   // Per level compaction stats.  comp_stats_[level] stores the stats for
   // compactions that produced data for the specified "level".
@@ -151,21 +139,6 @@ class InternalStats {
           num_input_records(0),
           num_dropped_records(0),
           count(_count) {}
-
-    explicit CompactionStats(const CompactionStats& c)
-        : micros(c.micros),
-          bytes_read_non_output_levels(c.bytes_read_non_output_levels),
-          bytes_read_output_level(c.bytes_read_output_level),
-          bytes_written(c.bytes_written),
-          bytes_moved(c.bytes_moved),
-          num_input_files_in_non_output_levels(
-              c.num_input_files_in_non_output_levels),
-          num_input_files_in_output_level(
-              c.num_input_files_in_output_level),
-          num_output_files(c.num_output_files),
-          num_input_records(c.num_input_records),
-          num_dropped_records(c.num_dropped_records),
-          count(c.count) {}
 
     void Add(const CompactionStats& c) {
       this->micros += c.micros;
@@ -218,18 +191,16 @@ class InternalStats {
   }
 
   void AddDBStats(InternalDBStatsType type, uint64_t value) {
-    auto& v = db_stats_[type];
+    auto& v = db_stats_[static_cast<size_t>(type)];
     v.store(v.load(std::memory_order_relaxed) + value,
             std::memory_order_relaxed);
   }
 
   uint64_t GetDBStats(InternalDBStatsType type) {
-    return db_stats_[type].load(std::memory_order_relaxed);
+    return db_stats_[static_cast<size_t>(type)].load(std::memory_order_relaxed);
   }
 
-  HistogramImpl* GetFileReadHist(int level) {
-    return &file_read_latency_[level];
-  }
+  HistogramImpl* GetFileReadHist(int level);
 
   uint64_t GetBackgroundErrorCount() const { return bg_error_count_; }
 
@@ -253,7 +224,8 @@ class InternalStats {
   void DumpCFStats(std::string* value);
 
   // Per-DB stats
-  std::atomic<uint64_t> db_stats_[INTERNAL_DB_STATS_ENUM_MAX];
+  std::atomic<uint64_t> db_stats_[
+      static_cast<size_t>(InternalDBStatsType::INTERNAL_DB_STATS_ENUM_MAX)];
   // Per-ColumnFamily stats
   uint64_t cf_stats_value_[INTERNAL_CF_STATS_ENUM_MAX];
   uint64_t cf_stats_count_[INTERNAL_CF_STATS_ENUM_MAX];
@@ -375,91 +347,5 @@ class InternalStats {
   const uint64_t started_at_;
 };
 
-#else
-
-class InternalStats {
- public:
-  enum InternalCFStatsType {
-    LEVEL0_SLOWDOWN_TOTAL,
-    LEVEL0_SLOWDOWN_WITH_COMPACTION,
-    MEMTABLE_COMPACTION,
-    MEMTABLE_SLOWDOWN,
-    LEVEL0_NUM_FILES_TOTAL,
-    LEVEL0_NUM_FILES_WITH_COMPACTION,
-    SOFT_PENDING_COMPACTION_BYTES_LIMIT,
-    HARD_PENDING_COMPACTION_BYTES_LIMIT,
-    WRITE_STALLS_ENUM_MAX,
-    BYTES_FLUSHED,
-    INTERNAL_CF_STATS_ENUM_MAX,
-  };
-
-  enum InternalDBStatsType {
-    WAL_FILE_BYTES,
-    WAL_FILE_SYNCED,
-    BYTES_WRITTEN,
-    NUMBER_KEYS_WRITTEN,
-    WRITE_DONE_BY_OTHER,
-    WRITE_DONE_BY_SELF,
-    WRITE_WITH_WAL,
-    WRITE_STALL_MICROS,
-    INTERNAL_DB_STATS_ENUM_MAX,
-  };
-
-  InternalStats(int num_levels, Env* env, ColumnFamilyData* cfd) {}
-
-  struct CompactionStats {
-    uint64_t micros;
-    uint64_t bytes_read_non_output_levels;
-    uint64_t bytes_read_output_level;
-    uint64_t bytes_written;
-    uint64_t bytes_moved;
-    int num_input_files_in_non_output_levels;
-    int num_input_files_in_output_level;
-    int num_output_files;
-    uint64_t num_input_records;
-    uint64_t num_dropped_records;
-    int count;
-
-    explicit CompactionStats(int _count = 0) {}
-
-    explicit CompactionStats(const CompactionStats& c) {}
-
-    void Add(const CompactionStats& c) {}
-
-    void Subtract(const CompactionStats& c) {}
-  };
-
-  void AddCompactionStats(int level, const CompactionStats& stats) {}
-
-  void IncBytesMoved(int level, uint64_t amount) {}
-
-  void AddCFStats(InternalCFStatsType type, uint64_t value) {}
-
-  void AddDBStats(InternalDBStatsType type, uint64_t value) {}
-
-  HistogramImpl* GetFileReadHist(int level) { return nullptr; }
-
-  uint64_t GetBackgroundErrorCount() const { return 0; }
-
-  uint64_t BumpAndGetBackgroundErrorCount() { return 0; }
-
-  bool GetStringProperty(const DBPropertyInfo& property_info,
-                         const Slice& property, std::string* value) {
-    return false;
-  }
-
-  bool GetIntProperty(const DBPropertyInfo& property_info, uint64_t* value,
-                      DBImpl* db) const {
-    return false;
-  }
-
-  bool GetIntPropertyOutOfMutex(const DBPropertyInfo& property_info,
-                                Version* version, uint64_t* value) const {
-    return false;
-  }
-};
-#endif  // !ROCKSDB_LITE
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_INTERNAL_STATS_H

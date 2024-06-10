@@ -11,10 +11,9 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_TYPES_VTABLE_H
-#define YB_MASTER_YQL_TYPES_VTABLE_H
+#pragma once
 
-#include "yb/master/yql_empty_vtable.h"
+#include "yb/master/yql_virtual_table.h"
 
 namespace yb {
 namespace master {
@@ -22,9 +21,10 @@ namespace master {
 // VTable implementation of system_schema.types.
 class QLTypesVTable : public YQLVirtualTable {
  public:
-  explicit QLTypesVTable(const Master* const master);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  explicit QLTypesVTable(const TableName& table_name,
+                         const NamespaceName& namespace_name,
+                         Master* const master);
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
  protected:
   Schema CreateSchema() const;
  private:
@@ -37,4 +37,3 @@ class QLTypesVTable : public YQLVirtualTable {
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_TYPES_VTABLE_H

@@ -20,6 +20,7 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 import static junit.framework.TestCase.assertTrue;
@@ -37,17 +38,25 @@ import org.junit.runner.RunWith;
 @RunWith(value=YBTestRunner.class)
 public class TestSystemTables extends BaseCQLTest {
 
+  protected Map<String, String> getTServerFlags() {
+      Map<String, String> flagMap = super.getTServerFlags();
+      flagMap.put("cql_update_system_query_cache_msecs", "0");
+      return flagMap;
+  }
+
   @Test
   public void testSystemTables() throws Exception {
     List<InetSocketAddress> contactPoints = miniCluster.getCQLContactPoints();
     assertEquals(NUM_TABLET_SERVERS, contactPoints.size());
 
+    TranslatedAddressEndPoint translatedContactPointToConnect;
     // Chose one contact point to connect.
     for (InetSocketAddress contactPointToConnect : contactPoints) {
 
       // Initialize connection.
-      Host host = new Host(contactPointToConnect, cluster.manager.convictionPolicyFactory,
-        cluster.manager);
+      translatedContactPointToConnect = new TranslatedAddressEndPoint(contactPointToConnect);
+      Host host = new Host(translatedContactPointToConnect, cluster.manager.convictionPolicyFactory,
+            cluster.manager);
       Connection connection = cluster.manager.connectionFactory.open(host);
 
       // Run query and verify.

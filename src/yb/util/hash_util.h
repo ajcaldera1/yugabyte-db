@@ -32,8 +32,7 @@
 
 #include <stdint.h>
 
-#ifndef YB_UTIL_HASH_UTIL_H
-#define YB_UTIL_HASH_UTIL_H
+#pragma once
 
 namespace yb {
 
@@ -45,7 +44,7 @@ class HashUtil {
   static const int MURMUR_R = 47;
 
   /// Murmur2 hash implementation returning 64-bit hashes.
-  static uint64_t MurmurHash2_64(const void* input, int len, uint64_t seed) {
+  static uint64_t MurmurHash2_64(const void* input, size_t len, uint64_t seed) {
     uint64_t h = seed ^ (len * MURMUR_PRIME);
 
     const uint64_t* data = reinterpret_cast<const uint64_t*>(input);
@@ -80,4 +79,3 @@ class HashUtil {
 };
 
 } // namespace yb
-#endif

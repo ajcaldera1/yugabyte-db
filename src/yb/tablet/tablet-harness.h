@@ -29,32 +29,27 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TABLET_TABLET_HARNESS_H
-#define YB_TABLET_TABLET_HARNESS_H
+#pragma once
 
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "yb/common/partition.h"
 #include "yb/common/schema.h"
-#include "yb/consensus/log_anchor_registry.h"
+
+#include "yb/dockv/dockv_fwd.h"
+
 #include "yb/fs/fs_manager.h"
-#include "yb/server/logical_clock.h"
-#include "yb/server/metadata.h"
+
+#include "yb/server/clock.h"
 
 #include "yb/tablet/tablet_fwd.h"
-#include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet_metadata.h"
-#include "yb/tablet/tablet_options.h"
-#include "yb/util/env.h"
-#include "yb/util/mem_tracker.h"
-#include "yb/util/metrics.h"
-#include "yb/util/status.h"
 
-using std::string;
-using std::vector;
+#include "yb/util/env.h"
+#include "yb/util/metrics.h"
+#include "yb/util/status_log.h"
+
 
 namespace yb {
 namespace tablet {
@@ -65,22 +60,12 @@ namespace tablet {
 //
 // The partition schema will have no hash components, and a single range component over the primary
 // key columns. The partition will cover the entire partition-key space.
-static std::pair<PartitionSchema, Partition> CreateDefaultPartition(const Schema& schema) {
-  // Create a default partition schema.
-  PartitionSchema partition_schema;
-  CHECK_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
-
-  // Create the tablet partitions.
-  vector<Partition> partitions;
-  CHECK_OK(partition_schema.CreatePartitions(vector<YBPartialRow>(), schema, &partitions));
-  CHECK_EQ(1, partitions.size());
-  return std::make_pair(partition_schema, partitions[0]);
-}
+std::pair<dockv::PartitionSchema, dockv::Partition> CreateDefaultPartition(const Schema& schema);
 
 class TabletHarness {
  public:
   struct Options {
-    explicit Options(string root_dir)
+    explicit Options(std::string root_dir)
         : env(Env::Default()),
           tablet_id("test_tablet_id"),
           root_dir(std::move(root_dir)),
@@ -88,8 +73,8 @@ class TabletHarness {
           enable_metrics(true) {}
 
     Env* env;
-    string tablet_id;
-    string root_dir;
+    std::string tablet_id;
+    std::string root_dir;
     TableType table_type;
     bool enable_metrics;
   };
@@ -97,61 +82,21 @@ class TabletHarness {
   TabletHarness(const Schema& schema, Options options)
       : options_(std::move(options)), schema_(schema) {}
 
-  virtual ~TabletHarness() {}
+  virtual ~TabletHarness() = default;
 
-  CHECKED_STATUS Create(bool first_time) {
-    std::pair<PartitionSchema, Partition> partition(CreateDefaultPartition(schema_));
+  Status Create(bool first_time);
 
-    // Build the Tablet
-    fs_manager_.reset(new FsManager(options_.env, options_.root_dir, "tserver_test"));
-    if (first_time) {
-      RETURN_NOT_OK(fs_manager_->CreateInitialFileSystemLayout());
-    }
-    RETURN_NOT_OK(fs_manager_->Open());
+  Status Open();
 
-    scoped_refptr<TabletMetadata> metadata;
-    RETURN_NOT_OK(TabletMetadata::LoadOrCreate(fs_manager_.get(),
-                                               "YBTableTest",
-                                               options_.tablet_id,
-                                               "YBTableTest",
-                                               options_.table_type,
-                                               schema_,
-                                               partition.first,
-                                               partition.second,
-                                               boost::none /* index_info */,
-                                               TABLET_DATA_READY,
-                                               &metadata));
-    if (options_.enable_metrics) {
-      metrics_registry_.reset(new MetricRegistry());
-    }
+  Result<TabletPtr> OpenTablet(const TabletId& tablet_id);
 
-    clock_ = server::LogicalClock::CreateStartingAt(HybridTime::kInitial);
-    TabletOptions tablet_options;
-    tablet_.reset(new TabletClass(metadata,
-                                  std::shared_future<client::YBClientPtr>(),
-                                  clock_,
-                                  std::shared_ptr<MemTracker>(),
-                                  metrics_registry_.get(),
-                                  new log::LogAnchorRegistry(),
-                                  tablet_options,
-                                  std::string() /* log_pefix_suffix */,
-                                  nullptr /* transaction_participant_context */,
-                                  client::LocalTabletFilter(),
-                                  nullptr /* transaction_coordinator_context */));
-    return Status::OK();
-  }
-
-  CHECKED_STATUS Open() {
-    RETURN_NOT_OK(tablet_->Open());
-    tablet_->MarkFinishedBootstrapping();
-    return tablet_->EnableCompactions();
-  }
+  TabletInitData MakeTabletInitData(const RaftGroupMetadataPtr& metadata);
 
   server::Clock* clock() const {
     return clock_.get();
   }
 
-  const std::shared_ptr<TabletClass>& tablet() {
+  const TabletPtr& tablet() {
     return tablet_;
   }
 
@@ -163,17 +108,18 @@ class TabletHarness {
     return metrics_registry_.get();
   }
 
+  const Options& options() const { return options_; }
+
  private:
   Options options_;
 
-  gscoped_ptr<MetricRegistry> metrics_registry_;
+  std::unique_ptr<MetricRegistry> metrics_registry_;
 
   scoped_refptr<server::Clock> clock_;
   Schema schema_;
-  gscoped_ptr<FsManager> fs_manager_;
-  std::shared_ptr<TabletClass> tablet_;
+  std::unique_ptr<FsManager> fs_manager_;
+  TabletPtr tablet_;
 };
 
 } // namespace tablet
 } // namespace yb
-#endif // YB_TABLET_TABLET_HARNESS_H

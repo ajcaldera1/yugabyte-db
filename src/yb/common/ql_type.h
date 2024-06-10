@@ -15,15 +15,21 @@
 // This module is to define a few supporting functions for QLTYPE.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_COMMON_QL_TYPE_H_
-#define YB_COMMON_QL_TYPE_H_
+#pragma once
 
-#include <glog/logging.h>
+#include <memory>
+#include <string>
+#include <utility>
+#include <vector>
 
-#include "yb/common/key_encoder.h"
-#include "yb/common/common.pb.h"
-#include "yb/util/result.h"
-#include "yb/util/status.h"
+#include <boost/optional.hpp>
+
+#include "yb/util/logging.h"
+
+#include "yb/common/common_fwd.h"
+#include "yb/common/value.messages.h"
+#include "yb/gutil/macros.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -31,234 +37,136 @@ namespace yb {
 // Used internally in QLType and only set for user-defined types.
 class UDTypeInfo {
  public:
-
-  UDTypeInfo(std::string keyspace_name, std::string name)
-      : keyspace_name_(keyspace_name), name_(name) {
+  UDTypeInfo(std::string&& keyspace_name,
+             std::string&& name,
+             std::string&& id,
+             std::vector<std::string>&& field_names)
+      : keyspace_name_(std::move(keyspace_name)),
+        name_(std::move(name)),
+        id_(std::move(id)),
+        field_names_(std::move(field_names)) {
   }
 
-  const string& keyspace_name() const {
+  const std::string& keyspace_name() const {
     return keyspace_name_;
   }
 
-  const string& name() const {
+  const std::string& name() const {
     return name_;
   }
 
-  const string& id() const {
+  const std::string& id() const {
     return id_;
   }
 
-  const std::vector<string>& field_names() const {
+  const std::vector<std::string>& field_names() const {
     return field_names_;
   }
 
-  const string& field_name(int index) const {
+  const std::string& field_name(size_t index) const {
     return field_names_[index];
   }
 
-  void set_udt_fields(const std::string& type_id,
-                      const std::vector<std::string>& field_names) {
-    id_ = type_id;
-    field_names_ = field_names;
-  }
-
  private:
-  std::string keyspace_name_;
-  std::string name_;
-  std::string id_;
-  std::vector<std::string> field_names_ = {};
+  const std::string keyspace_name_;
+  const std::string name_;
+  const std::string id_;
+  const std::vector<std::string> field_names_;
 };
 
 class QLType {
  public:
-  typedef std::shared_ptr<QLType> SharedPtr;
+  using SharedPtr = std::shared_ptr<QLType>;
+  using Params = std::vector<SharedPtr>;
 
   //------------------------------------------------------------------------------------------------
-  // The Create() functions are to construct QLType objects.
-  template<DataType data_type>
-  static const std::shared_ptr<QLType>& CreatePrimitiveType() {
-    static std::shared_ptr<QLType> ql_type = std::make_shared<QLType>(data_type);
-    return ql_type;
-  }
-
-  template<DataType data_type>
-  static std::shared_ptr<QLType> CreateCollectionType(
-      const vector<std::shared_ptr<QLType>>& params) {
-    return std::make_shared<QLType>(data_type, params);
-  }
-
   // Create all builtin types including collection.
-  static std::shared_ptr<QLType> Create(DataType data_type,
-                                        const vector<std::shared_ptr<QLType>>& params);
+  static SharedPtr Create(DataType type, Params params);
 
   // Create primitive types, all builtin types except collection.
-  static std::shared_ptr<QLType> Create(DataType data_type);
+  static SharedPtr Create(DataType type);
 
   // Check type methods.
   static bool IsValidPrimaryType(DataType type);
 
   // Create map datatype.
-  static std::shared_ptr<QLType> CreateTypeMap(std::shared_ptr<QLType> key_type,
-                                               std::shared_ptr<QLType> value_type);
-  static std::shared_ptr<QLType> CreateTypeMap(DataType key_type, DataType value_type);
-  static std::shared_ptr<QLType> CreateTypeMap() {
-    // Create default map type: MAP <UNKNOWN -> UNKNOWN>.
-    static const std::shared_ptr<QLType> default_map =
-        CreateTypeMap(QLType::Create(DataType::UNKNOWN_DATA),
-                      QLType::Create(DataType::UNKNOWN_DATA));
-    return default_map;
-  }
+  static SharedPtr CreateTypeMap(SharedPtr key_type, SharedPtr value_type);
+  static SharedPtr CreateTypeMap(DataType key_type, DataType value_type);
 
   // Create list datatype.
-  static std::shared_ptr<QLType> CreateTypeList(std::shared_ptr<QLType> value_type);
-  static std::shared_ptr<QLType> CreateTypeList(DataType val_type);
-  static std::shared_ptr<QLType> CreateTypeList() {
-    // Create default list type: LIST <UNKNOWN>.
-    static const std::shared_ptr<QLType> default_list = CreateTypeList(DataType::UNKNOWN_DATA);
-    return default_list;
-  }
+  static SharedPtr CreateTypeList(SharedPtr value_type);
+  static SharedPtr CreateTypeList(DataType val_type);
 
   // Create set datatype.
-  static std::shared_ptr<QLType> CreateTypeSet(std::shared_ptr<QLType> value_type);
-  static std::shared_ptr<QLType> CreateTypeSet(DataType value_type);
-  static std::shared_ptr<QLType> CreateTypeSet() {
-    // Create default set type: SET <UNKNOWN>.
-    static const std::shared_ptr<QLType> default_set = CreateTypeSet(DataType::UNKNOWN_DATA);
-    return default_set;
-  }
+  static SharedPtr CreateTypeSet(SharedPtr value_type);
+  static SharedPtr CreateTypeSet(DataType value_type);
 
   // Create frozen datatype
-  static std::shared_ptr<QLType> CreateTypeFrozen(std::shared_ptr<QLType> value_type);
-  static std::shared_ptr<QLType> CreateTypeFrozen() {
-  // Create default frozen type: FROZEN <UNKNOWN>.
-    static const std::shared_ptr<QLType> default_frozen =
-        CreateTypeFrozen(QLType::Create(DataType::UNKNOWN_DATA));
-    return default_frozen;
-  }
+  static SharedPtr CreateTypeFrozen(SharedPtr value_type);
 
-  //------------------------------------------------------------------------------------------------
-  // Constructors.
-
-  // Constructor for elementary types
-  explicit QLType(DataType ql_typeid) : id_(ql_typeid), params_(0) {
-  }
-
-  // Constructor for collection types
-  QLType(DataType ql_typeid, const vector<std::shared_ptr<QLType>>& params)
-      : id_(ql_typeid), params_(params) {
-  }
-
-  // Constructor for user-defined types
-  QLType(const string& keyspace_name, const string& type_name)
-      : id_(USER_DEFINED_TYPE), params_(0) {
-    udtype_info_ = std::make_shared<UDTypeInfo>(keyspace_name, type_name);
-  }
-
-  virtual ~QLType() {
-  }
+  static SharedPtr CreateUDType(
+      std::string keyspace_name,
+      std::string type_name,
+      std::string type_id,
+      std::vector<std::string> field_names,
+      Params field_types);
 
   //------------------------------------------------------------------------------------------------
   // Protobuf support.
 
-  void ToQLTypePB(QLTypePB *pb_type) const;
-  static std::shared_ptr<QLType> FromQLTypePB(const QLTypePB& pb_type);
+  void ToQLTypePB(QLTypePB* pb_type) const;
+  static SharedPtr FromQLTypePB(const QLTypePB& pb_type);
 
   //------------------------------------------------------------------------------------------------
   // Access functions.
 
-  const DataType main() const {
+  DataType main() const {
     return id_;
   }
 
-  const vector<std::shared_ptr<QLType>>& params() const {
+  const Params& params() const {
     return params_;
   }
 
-  std::shared_ptr<QLType> keys_type() const {
-    switch (id_) {
-      case MAP:
-        return params_[0];
-      case LIST:
-        return QLType::Create(INT32);
-      case SET:
-        // set has no keys, only values
-        return nullptr;
-      case TUPLE:
-        LOG(FATAL) << "Tuple type not implemented yet";
+  const SharedPtr& keys_type() const;
 
-      default:
-        // elementary types have no keys or values
-        return nullptr;
-    }
-  }
+  const SharedPtr& values_type() const;
 
-  std::shared_ptr<QLType> values_type() const {
-    switch (id_) {
-      case MAP:
-        return params_[1];
-      case LIST:
-        return params_[0];
-      case SET:
-        return params_[0];
-      case TUPLE:
-        LOG(FATAL) << "Tuple type not implemented yet";
+  const SharedPtr& param_type(size_t member_index = 0) const;
 
-      default:
-        // other types have no keys or values
-        return nullptr;
-    }
-  }
-
-  const QLType::SharedPtr& param_type(int member_index = 0) const {
-    DCHECK_LT(member_index, params_.size());
-    return params_[member_index];
-  }
-
-  const TypeInfo* type_info() const {
-    return GetTypeInfo(id_);
-  }
+  const TypeInfo* type_info() const;
 
   //------------------------------------------------------------------------------------------------
   // Methods for User-Defined types.
 
-  const std::vector<string>& udtype_field_names() const {
+  const UDTypeInfo* udtype_info() const {
+    return udtype_info_;
+  }
+
+  const std::vector<std::string>& udtype_field_names() const {
     return udtype_info_->field_names();
   }
 
-  const string& udtype_field_name(int index) const {
+  const std::string& udtype_field_name(size_t index) const {
     return udtype_info_->field_name(index);
   }
 
-  const string& udtype_keyspace_name() const {
+  const std::string& udtype_keyspace_name() const {
     return udtype_info_->keyspace_name();
   }
 
-  const string& udtype_name() const {
+  const std::string& udtype_name() const {
     return udtype_info_->name();
   }
 
-  const string& udtype_id() const {
+  const std::string& udtype_id() const {
     return udtype_info_->id();
   }
 
-  void SetUDTypeFields(const std::string &type_id,
-                       const std::vector<std::string> &field_names,
-                       const std::vector<std::shared_ptr<QLType>> &field_types) {
-    udtype_info_->set_udt_fields(type_id, field_names);
-    params_ = field_types;
-  }
-
   // returns position of "field_name" in udtype_field_names() vector if found, otherwise -1
-  const int GetUDTypeFieldIdxByName(const string &field_name) const {
-    const std::vector<string>& field_names = udtype_field_names();
-    int i = 0;
-    while (i != field_names.size()) {
-      if (field_names[i] == field_name) return i;
-      i++;
-    }
-    return -1;
-  }
+  boost::optional<size_t> GetUDTypeFieldIdxByName(const std::string& field_name) const;
 
+  // Get the type ids of all UDTs (transitively) referenced by this UDT.
   std::vector<std::string> GetUserDefinedTypeIds() const {
     std::vector<std::string> udt_ids;
     GetUserDefinedTypeIds(&udt_ids);
@@ -274,29 +182,33 @@ class QLType {
     }
   }
 
+  // Check whether the type id exists among type ids of all UDTs referenced by this UDT.
+  static bool DoesUserDefinedTypeIdExist(const QLTypePB& type_pb,
+                                         bool transitive,
+                                         const std::string& udt_id);
+
+  // Get the type ids of all UDTs referenced by this UDT.
+  static void GetUserDefinedTypeIds(const QLTypePB& type_pb,
+                                    bool transitive,
+                                    std::vector<std::string>* udt_ids);
+
   // Returns the type of given field, or nullptr if that field is not found in this UDT.R
-  const Result<QLType::SharedPtr> GetUDTFieldTypeByName(const std::string& field_name) const {
-    SCHECK(IsUserDefined(), InternalError, "Can only be called on UDT");
-    const int idx = GetUDTypeFieldIdxByName(field_name);
-    if (idx == -1) {
-      return nullptr;
-    }
-    return param_type(idx);
-  }
+  Result<SharedPtr> GetUDTFieldTypeByName(const std::string& field_name) const;
 
   //------------------------------------------------------------------------------------------------
   // Predicates.
 
   bool IsCollection() const {
-    return id_ == MAP || id_ == SET || id_ == LIST || id_ == TUPLE;
+    return id_ == DataType::MAP || id_ == DataType::SET || id_ == DataType::LIST ||
+           id_ == DataType::TUPLE;
   }
 
   bool IsUserDefined() const {
-    return id_ == USER_DEFINED_TYPE;
+    return id_ == DataType::USER_DEFINED_TYPE;
   }
 
   bool IsFrozen() const {
-    return id_ == FROZEN;
+    return id_ == DataType::FROZEN;
   }
 
   bool IsParametric() const {
@@ -338,13 +250,13 @@ class QLType {
       return params_.empty();
     } else {
       // checking number of params
-      if (id_ == MAP && params_.size() != 2) {
+      if (id_ == DataType::MAP && params_.size() != 2) {
         return false; // expect two type parameters for maps
-      } else if ((id_ == SET || id_ == LIST) && params_.size() != 1) {
+      } else if ((id_ == DataType::SET || id_ == DataType::LIST) && params_.size() != 1) {
         return false; // expect one type parameter for set and list
-      } else if (id_ == TUPLE && params_.size() == 0) {
+      } else if (id_ == DataType::TUPLE && params_.size() == 0) {
         return false; // expect at least one type parameters for tuples
-      } else if (id_ == FROZEN && params_.size() != 1) {
+      } else if (id_ == DataType::FROZEN && params_.size() != 1) {
         return false; // expect one type parameter for frozen
       }
       // recursively checking params
@@ -355,12 +267,24 @@ class QLType {
     }
   }
 
+  bool Contains(DataType id) const {
+    if (id_ == id) {
+      return true;
+    }
+    for (const auto& param : params_) {
+      if (param->Contains(id)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   bool operator ==(const QLType& other) const {
     if (IsUserDefined()) {
       return other.IsUserDefined() && udtype_id() == other.udtype_id();
     }
     if (id_ == other.id_ && params_.size() == other.params_.size()) {
-      for (int i = 0; i < params_.size(); i++) {
+      for (size_t i = 0; i < params_.size(); i++) {
         if (*params_[i] == *other.params_[i]) {
           continue;
         }
@@ -372,37 +296,41 @@ class QLType {
     return false;
   }
 
+  bool operator !=(const QLType& other) const {
+    return !(*this == other);
+  }
+
+  // TODO: It is the only non-const method which is used for tuples only.
+  //       It must be removed somehow as the QLType objects are stored in various caches and they
+  //       must be immutable.
+  void add_param(SharedPtr param) {
+    DCHECK(id_ == DataType::TUPLE);
+    params_.push_back(std::move(param));
+  }
+
   //------------------------------------------------------------------------------------------------
   // Logging supports.
-  const string ToString() const;
+  std::string ToString() const;
   void ToString(std::stringstream& os) const;
-  static const string ToCQLString(const DataType& datatype);
+  static const std::string& ToCQLString(DataType type);
 
   //------------------------------------------------------------------------------------------------
   // static methods
-  static const int kMaxTypeIndex = DataType::JSONB + 1;
-
-  // When a new type is added in the enum "DataType", kMaxTypeIndex should be updated for this
-  // module to work properly. The DCHECKs in this struct would failed if kMaxTypeIndex is wrong.
-  static bool IsValid(DataType type) {
-    return (type >= 0 && type < kMaxTypeIndex);
-  }
-
   static bool IsInteger(DataType t) {
-    return (t >= INT8 && t <= INT64) || t == VARINT;
+    return (t >= DataType::INT8 && t <= DataType::INT64) || t == DataType::VARINT;
   }
 
   static bool IsJson(DataType t) {
-    return t == JSONB;
+    return t == DataType::JSONB;
   }
 
   static bool IsNumeric(DataType t) {
-    return IsInteger(t) || t == FLOAT || t == DOUBLE || t == DECIMAL;
+    return IsInteger(t) || t == DataType::FLOAT || t == DataType::DOUBLE || t == DataType::DECIMAL;
   }
 
   // NULL_VALUE_TYPE represents type of a null value.
   static bool IsNull(DataType t) {
-    return t == NULL_VALUE_TYPE;
+    return t == DataType::NULL_VALUE_TYPE;
   }
 
   // Type is not yet set (VOID).
@@ -432,146 +360,44 @@ class QLType {
     kNotAllowed = 5,
   };
 
-  static ConversionMode GetConversionMode(DataType left, DataType right) {
-    DCHECK(IsValid(left) && IsValid(right)) << left << ", " << right;
-
-    static const ConversionMode kID = ConversionMode::kIdentical;
-    static const ConversionMode kSI = ConversionMode::kSimilar;
-    static const ConversionMode kIM = ConversionMode::kImplicit;
-    static const ConversionMode kFC = ConversionMode::kFurtherCheck;
-    static const ConversionMode kEX = ConversionMode::kExplicit;
-    static const ConversionMode kNA = ConversionMode::kNotAllowed;
-    static const ConversionMode kConversionMode[kMaxTypeIndex][kMaxTypeIndex] = {
-        // LHS :=  RHS (source)
-        //         nul | i8  | i16 | i32 | i64 | str | bln | flt | dbl | bin | tst | dec | vit | ine | lst | map | set | uid | tui | tup | arg | udt | frz | dat | tim | jso
-        /* nul */{ kID,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM,  kIM },
-        /* i8 */ { kIM,  kID,  kSI,  kSI,  kSI,  kNA,  kNA,  kEX,  kEX,  kNA,  kNA,  kEX,  kSI,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* i16 */{ kIM,  kSI,  kID,  kSI,  kSI,  kNA,  kNA,  kEX,  kEX,  kNA,  kNA,  kEX,  kSI,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* i32 */{ kIM,  kSI,  kSI,  kID,  kSI,  kNA,  kNA,  kEX,  kEX,  kNA,  kNA,  kEX,  kSI,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* i64 */{ kIM,  kSI,  kSI,  kSI,  kID,  kNA,  kNA,  kEX,  kEX,  kNA,  kEX,  kEX,  kSI,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kEX,  kEX,  kNA },
-        /* str */{ kIM,  kEX,  kEX,  kEX,  kEX,  kID,  kEX,  kEX,  kEX,  kNA,  kEX,  kEX,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kEX,  kEX,  kEX },
-        /* bln */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* flt */{ kIM,  kIM,  kIM,  kIM,  kIM,  kNA,  kNA,  kID,  kSI,  kNA,  kNA,  kSI,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* dbl */{ kIM,  kIM,  kIM,  kIM,  kIM,  kNA,  kNA,  kSI,  kID,  kNA,  kNA,  kSI,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* bin */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* tst */{ kIM,  kNA,  kNA,  kNA,  kIM,  kIM,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kEX,  kNA,  kNA,  kNA,  kNA,  kIM,  kIM,  kNA },
-        /* dec */{ kIM,  kIM,  kIM,  kIM,  kIM,  kEX,  kNA,  kSI,  kSI,  kNA,  kEX,  kID,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* vit */{ kIM,  kSI,  kSI,  kSI,  kSI,  kNA,  kNA,  kEX,  kEX,  kNA,  kEX,  kEX,  kID,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kEX,  kEX,  kNA },
-        /* ine */{ kIM,  kNA,  kNA,  kNA,  kNA,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* lst */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* map */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kFC,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* set */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* uid */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* tui */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kIM,  kID,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* tup */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* arg */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kNA,  kNA,  kNA,  kNA },
-        /* udt */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kNA,  kNA,  kNA,  kNA },
-        /* frz */{ kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kFC,  kFC,  kFC,  kNA,  kNA,  kFC,  kNA,  kFC,  kFC,  kNA,  kNA,  kNA },
-        /* dat */{ kIM,  kNA,  kNA,  kNA,  kIM,  kIM,  kNA,  kNA,  kNA,  kNA,  kIM,  kNA,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kEX,  kNA,  kNA,  kNA,  kNA,  kID,  kNA,  kNA },
-        /* tim */{ kIM,  kNA,  kNA,  kNA,  kIM,  kIM,  kNA,  kNA,  kNA,  kNA,  kIM,  kNA,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID,  kNA },
-        /* jso */{ kNA,  kNA,  kNA,  kNA,  kNA,  kIM,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kNA,  kID },
-    };
-    return kConversionMode[left][right];
-  }
+  static ConversionMode GetConversionMode(DataType left, DataType right);
 
   static bool IsIdentical(DataType left, DataType right) {
     return GetConversionMode(left, right) == ConversionMode::kIdentical;
   }
 
-  static bool IsSimilar(DataType left, DataType right) {
-    return GetConversionMode(left, right) <= ConversionMode::kSimilar;
-  }
+  static bool IsSimilar(DataType left, DataType right);
 
   static bool IsImplicitlyConvertible(DataType left, DataType right) {
     return GetConversionMode(left, right) <= ConversionMode::kImplicit;
   }
 
-  static bool IsPotentiallyConvertible(DataType left, DataType right) {
-    return GetConversionMode(left, right) <= ConversionMode::kFurtherCheck;
-  }
+  static bool IsPotentiallyConvertible(DataType left, DataType right);
 
   static bool IsExplicitlyConvertible(DataType left, DataType right) {
     return GetConversionMode(left, right) <= ConversionMode::kExplicit;
   }
 
-  static bool IsImplicitlyConvertible(const std::shared_ptr<QLType>& lhs_type,
-                                      const std::shared_ptr<QLType>& rhs_type) {
-    switch (QLType::GetConversionMode(lhs_type->main(), rhs_type->main())) {
-      case QLType::ConversionMode::kIdentical: FALLTHROUGH_INTENDED;
-      case QLType::ConversionMode::kSimilar: FALLTHROUGH_INTENDED;
-      case QLType::ConversionMode::kImplicit:
-        return true;
+  static bool IsImplicitlyConvertible(const SharedPtr& lhs_type,
+                                      const SharedPtr& rhs_type);
 
-      case QLType::ConversionMode::kFurtherCheck:
-        // checking params convertibility
-        if (lhs_type->params().size() != rhs_type->params().size()) {
-          return false;
-        }
-        for (int i = 0; i < lhs_type->params().size(); i++) {
-          if (!IsImplicitlyConvertible(lhs_type->params().at(i), rhs_type->params().at(i))) {
-            return false;
-          }
-        }
-        return true;
+  static bool IsComparable(DataType left, DataType right);
 
-      case QLType::ConversionMode::kExplicit: FALLTHROUGH_INTENDED;
-      case QLType::ConversionMode::kNotAllowed:
-        return false;
-    }
-
-    LOG(FATAL) << "Unsupported conversion mode in switch statement";
-    return false;
-  }
-
-  static bool IsComparable(DataType left, DataType right) {
-    DCHECK(IsValid(left) && IsValid(right)) << left << ", " << right;
-
-    static const bool kYS = true;
-    static const bool kNO = false;
-    static const bool kCompareMode[kMaxTypeIndex][kMaxTypeIndex] = {
-        // LHS ==  RHS (source)
-        //         nul | i8  | i16 | i32 | i64 | str | bln | flt | dbl | bin | tst | dec | vit | ine | lst | map | set | uid | tui | tup | arg | udt | frz | dat | tim | jso 
-        /* nul */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* i8  */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* i16 */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* i32 */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* i64 */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* str */{ kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* bln */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* flt */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* dbl */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* bin */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* tst */{ kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO },
-        /* dec */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* vit */{ kNO,  kYS,  kYS,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* ine */{ kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* lst */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* map */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* set */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* uid */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* tui */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* tup */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* arg */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* udt */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO },
-        /* frz */{ kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO },
-        /* dat */{ kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO },
-        /* tim */{ kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kYS,  kNO },
-        /* jso */{ kNO,  kNO,  kNO,  kNO,  kNO,  kYS,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kNO,  kYS },
-    };
-    return kCompareMode[left][right];
-  }
+  struct Internals;
 
  private:
+  QLType(DataType id, Params&& params, const UDTypeInfo* udtype_info)
+      : id_(id), params_(std::move(params)), udtype_info_(udtype_info) {}
+
   //------------------------------------------------------------------------------------------------
   // Data members.
-  DataType id_;
-  std::vector<std::shared_ptr<QLType>> params_;
+  const DataType id_;
+  Params params_;
 
   // Members for User-Defined Types
-  std::shared_ptr<UDTypeInfo> udtype_info_ = nullptr; // default
+  const UDTypeInfo* udtype_info_;
+
+  DISALLOW_COPY_AND_ASSIGN(QLType);
 };
 
-
 }; // namespace yb
-
-#endif  // YB_COMMON_QL_TYPE_H_

@@ -11,8 +11,7 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_AUTH_ROLE_PERMISSIONS_VTABLE_H
-#define YB_MASTER_YQL_AUTH_ROLE_PERMISSIONS_VTABLE_H
+#pragma once
 
 #include "yb/master/yql_virtual_table.h"
 
@@ -22,10 +21,11 @@ namespace master {
 // VTable implementation of system_auth.role_permissions
 class YQLAuthRolePermissionsVTable : public YQLVirtualTable {
  public:
-  explicit YQLAuthRolePermissionsVTable(const Master* const master);
+  explicit YQLAuthRolePermissionsVTable(const TableName& table_name,
+                                        const NamespaceName& namespace_name,
+                                        yb::master::Master * const master);
 
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
 
  protected:
   Schema CreateSchema() const;
@@ -39,4 +39,3 @@ class YQLAuthRolePermissionsVTable : public YQLVirtualTable {
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_AUTH_ROLE_PERMISSIONS_VTABLE_H

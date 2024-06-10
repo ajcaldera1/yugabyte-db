@@ -19,20 +19,6 @@
 //
 #include "yb/rocksdb/port/stack_trace.h"
 
-#if defined(ROCKSDB_LITE) || !(defined(OS_LINUX) || defined(OS_MACOSX)) || \
-    defined(CYGWIN)
-
-// noop
-
-namespace rocksdb {
-namespace port {
-void InstallStackTraceHandler() {}
-void PrintStack(int first_frames_to_skip) {}
-}  // namespace port
-}  // namespace rocksdb
-
-#else
-
 #include <execinfo.h>
 #include <signal.h>
 #include <stdio.h>
@@ -46,7 +32,7 @@ namespace port {
 
 namespace {
 
-#ifdef OS_LINUX
+#ifdef __linux__
 const char* GetExecutableName() {
   static char name[1024];
 
@@ -147,5 +133,3 @@ void InstallStackTraceHandler() {
 
 }  // namespace port
 }  // namespace rocksdb
-
-#endif

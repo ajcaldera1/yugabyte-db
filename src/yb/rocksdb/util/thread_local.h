@@ -24,12 +24,11 @@
 #pragma once
 
 #include <atomic>
-#include <memory>
 #include <unordered_map>
 #include <vector>
 
-#include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/port/port.h"
+#include "yb/rocksdb/util/autovector.h"
 
 #ifndef ROCKSDB_SUPPORT_THREAD_LOCAL  // NOLINT
 #if !defined(OS_WIN) && !defined(OS_MACOSX) && !defined(IOS_CROSS_COMPILE)
@@ -105,7 +104,7 @@ class ThreadLocalPtr {
   // global StaticMeta singleton. So if we instantiated 3 ThreadLocalPtr
   // instances, each thread will have a ThreadData with a vector of size 3:
   //     ---------------------------------------------------
-  //     |          | instance 1 | instance 2 | instnace 3 |
+  //     |          | instance 1 | instance 2 | instance 3 |
   //     ---------------------------------------------------
   //     | thread 1 |    void*   |    void*   |    void*   | <- ThreadData
   //     ---------------------------------------------------

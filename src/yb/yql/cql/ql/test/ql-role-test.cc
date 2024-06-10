@@ -13,24 +13,25 @@
 //
 //--------------------------------------------------------------------------------------------------
 
-#include <bitset>
-
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 #include <gtest/gtest.h>
 
+#include "yb/client/client.h"
 #include "yb/client/permissions.h"
 
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master.h"
-#include "yb/master/master.proxy.h"
-#include "yb/master/mini_master.h"
+#include "yb/common/ql_value.h"
 
-#include "yb/rpc/messenger.h"
-
-#include "yb/yql/cql/ql/test/ql-test-base.h"
 #include "yb/gutil/strings/substitute.h"
 
+#include "yb/master/mini_master.h"
+
+#include "yb/util/crypt.h"
+#include "yb/util/status_log.h"
+
+#include "yb/yql/cql/ql/test/ql-test-base.h"
+
 DECLARE_bool(use_cassandra_authentication);
+DECLARE_bool(ycql_allow_non_authenticated_password_reset);
 
 constexpr const char* const kDefaultCassandraUsername = "cassandra";
 
@@ -48,18 +49,7 @@ using strings::Substitute;
 using std::string;
 
 #define EXEC_DUPLICATE_CREATE_ROLE_STMT(stmt)                           \
-  do {                                                                  \
-    Status s = processor->Run(stmt);                                    \
-    EXPECT_FALSE(s.ok());                                               \
-    EXPECT_FALSE(s.ToString().find("Duplicate Role. ") == string::npos); \
-  } while (false)
-
-#define EXEC_INVALID_STMT_MSG(stmt, msg)                                \
-  do {                                                                  \
-    Status s = processor->Run(stmt);                                    \
-    ASSERT_FALSE(s.ok());                                               \
-    ASSERT_FALSE(s.ToString().find(msg) == string::npos);               \
-  } while (false)
+  EXEC_INVALID_STMT_WITH_ERROR(stmt, "Duplicate Role. ")
 
 static const char invalid_grant_describe_error_msg[] =
     "Resource type DataResource does not support any of the requested permissions";
@@ -78,7 +68,7 @@ static const std::vector<string> all_permissions_for_role =
 
 class QLTestAuthentication : public QLTestBase {
  public:
-  QLTestAuthentication() : QLTestBase(), permissions_cache_(client_, false) {}
+  QLTestAuthentication() : QLTestBase(), permissions_cache_(client_.get(), false) {}
 
   virtual void SetUp() override {
     QLTestBase::SetUp();
@@ -124,6 +114,10 @@ class QLTestAuthentication : public QLTestBase {
     return "DROP ROLE IF EXISTS " + params;
   }
 
+  inline const string AlterStmt(const string& role, string password) {
+    return Substitute("ALTER ROLE $0 WITH PASSWORD = '$1'", role, password);
+  }
+
   static const string GrantStmt(const string& role, const string& recipient) {
     return Substitute("GRANT $0 TO $1", role, recipient);
   }
@@ -132,11 +126,11 @@ class QLTestAuthentication : public QLTestBase {
     return Substitute("REVOKE $0 FROM $1", role, recipient);
   }
 
-  void CreateRole(TestQLProcessor* processor, const string& role_name) {
-
-    // SUPERUSER = false because otherwise we can't really revoke permissions.
+  // Use superuser = false if there is a need to revoke permissions.
+  void CreateRole(TestQLProcessor* processor, const string& role_name, bool superuser = false) {
     const string create_stmt = Substitute(
-        "CREATE ROLE $0 WITH LOGIN = TRUE AND SUPERUSER = FALSE AND PASSWORD = 'TEST';", role_name);
+        "CREATE ROLE $0 WITH LOGIN = TRUE AND SUPERUSER = $1 AND PASSWORD = 'TEST';", role_name,
+            superuser ? "TRUE" : "FALSE");
     ExecuteValidModificationStmt(processor, create_stmt);
   }
 
@@ -170,7 +164,7 @@ class QLTestAuthentication : public QLTestBase {
 class TestQLPermission : public QLTestAuthentication {
  public:
   TestQLPermission() : QLTestAuthentication() {
-    FLAGS_use_cassandra_authentication = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = true;
   }
 
   // Helper Functions
@@ -246,18 +240,18 @@ class TestQLPermission : public QLTestAuthentication {
         role_name, resource);
   }
 
-  void CheckRowContents(const QLRow& row, const string& canonical_resource,
+  void CheckRowContents(const qlexpr::QLRow& row, const string& canonical_resource,
                         const std::vector<string> &permissions, const string& role_name) {
     EXPECT_EQ(role_name, row.column(0).string_value());
     EXPECT_EQ(canonical_resource, row.column(1).string_value());
 
-    EXPECT_EQ(QLValue::InternalType::kListValue, row.column(2).type());
-    QLSeqValuePB list_value = row.column(2).list_value();
+    EXPECT_EQ(InternalType::kListValue, row.column(2).type());
+    const QLSeqValuePB& list_value = row.column(2).list_value();
     EXPECT_EQ(permissions.size(), list_value.elems_size());
     // Create a set of the values:
     std::unordered_set<string> permissions_set;
-    for (int i = 0; i < permissions.size(); i++) {
-      permissions_set.insert(list_value.elems(i).string_value());
+    for (const auto& elem : list_value.elems()) {
+      permissions_set.insert(elem.string_value());
     }
 
     for (const auto& permission : permissions) {
@@ -287,7 +281,7 @@ class TestQLPermission : public QLTestAuthentication {
 
     EXPECT_EQ(1, row_block->row_count());
 
-    QLRow &row = row_block->row(0);
+    auto& row = row_block->row(0);
     CheckRowContents(row, canonical_resource, permissions, role_name);
 
     std::unordered_map<std::string, uint64_t>  permission_map = {
@@ -300,7 +294,7 @@ class TestQLPermission : public QLTestAuthentication {
         {"DESCRIBE", PermissionType::DESCRIBE_PERMISSION}
     };
 
-    client::internal::PermissionsCache permissions_cache(client_, false);
+    client::internal::PermissionsCache permissions_cache(client_.get(), false);
     ASSERT_OK(client_->GetPermissions(&permissions_cache));
 
     std::shared_ptr<client::internal::RolesPermissionsMap> roles_permissions_map =
@@ -371,7 +365,7 @@ TEST_F(TestQLPermission, TestGrantRevokeAll) {
 
   // Ensure no permission granted to non-existent role.
   const string grant_stmt2 = GrantAllKeyspaces("MODIFY", role_name_3);
-  EXEC_INVALID_STMT_MSG(grant_stmt2, "Invalid Argument");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt2, "Invalid Argument");
 
   LOG(INFO) << "Permissions version: " << GetPermissionsVersion();
 
@@ -391,8 +385,8 @@ TEST_F(TestQLPermission, TestGrantRevokeAll) {
   auto row_block = processor->row_block();
   EXPECT_EQ(2, row_block->row_count());  // 2 Resources found.
 
-  QLRow& keyspaces_row = row_block->row(0);
-  QLRow& roles_row = row_block->row(1);
+  auto& keyspaces_row = row_block->row(0);
+  auto& roles_row = row_block->row(1);
   CheckRowContents(roles_row, canonical_resource_roles, permissions_roles, role_name);
   CheckRowContents(keyspaces_row, canonical_resource_keyspaces, permissions_keyspaces, role_name);
 
@@ -420,8 +414,8 @@ TEST_F(TestQLPermission, TestGrantRevokeAll) {
   GrantRevokePermissionAndVerify(processor, revoke_describe_all_roles,
                                  canonical_resource_roles, permissions_keyspaces, role_name);
 
-  FLAGS_use_cassandra_authentication = false;
-  EXEC_INVALID_STMT_MSG(grant_stmt, "Unauthorized");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt, "Unauthorized");
 }
 
 TEST_F(TestQLPermission, TestGrantRevokeKeyspace) {
@@ -469,10 +463,10 @@ TEST_F(TestQLPermission, TestGrantRevokeKeyspace) {
   // Invalid keyspace.
   const string keyspace2 = "keyspace2";
   const string grant_stmt4 = GrantKeyspace("ALTER", keyspace2, role_name);
-  EXEC_INVALID_STMT_MSG(grant_stmt4, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt4, "Resource Not Found");
 
   const string revoke_invalid_stmt = GrantKeyspace("ALTER", keyspace2, role_name);
-  EXEC_INVALID_STMT_MSG(revoke_invalid_stmt, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(revoke_invalid_stmt, "Resource Not Found");
 
   // Grant ALL permissions.
   const string role_name_2 = "test_role_2";
@@ -485,9 +479,9 @@ TEST_F(TestQLPermission, TestGrantRevokeKeyspace) {
   const auto revoke_all_stmt = RevokeKeyspace("ALL", keyspace1, role_name_2);
   GrantRevokePermissionAndVerify(processor, revoke_all_stmt, canonical_resource, {}, role_name_2);
 
-  FLAGS_use_cassandra_authentication = false;
-  EXEC_INVALID_STMT_MSG(grant_stmt, "Unauthorized");
-  EXEC_INVALID_STMT_MSG(grant_stmt4, "Unauthorized");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt, "Unauthorized");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt4, "Unauthorized");
 }
 
 TEST_F(TestQLPermission, TestGrantToRole) {
@@ -516,14 +510,14 @@ TEST_F(TestQLPermission, TestGrantToRole) {
   // Resource (role) not present.
   const string role_name_3 = "test_role_3";
   const string grant_stmt3 = GrantRole("DROP", role_name_3, role_name);
-  EXEC_INVALID_STMT_MSG(grant_stmt3, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt3, "Resource Not Found");
 
   // Lastly, create another role to verify that the roles version didn't change after all the
   // statements that didn't modify anything in the master.
   CreateRole(processor, "some_role");
 
-  FLAGS_use_cassandra_authentication = false;
-  EXEC_INVALID_STMT_MSG(grant_stmt, "Unauthorized");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt, "Unauthorized");
 }
 
 TEST_F(TestQLPermission, TestGrantRevokeTable) {
@@ -552,27 +546,27 @@ TEST_F(TestQLPermission, TestGrantRevokeTable) {
 
   // Grant with keyspace not provided.
   const auto grant_stmt2 = GrantTable("SELECT", "table1", role_name);
-  EXEC_INVALID_STMT_MSG(grant_stmt2, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt2, "Resource Not Found");
 
   // Grant with invalid keyspace.
   const string grant_stmt3 = GrantTable("SELECT", "keyspace2.table1", role_name);
-  EXEC_INVALID_STMT_MSG(grant_stmt3, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt3, "Resource Not Found");
 
   // Grant with invalid table.
   const string grant_stmt4 = GrantTable("SELECT", "keyspace1.table2", role_name);
-  EXEC_INVALID_STMT_MSG(grant_stmt4, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt4, "Resource Not Found");
 
   // Revoke with keyspace not provided.
   const auto invalid_revoke1 = RevokeTable("SELECT", "table1", role_name);
-  EXEC_INVALID_STMT_MSG(invalid_revoke1, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_revoke1, "Resource Not Found");
 
   // Revoke with invalid keyspace.
   const auto invalid_revoke2 = RevokeTable("SELECT", "someKeyspace.table1", role_name);
-  EXEC_INVALID_STMT_MSG(invalid_revoke2, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_revoke2, "Resource Not Found");
 
   // Revoke with invalid table.
   const auto invalid_revoke3 = RevokeTable("SELECT", "keyspace1.someTable", role_name);
-  EXEC_INVALID_STMT_MSG(invalid_revoke3, "Resource Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_revoke3, "Resource Not Found");
 
   const string revoke = RevokeTable("MODIFY", "keyspace1.table1", role_name);
   // No permissions on keyspace1.table1 should remain for role test_role.
@@ -588,9 +582,9 @@ TEST_F(TestQLPermission, TestGrantRevokeTable) {
   // statements that didn't modify anything in the master.
   CreateRole(processor, "some_role");
 
-  FLAGS_use_cassandra_authentication = false;
-  EXEC_INVALID_STMT_MSG(grant_stmt, "Unauthorized");
-  EXEC_INVALID_STMT_MSG(grant_stmt3, "Unauthorized");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt, "Unauthorized");
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt3, "Unauthorized");
 }
 
 TEST_F(TestQLPermission, TestGrantDescribe) {
@@ -620,35 +614,35 @@ TEST_F(TestQLPermission, TestGrantDescribe) {
 
   // Grant DESCRIBE on a table. It should fail.
   const string grant_stmt = GrantTable("DESCRIBE", table_name, role1);
-  EXEC_INVALID_STMT_MSG(grant_stmt, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a table that doesn't exist. It should fail with a syntax error.
   const string grant_on_invalid_table = GrantTable("DESCRIBE", "invalid_table", role1);
-  EXEC_INVALID_STMT_MSG(grant_on_invalid_table, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_invalid_table, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a table to a role that doesn't exist. It should fail with a syntax error.
   const string grant_on_table_to_invalid_role = GrantTable("DESCRIBE", table_name, "some_role");
-  EXEC_INVALID_STMT_MSG(grant_on_table_to_invalid_role, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_table_to_invalid_role, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a keyspace. It shold fail.
   const string grant_stmt2 = GrantKeyspace("DESCRIBE", keyspace, role1);
-  EXEC_INVALID_STMT_MSG(grant_stmt2, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_stmt2, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a keyspace that doesn't exist. It should fail with a syntax error.
   const string grant_on_invalid_keyspace = GrantKeyspace("DESCRIBE", "some_keyspace", role1);
-  EXEC_INVALID_STMT_MSG(grant_on_invalid_keyspace, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_invalid_keyspace, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a keyspace to a role that doesn't exist. It should fail with a syntax error.
   const string grant_on_keyspace_to_invalid_role = GrantKeyspace("DESCRIBE", keyspace, "some_role");
-  EXEC_INVALID_STMT_MSG(grant_on_keyspace_to_invalid_role, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_keyspace_to_invalid_role, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on all keyspaces. It should fail.
   const string grant_on_all_keyspaces = GrantAllKeyspaces("DESCRIBE", role1);
-  EXEC_INVALID_STMT_MSG(grant_on_all_keyspaces, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_all_keyspaces, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on a role. It should fail.
   const string grant_on_role = GrantRole("DESCRIBE", role2, role1);
-  EXEC_INVALID_STMT_MSG(grant_on_role, invalid_grant_describe_error_msg);
+  EXEC_INVALID_STMT_WITH_ERROR(grant_on_role, invalid_grant_describe_error_msg);
 
   // Grant DESCRIBE on all roles. It should succeed.
   const string grant_on_all_roles = GrantAllRoles("DESCRIBE", role3);
@@ -672,7 +666,8 @@ TEST_F(TestQLPermission, TestGrantDescribe) {
 class TestQLRole : public QLTestAuthentication {
  public:
   TestQLRole() : QLTestAuthentication() {
-    FLAGS_use_cassandra_authentication = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = true;
+    DCHECK(!FLAGS_ycql_allow_non_authenticated_password_reset);
   }
 
   // Check the granted roles for a role
@@ -684,9 +679,9 @@ class TestQLRole : public QLTestAuthentication {
     auto row_block = processor->row_block();
     EXPECT_EQ(1, row_block->row_count());
 
-    QLRow &row = row_block->row(0);
+    auto& row = row_block->row(0);
 
-    EXPECT_EQ(QLValue::InternalType::kListValue, row.column(3).type());
+    EXPECT_EQ(InternalType::kListValue, row.column(3).type());
     QLSeqValuePB list_value = row.column(3).list_value();
     EXPECT_EQ(roles.size(), list_value.elems_size());
     for (int i = 0; i < list_value.elems_size(); i++) {
@@ -715,7 +710,7 @@ class TestQLRole : public QLTestAuthentication {
     CHECK(s.ok());
     auto row_block = processor->row_block();
     EXPECT_EQ(2, row_block->row_count());
-    QLRow &row = row_block->row(0);
+    auto& row = row_block->row(0);
 
     EXPECT_EQ(role_name, row.column(0).string_value());
     EXPECT_EQ(can_login, row.column(1).bool_value());
@@ -745,6 +740,30 @@ class TestQLRole : public QLTestAuthentication {
     EXPECT_EQ(1, row_block_after_drop->row_count());
     row = row_block_after_drop->row(0);
     EXPECT_EQ("cassandra", row.column(0).string_value());
+  }
+
+  void CheckRole(TestQLProcessor* processor, const string& role_name, const char* password,
+                 const bool can_login, const bool is_superuser) {
+    auto select = Substitute("SELECT * FROM system_auth.roles WHERE role = '$0';", role_name);
+
+    CHECK_OK(processor->Run(select));
+    auto row_block = processor->row_block();
+    EXPECT_EQ(1, row_block->row_count());
+    auto& row = row_block->row(0);
+
+    EXPECT_EQ(role_name, row.column(0).string_value());
+    EXPECT_EQ(can_login, row.column(1).bool_value());
+    EXPECT_EQ(is_superuser, row.column(2).bool_value());
+
+    if (password == nullptr) {
+      EXPECT_TRUE(row.column(4).IsNull());
+    } else {
+      char hash[kBcryptHashSize];
+      bcrypt_hashpw(password, hash);
+      const auto& saved_hash = row.column(4).string_value();
+      const bool password_match = (0 == bcrypt_checkpw(password, saved_hash.c_str()));
+      EXPECT_TRUE(password_match);
+    }
   }
 };
 
@@ -786,24 +805,24 @@ TEST_F(TestQLRole, TestGrantRole) {
 
   // Same Grant Twice
   const string invalid_grant_1 = GrantStmt(role_1, role_2);
-  EXEC_INVALID_STMT_MSG(invalid_grant_1, Substitute("$0 is a member of $1", role_2, role_1));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_grant_1, Substitute("$0 is a member of $1", role_2, role_1));
 
   // Roles not present
   const string invalid_grant_2 = GrantStmt(role_1, role_4);
-  EXEC_INVALID_STMT_MSG(invalid_grant_2, Substitute("$0 doesn't exist", role_4));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_grant_2, Substitute("$0 doesn't exist", role_4));
 
   const string invalid_grant_3 = GrantStmt(role_4, role_2);
-  EXEC_INVALID_STMT_MSG(invalid_grant_3, Substitute("$0 doesn't exist", role_4));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_grant_3, Substitute("$0 doesn't exist", role_4));
 
   const auto invalid_circular_reference_grant = GrantStmt(role_1, role_1);
-  EXEC_INVALID_STMT_MSG(invalid_circular_reference_grant,
-                        Substitute("$0 is a member of $1", role_1, role_1));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_circular_reference_grant,
+                               Substitute("$0 is a member of $1", role_1, role_1));
 
   // It should fail because role_3 was granted to role_2.
   const auto invalid_circular_reference_grant2 = GrantStmt(role_2, role_3);
   // The message is backwards, but that's what Apache Cassandra outputs.
-  EXEC_INVALID_STMT_MSG(invalid_circular_reference_grant2,
-                        Substitute("$0 is a member of $1", role_3, role_2));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_circular_reference_grant2,
+                               Substitute("$0 is a member of $1", role_3, role_2));
 
   CreateRole(processor, role_4);
   // Single Role Granted
@@ -814,20 +833,20 @@ TEST_F(TestQLRole, TestGrantRole) {
   // It should fail because role_3 was granted to role_2, and role_4 granted to role3.
   const auto invalid_circular_reference_grant3 = GrantStmt(role_4, role_2);
   // The message is backwards, but that's what Apache Cassandra outputs.
-  EXEC_INVALID_STMT_MSG(invalid_circular_reference_grant3,
-                        Substitute("$0 is a member of $1", role_2, role_4));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_circular_reference_grant3,
+                               Substitute("$0 is a member of $1", role_2, role_4));
 
   // It should fail because role_4 was granted to role_3, and role_3 to role_2.
   const auto invalid_circular_reference_grant4 = GrantStmt(role_2, role_4);
   // The message is backwards, but that's what Apache Cassandra outputs.
-  EXEC_INVALID_STMT_MSG(invalid_circular_reference_grant4,
-                        Substitute("$0 is a member of $1", role_4, role_2));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_circular_reference_grant4,
+                               Substitute("$0 is a member of $1", role_4, role_2));
 
   // It should fail because role_7 -> role_5 -> role_3 -> role_2.
   const auto invalid_circular_reference_grant5 = GrantStmt(role_2, role_7);
   // The message is backwards, but that's what Apache Cassandra outputs.
-  EXEC_INVALID_STMT_MSG(invalid_circular_reference_grant5,
-                        Substitute("$0 is a member of $1", role_7, role_2));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_circular_reference_grant5,
+                               Substitute("$0 is a member of $1", role_7, role_2));
 
   // Lastly, create another role to verify that the roles version didn't change after all the
   // statements that didn't modify anything in the master.
@@ -876,7 +895,8 @@ TEST_F(TestQLRole, TestRevokeRole) {
 
   // Try to revoke it again. It should fail.
   const auto invalid_revoke = RevokeStmt(role3, role2);
-  EXEC_INVALID_STMT_MSG(invalid_revoke, Substitute("$0 is not a member of $1", role2, role3));
+  EXEC_INVALID_STMT_WITH_ERROR(
+      invalid_revoke, Substitute("$0 is not a member of $1", role2, role3));
 }
 
 TEST_F(TestQLRole, TestRoleQuerySimple) {
@@ -970,25 +990,29 @@ TEST_F(TestQLRole, TestQLCreateRoleSimple) {
   EXEC_VALID_STMT(CreateIfNotExistsStmt(role12));
 
   // Invalid Statements
-  EXEC_INVALID_STMT_MSG(CreateStmt(role9), "Invalid Role Definition");
-  EXEC_INVALID_STMT_MSG(CreateStmt(role10), "Invalid Role Definition");
-  EXEC_INVALID_STMT_MSG(CreateStmt(role11), "Invalid Role Definition");
-  EXEC_INVALID_STMT_MSG(CreateStmt(role13), "Invalid Role Definition");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role9), "Invalid Role Definition");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role10), "Invalid Role Definition");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role11), "Invalid Role Definition");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role13), "Invalid Role Definition");
 
   // Single role_option
-  EXEC_INVALID_STMT_MSG(CreateStmt(role14), "Feature Not Supported");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role14), "Feature Not Supported");
 
   // Multiple role_options
-  EXEC_INVALID_STMT_MSG(CreateStmt(role15), "Feature Not Supported");
+  EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role15), "Feature Not Supported");
 
   // Lastly, create another role to verify that the roles version didn't change after all the
   // statements that didn't modify anything in the master.
   CreateRole(processor, "another_role");
 
   // Flag Test:
-  FLAGS_use_cassandra_authentication = false;;
-  EXEC_INVALID_STMT_MSG(CreateStmt(role4), "Unauthorized");  // Valid, but unauthorized
-  EXEC_INVALID_STMT_MSG(CreateStmt(role9), "Unauthorized");  // Invalid and unauthorized
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  for (bool non_authenticated_password_reset : {false, true}) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_allow_non_authenticated_password_reset) =
+        non_authenticated_password_reset;
+    EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role4), "Unauthorized");  // Valid, but unauthorized
+    EXEC_INVALID_STMT_WITH_ERROR(CreateStmt(role9), "Unauthorized");  // Invalid and unauthorized
+  }
 }
 
 TEST_F(TestQLRole, TestQLDropRoleSimple) {
@@ -1013,9 +1037,9 @@ TEST_F(TestQLRole, TestQLDropRoleSimple) {
   ExecuteValidModificationStmt(processor, DropStmt(role3));          // Drop role
 
   // Check if subsequent drop generates errors
-  EXEC_INVALID_STMT_MSG(DropStmt(role1), "Role Not Found");
-  EXEC_INVALID_STMT_MSG(DropStmt(role2), "Role Not Found");
-  EXEC_INVALID_STMT_MSG(DropStmt(role3), "Role Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(DropStmt(role1), "Role Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(DropStmt(role2), "Role Not Found");
+  EXEC_INVALID_STMT_WITH_ERROR(DropStmt(role3), "Role Not Found");
 
   // These statements will not change the roles' version in the master.
   EXEC_VALID_STMT(DropIfExistsStmt(role1));   // Check if exists
@@ -1026,8 +1050,46 @@ TEST_F(TestQLRole, TestQLDropRoleSimple) {
   // statements that didn't modify anything in the master.
   CreateRole(processor, "some_role");
 
-  FLAGS_use_cassandra_authentication = false;
-  EXEC_INVALID_STMT_MSG(DropStmt(role1), "Unauthorized");
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  for (bool non_authenticated_password_reset : {false, true}) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_allow_non_authenticated_password_reset) =
+        non_authenticated_password_reset;
+    EXEC_INVALID_STMT_WITH_ERROR(DropStmt(role1), "Unauthorized");
+  }
+}
+
+TEST_F(TestQLRole, TestQLAlterRoleSimple) {
+  // Init the simulated cluster.
+  ASSERT_NO_FATALS(CreateSimulatedCluster());
+
+  // Get an available processor.
+  TestQLProcessor* processor = GetQLProcessor(kDefaultCassandraUsername);
+
+  // Valid Create Role Statements.
+  const string role1 = "normal_user";
+  const string role2 = "super_user";
+
+  CreateRole(processor, role1);
+  CreateRole(processor, role2, /*superuser=*/ true);
+
+  // Check all variants of role_name.
+  ExecuteValidModificationStmt(processor, AlterStmt(role1, "UPDATED_PWD"));
+  CheckRole(processor, role1, "UPDATED_PWD", /*can_login*/ true, /*is_superuser*/ false);
+  ExecuteValidModificationStmt(processor, AlterStmt(role2, "UPDATED_PWD"));
+  CheckRole(processor, role2, "UPDATED_PWD", /*can_login*/ true, /*is_superuser*/ true);
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_use_cassandra_authentication) = false;
+  for (bool non_authenticated_password_reset : {false, true}) {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_ycql_allow_non_authenticated_password_reset) =
+        non_authenticated_password_reset;
+    if (non_authenticated_password_reset) {
+      ExecuteValidModificationStmt(processor, AlterStmt(role1, "UPDATED_WITH_DISABLED_AUTH"));
+      ExecuteValidModificationStmt(processor, AlterStmt(role2, "UPDATED_WITH_DISABLED_AUTH"));
+    } else {
+      EXEC_INVALID_STMT_WITH_ERROR(AlterStmt(role1, "UPDATED_WITH_DISABLED_AUTH"), "Unauthorized");
+      EXEC_INVALID_STMT_WITH_ERROR(AlterStmt(role2, "UPDATED_WITH_DISABLED_AUTH"), "Unauthorized");
+    }
+  }
 }
 
 // Test that whenever we remove a role, this role is removed from the member_of field of all the
@@ -1082,19 +1144,21 @@ TEST_F(TestQLRole, TestMutationsGetCommittedOrAborted) {
 
   // Same Grant Twice
   const auto invalid_grant = GrantStmt(role1, role2);
-  EXEC_INVALID_STMT_MSG(invalid_grant, Substitute("$0 is a member of $1", role2, role1));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_grant, Substitute("$0 is a member of $1", role2, role1));
 
   // Verify that the same invalid operation fails instead of timing out.
-  EXEC_INVALID_STMT_MSG(invalid_grant, Substitute("$0 is a member of $1", role2, role1));
+  EXEC_INVALID_STMT_WITH_ERROR(invalid_grant, Substitute("$0 is a member of $1", role2, role1));
 
   RevokeRole(processor, role1, role2);
 
   // Revoke it again.
   const auto invalid_revoke = RevokeStmt(role1, role2);
-  EXEC_INVALID_STMT_MSG(invalid_revoke, Substitute("$0 is not a member of $1", role2, role1));
+  EXEC_INVALID_STMT_WITH_ERROR(
+      invalid_revoke, Substitute("$0 is not a member of $1", role2, role1));
 
   // If the mutation was ended properly, this request shouldn't time out.
-  EXEC_INVALID_STMT_MSG(invalid_revoke, Substitute("$0 is not a member of $1", role2, role1));
+  EXEC_INVALID_STMT_WITH_ERROR(
+      invalid_revoke, Substitute("$0 is not a member of $1", role2, role1));
 
   // Lastly, create another role to verify that the roles version didn't change after all the
   // statements that didn't modify anything in the master.

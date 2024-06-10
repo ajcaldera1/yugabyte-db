@@ -21,14 +21,17 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_UTIL_TESTUTIL_H
-#define YB_ROCKSDB_UTIL_TESTUTIL_H
 
 #pragma once
 #include <algorithm>
 #include <deque>
+#include <mutex>
 #include <string>
 #include <vector>
+
+#include <gtest/gtest.h>
+
+#include "yb/gutil/casts.h"
 
 #include "yb/rocksdb/compaction_filter.h"
 #include "yb/rocksdb/env.h"
@@ -43,11 +46,22 @@
 #include "yb/rocksdb/util/mutexlock.h"
 #include "yb/rocksdb/util/random.h"
 
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/slice.h"
 
+DECLARE_bool(never_fsync);
+DECLARE_bool(TEST_enable_sync_points);
+
 namespace rocksdb {
-class SequentialFile;
 class SequentialFileReader;
+
+class RocksDBTest : public ::testing::Test {
+ public:
+  RocksDBTest() {
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_enable_sync_points) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_never_fsync) = true;
+  }
+};
 
 namespace test {
 
@@ -70,7 +84,7 @@ class ErrorEnv : public EnvWrapper {
                num_writable_file_errors_(0) { }
 
   virtual Status NewWritableFile(const std::string& fname,
-                                 unique_ptr<WritableFile>* result,
+                                 std::unique_ptr<WritableFile>* result,
                                  const EnvOptions& soptions) override {
     result->reset();
     if (writable_file_error_) {
@@ -92,7 +106,7 @@ class PlainInternalKeyComparator : public InternalKeyComparator {
 
   virtual ~PlainInternalKeyComparator() {}
 
-  virtual int Compare(const Slice& a, const Slice& b) const override {
+  virtual int Compare(Slice a, Slice b) const override {
     return user_comparator()->Compare(a, b);
   }
   virtual void FindShortestSeparator(std::string* start,
@@ -118,7 +132,7 @@ class SimpleSuffixReverseComparator : public Comparator {
     return "SimpleSuffixReverseComparator";
   }
 
-  virtual int Compare(const Slice& a, const Slice& b) const override {
+  virtual int Compare(Slice a, Slice b) const override {
     Slice prefix_a = Slice(a.data(), 8);
     Slice prefix_b = Slice(b.data(), 8);
     int prefix_comp = prefix_a.compare(prefix_b);
@@ -151,29 +165,51 @@ class VectorIterator : public InternalIterator {
     assert(keys_.size() == values_.size());
   }
 
-  virtual bool Valid() const override { return current_ < keys_.size(); }
-
-  virtual void SeekToFirst() override { current_ = 0; }
-  virtual void SeekToLast() override { current_ = keys_.size() - 1; }
-
-  virtual void Seek(const Slice& target) override {
-    current_ = std::lower_bound(keys_.begin(), keys_.end(), target.ToBuffer()) -
-               keys_.begin();
+  const KeyValueEntry& SeekToFirst() override {
+    current_ = 0;
+    return Entry();
   }
 
-  virtual void Next() override { current_++; }
-  virtual void Prev() override { current_--; }
+  const KeyValueEntry& SeekToLast() override {
+    current_ = keys_.size() - 1;
+    return Entry();
+  }
 
-  virtual Slice key() const override { return Slice(keys_[current_]); }
-  virtual Slice value() const override { return Slice(values_[current_]); }
+  const KeyValueEntry& Seek(Slice target) override {
+    current_ = std::lower_bound(keys_.begin(), keys_.end(), target.ToBuffer()) - keys_.begin();
+    return Entry();
+  }
 
-  virtual Status status() const override { return Status::OK(); }
+  const KeyValueEntry& Next() override {
+    current_++;
+    return Entry();
+  }
+
+  const KeyValueEntry& Prev() override {
+    current_--;
+    return Entry();
+  }
+
+  const KeyValueEntry& Entry() const override {
+    if (current_ >= keys_.size()) {
+      return KeyValueEntry::Invalid();
+    }
+    entry_ = KeyValueEntry {
+      .key = Slice(keys_[current_]),
+      .value = Slice(values_[current_]),
+    };
+    return entry_;
+  }
+
+  Status status() const override { return Status::OK(); }
 
  private:
   std::vector<std::string> keys_;
   std::vector<std::string> values_;
   size_t current_;
+  mutable KeyValueEntry entry_;
 };
+
 extern WritableFileWriter* GetWritableFileWriter(WritableFile* wf);
 
 extern RandomAccessFileReader* GetRandomAccessFileReader(RandomAccessFile* raf);
@@ -227,6 +263,11 @@ class StringSink: public WritableFile {
     }
   }
 
+  const std::string& filename() const override {
+    static const std::string kFilename = "StringSink";
+    return kFilename;
+  }
+
  private:
   Slice* reader_contents_;
   size_t last_flush_;
@@ -241,12 +282,11 @@ class StringSource: public RandomAccessFile {
         mmap_(mmap),
         total_reads_(0) {}
 
-  virtual ~StringSource() { }
+  virtual ~StringSource() {}
 
-  uint64_t Size() const { return contents_.size(); }
+  yb::Result<uint64_t> Size() const override { return contents_.size(); }
 
-  virtual Status Read(uint64_t offset, size_t n, Slice* result,
-      char* scratch) const override {
+  Status Read(uint64_t offset, size_t n, Slice* result, uint8_t* scratch) const override {
     total_reads_++;
     if (offset > contents_.size()) {
       return STATUS(InvalidArgument, "invalid Read offset");
@@ -263,22 +303,25 @@ class StringSource: public RandomAccessFile {
     return Status::OK();
   }
 
-  virtual size_t GetUniqueId(char* id, size_t max_size) const override {
-    if (max_size < 20) {
-      return 0;
-    }
-
+  virtual size_t GetUniqueId(char* id) const override {
     char* rid = id;
     rid = EncodeVarint64(rid, uniq_id_);
     rid = EncodeVarint64(rid, 0);
     return static_cast<size_t>(rid-id);
   }
 
+  yb::Result<uint64_t> INode() const override { return STATUS(NotSupported, "Not supported"); }
+
+  const std::string& filename() const override { return filename_; }
+
+  size_t memory_footprint() const override { LOG(FATAL) << "Not supported"; }
+
   int total_reads() const { return total_reads_; }
 
   void set_total_reads(int tr) { total_reads_ = tr; }
 
  private:
+  std::string filename_ = "StringSource";
   std::string contents_;
   uint64_t uniq_id_;
   bool mmap_;
@@ -314,13 +357,13 @@ class SleepingBackgroundTask {
   void DoSleep() {
     MutexLock l(&mutex_);
     sleeping_ = true;
-    bg_cv_.SignalAll();
+    YB_PROFILE(bg_cv_.SignalAll());
     while (should_sleep_) {
       bg_cv_.Wait();
     }
     sleeping_ = false;
     done_with_sleep_ = true;
-    bg_cv_.SignalAll();
+    YB_PROFILE(bg_cv_.SignalAll());
   }
   void WaitUntilSleeping() {
     MutexLock l(&mutex_);
@@ -331,7 +374,7 @@ class SleepingBackgroundTask {
   void WakeUp() {
     MutexLock l(&mutex_);
     should_sleep_ = false;
-    bg_cv_.SignalAll();
+    YB_PROFILE(bg_cv_.SignalAll());
   }
   void WaitUntilDone() {
     MutexLock l(&mutex_);
@@ -405,8 +448,10 @@ class StringEnv : public EnvWrapper {
    public:
     explicit SeqStringSource(const std::string& data)
         : data_(data), offset_(0) {}
+
     ~SeqStringSource() {}
-    Status Read(size_t n, Slice* result, char* scratch) override {
+
+    Status Read(size_t n, Slice* result, uint8_t* scratch) override {
       std::string output;
       if (offset_ < data_.size()) {
         n = std::min(data_.size() - offset_, n);
@@ -419,6 +464,7 @@ class StringEnv : public EnvWrapper {
       }
       return Status::OK();
     }
+
     Status Skip(uint64_t n) override {
       if (offset_ >= data_.size()) {
         return STATUS(InvalidArgument,
@@ -427,6 +473,11 @@ class StringEnv : public EnvWrapper {
       // TODO(yhchiang): Currently doesn't handle the overflow case.
       offset_ += n;
       return Status::OK();
+    }
+
+    const std::string& filename() const override {
+      static const std::string kFilename = "SeqStringSource";
+      return kFilename;
     }
 
    private:
@@ -450,6 +501,11 @@ class StringEnv : public EnvWrapper {
       return Status::OK();
     }
 
+    const std::string& filename() const override {
+      static const std::string kFilename = "StringSink";
+      return kFilename;
+    }
+
    private:
     std::string* contents_;
   };
@@ -461,20 +517,20 @@ class StringEnv : public EnvWrapper {
 
   const Status WriteToNewFile(const std::string& file_name,
                               const std::string& content) {
-    unique_ptr<WritableFile> r;
+    std::unique_ptr<WritableFile> r;
     auto s = NewWritableFile(file_name, &r, EnvOptions());
     if (!s.ok()) {
       return s;
     }
-    r->Append(content);
-    r->Flush();
-    r->Close();
+    RETURN_NOT_OK(r->Append(content));
+    RETURN_NOT_OK(r->Flush());
+    RETURN_NOT_OK(r->Close());
     assert(files_[file_name] == content);
     return Status::OK();
   }
 
   // The following text is boilerplate that forwards all methods to target()
-  Status NewSequentialFile(const std::string& f, unique_ptr<SequentialFile>* r,
+  Status NewSequentialFile(const std::string& f, std::unique_ptr<SequentialFile>* r,
                            const EnvOptions& options) override {
     auto iter = files_.find(f);
     if (iter == files_.end()) {
@@ -484,11 +540,11 @@ class StringEnv : public EnvWrapper {
     return Status::OK();
   }
   Status NewRandomAccessFile(const std::string& f,
-                             unique_ptr<RandomAccessFile>* r,
+                             std::unique_ptr<RandomAccessFile>* r,
                              const EnvOptions& options) override {
     return STATUS(NotSupported, "");
   }
-  Status NewWritableFile(const std::string& f, unique_ptr<WritableFile>* r,
+  Status NewWritableFile(const std::string& f, std::unique_ptr<WritableFile>* r,
                          const EnvOptions& options) override {
     auto iter = files_.find(f);
     if (iter != files_.end()) {
@@ -498,7 +554,7 @@ class StringEnv : public EnvWrapper {
     return Status::OK();
   }
   virtual Status NewDirectory(const std::string& name,
-                              unique_ptr<Directory>* result) override {
+                              std::unique_ptr<Directory>* result) override {
     return STATUS(NotSupported, "");
   }
   Status FileExists(const std::string& f) override {
@@ -654,20 +710,20 @@ TableFactory* RandomTableFactory(Random* rnd, int pre_defined = -1);
 std::string RandomName(Random* rnd, const size_t len);
 
 std::shared_ptr<BoundaryValuesExtractor> MakeBoundaryValuesExtractor();
-UserBoundaryValuePtr MakeIntBoundaryValue(int64_t value);
-UserBoundaryValuePtr MakeStringBoundaryValue(std::string value);
-int64_t GetBoundaryInt(const UserBoundaryValues& values);
-std::string GetBoundaryString(const UserBoundaryValues& values);
+UserBoundaryValue MakeLeftBoundaryValue(const Slice& value);
+UserBoundaryValue MakeRightBoundaryValue(const Slice& value);
+Slice GetBoundaryLeft(const UserBoundaryValues& values);
+Slice GetBoundaryRight(const UserBoundaryValues& values);
 
 struct BoundaryTestValues {
   void Feed(Slice key);
   void Check(const FileBoundaryValues<InternalKey>& smallest,
              const FileBoundaryValues<InternalKey>& largest);
 
-  int64_t min_int = std::numeric_limits<int64_t>::max();
-  int64_t max_int = std::numeric_limits<int64_t>::min();
-  std::string min_string;
-  std::string max_string;
+  UserBoundaryValue::Value min_left;
+  UserBoundaryValue::Value max_left;
+  UserBoundaryValue::Value min_right;
+  UserBoundaryValue::Value max_right;
 };
 
 // A test implementation of UserFrontier, wrapper over simple int64_t value.
@@ -688,9 +744,7 @@ class TestUserFrontier : public UserFrontier {
     return value_;
   }
 
-  std::string ToString() const override {
-    return yb::Format("{ value: $0 }", value_);
-  }
+  std::string ToString() const override;
 
   void ToPB(google::protobuf::Any* pb) const override {
     UserBoundaryValuePB value;
@@ -728,10 +782,21 @@ class TestUserFrontier : public UserFrontier {
 
   void FromOpIdPBDeprecated(const yb::OpIdPB& op_id) override {}
 
-  void FromPB(const google::protobuf::Any& pb) override {
+  Status FromPB(const google::protobuf::Any& pb) override {
     UserBoundaryValuePB value;
     pb.UnpackTo(&value);
     value_ = value.tag();
+    return Status::OK();
+  }
+
+  Slice FilterAsSlice() override {
+    return Slice();
+  }
+
+  void ResetFilter() override {}
+
+  uint64_t GetHybridTimeAsUInt64() const override {
+    return 0;
   }
 
  private:
@@ -750,7 +815,47 @@ class TestUserFrontiers : public rocksdb::UserFrontiersBase<TestUserFrontier> {
   }
 };
 
+// A class which remembers the name of each flushed file.
+class FlushedFileCollector : public EventListener {
+ public:
+  virtual void OnFlushCompleted(DB* db, const FlushJobInfo& info) override {
+    std::lock_guard lock(mutex_);
+    flushed_file_infos_.push_back(info);
+  }
+
+  std::vector<std::string> GetFlushedFiles() {
+    std::vector<std::string> flushed_files;
+    std::lock_guard lock(mutex_);
+    for (const auto& info : flushed_file_infos_) {
+      flushed_files.push_back(info.file_path);
+    }
+    return flushed_files;
+  }
+
+  std::vector<std::string> GetAndClearFlushedFiles() {
+    std::vector<std::string> flushed_files;
+    std::lock_guard lock(mutex_);
+    for (const auto& info : flushed_file_infos_) {
+      flushed_files.push_back(info.file_path);
+    }
+    flushed_file_infos_.clear();
+    return flushed_files;
+  }
+
+  std::vector<FlushJobInfo> GetFlushedFileInfos() {
+    std::lock_guard lock(mutex_);
+    return flushed_file_infos_;
+  }
+
+  void Clear() {
+    std::lock_guard lock(mutex_);
+    flushed_file_infos_.clear();
+  }
+
+ private:
+  std::vector<FlushJobInfo> flushed_file_infos_;
+  std::mutex mutex_;
+};
+
 }  // namespace test
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_UTIL_TESTUTIL_H

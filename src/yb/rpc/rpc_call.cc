@@ -12,23 +12,38 @@
 // under the License.
 //
 //
-
 #include "yb/rpc/rpc_call.h"
 
+#include "yb/rpc/connection.h"
+
 #include "yb/util/status.h"
+#include "yb/util/logging.h"
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
 
-void RpcCall::Transferred(const Status& status, Connection* conn) {
-  if (state_ != TransferState::PENDING) {
-    LOG(DFATAL) << "Transferred for " << ToString() << " executed twice, state: "
-                << yb::ToString(state_) << ", status: " << status;
-    return;
+RpcCall::RpcCall() : start_time_ns_(FastClockNanos()) {
+}
+
+void RpcCall::Transferred(const Status& status, const ConnectionPtr& conn) {
+  auto transfer_state = transfer_state_.load(std::memory_order_acquire);
+  for (;;) {
+    if (transfer_state != TransferState::PENDING) {
+      LOG_WITH_PREFIX(DFATAL) << __PRETTY_FUNCTION__ << " executed more than once on call "
+                              << static_cast<void*>(this) << ", current state: "
+                              << yb::ToString(transfer_state) << " (expected to be PENDING), "
+                              << "status passed to the current Transferred call: " << status << ", "
+                              << "this RpcCall: " << ToString();
+      return;
+    }
+    auto new_state = status.ok() ? TransferState::FINISHED : TransferState::ABORTED;
+    if (transfer_state_.compare_exchange_strong(transfer_state, new_state)) {
+      break;
+    }
   }
-  state_ = status.ok() ? TransferState::FINISHED : TransferState::ABORTED;
+  if (status.ok()) {
+    conn->ReportQueueTime(MonoDelta::FromNanoseconds(FastClockNanos() - start_time_ns_));
+  }
   NotifyTransferred(status, conn);
 }
 
-} // namespace rpc
-} // namespace yb
+} // namespace yb::rpc

@@ -20,16 +20,14 @@
 #
 # Author: Konstantin Lepa <konstantin.lepa@gmail.com>
 #
-# Find the Google Test Framework
+# Find the Google Test Framework, heavily cribbed from FindGTest.cmake.
 #
 # This module defines
-# GTEST_INCLUDE_DIR, where to find gtest include files, etc.
-# GTest_FOUND, If false, do not try to use gtest.
-# GTEST_STATIC_LIBRARY, Location of libgtest.a
-# GTEST_SHARED_LIBRARY, Location of libttest's shared library
-
-# also defined, but not for general use are
-# GTEST_LIBRARY, where to find the GTest library.
+# GMOCK_INCLUDE_DIR, where to find gmock include files, etc.
+# GTEST_INCLUDE_DIR, where to find gtest include files
+# GMOCK_SHARED_LIBRARY, Location of libgmock's shared library
+# GMOCK_STATIC_LIBRARY, Location of libgmock's static library
+# GMOCK_FOUND, If false, do not try to use gmock.
 
 #
 # The following only applies to changes made to this file as part of YugaByte development.
@@ -46,61 +44,38 @@
 # or implied.  See the License for the specific language governing permissions and limitations
 # under the License.
 #
-set(GTEST_SEARCH_PATH ${CMAKE_SOURCE_DIR}/thirdparty/gtest-1.7.0)
+find_path(GMOCK_INCLUDE_DIR gmock/gmock.h
+          DOC   "Path to the gmock header file"
+          NO_CMAKE_SYSTEM_PATH
+          NO_SYSTEM_ENVIRONMENT_PATH)
 
-set(GTEST_H gtest/gtest.h)
+find_path(GTEST_INCLUDE_DIR gtest/gtest.h
+          DOC   "Path to the gtest header file"
+          NO_CMAKE_SYSTEM_PATH
+          NO_SYSTEM_ENVIRONMENT_PATH)
 
-find_path(GTEST_INCLUDE_DIR ${GTEST_H}
-  PATHS ${GTEST_SEARCH_PATH}/include
-        NO_DEFAULT_PATH
-  DOC   "Path to the ${GTEST_H} file"
-)
+find_library(GMOCK_SHARED_LIBRARY gmock
+             DOC   "Google's framework for writing C++ tests (gmock)"
+             NO_CMAKE_SYSTEM_PATH
+             NO_SYSTEM_ENVIRONMENT_PATH)
 
-find_library(GTEST_LIBRARY
-  NAMES gtest
-  PATHS ${GTEST_SEARCH_PATH}
-        NO_DEFAULT_PATH
-  DOC   "Google's framework for writing C++ tests (gtest)"
-)
+find_library(GMOCK_STATIC_LIBRARY libgmock.a
+             DOC   "Google's framework for writing C++ tests (gmock) static"
+             NO_CMAKE_SYSTEM_PATH
+             NO_SYSTEM_ENVIRONMENT_PATH)
 
-# We do not use the gtest_main library (we have yb_test_main).
-#find_library(GTEST_MAIN_LIBRARY_PATH
-#  NAMES gtest_main
-#  PATHS GTEST_SEARCH_PATH
-#        NO_DEFAULT_PATH
-#  DOC   "Google's framework for writing C++ tests (gtest_main)"
-#)
-set(GTEST_LIB_NAME libgtest)
-if(GTEST_INCLUDE_DIR AND GTEST_LIBRARY)
-  set(GTEST_STATIC_LIBRARY ${GTEST_SEARCH_PATH}/${GTEST_LIB_NAME}.a)
-  if(EXISTS "${GTEST_STATIC_LIBRARY}")
-    set(GTEST_FOUND TRUE)
-  endif()
+find_library(GTEST_SHARED_LIBRARY gtest
+             DOC   "Google's framework for writing C++ tests (gtest)"
+             NO_CMAKE_SYSTEM_PATH
+             NO_SYSTEM_ENVIRONMENT_PATH)
 
-  set(GTEST_SHARED_LIBRARY ${GTEST_SEARCH_PATH}/${GTEST_LIB_NAME}${CMAKE_SHARED_LIBRARY_SUFFIX})
-  if(EXISTS "${GTEST_SHARED_LIBRARY}")
-    set(GTEST_FOUND TRUE)
-  endif()
-else()
-  set(GTEST_FOUND FALSE)
-endif()
+find_library(GTEST_STATIC_LIBRARY libgtest.a
+             DOC   "Google's framework for writing C++ tests (gtest) static"
+             NO_CMAKE_SYSTEM_PATH
+             NO_SYSTEM_ENVIRONMENT_PATH)
 
-if(GTEST_FOUND)
-  if(NOT GTest_FIND_QUIETLY)
-    message(STATUS "Found the GTest library: ${GTEST_STATIC_LIBRARY} ${GTEST_SHARED_LIBRARY}")
-  endif(NOT GTest_FIND_QUIETLY)
-else(GTEST_FOUND)
-  if(NOT GTest_FIND_QUIETLY)
-    if(GTest_FIND_REQUIRED)
-      message(FATAL_ERROR "Could not find the GTest library")
-    else(GTest_FIND_REQUIRED)
-      message(STATUS "Could not find the GTest library")
-    endif(GTest_FIND_REQUIRED)
-  endif(NOT GTest_FIND_QUIETLY)
-endif(GTEST_FOUND)
-
-mark_as_advanced(
-  GTEST_INCLUDE_DIR
-  GTEST_STATIC_LIBRARY
-  GTEST_SHARED_LIBRARY)
-
+include(FindPackageHandleStandardArgs)
+find_package_handle_standard_args(GTEST REQUIRED_VARS
+  GTEST_SHARED_LIBRARY GTEST_STATIC_LIBRARY
+  GMOCK_SHARED_LIBRARY GMOCK_STATIC_LIBRARY
+  GMOCK_INCLUDE_DIR GTEST_INCLUDE_DIR)

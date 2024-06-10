@@ -31,36 +31,35 @@
 //
 package org.yb.client;
 
+import com.google.common.net.HostAndPort;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Random;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.yb.ColumnSchema;
+import org.yb.CommonNet.HostPortPB;
+import org.yb.CommonTypes.TableType;
+import org.yb.Schema;
+import org.yb.Type;
+import org.yb.YBTestRunner;
+import org.yb.tserver.TserverTypes.TabletServerErrorPB;
+import org.yb.util.Pair;
+import org.yb.util.Timeouts;
+import org.yb.minicluster.MiniYBClusterParameters;
 import static org.yb.AssertionWrappers.assertEquals;
 import static org.yb.AssertionWrappers.assertFalse;
 import static org.yb.AssertionWrappers.assertNotEquals;
 import static org.yb.AssertionWrappers.assertNotNull;
 import static org.yb.AssertionWrappers.assertTrue;
-
-import java.util.*;
-
-import org.junit.After;
-import org.junit.Before;
-import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.yb.ColumnSchema;
-import org.yb.Common.HostPortPB;
-import org.yb.Common.TableType;
-import org.yb.Schema;
-import org.yb.Type;
-import org.yb.master.Master;
-import org.yb.minicluster.MiniYBCluster;
-import org.yb.tserver.Tserver.TabletServerErrorPB;
-
-import com.google.common.net.HostAndPort;
-
-import com.google.protobuf.ByteString;
-
-import org.yb.YBTestRunner;
-
-import org.junit.runner.RunWith;
-import org.yb.util.Timeouts;
 
 @RunWith(value=YBTestRunner.class)
 public class TestYBClient extends BaseYBClientTest {
@@ -96,6 +95,17 @@ public class TestYBClient extends BaseYBClientTest {
   }
 
   /**
+   * Test load balancer idle check.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testIsLoadBalancerIdle() throws Exception {
+    LOG.info("Starting testIsLoadBalancerIdle");
+    IsLoadBalancerIdleResponse resp = syncClient.getIsLoadBalancerIdle();
+    assertFalse(resp.hasError());
+  }
+
+  /**
    * Test that we can create and destroy client objects (to catch leaking resources).
    * @throws Exception
    */
@@ -124,17 +134,70 @@ public class TestYBClient extends BaseYBClientTest {
   }
 
   /**
+   * Test Waiting for load balancer idle, with simulated errors.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testWaitForLoadBalancerIdle() throws Exception {
+    syncClient.injectWaitError();
+    boolean isIdle = syncClient.waitForLoadBalancerIdle(Long.MAX_VALUE);
+    assertTrue(isIdle);
+  }
+
+  private void testServerReady(HostAndPort hp, boolean isTserver) throws Exception {
+    testServerReady(hp, isTserver, false /* slowMaster */);
+  }
+
+  private void testServerReady(HostAndPort hp, boolean isTserver, boolean slowMaster)
+      throws Exception {
+    IsServerReadyResponse resp = syncClient.isServerReady(hp, isTserver);
+    assertFalse(resp.hasError());
+    assertEquals(resp.getNumNotRunningTablets(), slowMaster ? 1 : 0);
+    assertEquals(resp.getCode(), TabletServerErrorPB.Code.UNKNOWN_ERROR);
+    assertEquals(resp.getTotalTablets(), isTserver ? 0 : 1);
+  }
+
+  /**
    * Test to check tserver readiness status.
    * @throws Exception
    */
   @Test(timeout = 100000)
   public void testTServerReady() throws Exception {
-    HostAndPort thp = miniCluster.getTabletServers().entrySet().iterator().next().getKey();
-    IsTabletServerReadyResponse resp = syncClient.isTServerReady(thp);
-    assertFalse(resp.hasError());
-    assertEquals(resp.getNumNotRunningTablets(), 0);
-    assertEquals(resp.getCode(), TabletServerErrorPB.Code.UNKNOWN_ERROR);
-    assertEquals(resp.getTotalTablets(), 0);
+    for (HostAndPort thp : miniCluster.getTabletServers().keySet()) {
+      testServerReady(thp, true);
+    }
+  }
+
+  /**
+   * Test to check master readiness status.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testMasterReady() throws Exception {
+    for (HostAndPort mhp : miniCluster.getMasters().keySet()) {
+      testServerReady(mhp, false);
+    }
+  }
+
+  /**
+   * Test to check master not ready status.
+   * @throws Exception
+   */
+  @Test(timeout = 100000)
+  public void testMasterNotReady() throws Exception {
+    destroyMiniCluster();
+    createMiniCluster(3, 3, cb -> {
+      // Discard original master/tserver flags
+      cb.masterFlags(
+          Collections.singletonMap("TEST_simulate_slow_system_tablet_bootstrap_secs", "20"));
+      cb.commonTServerFlags(
+          Collections.emptyMap());
+    });
+    miniCluster.restart(false /* waitForMasterLeader */);
+
+    for (HostAndPort mhp : miniCluster.getMasters().keySet()) {
+      testServerReady(mhp, false, true);
+    }
   }
 
   /**
@@ -157,11 +220,11 @@ public class TestYBClient extends BaseYBClientTest {
     HostAndPort oldHp;
     for (int i = 0; i < 3; i++) {
       LOG.info("Add server {}", newHp[i].toString());
-      resp = syncClient.changeMasterConfig(newHp[i].getHostText(), newHp[i].getPort(), true);
+      resp = syncClient.changeMasterConfig(newHp[i].getHost(), newHp[i].getPort(), true);
       assertFalse(resp.hasError());
       oldHp = miniCluster.getMasterHostPort(i);
       LOG.info("Remove server {}", oldHp.toString());
-      resp = syncClient.changeMasterConfig(oldHp.getHostText(), oldHp.getPort(), false);
+      resp = syncClient.changeMasterConfig(oldHp.getHost(), oldHp.getPort(), false);
       assertFalse(resp.hasError());
     }
 
@@ -183,7 +246,7 @@ public class TestYBClient extends BaseYBClientTest {
     assertEquals(listResp.getMasters().size(), numBefore);
     HostAndPort newHp = miniCluster.startShellMaster();
     ChangeConfigResponse resp = syncClient.changeMasterConfig(
-        newHp.getHostText(), newHp.getPort(), true);
+        newHp.getHost(), newHp.getPort(), true);
     assertFalse(resp.hasError());
     int numAfter = miniCluster.getNumMasters();
     assertEquals(numAfter, numBefore + 1);
@@ -207,9 +270,9 @@ public class TestYBClient extends BaseYBClientTest {
         break;
       }
     }
-    LOG.info("Using host/port {}/{}.",nonLeaderHp.getHostText(), nonLeaderHp.getPort());
+    LOG.info("Using host/port {}/{}.",nonLeaderHp.getHost(), nonLeaderHp.getPort());
     ChangeConfigResponse resp = syncClient.changeMasterConfig(
-        nonLeaderHp.getHostText(), nonLeaderHp.getPort(), false, true);
+        nonLeaderHp.getHost(), nonLeaderHp.getPort(), false, true);
     assertFalse(resp.hasError());
     ListMastersResponse listResp = syncClient.listMasters();
     assertEquals(listResp.getMasters().size(), numBefore - 1);
@@ -228,7 +291,7 @@ public class TestYBClient extends BaseYBClientTest {
     assertEquals(listResp.getMasters().size(), numBefore);
     HostAndPort leaderHp = BaseYBClientTest.findLeaderMasterHostPort();
     ChangeConfigResponse resp = syncClient.changeMasterConfig(
-        leaderHp.getHostText(), leaderHp.getPort(), false);
+        leaderHp.getHost(), leaderHp.getPort(), false);
     assertFalse(resp.hasError());
     listResp = syncClient.listMasters();
     assertEquals(listResp.getMasters().size(), numBefore - 1);
@@ -363,24 +426,24 @@ public class TestYBClient extends BaseYBClientTest {
   @Test(timeout = 100000)
   public void testAffinitizedLeaders() throws Exception {
     destroyMiniCluster();
-    List<List<String>> tserverArgs = new ArrayList<List<String>>();
-    tserverArgs.add(Arrays.asList(
-        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone0"));
-    tserverArgs.add(Arrays.asList(
-        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone1"));
-    tserverArgs.add(Arrays.asList(
-        "--placement_cloud=testCloud", "--placement_region=testRegion", "--placement_zone=testZone2"));
-    createMiniCluster(3, tserverArgs);
+    createMiniCluster(3, 3, cb -> {
+      cb.addCommonTServerFlag("placement_cloud", "testCloud");
+      cb.addCommonTServerFlag("placement_region", "testRegion");
+      cb.perTServerFlags(Arrays.asList(
+          Collections.singletonMap("placement_zone", "testZone0"),
+          Collections.singletonMap("placement_zone", "testZone1"),
+          Collections.singletonMap("placement_zone", "testZone2")));
+    });
     LOG.info("created mini cluster");
 
-    List<org.yb.Common.CloudInfoPB> leaders = new ArrayList<org.yb.Common.CloudInfoPB>();
+    List<org.yb.CommonNet.CloudInfoPB> leaders = new ArrayList<org.yb.CommonNet.CloudInfoPB>();
 
-    org.yb.Common.CloudInfoPB.Builder cloudInfoBuilder = org.yb.Common.CloudInfoPB.newBuilder().
-    setPlacementCloud("testCloud").setPlacementRegion("testRegion");
+    org.yb.CommonNet.CloudInfoPB.Builder cloudInfoBuilder = org.yb.CommonNet.CloudInfoPB.
+        newBuilder().setPlacementCloud("testCloud").setPlacementRegion("testRegion");
 
-    org.yb.Common.CloudInfoPB ci0 = cloudInfoBuilder.setPlacementZone("testZone0").build();
-    org.yb.Common.CloudInfoPB ci1 = cloudInfoBuilder.setPlacementZone("testZone1").build();
-    org.yb.Common.CloudInfoPB ci2 = cloudInfoBuilder.setPlacementZone("testZone2").build();
+    org.yb.CommonNet.CloudInfoPB ci0 = cloudInfoBuilder.setPlacementZone("testZone0").build();
+    org.yb.CommonNet.CloudInfoPB ci1 = cloudInfoBuilder.setPlacementZone("testZone1").build();
+    org.yb.CommonNet.CloudInfoPB ci2 = cloudInfoBuilder.setPlacementZone("testZone2").build();
 
     // First, making the first two zones affinitized leaders.
     leaders.add(ci0);
@@ -398,7 +461,7 @@ public class TestYBClient extends BaseYBClientTest {
     List<ColumnSchema> columns = new ArrayList<>(hashKeySchema.getColumns());
     Schema newSchema = new Schema(columns);
     CreateTableOptions tableOptions = new CreateTableOptions().setNumTablets(8);
-    YBTable table = syncClient.createTable(DEFAULT_KEYSPACE_NAME, "AffinitizedLeaders", newSchema, tableOptions);
+    syncClient.createTable(DEFAULT_KEYSPACE_NAME, "AffinitizedLeaders", newSchema, tableOptions);
 
     assertTrue(syncClient.waitForAreLeadersOnPreferredOnlyCondition(DEFAULT_TIMEOUT_MS));
 
@@ -500,5 +563,67 @@ public class TestYBClient extends BaseYBClientTest {
     // Check that we can open a table and see that it has the new schema.
     YBTable table = syncClient.openTable(DEFAULT_KEYSPACE_NAME, tableName);
     assertEquals(newSchema.getColumnCount(), table.getSchema().getColumnCount());
+  }
+
+  /**
+   * Test proper number of tables is returned by YBClient.
+   */
+  @Test(timeout = 100000)
+  public void testGetTablesList() throws Exception {
+    LOG.info("Starting testGetTablesList");
+    assertTrue(syncClient.getTablesList().getTableInfoList().isEmpty());
+
+    // Check that YEDIS tables are created and retrieved properly.
+    String redisTableName = YBClient.REDIS_DEFAULT_TABLE_NAME;
+    syncClient.createRedisTable(redisTableName);
+    assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
+    assertTrue(syncClient.getTablesList().getTablesList().contains(redisTableName));
+
+    // Check that non-YEDIS tables are created and retrieved properly.
+    syncClient.createTable(DEFAULT_KEYSPACE_NAME, tableName, hashKeySchema,
+                           new CreateTableOptions());
+    assertFalse(syncClient.getTablesList().getTablesList().isEmpty());
+    assertTrue(syncClient.getTablesList().getTablesList().contains(tableName));
+  }
+
+  @Test(timeout = 100000)
+  public void testEncryptionClientCommands() throws Exception {
+    LOG.info("Starting testEncryptionClientCommands");
+
+    final String keyId1 = "key1";
+    final String keyId2 = "key2";
+
+    Map<String, byte[]> universeKeys = new HashMap<>();
+    byte[] bytes = new byte[32];
+    new Random().nextBytes(bytes);
+    universeKeys.put(keyId1, bytes);
+    for (HostAndPort hp : miniCluster.getMasterHostPorts()) {
+      syncClient.addUniverseKeys(universeKeys, hp);
+      syncClient.waitForMasterHasUniverseKeyInMemory(10000, keyId1, hp);
+      assertFalse(syncClient.hasUniverseKeyInMemory(keyId2, hp));
+    }
+
+    syncClient.enableEncryptionAtRestInMemory(keyId1);
+    Pair<Boolean, String> status = syncClient.isEncryptionEnabled();
+    assertTrue(status.getFirst());
+    assertEquals(status.getSecond(), keyId1);
+    LOG.info("finished first");
+
+    // Now, lets trigger a key rotation.
+    new Random().nextBytes(bytes);
+
+    universeKeys.clear();
+    universeKeys.put(keyId2, bytes);
+    for (HostAndPort hp : miniCluster.getMasterHostPorts()) {
+      LOG.info("Processing add 2nd time");
+      syncClient.addUniverseKeys(universeKeys, hp);
+      syncClient.waitForMasterHasUniverseKeyInMemory(10000, keyId2, hp);
+      assertTrue(syncClient.hasUniverseKeyInMemory(keyId1, hp));
+    }
+
+    syncClient.enableEncryptionAtRestInMemory(keyId2);
+    status = syncClient.isEncryptionEnabled();
+    assertTrue(status.getFirst());
+    assertEquals(status.getSecond(), keyId2);
   }
 }

@@ -33,32 +33,34 @@
 // First column is in ascending order, the rest are random data.
 // Helps make things like availability demos a little easier.
 
-#include <iostream>
 #include <memory>
 #include <vector>
-#include <gflags/gflags.h>
-#include <glog/logging.h>
 
 #include "yb/client/client.h"
 #include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
 #include "yb/client/table.h"
 #include "yb/client/table_handle.h"
 #include "yb/client/yb_op.h"
+#include "yb/client/yb_table_name.h"
 
-#include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/split.h"
 #include "yb/gutil/strings/substitute.h"
+
 #include "yb/tools/data_gen_util.h"
+
 #include "yb/util/flags.h"
 #include "yb/util/logging.h"
 #include "yb/util/random.h"
 #include "yb/util/random_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status_log.h"
 
 using namespace std::literals;
 
-DEFINE_string(master_address, "localhost",
-              "Comma separated list of master addresses to run against.");
+DEFINE_NON_RUNTIME_string(master_address, "localhost",
+    "Comma separated list of master addresses to run against.");
 
 namespace yb {
 namespace tools {
@@ -66,12 +68,9 @@ namespace tools {
 using std::string;
 using std::vector;
 
-using client::YBClient;
 using client::YBClientBuilder;
-using client::YBColumnSchema;
 using client::YBSchema;
 using client::YBSession;
-using client::YBTable;
 using client::YBTableName;
 using std::shared_ptr;
 
@@ -89,25 +88,23 @@ static int WriteRandomDataToTable(int argc, char** argv) {
   InitGoogleLoggingSafe(argv[0]);
   FLAGS_logtostderr = true;
 
-  YBTableName table_name(argv[1]); // Default namespace.
+  YBTableName table_name(YQL_DATABASE_CQL, argv[1]); // Default namespace.
 
   vector<string> addrs = strings::Split(FLAGS_master_address, ",");
   CHECK(!addrs.empty()) << "At least one master address must be specified!";
 
   // Set up client.
   LOG(INFO) << "Connecting to YB Master...";
-  shared_ptr<YBClient> client;
-  CHECK_OK(YBClientBuilder()
-           .master_server_addrs(addrs)
-           .Build(&client));
+  auto client = CHECK_RESULT(YBClientBuilder()
+      .master_server_addrs(addrs)
+      .Build());
 
   LOG(INFO) << "Opening table...";
   client::TableHandle table;
   CHECK_OK(table.Open(table_name, client.get()));
   YBSchema schema = table->schema();
 
-  shared_ptr<YBSession> session = client->NewSession();
-  session->SetTimeout(5s); // Time out after 5 seconds.
+  auto session = client->NewSession(5s);  // Time out after 5 seconds.
 
   Random random(GetRandomSeed32());
 
@@ -118,10 +115,11 @@ static int WriteRandomDataToTable(int argc, char** argv) {
     GenerateDataForRow(schema, record_id, &random, req);
 
     LOG(INFO) << "Inserting record: " << req->ShortDebugString();
-    CHECK_OK(session->Apply(insert));
-    Status s = session->Flush();
+    session->Apply(insert);
+    auto flush_status = session->TEST_FlushAndGetOpsErrors();
+    const auto& s = flush_status.status;
     if (PREDICT_FALSE(!s.ok())) {
-      for (const auto& e : session->GetPendingErrors()) {
+      for (const auto& e : flush_status.errors) {
         if (e->status().IsAlreadyPresent()) {
           LOG(WARNING) << "Ignoring insert error: " << e->status().ToString();
         } else {

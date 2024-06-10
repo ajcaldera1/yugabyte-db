@@ -357,15 +357,17 @@ build_subplan(PlannerInfo *root, Plan *plan, PlannerInfo *subroot,
 		Node	   *arg = pitem->item;
 
 		/*
-		 * The Var, PlaceHolderVar, or Aggref has already been adjusted to
-		 * have the correct varlevelsup, phlevelsup, or agglevelsup.
+		 * The Var, PlaceHolderVar, Aggref or GroupingFunc has already been
+		 * adjusted to have the correct varlevelsup, phlevelsup, or
+		 * agglevelsup.
 		 *
-		 * If it's a PlaceHolderVar or Aggref, its arguments might contain
-		 * SubLinks, which have not yet been processed (see the comments for
-		 * SS_replace_correlation_vars).  Do that now.
+		 * If it's a PlaceHolderVar, Aggref or GroupingFunc, its arguments
+		 * might contain SubLinks, which have not yet been processed (see the
+		 * comments for SS_replace_correlation_vars).  Do that now.
 		 */
 		if (IsA(arg, PlaceHolderVar) ||
-			IsA(arg, Aggref))
+			IsA(arg, Aggref) ||
+			IsA(arg, GroupingFunc))
 			arg = SS_process_sublinks(root, arg, false);
 
 		splan->parParam = lappend_int(splan->parParam, pitem->paramId);
@@ -1672,10 +1674,11 @@ process_sublinks_mutator(Node *node, process_sublinks_context *context)
 	}
 
 	/*
-	 * Don't recurse into the arguments of an outer PHV or aggregate here. Any
-	 * SubLinks in the arguments have to be dealt with at the outer query
-	 * level; they'll be handled when build_subplan collects the PHV or Aggref
-	 * into the arguments to be passed down to the current subplan.
+	 * Don't recurse into the arguments of an outer PHV, Aggref or
+	 * GroupingFunc here.  Any SubLinks in the arguments have to be dealt with
+	 * at the outer query level; they'll be handled when build_subplan
+	 * collects the PHV, Aggref or GroupingFunc into the arguments to be
+	 * passed down to the current subplan.
 	 */
 	if (IsA(node, PlaceHolderVar))
 	{
@@ -1685,6 +1688,11 @@ process_sublinks_mutator(Node *node, process_sublinks_context *context)
 	else if (IsA(node, Aggref))
 	{
 		if (((Aggref *) node)->agglevelsup > 0)
+			return node;
+	}
+	else if (IsA(node, GroupingFunc))
+	{
+		if (((GroupingFunc *) node)->agglevelsup > 0)
 			return node;
 	}
 
@@ -1799,7 +1807,7 @@ SS_identify_outer_params(PlannerInfo *root)
 	outer_params = NULL;
 	for (proot = root->parent_root; proot != NULL; proot = proot->parent_root)
 	{
-		/* Include ordinary Var/PHV/Aggref params */
+		/* Include ordinary Var/PHV/Aggref/GroupingFunc params */
 		foreach(l, proot->plan_params)
 		{
 			PlannerParamItem *pitem = (PlannerParamItem *) lfirst(l);
@@ -2028,6 +2036,12 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			context.paramids = bms_add_members(context.paramids, scan_params);
 			break;
 
+		case T_YbSeqScan:
+			finalize_primnode((Node *) ((YbSeqScan *) plan)->yb_pushdown.quals,
+							  &context);
+			context.paramids = bms_add_members(context.paramids, scan_params);
+			break;
+
 		case T_SampleScan:
 			finalize_primnode((Node *) ((SampleScan *) plan)->tablesample,
 							  &context);
@@ -2038,6 +2052,10 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			finalize_primnode((Node *) ((IndexScan *) plan)->indexqual,
 							  &context);
 			finalize_primnode((Node *) ((IndexScan *) plan)->indexorderby,
+							  &context);
+			finalize_primnode((Node *) ((IndexScan *) plan)->yb_rel_pushdown.quals,
+							  &context);
+			finalize_primnode((Node *) ((IndexScan *) plan)->yb_idx_pushdown.quals,
 							  &context);
 
 			/*
@@ -2052,6 +2070,8 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->indexqual,
 							  &context);
 			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->indexorderby,
+							  &context);
+			finalize_primnode((Node *) ((IndexOnlyScan *) plan)->yb_pushdown.quals,
 							  &context);
 
 			/*
@@ -2070,12 +2090,38 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			 */
 			break;
 
+		case T_YbBitmapIndexScan:
+			finalize_primnode((Node *) ((YbBitmapIndexScan *) plan)->indexqual,
+							  &context);
+
+			/*
+			 * we need not look at indexqualorig, since it will have the same
+			 * param references as indexqual.
+			 */
+			break;
+
 		case T_BitmapHeapScan:
 			finalize_primnode((Node *) ((BitmapHeapScan *) plan)->bitmapqualorig,
 							  &context);
 			context.paramids = bms_add_members(context.paramids, scan_params);
 			break;
 
+		case T_YbBitmapTableScan:
+		{
+			YbBitmapTableScan *bitmapscan = (YbBitmapTableScan *) plan;
+			finalize_primnode((Node *) bitmapscan->rel_pushdown.quals,
+							  &context);
+			finalize_primnode((Node *) bitmapscan->recheck_pushdown.quals,
+							  &context);
+			finalize_primnode((Node *) bitmapscan->recheck_local_quals,
+							  &context);
+			finalize_primnode((Node *) bitmapscan->fallback_pushdown.quals,
+							  &context);
+			finalize_primnode((Node *) bitmapscan->fallback_local_quals,
+							  &context);
+			context.paramids = bms_add_members(context.paramids, scan_params);
+			break;
+		}
 		case T_TidScan:
 			finalize_primnode((Node *) ((TidScan *) plan)->tidquals,
 							  &context);
@@ -2339,6 +2385,7 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 			break;
 
 		case T_NestLoop:
+		case T_YbBatchedNestLoop:
 			{
 				ListCell   *l;
 
@@ -2349,8 +2396,13 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 				{
 					NestLoopParam *nlp = (NestLoopParam *) lfirst(l);
 
-					nestloop_params = bms_add_member(nestloop_params,
-													 nlp->paramno);
+					int batch_size = nlp->yb_batch_size;
+					for (size_t i = 0; i < batch_size; i++)
+					{
+						nestloop_params =
+							bms_add_member(nestloop_params,
+										   nlp->paramno + i);
+					}
 				}
 			}
 			break;
@@ -2555,8 +2607,8 @@ finalize_plan(PlannerInfo *root, Plan *plan,
 }
 
 /*
- * finalize_primnode: add IDs of all PARAM_EXEC params appearing in the given
- * expression tree to the result set.
+ * finalize_primnode: add IDs of all PARAM_EXEC params that appear (or will
+ * appear) in the given expression tree to the result set.
  */
 static bool
 finalize_primnode(Node *node, finalize_primnode_context *context)
@@ -2573,7 +2625,26 @@ finalize_primnode(Node *node, finalize_primnode_context *context)
 		}
 		return false;			/* no more to do here */
 	}
-	if (IsA(node, SubPlan))
+	else if (IsA(node, Aggref))
+	{
+		/*
+		 * Check to see if the aggregate will be replaced by a Param
+		 * referencing a subquery output during setrefs.c.  If so, we must
+		 * account for that Param here.  (For various reasons, it's not
+		 * convenient to perform that substitution earlier than setrefs.c, nor
+		 * to perform this processing after setrefs.c.  Thus we need a wart
+		 * here.)
+		 */
+		Aggref	   *aggref = (Aggref *) node;
+		Param	   *aggparam;
+
+		aggparam = find_minmax_agg_replacement_param(context->root, aggref);
+		if (aggparam != NULL)
+			context->paramids = bms_add_member(context->paramids,
+											   aggparam->paramid);
+		/* Fall through to examine the agg's arguments */
+	}
+	else if (IsA(node, SubPlan))
 	{
 		SubPlan    *subplan = (SubPlan *) node;
 		Plan	   *plan = planner_subplan_get_plan(context->root, subplan);

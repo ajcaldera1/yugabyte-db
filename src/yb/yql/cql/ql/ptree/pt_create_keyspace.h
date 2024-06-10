@@ -15,8 +15,7 @@
 // Tree node definitions for CREATE KEYSPACE statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_CREATE_KEYSPACE_H_
-#define YB_YQL_CQL_QL_PTREE_PT_CREATE_KEYSPACE_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 #include "yb/yql/cql/ql/ptree/pt_keyspace_property.h"
@@ -37,7 +36,7 @@ class PTCreateKeyspace : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTCreateKeyspace(MemoryContext *memctx,
-                   YBLocation::SharedPtr loc,
+                   YBLocationPtr loc,
                    const MCSharedPtr<MCString>& name,
                    bool create_if_not_exists,
                    const PTKeyspacePropertyListNode::SharedPtr& keyspace_properties);
@@ -54,7 +53,7 @@ class PTCreateKeyspace : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   bool create_if_not_exists() const {
@@ -78,5 +77,3 @@ class PTCreateKeyspace : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_CREATE_KEYSPACE_H_

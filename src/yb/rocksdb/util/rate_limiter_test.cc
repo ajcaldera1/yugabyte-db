@@ -27,14 +27,17 @@
 
 #include <inttypes.h>
 #include <limits>
-#include "yb/rocksdb/util/testharness.h"
+#include <string>
+#include <gtest/gtest.h>
+#include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/rate_limiter.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/env.h"
+
+#include "yb/rocksdb/util/testutil.h"
 
 namespace rocksdb {
 
-class RateLimiterTest : public testing::Test {};
+class RateLimiterTest : public RocksDBTest {};
 
 TEST_F(RateLimiterTest, StartStop) {
   std::unique_ptr<RateLimiter> limiter(new GenericRateLimiter(100, 100, 10));
@@ -63,9 +66,9 @@ TEST_F(RateLimiterTest, Rate) {
     while (thread_env->NowMicros() < until) {
       for (int i = 0; i < static_cast<int>(r.Skewed(arg->burst) + 1); ++i) {
         arg->limiter->Request(r.Uniform(arg->request_size - 1) + 1,
-                              Env::IO_HIGH);
+                              yb::IOPriority::kHigh);
       }
-      arg->limiter->Request(r.Uniform(arg->request_size - 1) + 1, Env::IO_LOW);
+      arg->limiter->Request(r.Uniform(arg->request_size - 1) + 1, yb::IOPriority::kLow);
     }
   };
 

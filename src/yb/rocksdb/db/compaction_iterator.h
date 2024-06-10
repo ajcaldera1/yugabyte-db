@@ -19,8 +19,6 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_ROCKSDB_DB_COMPACTION_ITERATOR_H
-#define YB_ROCKSDB_DB_COMPACTION_ITERATOR_H
 
 #pragma once
 
@@ -41,7 +39,6 @@ struct CompactionIteratorStats {
   int64_t num_record_drop_user = 0;
   int64_t num_record_drop_hidden = 0;
   int64_t num_record_drop_obsolete = 0;
-  uint64_t total_filter_time = 0;
 
   // Input statistics
   // TODO(noetzli): The stats are incomplete. They are lacking everything
@@ -58,13 +55,17 @@ class CompactionIterator {
   CompactionIterator(InternalIterator* input, const Comparator* cmp,
                      MergeHelper* merge_helper, SequenceNumber last_sequence,
                      std::vector<SequenceNumber>* snapshots,
-                     SequenceNumber earliest_write_conflict_snapshot, Env* env,
+                     SequenceNumber earliest_write_conflict_snapshot,
                      bool expect_valid_internal_key,
                      Compaction* compaction = nullptr,
                      CompactionFilter* compaction_filter = nullptr,
                      LogBuffer* log_buffer = nullptr);
 
   void ResetRecordCounts();
+
+  // Add live ranges to this iterator.
+  // See live_key_ranges_stack_ comment for details.
+  void AddLiveRanges(const std::vector<std::pair<Slice, Slice>>& ranges);
 
   // Seek to the beginning of the compaction iterator output.
   //
@@ -108,7 +109,6 @@ class CompactionIterator {
   MergeHelper* merge_helper_;
   const std::vector<SequenceNumber>* snapshots_;
   const SequenceNumber earliest_write_conflict_snapshot_;
-  Env* env_;
   bool expect_valid_internal_key_;
   Compaction* compaction_;
   CompactionFilter* compaction_filter_;
@@ -163,7 +163,10 @@ class CompactionIterator {
   // is in or beyond the last file checked during the previous call
   std::vector<size_t> level_ptrs_;
   CompactionIteratorStats iter_stats_;
+
+  // Stores the disjoint live ranges of this tablet in user keyspace. Ranges at the back are
+  // lexicographically first. Ranges are popped off the back of the stack as our iteration passes
+  // them.
+  std::vector<std::pair<Slice, Slice>> live_key_ranges_stack_;
 };
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_COMPACTION_ITERATOR_H

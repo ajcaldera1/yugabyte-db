@@ -17,18 +17,45 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
+
 #include "yb/rocksdb/db/auto_roll_logger.h"
+
 #include "yb/rocksdb/util/mutexlock.h"
+
+#include "yb/util/path_util.h"
+#include "yb/util/status_log.h"
 
 using std::string;
 
 namespace rocksdb {
 
+AutoRollLogger::AutoRollLogger(Env* env, const std::string& dbname,
+               const std::string& db_log_dir, size_t log_max_size,
+               size_t log_file_time_to_roll,
+               const InfoLogLevel log_level)
+    : Logger(log_level),
+      dbname_(dbname),
+      db_log_dir_(db_log_dir),
+      env_(env),
+      status_(Status::OK()),
+      kMaxLogFileSize(log_max_size),
+      kLogFileTimeToRoll(log_file_time_to_roll),
+      cached_now(static_cast<uint64_t>(env_->NowMicros() * 1e-6)),
+      ctime_(cached_now),
+      cached_now_access_count(0),
+      call_NowMicros_every_N_records_(100),
+      mutex_() {
+  CHECK_OK(env->GetAbsolutePath(dbname, &db_absolute_path_));
+  log_fname_ = InfoLogFileName(dbname_, db_absolute_path_, db_log_dir_);
+  RollLogFile();
+  CHECK_OK(ResetLogger());
+}
+
 // -- AutoRollLogger
 Status AutoRollLogger::ResetLogger() {
-  TEST_SYNC_POINT("AutoRollLogger::ResetLogger:BeforeNewLogger");
+  DEBUG_ONLY_TEST_SYNC_POINT("AutoRollLogger::ResetLogger:BeforeNewLogger");
   status_ = env_->NewLogger(log_fname_, &logger_);
-  TEST_SYNC_POINT("AutoRollLogger::ResetLogger:AfterNewLogger");
+  DEBUG_ONLY_TEST_SYNC_POINT("AutoRollLogger::ResetLogger:AfterNewLogger");
 
   if (!status_.ok()) {
     return status_;
@@ -51,6 +78,9 @@ void AutoRollLogger::RollLogFile() {
   // This function is called when log is rotating. Two rotations
   // can happen quickly (NowMicro returns same value). To not overwrite
   // previous log file we increment by one micro second and try again.
+  if (!env_->FileExists(log_fname_).ok()) {
+    return;
+  }
   uint64_t now = env_->NowMicros();
   std::string old_fname;
   do {
@@ -58,7 +88,7 @@ void AutoRollLogger::RollLogFile() {
       dbname_, now, db_absolute_path_, db_log_dir_);
     now++;
   } while (env_->FileExists(old_fname).ok());
-  env_->RenameFile(log_fname_, old_fname);
+  CHECK_OK(env_->RenameFile(log_fname_, old_fname));
 }
 
 string AutoRollLogger::ValistToString(const char* format, va_list args) const {
@@ -147,6 +177,15 @@ bool AutoRollLogger::LogExpired() {
   return cached_now >= ctime_ + kLogFileTimeToRoll;
 }
 
+Status CreateDirs(Env* env, const std::string& dir) {
+  if (dir == "/" || env->DirExists(dir)) {
+    return Status::OK();
+  }
+
+  RETURN_NOT_OK(CreateDirs(env, yb::DirName(dir)));
+  return env->CreateDir(dir);
+}
+
 Status CreateLoggerFromOptions(const std::string& dbname,
                                const DBOptions& options,
                                std::shared_ptr<Logger>* logger) {
@@ -157,11 +196,11 @@ Status CreateLoggerFromOptions(const std::string& dbname,
 
   Env* env = options.env;
   std::string db_absolute_path;
-  env->GetAbsolutePath(dbname, &db_absolute_path);
+  RETURN_NOT_OK(env->GetAbsolutePath(dbname, &db_absolute_path));
   std::string fname =
       InfoLogFileName(dbname, db_absolute_path, options.db_log_dir);
 
-  env->CreateDirIfMissing(dbname);  // In case it does not exist
+  RETURN_NOT_OK(CreateDirs(env, yb::DirName(fname)));  // In case it does not exist
   // Currently we only support roll by time-to-roll and log size
   if (options.log_file_time_to_roll > 0 || options.max_log_file_size > 0) {
     AutoRollLogger* result = new AutoRollLogger(
@@ -176,9 +215,11 @@ Status CreateLoggerFromOptions(const std::string& dbname,
     return s;
   } else {
     // Open a log file in the same directory as the db
-    env->RenameFile(
-        fname, OldInfoLogFileName(dbname, env->NowMicros(), db_absolute_path,
-                                  options.db_log_dir));
+    if (env->FileExists(fname).ok()) {
+      RETURN_NOT_OK(env->RenameFile(
+          fname, OldInfoLogFileName(dbname, env->NowMicros(), db_absolute_path,
+                                    options.db_log_dir)));
+    }
     auto s = env->NewLogger(fname, logger);
     if (logger->get() != nullptr) {
       (*logger)->SetInfoLogLevel(options.info_log_level);

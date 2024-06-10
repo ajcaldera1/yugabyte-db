@@ -32,13 +32,13 @@
 #include "yb/util/jsonwriter.h"
 
 #include <string>
-#include <vector>
 
-#include <glog/logging.h>
-#include <google/protobuf/descriptor.h>
+#include "yb/util/logging.h"
 #include <google/protobuf/message.h>
 #include <rapidjson/prettywriter.h>
-#include <rapidjson/rapidjson.h>
+
+#include "yb/gutil/casts.h"
+#include "yb/gutil/strings/escaping.h"
 
 using google::protobuf::FieldDescriptor;
 using google::protobuf::Message;
@@ -49,6 +49,40 @@ using std::stringstream;
 using std::vector;
 
 namespace yb {
+
+void JsonEscape(GStringPiece s, string* out) {
+  out->reserve(out->size() + s.size() * 2);
+  const char* p_end = s.data() + s.size();
+  for (const char* p = s.data(); p != p_end; p++) {
+    // Only the following characters need to be escaped, according to json.org.
+    // In particular, it's illegal to escape the single-quote character, and
+    // JSON does not support the "\x" escape sequence like C/Java.
+    switch (*p) {
+      case '"':
+      case '\\':
+        out->push_back('\\');
+        out->push_back(*p);
+        break;
+      case '\b':
+        out->append("\\b");
+        break;
+      case '\f':
+        out->append("\\f");
+        break;
+      case '\n':
+        out->append("\\n");
+        break;
+      case '\r':
+        out->append("\\r");
+        break;
+      case '\t':
+        out->append("\\t");
+        break;
+      default:
+        out->push_back(*p);
+    }
+  }
+}
 
 // Adapter to allow RapidJSON to write directly to a stringstream.
 // Since Squeasel exposes a stringstream as its interface, this is needed to avoid overcopying.
@@ -112,10 +146,21 @@ class JsonWriterImpl : public JsonWriterIf {
   void StartArray() override;
   void EndArray() override;
 
- private:
+ protected:
   UTF8StringStreamBuffer stream_;
   T writer_;
+ private:
   DISALLOW_COPY_AND_ASSIGN(JsonWriterImpl);
+};
+
+template<class T>
+class EscapedJsonWriterImpl : public JsonWriterImpl<T> {
+ public:
+  explicit EscapedJsonWriterImpl(stringstream* out) : JsonWriterImpl<T>(out) {}
+
+  void String(const char* str, size_t length) override;
+  void String(const char* str) override;
+  void String(const std::string& str) override;
 };
 
 //
@@ -132,6 +177,12 @@ JsonWriter::JsonWriter(stringstream* out, Mode m) {
       break;
     case COMPACT:
       impl_.reset(new JsonWriterImpl<CompactWriterClass>(DCHECK_NOTNULL(out)));
+      break;
+    case PRETTY_ESCAPE_STR:
+      impl_.reset(new EscapedJsonWriterImpl<PrettyWriterClass>(DCHECK_NOTNULL(out)));
+      break;
+    case COMPACT_ESCAPE_STR:
+      impl_.reset(new EscapedJsonWriterImpl<CompactWriterClass>(DCHECK_NOTNULL(out)));
       break;
   }
 }
@@ -321,12 +372,16 @@ template<class T>
 void JsonWriterImpl<T>::Uint64(uint64_t u64) { writer_.Uint64(u64); }
 template<class T>
 void JsonWriterImpl<T>::Double(double d) { writer_.Double(d); }
+
 template<class T>
-void JsonWriterImpl<T>::String(const char* str, size_t length) { writer_.String(str, length); }
+void JsonWriterImpl<T>::String(const char* str, size_t length) {
+  writer_.String(str, narrow_cast<rapidjson::SizeType>(length));
+}
+
 template<class T>
 void JsonWriterImpl<T>::String(const char* str) { writer_.String(str); }
 template<class T>
-void JsonWriterImpl<T>::String(const string& str) { writer_.String(str.c_str(), str.length()); }
+void JsonWriterImpl<T>::String(const string& str) { String(str.c_str(), str.length()); }
 template<class T>
 void JsonWriterImpl<T>::StartObject() { writer_.StartObject(); }
 template<class T>
@@ -335,5 +390,26 @@ template<class T>
 void JsonWriterImpl<T>::StartArray() { writer_.StartArray(); }
 template<class T>
 void JsonWriterImpl<T>::EndArray() { writer_.EndArray(); }
+
+//
+// EscapedJsonWriterImpl: implementation with escaping non-printable characters in strings.
+//
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const string& str) {
+  const string escaped = CHexEscape(str);
+  JsonWriterImpl<T>::writer_.String(
+      escaped.c_str(), narrow_cast<rapidjson::SizeType>(escaped.length()));
+}
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const char* str, size_t length) {
+  String(string(str, length));
+}
+
+template<class T>
+void EscapedJsonWriterImpl<T>::String(const char* str) {
+  String(string(str));
+}
 
 } // namespace yb

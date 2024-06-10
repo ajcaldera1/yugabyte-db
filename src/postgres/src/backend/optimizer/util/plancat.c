@@ -243,6 +243,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->rel = rel;
 			info->ncolumns = ncolumns = index->indnatts;
 			info->nkeycolumns = nkeycolumns = index->indnkeyatts;
+			info->nhashcolumns = 0;
 
 			info->indexkeys = (int *) palloc(sizeof(int) * ncolumns);
 			info->indexcollations = (Oid *) palloc(sizeof(Oid) * nkeycolumns);
@@ -274,14 +275,15 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			info->amcanparallel = amroutine->amcanparallel;
 			info->amhasgettuple = (amroutine->amgettuple != NULL);
 			info->amhasgetbitmap = (amroutine->amgetbitmap != NULL);
+			info->yb_amhasgetbitmap = (amroutine->yb_amgetbitmap != NULL);
 			info->amcostestimate = amroutine->amcostestimate;
+			info->yb_cached_ybctid_size = 0;
 			Assert(info->amcostestimate != NULL);
 
 			/*
 			 * Fetch the ordering information for the index, if any.
-			 * TODO: support ordering with range-based index in YugaByte.
 			 */
-			if (info->relam == BTREE_AM_OID && !IsYugaByteEnabled())
+			if (info->relam == BTREE_AM_OID)
 			{
 				/*
 				 * If it's a btree index, we can use its opfamily OIDs
@@ -329,8 +331,15 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					Oid			btopcintype;
 					int16		btstrategy;
 
-					info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
-					info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					if (IsYBRelation(relation) && (opt & INDOPTION_HASH) != 0)
+					{
+						info->nhashcolumns++;
+						info->reverse_sort[i] = false;
+						info->nulls_first[i] = false;
+					} else {
+						info->reverse_sort[i] = (opt & INDOPTION_DESC) != 0;
+						info->nulls_first[i] = (opt & INDOPTION_NULLS_FIRST) != 0;
+					}
 
 					ltopr = get_opfamily_member(info->opfamily[i],
 												info->opcintype[i],
@@ -393,7 +402,7 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			 * a table, except we can be sure that the index is not larger
 			 * than the table.
 			 */
-			if (info->indpred == NIL && !IsYugaByteEnabled())
+			if (info->indpred == NIL && !IsYBRelation(indexRelation))
 			{
 				info->pages = RelationGetNumberOfBlocks(indexRelation);
 				info->tuples = rel->tuples;
@@ -410,18 +419,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 
 			if (info->relam == BTREE_AM_OID)
 			{
-				/*
-				 * For YugaByte-based index, set the tree height to "unknown".
-				 */
-				if (IsYugaByteEnabled())
-				{
-					info->tree_height = -1;
-				}
-				else
-				{
-					/* For btrees, get tree height while we have the index open */
-					info->tree_height = _bt_getrootheight(indexRelation);
-				}
+				/* For btrees, get tree height while we have the index open */
+				info->tree_height = _bt_getrootheight(indexRelation);
 			}
 			else
 			{
@@ -961,7 +960,7 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	 * TODO We don't support forwarding size estimates to postgres yet.
 	 * Use whatever is in pg_class.
 	 */
-	if (IsYugaByteEnabled())
+	if (IsYBRelation(rel))
 	{
 		*pages = rel->rd_rel->relpages;
 		*tuples = rel->rd_rel->reltuples;
@@ -2041,7 +2040,7 @@ find_partition_scheme(PlannerInfo *root, Relation relation)
 		palloc(sizeof(FmgrInfo) * partnatts);
 	for (i = 0; i < partnatts; i++)
 		fmgr_info_copy(&part_scheme->partsupfunc[i], &partkey->partsupfunc[i],
-					   CurrentMemoryContext);
+					   GetCurrentMemoryContext());
 
 	/* Add the partitioning scheme to PlannerInfo. */
 	root->part_schemes = lappend(root->part_schemes, part_scheme);

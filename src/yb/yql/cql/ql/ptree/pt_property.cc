@@ -12,8 +12,17 @@
 //
 
 #include "yb/yql/cql/ql/ptree/pt_property.h"
+
+#include "yb/common/ql_type.h"
+
+#include "yb/util/logging.h"
+#include "yb/util/status_format.h"
 #include "yb/util/stol_utils.h"
 #include "yb/util/string_case.h"
+
+#include "yb/yql/cql/ql/ptree/pt_expr.h"
+
+using std::string;
 
 namespace yb {
 namespace ql {
@@ -21,7 +30,7 @@ namespace ql {
 using strings::Substitute;
 
 PTProperty::PTProperty(MemoryContext *memctx,
-                      YBLocation::SharedPtr loc,
+                      YBLocationPtr loc,
                       const MCSharedPtr<MCString>& lhs,
                       const PTExpr::SharedPtr& rhs)
     : TreeNode(memctx, loc),
@@ -30,7 +39,7 @@ PTProperty::PTProperty(MemoryContext *memctx,
 }
 
 PTProperty::PTProperty(MemoryContext *memctx,
-                       YBLocation::SharedPtr loc)
+                       YBLocationPtr loc)
     : TreeNode(memctx, loc) {
 }
 
@@ -54,7 +63,7 @@ Status PTProperty::GetIntValueFromExpr(PTExpr::SharedPtr expr,
       DCHECK(expr->ql_type_id() == DataType::VARINT);
       str_val = std::dynamic_pointer_cast<PTConstVarInt>(expr)->Eval();
     }
-    return ResultToStatus(&util::CheckedStoll)(val, *str_val);
+    return ResultToStatus(&CheckedStoll)(val, *str_val);
   } else if (QLType::IsInteger(expr->ql_type_id())) {
     *val = std::dynamic_pointer_cast<PTConstInt>(expr)->Eval();
     return Status::OK();
@@ -81,7 +90,7 @@ Status PTProperty::GetDoubleValueFromExpr(PTExpr::SharedPtr expr,
     return Status::OK();
   } else if (expr->ql_type_id() == DataType::STRING) {
     auto str_val = std::dynamic_pointer_cast<PTConstText>(expr)->Eval();
-    return ResultToStatus(&util::CheckedStold)(val, *str_val);
+    return ResultToStatus(&CheckedStold)(val, *str_val);
   }
   return STATUS_FORMAT(InvalidArgument, "Invalid float value for '$0'", property_name);
 }

@@ -19,6 +19,7 @@
 #include "executor/nodeAppend.h"
 #include "executor/nodeBitmapAnd.h"
 #include "executor/nodeBitmapHeapscan.h"
+#include "executor/nodeYbBitmapTablescan.h"
 #include "executor/nodeBitmapIndexscan.h"
 #include "executor/nodeBitmapOr.h"
 #include "executor/nodeCtescan.h"
@@ -40,6 +41,7 @@
 #include "executor/nodeMergejoin.h"
 #include "executor/nodeModifyTable.h"
 #include "executor/nodeNamedtuplestorescan.h"
+#include "executor/nodeYbBatchedNestloop.h"
 #include "executor/nodeNestloop.h"
 #include "executor/nodeProjectSet.h"
 #include "executor/nodeRecursiveunion.h"
@@ -56,6 +58,8 @@
 #include "executor/nodeValuesscan.h"
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
+#include "executor/nodeYbBitmapIndexscan.h"
+#include "executor/nodeYbSeqscan.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/relation.h"
 #include "utils/rel.h"
@@ -165,6 +169,10 @@ ExecReScan(PlanState *node)
 			ExecReScanSeqScan((SeqScanState *) node);
 			break;
 
+		case T_YbSeqScanState:
+			ExecReScanYbSeqScan((YbSeqScanState *) node);
+			break;
+
 		case T_SampleScanState:
 			ExecReScanSampleScan((SampleScanState *) node);
 			break;
@@ -189,8 +197,17 @@ ExecReScan(PlanState *node)
 			ExecReScanBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
+
+		case T_YbBitmapIndexScanState:
+			ExecReScanYbBitmapIndexScan((YbBitmapIndexScanState *) node);
+			break;
+
 		case T_BitmapHeapScanState:
 			ExecReScanBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_YbBitmapTableScanState:
+			ExecReScanYbBitmapTableScan((YbBitmapTableScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -235,6 +252,10 @@ ExecReScan(PlanState *node)
 
 		case T_NestLoopState:
 			ExecReScanNestLoop((NestLoopState *) node);
+			break;
+
+		case T_YbBatchedNestLoopState:
+			ExecReScanYbBatchedNestLoop((YbBatchedNestLoopState *) node);
 			break;
 
 		case T_MergeJoinState:
@@ -413,6 +434,15 @@ ExecSupportsMarkRestore(Path *pathnode)
 	{
 		case T_IndexScan:
 		case T_IndexOnlyScan:
+
+			/*
+			 * Yugabyte index scan do not support mark/restore, that would force
+			 * a Materialize plan node on top of the scan.
+			 * TODO Consider to support mark/restore. Though Materialize remote
+			 * index scan may be more efficient solution anyway.
+			 */
+			return false;
+
 		case T_Material:
 		case T_Sort:
 			return true;
@@ -516,6 +546,9 @@ ExecSupportsBackwardScan(Plan *node)
 				if (flags & CUSTOMPATH_SUPPORT_BACKWARD_SCAN)
 					return true;
 			}
+			return false;
+
+		case T_YbSeqScan:
 			return false;
 
 		case T_SeqScan:

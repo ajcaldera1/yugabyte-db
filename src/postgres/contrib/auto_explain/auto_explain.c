@@ -31,6 +31,7 @@ static bool auto_explain_log_timing = true;
 static int	auto_explain_log_format = EXPLAIN_FORMAT_TEXT;
 static bool auto_explain_log_nested_statements = false;
 static double auto_explain_sample_rate = 1;
+static bool auto_explain_log_dist = true; /* option = auto_explain.log_dist */
 
 static const struct config_enum_entry format_options[] = {
 	{"text", EXPLAIN_FORMAT_TEXT, false},
@@ -177,6 +178,18 @@ _PG_init(void)
 							 NULL,
 							 NULL);
 
+	/* No effect when log_analyze is switched off */
+	DefineCustomBoolVariable("auto_explain.log_dist",
+							 "Set log_dist=false to disable distributed metrics for explain analyze.",
+							 NULL,
+							 &auto_explain_log_dist,
+							 true,
+							 PGC_SUSET,
+							 0,
+							 NULL,
+							 NULL,
+							 NULL);
+
 	EmitWarningsOnPlaceholders("auto_explain");
 
 	/* Install hooks. */
@@ -309,7 +322,14 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 {
 	if (queryDesc->totaltime && auto_explain_enabled() && current_query_sampled)
 	{
+		MemoryContext oldcxt;
 		double		msec;
+
+		/*
+		 * Make sure we operate in the per-query context, so any cruft will be
+		 * discarded later during ExecutorEnd.
+		 */
+		oldcxt = MemoryContextSwitchTo(queryDesc->estate->es_query_cxt);
 
 		/*
 		 * Make sure stats accumulation is done.  (Note: it's okay if several
@@ -329,6 +349,7 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 			es->timing = (es->analyze && auto_explain_log_timing);
 			es->summary = es->analyze;
 			es->format = auto_explain_log_format;
+			es->rpc = (es->analyze && auto_explain_log_dist);
 
 			ExplainBeginOutput(es);
 			ExplainQueryText(es, queryDesc);
@@ -360,9 +381,9 @@ explain_ExecutorEnd(QueryDesc *queryDesc)
 					(errmsg("duration: %.3f ms  plan:\n%s",
 							msec, es->str->data),
 					 errhidestmt(true)));
-
-			pfree(es->str->data);
 		}
+
+		MemoryContextSwitchTo(oldcxt);
 	}
 
 	if (prev_ExecutorEnd)

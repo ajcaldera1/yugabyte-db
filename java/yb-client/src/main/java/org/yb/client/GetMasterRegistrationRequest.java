@@ -32,13 +32,14 @@
 package org.yb.client;
 
 import com.google.protobuf.Message;
-import static org.yb.consensus.Metadata.*;
-import static org.yb.master.Master.*;
-
+import io.netty.buffer.ByteBuf;
+import org.yb.CommonTypes.PeerRole;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
 
+import static org.yb.master.MasterClusterOuterClass.GetMasterRegistrationRequestPB;
+import static org.yb.master.MasterClusterOuterClass.GetMasterRegistrationResponsePB;
+import static org.yb.master.MasterTypes.MasterErrorPB;
 /**
  * Package-private RPC that can only go to master.
  */
@@ -51,7 +52,7 @@ public class GetMasterRegistrationRequest extends YRpc<GetMasterRegistrationResp
   }
 
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     final GetMasterRegistrationRequestPB.Builder builder =
         GetMasterRegistrationRequestPB.newBuilder();
@@ -72,7 +73,7 @@ public class GetMasterRegistrationRequest extends YRpc<GetMasterRegistrationResp
     final GetMasterRegistrationResponsePB.Builder respBuilder =
         GetMasterRegistrationResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), respBuilder);
-    RaftPeerPB.Role role = RaftPeerPB.Role.FOLLOWER;
+    PeerRole role = PeerRole.FOLLOWER;
     if (!respBuilder.hasError() || respBuilder.getError().getCode() !=
         MasterErrorPB.Code.CATALOG_MANAGER_NOT_INITIALIZED) {
       role = respBuilder.getRole();

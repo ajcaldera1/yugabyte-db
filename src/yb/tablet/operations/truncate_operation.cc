@@ -13,62 +13,41 @@
 
 #include "yb/tablet/operations/truncate_operation.h"
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
-#include "yb/common/wire_protocol.h"
-#include "yb/consensus/consensus.h"
-#include "yb/rpc/rpc_context.h"
-#include "yb/server/hybrid_clock.h"
+#include "yb/consensus/consensus_round.h"
+#include "yb/consensus/consensus.messages.h"
+
 #include "yb/tablet/tablet.h"
-#include "yb/tablet/tablet_peer.h"
-#include "yb/tserver/tserver.pb.h"
+
 #include "yb/util/trace.h"
 
 namespace yb {
 namespace tablet {
 
-using consensus::ReplicateMsg;
-using consensus::TRUNCATE_OP;
-using consensus::DriverType;
-using strings::Substitute;
-
-void TruncateOperationState::UpdateRequestFromConsensusRound() {
-  request_ = consensus_round()->replicate_msg()->mutable_truncate_request();
+template <>
+void RequestTraits<LWTruncatePB>::SetAllocatedRequest(
+    consensus::LWReplicateMsg* replicate, LWTruncatePB* request) {
+  replicate->ref_truncate(request);
 }
 
-string TruncateOperationState::ToString() const {
-  return Format("TruncateOperationState [hybrid_time=$0]", hybrid_time_even_if_unset());
+template <>
+LWTruncatePB* RequestTraits<LWTruncatePB>::MutableRequest(consensus::LWReplicateMsg* replicate) {
+  return replicate->mutable_truncate();
 }
 
-TruncateOperation::TruncateOperation(std::unique_ptr<TruncateOperationState> state)
-    : Operation(std::move(state), OperationType::kTruncate) {
+Status TruncateOperation::DoAborted(const Status& status) {
+  return status;
 }
 
-consensus::ReplicateMsgPtr TruncateOperation::NewReplicateMsg() {
-  auto result = std::make_shared<ReplicateMsg>();
-  result->set_op_type(TRUNCATE_OP);
-  result->mutable_truncate_request()->CopyFrom(*state()->request());
-  return result;
-}
-
-void TruncateOperation::DoStart() {
-  state()->TrySetHybridTimeFromClock();
-
-  TRACE("START TRUNCATE: hybrid time: $0",
-        server::HybridClock::GetPhysicalValueMicros(state()->hybrid_time()));
-}
-
-Status TruncateOperation::Apply(int64_t leader_term) {
+Status TruncateOperation::DoReplicated(int64_t leader_term, Status* complete_status) {
   TRACE("APPLY TRUNCATE: started");
 
-  RETURN_NOT_OK(state()->tablet()->Truncate(state()));
+  RETURN_NOT_OK(VERIFY_RESULT(tablet_safe())->Truncate(this));
 
   TRACE("APPLY TRUNCATE: finished");
-  return Status::OK();
-}
 
-string TruncateOperation::ToString() const {
-  return Substitute("TruncateOperation [state=$0]", state()->ToString());
+  return Status::OK();
 }
 
 }  // namespace tablet

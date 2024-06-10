@@ -33,12 +33,8 @@
 #include <iostream>
 #include <string>
 
-#include <glog/logging.h>
-
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/util/env.h"
 #include "yb/util/flags.h"
-#include "yb/util/flag_tags.h"
 #include "yb/util/logging.h"
 #include "yb/util/pb_util.h"
 #include "yb/util/status.h"
@@ -48,7 +44,7 @@ using std::cerr;
 using std::endl;
 using std::string;
 
-DEFINE_bool(oneline, false, "print each protobuf on a single line");
+DEFINE_NON_RUNTIME_bool(oneline, false, "print each protobuf on a single line");
 TAG_FLAG(oneline, stable);
 
 namespace yb {
@@ -56,9 +52,9 @@ namespace pb_util {
 
 Status DumpPBContainerFile(const string& filename) {
   Env* env = Env::Default();
-  gscoped_ptr<RandomAccessFile> reader;
+  std::unique_ptr<RandomAccessFile> reader;
   RETURN_NOT_OK(env->NewRandomAccessFile(filename, &reader));
-  ReadablePBContainerFile pb_reader(reader.Pass());
+  ReadablePBContainerFile pb_reader(std::move(reader));
   RETURN_NOT_OK(pb_reader.Init());
   RETURN_NOT_OK(pb_reader.Dump(&std::cout, FLAGS_oneline));
 

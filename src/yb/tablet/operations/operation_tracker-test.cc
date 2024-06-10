@@ -35,6 +35,7 @@
 
 #include <gtest/gtest.h>
 
+#include "yb/consensus/consensus.messages.h"
 #include "yb/gutil/ref_counted.h"
 #include "yb/tablet/operations/operation_driver.h"
 #include "yb/tablet/operations/operation_tracker.h"
@@ -42,6 +43,7 @@
 #include "yb/tablet/operations/write_operation.h"
 #include "yb/util/mem_tracker.h"
 #include "yb/util/metrics.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
 
@@ -63,40 +65,49 @@ namespace tablet {
 
 class OperationTrackerTest : public YBTest {
  public:
-  class NoOpOperationState : public OperationState {
-   public:
-    NoOpOperationState() : OperationState(nullptr), req_(new consensus::ReplicateMsg()) {}
-    const google::protobuf::Message* request() const override { return req_.get(); }
-    void UpdateRequestFromConsensusRound() override {
-      req_ = consensus_round()->replicate_msg();
-    }
-    std::string ToString() const override { return "NoOpOperationState"; }
-   private:
-    std::shared_ptr<consensus::ReplicateMsg> req_;
-  };
-
   class NoOpOperation : public Operation {
    public:
-    explicit NoOpOperation(std::unique_ptr<NoOpOperationState> state)
-      : Operation(std::move(state), consensus::LEADER, Operation::WRITE_TXN) {
+    NoOpOperation()
+        : Operation(OperationType::kWrite, nullptr), req_{rpc::MakeSharedMessage<LWWritePB>()} {
+      req_->set_batch_idx(1);
     }
+
+    ~NoOpOperation() override {}
 
     consensus::ReplicateMsgPtr NewReplicateMsg() override {
-      return std::make_shared<consensus::ReplicateMsg>();
+      auto replicate = rpc::MakeSharedMessage<consensus::LWReplicateMsg>();
+      OpId(1, 1).ToPB(replicate->mutable_id());
+      replicate->set_hybrid_time(2);
+      replicate->set_op_type(consensus::OperationType::NO_OP);
+      return replicate;
     }
 
-    Status Prepare() override { return Status::OK(); }
-    void Start() override {}
-    Status Apply() override {
+    const rpc::LightweightMessage* request() const override { return req_.get(); }
+
+    void UpdateRequestFromConsensusRound() override {}
+
+    Status Prepare(IsLeaderSide is_leader_side) override { return Status::OK(); }
+    void Release() override {}
+
+    std::string ToString() const override { return "NoOp"; }
+
+    HybridTime WriteHybridTime() const override { return HybridTime::kMax; }
+
+   private:
+    Status DoReplicated(int64_t leader_term, Status* complete_status) override {
       return Status::OK();
     }
-    std::string ToString() const override {
-      return "NoOp";
-    }
+
+    Status DoAborted(const Status& status) override { return Status::OK(); }
+    void AddedAsPending(const TabletPtr& tablet) override {}
+    void RemovedFromPending(const TabletPtr& tablet) override {}
+
+    std::shared_ptr<LWWritePB> req_;
   };
 
   OperationTrackerTest()
-      : entity_(METRIC_ENTITY_tablet.Instantiate(&registry_, "test")) {
+      : entity_(METRIC_ENTITY_tablet.Instantiate(&registry_, "test")),
+        tracker_("OperationTrackerTest") {
     tracker_.StartInstrumentation(entity_);
   }
 
@@ -110,12 +121,9 @@ class OperationTrackerTest : public YBTest {
           &tracker_,
           nullptr,
           nullptr,
-          nullptr,
-          nullptr,
-          nullptr,
           TableType::DEFAULT_TABLE_TYPE));
-      auto tx = std::make_unique<NoOpOperation>(std::make_unique<NoOpOperationState>());
-      RETURN_NOT_OK(driver->Init(std::move(tx), consensus::LEADER));
+      std::unique_ptr<Operation> op = std::make_unique<NoOpOperation>();
+      RETURN_NOT_OK(driver->Init(&op, consensus::LEADER));
       local_drivers.push_back(driver);
     }
 
@@ -131,20 +139,20 @@ class OperationTrackerTest : public YBTest {
 };
 
 TEST_F(OperationTrackerTest, TestGetPending) {
-  ASSERT_EQ(0, tracker_.GetNumPendingForTests());
+  ASSERT_EQ(0, tracker_.TEST_GetNumPending());
   vector<scoped_refptr<OperationDriver> > drivers;
   ASSERT_OK(AddDrivers(1, &drivers));
   scoped_refptr<OperationDriver> driver = drivers[0];
-  ASSERT_EQ(1, tracker_.GetNumPendingForTests());
+  ASSERT_EQ(1, tracker_.TEST_GetNumPending());
 
   auto pending_operations = tracker_.GetPendingOperations();
   ASSERT_EQ(1, pending_operations.size());
   ASSERT_EQ(driver.get(), pending_operations.front().get());
 
   // And mark the operation as failed, which will cause it to unregister itself.
-  driver->Abort(STATUS(Aborted, ""));
+  driver->TEST_Abort(STATUS(Aborted, ""));
 
-  ASSERT_EQ(0, tracker_.GetNumPendingForTests());
+  ASSERT_EQ(0, tracker_.TEST_GetNumPending());
 }
 
 // Thread which starts a bunch of operations and later stops them all.
@@ -164,7 +172,7 @@ void OperationTrackerTest::RunOperationsThread(CountDownLatch* finish_latch) {
   // Finish all the operations
   for (const scoped_refptr<OperationDriver>& driver : drivers) {
     // And mark the operation as failed, which will cause it to unregister itself.
-    driver->Abort(STATUS(Aborted, ""));
+    driver->TEST_Abort(STATUS(Aborted, ""));
   }
 }
 
@@ -177,7 +185,7 @@ TEST_F(OperationTrackerTest, TestWaitForAllToFinish) {
                           &thr));
 
   // Wait for the txns to start.
-  while (tracker_.GetNumPendingForTests() == 0) {
+  while (tracker_.TEST_GetNumPending() == 0) {
     SleepFor(MonoDelta::FromMilliseconds(1));
   }
 
@@ -186,21 +194,25 @@ TEST_F(OperationTrackerTest, TestWaitForAllToFinish) {
   tracker_.WaitForAllToFinish();
 
   CHECK_OK(ThreadJoiner(thr.get()).Join());
-  ASSERT_EQ(tracker_.GetNumPendingForTests(), 0);
+  ASSERT_EQ(tracker_.TEST_GetNumPending(), 0);
 }
 
 static void CheckMetrics(const scoped_refptr<MetricEntity>& entity,
                          int expected_num_writes,
                          int expected_num_alters,
                          int expected_num_rejections) {
-  ASSERT_EQ(expected_num_writes + expected_num_alters, down_cast<AtomicGauge<uint64_t>*>(
-      entity->FindOrNull(METRIC_all_operations_inflight).get())->value());
-  ASSERT_EQ(expected_num_writes, down_cast<AtomicGauge<uint64_t>*>(
-      entity->FindOrNull(METRIC_write_operations_inflight).get())->value());
-  ASSERT_EQ(expected_num_alters, down_cast<AtomicGauge<uint64_t>*>(
-      entity->FindOrNull(METRIC_alter_schema_operations_inflight).get())->value());
-  ASSERT_EQ(expected_num_rejections, down_cast<Counter*>(
-      entity->FindOrNull(METRIC_operation_memory_pressure_rejections).get())->value());
+  ASSERT_EQ(
+      expected_num_writes + expected_num_alters,
+      entity->FindOrNull<AtomicGauge<uint64_t>>(METRIC_all_operations_inflight)->value());
+  ASSERT_EQ(
+      expected_num_writes,
+      entity->FindOrNull<AtomicGauge<uint64_t>>(METRIC_write_operations_inflight)->value());
+  ASSERT_EQ(
+      expected_num_alters,
+      entity->FindOrNull<AtomicGauge<uint64_t>>(METRIC_alter_schema_operations_inflight)->value());
+  ASSERT_EQ(
+      expected_num_rejections,
+      entity->FindOrNull<Counter>(METRIC_operation_memory_pressure_rejections)->value());
 }
 
 // Basic testing for metrics. Note that the NoOpOperations we use in this
@@ -212,11 +224,11 @@ TEST_F(OperationTrackerTest, TestMetrics) {
   ASSERT_OK(AddDrivers(3, &drivers));
   ASSERT_NO_FATALS(CheckMetrics(entity_, 3, 0, 0));
 
-  drivers[0]->Abort(STATUS(Aborted, ""));
+  drivers[0]->TEST_Abort(STATUS(Aborted, ""));
   ASSERT_NO_FATALS(CheckMetrics(entity_, 2, 0, 0));
 
-  drivers[1]->Abort(STATUS(Aborted, ""));
-  drivers[2]->Abort(STATUS(Aborted, ""));
+  drivers[1]->TEST_Abort(STATUS(Aborted, ""));
+  drivers[2]->TEST_Abort(STATUS(Aborted, ""));
   ASSERT_NO_FATALS(CheckMetrics(entity_, 0, 0, 0));
 }
 
@@ -233,7 +245,7 @@ static void CheckMemTracker(const shared_ptr<MemTracker>& t) {
 // Test that if too many operations are added, eventually the tracker starts
 // rejecting new ones.
 TEST_F(OperationTrackerTest, TestTooManyOperations) {
-  FLAGS_tablet_operation_memory_limit_mb = 1;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_tablet_operation_memory_limit_mb) = 1;
   shared_ptr<MemTracker> t = MemTracker::CreateTracker("test");
   tracker_.StartMemoryTracking(t);
 
@@ -244,22 +256,22 @@ TEST_F(OperationTrackerTest, TestTooManyOperations) {
   // and check that when we fail, it's because we've hit the limit.
   Status s;
   vector<scoped_refptr<OperationDriver> > drivers;
-  for (int i = 0; s.ok(); i++) {
+  while (s.ok()) {
     s = AddDrivers(1, &drivers);
   }
 
   LOG(INFO) << "Added " << drivers.size() << " drivers";
   ASSERT_TRUE(s.IsServiceUnavailable());
-  ASSERT_STR_CONTAINS(s.ToString(), "exceeded its limit");
-  ASSERT_NO_FATALS(CheckMetrics(entity_, drivers.size(), 0, 1));
+  ASSERT_STR_CONTAINS(s.ToString(), "hit the limit");
+  ASSERT_NO_FATALS(CheckMetrics(entity_, narrow_cast<int>(drivers.size()), 0, 1));
   ASSERT_NO_FATALS(CheckMemTracker(t));
 
   ASSERT_TRUE(AddDrivers(1, &drivers).IsServiceUnavailable());
-  ASSERT_NO_FATALS(CheckMetrics(entity_, drivers.size(), 0, 2));
+  ASSERT_NO_FATALS(CheckMetrics(entity_, narrow_cast<int>(drivers.size()), 0, 2));
   ASSERT_NO_FATALS(CheckMemTracker(t));
 
   // If we abort one operation, we should be able to add one more.
-  drivers.back()->Abort(STATUS(Aborted, ""));
+  drivers.back()->TEST_Abort(STATUS(Aborted, ""));
   drivers.pop_back();
   ASSERT_NO_FATALS(CheckMemTracker(t));
   ASSERT_OK(AddDrivers(1, &drivers));
@@ -267,7 +279,7 @@ TEST_F(OperationTrackerTest, TestTooManyOperations) {
 
   // Clean up.
   for (const scoped_refptr<OperationDriver>& driver : drivers) {
-    driver->Abort(STATUS(Aborted, ""));
+    driver->TEST_Abort(STATUS(Aborted, ""));
   }
 }
 

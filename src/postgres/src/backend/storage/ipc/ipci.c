@@ -47,6 +47,12 @@
 #include "utils/backend_random.h"
 #include "utils/snapmgr.h"
 
+/* YB includes */
+#include "common/pg_yb_common.h"
+#include "yb_ash.h"
+
+/* GUCs */
+int			shared_memory_type = DEFAULT_SHARED_MEMORY_TYPE;
 
 shmem_startup_hook_type shmem_startup_hook = NULL;
 
@@ -88,12 +94,9 @@ RequestAddinShmemSpace(Size size)
  * through the same code as before.  (Note that the called routines mostly
  * check IsUnderPostmaster, rather than EXEC_BACKEND, to detect this case.
  * This is a bit code-wasteful and could be cleaned up.)
- *
- * If "makePrivate" is true then we only need private memory, not shared
- * memory.  This is true for a standalone backend, false for a postmaster.
  */
 void
-CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
+CreateSharedMemoryAndSemaphores(int port)
 {
 	PGShmemHeader *shim = NULL;
 
@@ -154,6 +157,9 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		size = add_size(size, ShmemBackendArraySize());
 #endif
 
+		if (YBIsEnabledInPostgresEnvVar() && yb_ash_enable_infra)
+			size = add_size(size, YbAshShmemSize());
+
 		/* freeze the addin request size and include it */
 		addin_request_allowed = false;
 		size = add_size(size, total_addin_request);
@@ -166,7 +172,7 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 		/*
 		 * Create the shmem segment
 		 */
-		seghdr = PGSharedMemoryCreate(size, makePrivate, port, &shim);
+		seghdr = PGSharedMemoryCreate(size, port, &shim);
 
 		InitShmemAccess(seghdr);
 
@@ -187,12 +193,9 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	{
 		/*
 		 * We are reattaching to an existing shared memory segment. This
-		 * should only be reached in the EXEC_BACKEND case, and even then only
-		 * with makePrivate == false.
+		 * should only be reached in the EXEC_BACKEND case.
 		 */
-#ifdef EXEC_BACKEND
-		Assert(!makePrivate);
-#else
+#ifndef EXEC_BACKEND
 		elog(PANIC, "should be attached to shared memory already");
 #endif
 	}
@@ -270,6 +273,9 @@ CreateSharedMemoryAndSemaphores(bool makePrivate, int port)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	BackendRandomShmemInit();
+
+	if (YBIsEnabledInPostgresEnvVar() && yb_ash_enable_infra)
+		YbAshShmemInit();
 
 #ifdef EXEC_BACKEND
 

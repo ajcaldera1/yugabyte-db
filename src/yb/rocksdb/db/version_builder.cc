@@ -22,6 +22,7 @@
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
 #include "yb/rocksdb/db/version_builder.h"
+#include "yb/util/thread.h"
 
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
@@ -42,6 +43,10 @@
 #include "yb/rocksdb/db/table_cache.h"
 #include "yb/rocksdb/db/version_set.h"
 #include "yb/rocksdb/table/table_reader.h"
+
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/status_log.h"
 
 namespace rocksdb {
 
@@ -143,13 +148,14 @@ class VersionBuilder::Rep {
         auto f1 = level_files[i - 1];
         auto f2 = level_files[i];
         if (level == 0) {
-          assert(level_zero_cmp_(f1, f2));
-          assert(f1->largest.seqno > f2->largest.seqno ||
+          DCHECK(level_zero_cmp_(f1, f2));
+          DCHECK(f1->largest.seqno > f2->largest.seqno ||
                  // We can have multiple files with seqno = 0 as a result of
                  // using DB::AddFile()
-                 (f1->largest.seqno == 0 && f2->largest.seqno == 0));
+                 (f1->largest.seqno == 0 && f2->largest.seqno == 0))
+            << "files: " << yb::AsString(level_files);
         } else {
-          assert(level_nonzero_cmp_(f1, f2));
+          DCHECK(level_nonzero_cmp_(f1, f2));
 
           // Make sure there is no overlap in levels > 0
           if (vstorage->InternalComparator()->Compare(f1->largest.key,
@@ -201,10 +207,8 @@ class VersionBuilder::Rep {
         found = true;
       }
     }
-    if (!found) {
-      fprintf(stderr, "not found %" PRIu64 "\n", number);
-    }
-    assert(found);
+    LOG_IF(DFATAL, !found) << yb::Format(
+        "$0SST file not found: $1", info_log_ ? info_log_->Prefix() : "", number);
 #endif
   }
 
@@ -317,12 +321,12 @@ class VersionBuilder::Rep {
 
         auto* file_meta = files_meta[file_idx].first;
         int level = files_meta[file_idx].second;
-        table_cache_->FindTable(env_options_,
-                                base_vstorage_->InternalComparator(),
-                                file_meta->fd, &file_meta->table_reader_handle,
-                                kDefaultQueryId,
-                                false /*no_io */, true /* record_read_stats */,
-                                internal_stats->GetFileReadHist(level));
+        CHECK_OK(table_cache_->FindTable(env_options_,
+                                         base_vstorage_->InternalComparator(),
+                                         file_meta->fd, &file_meta->table_reader_handle,
+                                         kDefaultQueryId,
+                                         false /*no_io */, true /* record_read_stats */,
+                                         internal_stats->GetFileReadHist(level)));
         if (file_meta->table_reader_handle != nullptr) {
           // Load table_reader
           file_meta->fd.table_reader = table_cache_->GetTableReaderFromHandle(
@@ -334,13 +338,14 @@ class VersionBuilder::Rep {
     if (max_threads <= 1) {
       load_handlers_func();
     } else {
-      std::vector<std::thread> threads;
+      std::vector<scoped_refptr<yb::Thread>> threads(max_threads);
       for (int i = 0; i < max_threads; i++) {
-        threads.emplace_back(load_handlers_func);
+        CHECK_OK(
+            yb::Thread::Create("load_table_handlers", "handler", load_handlers_func, &threads[i]));
       }
 
-      for (auto& t : threads) {
-        t.join();
+      for (auto& thread : threads) {
+        thread->Join();
       }
     }
   }

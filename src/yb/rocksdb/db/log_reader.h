@@ -21,8 +21,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_DB_LOG_READER_H
-#define YB_ROCKSDB_DB_LOG_READER_H
+#pragma once
 
 #include <stdint.h>
 
@@ -112,7 +111,7 @@ class Reader {
   const std::unique_ptr<SequentialFileReader> file_;
   Reporter* const reporter_;
   bool const checksum_;
-  char* const backing_store_;
+  uint8_t* const backing_store_;
   Slice buffer_;
   bool eof_;   // Last Read() indicated EOF by returning < kBlockSize
   bool read_error_;   // Error occurred while reading from file
@@ -171,5 +170,3 @@ class Reader {
 
 }  // namespace log
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_DB_LOG_READER_H

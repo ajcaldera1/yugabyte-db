@@ -15,14 +15,20 @@
 
 #include "yb/client/transaction_rpc.h"
 
+#include <boost/preprocessor/cat.hpp>
+
 #include "yb/client/client.h"
-#include "yb/client/meta_cache.h"
 #include "yb/client/tablet_rpc.h"
 
+#include "yb/common/transaction.h"
+
 #include "yb/rpc/rpc.h"
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/tserver/tserver_service.pb.h"
 #include "yb/tserver/tserver_service.proxy.h"
+
+#include "yb/util/trace.h"
 
 using namespace std::literals;
 
@@ -33,17 +39,17 @@ namespace {
 
 class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
  public:
-  TransactionRpcBase(const MonoTime& deadline,
+  TransactionRpcBase(CoarseTimePoint deadline,
                      internal::RemoteTablet* tablet,
                      YBClient* client)
       : rpc::Rpc(deadline, client->messenger(), &client->proxy_cache()),
-        trace_(new Trace),
         invoker_(false /* local_tserver_only */,
                  false /* consistent_prefix */,
                  client,
                  this,
                  this,
                  tablet,
+                 /* table =*/ nullptr,
                  mutable_retrier(),
                  trace_.get()) {
   }
@@ -69,8 +75,12 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
     rpc::Rpc::Abort();
   }
 
+  internal::TabletInvoker& GetInvoker() {
+    return invoker_;
+  }
+
  private:
-  void SendRpcToTserver() override {
+  void SendRpcToTserver(int attempt_num) override {
     InvokeAsync(invoker_.proxy().get(),
                 PrepareController(),
                 std::bind(&TransactionRpcBase::Finished, this, Status::OK()));
@@ -82,7 +92,6 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
                            rpc::RpcController* controller,
                            rpc::ResponseCallback callback) = 0;
 
-  TracePtr trace_;
   internal::TabletInvoker invoker_;
 };
 
@@ -90,7 +99,7 @@ class TransactionRpcBase : public rpc::Rpc, public internal::TabletRpc {
 template <class Traits>
 class TransactionRpc : public TransactionRpcBase {
  public:
-  TransactionRpc(const MonoTime& deadline,
+  TransactionRpc(CoarseTimePoint deadline,
                  internal::RemoteTablet* tablet,
                  YBClient* client,
                  typename Traits::Request* req,
@@ -98,12 +107,32 @@ class TransactionRpc : public TransactionRpcBase {
       : TransactionRpcBase(deadline, tablet, client),
         callback_(std::move(callback)) {
     req_.Swap(req);
+    TRACE_TO(trace_, Traits::kName);
   }
 
   virtual ~TransactionRpc() {}
 
   const tserver::TabletServerErrorPB* response_error() const override {
     return resp_.has_error() ? &resp_.error() : nullptr;
+  }
+
+  bool RefreshMetaCacheWithResponse() override {
+    if constexpr (tserver::HasTabletConsensusInfo<typename Traits::Response>::value) {
+      DCHECK(client::internal::CheckIfConsensusInfoUnexpectedlyMissing(req_, resp_));
+      if (resp_.has_tablet_consensus_info()) {
+        return GetInvoker().RefreshTabletInfoWithConsensusInfo(resp_.tablet_consensus_info());
+      }
+      VLOG(1) << "Partial refresh of tablet for " << Traits::kName
+              << " RPC failed because the response did not "
+                 "have a tablet_consensus_info";
+    }
+    return false;
+  }
+
+  void SetRequestRaftConfigOpidIndex(int64_t opid_index) override {
+    if constexpr (tserver::HasRaftConfigOpidIndex<typename Traits::Request>::value) {
+      req_.set_raft_config_opid_index(opid_index);
+    }
   }
 
  private:
@@ -116,13 +145,13 @@ class TransactionRpc : public TransactionRpcBase {
   }
 
   void InvokeCallback(const Status& status) override {
-    Traits::CallCallback(callback_, status, resp_);
+    Traits::CallCallback(callback_, status, req_, resp_);
   }
 
   void InvokeAsync(tserver::TabletServerServiceProxy* proxy,
                    rpc::RpcController* controller,
                    rpc::ResponseCallback callback) override {
-    Traits::InvokeAsync(proxy, req_, &resp_, controller, std::move(callback));
+    Traits::InvokeAsync(proxy, &req_, &resp_, controller, std::move(callback));
   }
 
   typename Traits::Request req_;
@@ -130,106 +159,61 @@ class TransactionRpc : public TransactionRpcBase {
   typename Traits::Callback callback_;
 };
 
-struct UpdateTransactionTraits {
-  static constexpr const char* kName = "UpdateTransaction";
+void PrepareRequest(...) {}
 
-  typedef tserver::UpdateTransactionRequestPB Request;
-  typedef tserver::UpdateTransactionResponsePB Response;
-  typedef UpdateTransactionCallback Callback;
-
-  static void CallCallback(
-      const Callback& callback, const Status& status, const Response& response) {
-    callback(status, internal::GetPropagatedHybridTime(response));
+void PrepareRequest(tserver::UpdateTransactionRequestPB* req) {
+  if (req->state().status() == TransactionStatus::CREATED) {
+    auto id = TransactionId::GenerateRandom();
+    req->mutable_state()->set_transaction_id(id.data(), id.size());
   }
+}
 
-  static void InvokeAsync(tserver::TabletServerServiceProxy* proxy,
-                          const Request& request,
-                          Response* response,
-                          rpc::RpcController* controller,
-                          rpc::ResponseCallback callback) {
-    proxy->UpdateTransactionAsync(request, response, controller, std::move(callback));
-  }
-};
+#define TRANSACTION_RPC_TRAITS_NAME(entry) BOOST_PP_CAT(TRANSACTION_RPC_NAME(entry), Traits)
 
-constexpr const char* UpdateTransactionTraits::kName;
+#define TRANSACTION_RPC_TRAITS_CALL_CALLBACK_HELPER_WITHOUT_REQUEST() \
+    callback(status, response)
+#define TRANSACTION_RPC_TRAITS_CALL_CALLBACK_HELPER_WITH_REQUEST() \
+    callback(status, request, response)
 
-struct GetTransactionStatusTraits {
-  static constexpr const char* kName = "GetTransactionStatus";
+#define TRANSACTION_RPC_TRAITS_CALL_CALLBACK(entry) \
+  BOOST_PP_CAT(TRANSACTION_RPC_TRAITS_CALL_CALLBACK_HELPER_, BOOST_PP_TUPLE_ELEM(2, 1, entry))()
 
-  typedef tserver::GetTransactionStatusRequestPB Request;
-  typedef tserver::GetTransactionStatusResponsePB Response;
-  typedef GetTransactionStatusCallback Callback;
+#define TRANSACTION_RPC_TRAITS(i, data, entry) \
+struct TRANSACTION_RPC_TRAITS_NAME(entry) { \
+  static constexpr const char* kName = BOOST_PP_STRINGIZE(TRANSACTION_RPC_NAME(entry)); \
+  typedef TRANSACTION_RPC_REQUEST_PB(entry) Request; \
+  typedef TRANSACTION_RPC_RESPONSE_PB(entry) Response; \
+  typedef TRANSACTION_RPC_CALLBACK(entry) Callback; \
+  \
+  static void CallCallback( \
+      const Callback& callback, const Status& status, const Request& request, \
+      const Response& response) { \
+    TRANSACTION_RPC_TRAITS_CALL_CALLBACK(entry); \
+  } \
+  \
+  static void InvokeAsync(tserver::TabletServerServiceProxy* proxy, \
+                          Request* request, \
+                          Response* response, \
+                          rpc::RpcController* controller, \
+                          rpc::ResponseCallback callback) { \
+    PrepareRequest(request); \
+    proxy->BOOST_PP_CAT(TRANSACTION_RPC_NAME(entry), Async)( \
+        *request, response, controller, std::move(callback)); \
+  } \
+}; \
+\
+constexpr const char* TRANSACTION_RPC_TRAITS_NAME(entry)::kName;
 
-  static void CallCallback(
-      const Callback& callback, const Status& status, const Response& response) {
-    callback(status, response);
-  }
-
-  static void InvokeAsync(tserver::TabletServerServiceProxy* proxy,
-                          const Request& request,
-                          Response* response,
-                          rpc::RpcController* controller,
-                          rpc::ResponseCallback callback) {
-    proxy->GetTransactionStatusAsync(request, response, controller, std::move(callback));
-  }
-};
-
-constexpr const char* GetTransactionStatusTraits::kName;
-
-struct AbortTransactionTraits {
-  static constexpr const char* kName = "AbortTransaction";
-
-  typedef tserver::AbortTransactionRequestPB Request;
-  typedef tserver::AbortTransactionResponsePB Response;
-  typedef AbortTransactionCallback Callback;
-
-  static void CallCallback(
-      const Callback& callback, const Status& status, const Response& response) {
-    callback(status, response);
-  }
-
-  static void InvokeAsync(tserver::TabletServerServiceProxy* proxy,
-                          const Request& request,
-                          Response* response,
-                          rpc::RpcController* controller,
-                          rpc::ResponseCallback callback) {
-    proxy->AbortTransactionAsync(request, response, controller, std::move(callback));
-  }
-};
-
-constexpr const char* AbortTransactionTraits::kName;
+BOOST_PP_SEQ_FOR_EACH(TRANSACTION_RPC_TRAITS, ~, TRANSACTION_RPCS)
 
 } // namespace
 
-rpc::RpcCommandPtr UpdateTransaction(
-    const MonoTime& deadline,
-    internal::RemoteTablet* tablet,
-    YBClient* client,
-    tserver::UpdateTransactionRequestPB* req,
-    UpdateTransactionCallback callback) {
-  return std::make_shared<TransactionRpc<UpdateTransactionTraits>>(
-      deadline, tablet, client, req, std::move(callback));
-}
+#define TRANSACTION_RPC_BODY(entry) { \
+  return std::make_shared<TransactionRpc<TRANSACTION_RPC_TRAITS_NAME(entry)>>( \
+      deadline, tablet, client, req, std::move(callback)); \
+  }
 
-rpc::RpcCommandPtr GetTransactionStatus(
-    const MonoTime& deadline,
-    internal::RemoteTablet* tablet,
-    YBClient* client,
-    tserver::GetTransactionStatusRequestPB* req,
-    GetTransactionStatusCallback callback) {
-  return std::make_shared<TransactionRpc<GetTransactionStatusTraits>>(
-      deadline, tablet, client, req, std::move(callback));
-}
-
-rpc::RpcCommandPtr AbortTransaction(
-    const MonoTime& deadline,
-    internal::RemoteTablet* tablet,
-    YBClient* client,
-    tserver::AbortTransactionRequestPB* req,
-    AbortTransactionCallback callback) {
-  return std::make_shared<TransactionRpc<AbortTransactionTraits>>(
-      deadline, tablet, client, req, std::move(callback));
-}
+BOOST_PP_SEQ_FOR_EACH(TRANSACTION_RPC_FUNCTION, TRANSACTION_RPC_BODY, TRANSACTION_RPCS)
 
 } // namespace client
 } // namespace yb

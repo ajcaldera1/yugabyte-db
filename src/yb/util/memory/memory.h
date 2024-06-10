@@ -43,8 +43,7 @@
 // single allocator per a single user request, thus setting bounds on memory
 // usage on a per-request basis.
 
-#ifndef YB_UTIL_MEMORY_MEMORY_H_
-#define YB_UTIL_MEMORY_MEMORY_H_
+#pragma once
 
 #include <stddef.h>
 
@@ -55,25 +54,17 @@
 
 #include <boost/mpl/if.hpp>
 #include <boost/type_traits/is_const.hpp>
+#include "yb/util/logging.h"
 
-#include <glog/logging.h>
+#include "yb/gutil/casts.h"
+#include "yb/gutil/logging-inl.h"
+#include "yb/gutil/macros.h"
+#include "yb/gutil/singleton.h"
+#include "yb/gutil/strings/stringpiece.h"
 
 #include "yb/util/boost_mutex_utils.h"
 #include "yb/util/mutex.h"
-#include "yb/gutil/gscoped_ptr.h"
-#include "yb/gutil/logging-inl.h"
-#include "yb/gutil/macros.h"
-#include "yb/gutil/strings/stringpiece.h"
-#include "yb/gutil/singleton.h"
 
-using std::copy;
-using std::max;
-using std::min;
-using std::numeric_limits;
-using std::reverse;
-using std::sort;
-using std::swap;
-using std::vector;
 
 namespace yb {
 
@@ -187,7 +178,7 @@ class BufferAllocator {
   // For unbounded allocators (like raw HeapBufferAllocator) this is the highest
   // size_t value possible.
   // TODO(user): consider making pure virtual.
-  virtual size_t Available() const { return numeric_limits<size_t>::max(); }
+  virtual size_t Available() const { return std::numeric_limits<size_t>::max(); }
 
  protected:
   friend class Buffer;
@@ -205,24 +196,24 @@ class BufferAllocator {
   }
 
   // Called by chained buffer allocators.
-  Buffer DelegateAllocate(BufferAllocator* delegate,
-                          size_t requested,
-                          size_t minimal,
-                          BufferAllocator* originator) {
+  static Buffer DelegateAllocate(BufferAllocator* delegate,
+                                 size_t requested,
+                                 size_t minimal,
+                                 BufferAllocator* originator) {
     return delegate->AllocateInternal(requested, minimal, originator);
   }
 
   // Called by chained buffer allocators.
-  bool DelegateReallocate(BufferAllocator* delegate,
-                          size_t requested,
-                          size_t minimal,
-                          Buffer* buffer,
-                          BufferAllocator* originator) {
+  static bool DelegateReallocate(BufferAllocator* delegate,
+                                 size_t requested,
+                                 size_t minimal,
+                                 Buffer* buffer,
+                                 BufferAllocator* originator) {
     return delegate->ReallocateInternal(requested, minimal, buffer, originator);
   }
 
   // Called by chained buffer allocators.
-  void DelegateFree(BufferAllocator* delegate, Buffer* buffer) {
+  static void DelegateFree(BufferAllocator* delegate, Buffer* buffer) {
     delegate->FreeInternal(buffer);
   }
 
@@ -259,8 +250,8 @@ class HeapBufferAllocator : public BufferAllocator {
     return Singleton<HeapBufferAllocator>::get();
   }
 
-  virtual size_t Available() const override {
-    return numeric_limits<size_t>::max();
+  size_t Available() const override {
+    return std::numeric_limits<size_t>::max();
   }
 
  private:
@@ -271,19 +262,19 @@ class HeapBufferAllocator : public BufferAllocator {
   friend class Singleton<HeapBufferAllocator>;
 
   // Always allocates 'requested'-sized buffer, or returns NULL on OOM.
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override;
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override;
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override;
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override;
 
   void* Malloc(size_t size);
   void* Realloc(void* previousData, size_t previousSize, size_t newSize);
 
-  virtual void FreeInternal(Buffer* buffer) override;
+  void FreeInternal(Buffer* buffer) override;
 
   HeapBufferAllocator();
   explicit HeapBufferAllocator(bool aligned_mode)
@@ -300,24 +291,62 @@ class ClearingBufferAllocator : public BufferAllocator {
   explicit ClearingBufferAllocator(BufferAllocator* delegate)
       : delegate_(delegate) {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     return delegate_->Available();
   }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override;
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override;
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override;
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override;
 
-  virtual void FreeInternal(Buffer* buffer) override;
+  void FreeInternal(Buffer* buffer) override;
 
   BufferAllocator* delegate_;
   DISALLOW_COPY_AND_ASSIGN(ClearingBufferAllocator);
+};
+
+class PreallocatedBufferAllocator : public BufferAllocator {
+ public:
+  PreallocatedBufferAllocator(BufferAllocator* delegate, char* buffer, size_t buffer_size)
+      : delegate_(delegate), buffer_(buffer), buffer_size_(buffer_size) {
+  }
+
+ private:
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override {
+    if (make_signed(requested) > buffer_size_) {
+      return delegate_->BestEffortAllocate(requested, minimal);
+    }
+    Buffer result(buffer_, buffer_size_, this);
+    buffer_size_ = -buffer_size_;
+    return result;
+  }
+
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
+    CHECK(false); // Not supported.
+  }
+
+  void FreeInternal(Buffer* buffer) override {
+    if (buffer->data() == buffer_) {
+      buffer_size_ = -buffer_size_;
+    } else {
+      BufferAllocator::DelegateFree(delegate_, buffer);
+    }
+  }
+
+  BufferAllocator* delegate_;
+  char* buffer_;
+  int64_t buffer_size_; // Negative value means buffer was allocated.
 };
 
 // Abstract policy for modifying allocation requests - e.g. enforcing quotas.
@@ -336,7 +365,7 @@ class Mediator {
   virtual void Free(size_t amount) = 0;
 
   // TODO(user): consider making pure virtual.
-  virtual size_t Available() const { return numeric_limits<size_t>::max(); }
+  virtual size_t Available() const { return std::numeric_limits<size_t>::max(); }
 };
 
 // Optionally thread-safe skeletal implementation of a 'quota' abstraction,
@@ -352,14 +381,14 @@ class Quota : public Mediator {
   // value accordingly.  Otherwise, returns zero. The semantics of 'remaining
   // quota' are defined by subclasses (that must supply GetQuotaInternal()
   // method).
-  virtual size_t Allocate(size_t requested, size_t minimal) override;
+  size_t Allocate(size_t requested, size_t minimal) override;
 
-  virtual void Free(size_t amount) override;
+  void Free(size_t amount) override;
 
   // Returns memory still available in the quota. For unenforced Quota objects,
   // you are still able to perform _minimal_ allocations when the available
   // quota is 0 (or less than "minimal" param).
-  virtual size_t Available() const override {
+  size_t Available() const override {
     lock_guard_maybe<Mutex> lock(Quota<thread_safe>::mutex());
     const size_t quota = GetQuotaInternal();
     return (usage_ >= quota) ? 0 : (quota - usage_);
@@ -449,21 +478,21 @@ class MediatingBufferAllocator : public BufferAllocator {
 
   virtual ~MediatingBufferAllocator() {}
 
-  virtual size_t Available() const override {
-    return min(delegate_->Available(), mediator_->Available());
+  size_t Available() const override {
+    return std::min(delegate_->Available(), mediator_->Available());
   }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override;
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override;
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override;
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override;
 
-  virtual void FreeInternal(Buffer* buffer) override;
+  void FreeInternal(Buffer* buffer) override;
 
   BufferAllocator* delegate_;
   Mediator* const mediator_;
@@ -497,7 +526,7 @@ class MemoryLimit : public BufferAllocator {
 
   virtual ~MemoryLimit() {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     return allocator_.Available();
   }
 
@@ -506,19 +535,20 @@ class MemoryLimit : public BufferAllocator {
   void SetQuota(const size_t quota) { quota_.SetQuota(quota); }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override {
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override {
     return DelegateAllocate(&allocator_, requested, minimal, originator);
   }
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override {
-    return DelegateReallocate(&allocator_, requested, minimal, buffer,
-                              originator);
+
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
+    return DelegateReallocate(&allocator_, requested, minimal, buffer, originator);
   }
-  virtual void FreeInternal(Buffer* buffer) override {
+
+  void FreeInternal(Buffer* buffer) override {
     DelegateFree(&allocator_, buffer);
   }
 
@@ -537,11 +567,11 @@ class SoftQuotaBypassingBufferAllocator : public BufferAllocator {
       : allocator_(std::numeric_limits<size_t>::max(), allocator),
         bypassed_amount_(bypassed_amount) {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     const size_t usage = allocator_.GetUsage();
     size_t available = allocator_.Available();
     if (bypassed_amount_ > usage) {
-      available = max(bypassed_amount_ - usage, available);
+      available = std::max(bypassed_amount_ - usage, available);
     }
     return available;
   }
@@ -553,12 +583,12 @@ class SoftQuotaBypassingBufferAllocator : public BufferAllocator {
   // with increased minimal size is more likely to fail because of exceeding
   // hard quota, so we also fall back to the original minimal size.
   size_t AdjustMinimal(size_t requested, size_t minimal) const {
-    return min(requested, max(minimal, Available()));
+    return std::min(requested, std::max(minimal, Available()));
   }
 
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override {
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override {
     // Try increasing the "minimal" parameter to allocate more aggresively
     // within the bypassed amount of soft quota.
     Buffer result = DelegateAllocate(&allocator_,
@@ -572,10 +602,10 @@ class SoftQuotaBypassingBufferAllocator : public BufferAllocator {
     }
   }
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override {
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
     size_t adjusted_minimal = AdjustMinimal(requested, minimal);
     if (DelegateReallocate(&allocator_, requested, adjusted_minimal, buffer, originator)) {
       return true;
@@ -584,7 +614,7 @@ class SoftQuotaBypassingBufferAllocator : public BufferAllocator {
     }
   }
 
-  virtual void FreeInternal(Buffer* buffer) override {
+  void FreeInternal(Buffer* buffer) override {
     DelegateFree(&allocator_, buffer);
   }
 
@@ -632,24 +662,24 @@ class MemoryStatisticsCollectingBufferAllocator : public BufferAllocator {
 
   virtual ~MemoryStatisticsCollectingBufferAllocator() {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     return delegate_->Available();
   }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override;
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override;
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override;
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override;
 
-  virtual void FreeInternal(Buffer* buffer) override;
+  void FreeInternal(Buffer* buffer) override;
 
   BufferAllocator* delegate_;
-  gscoped_ptr<MemoryStatisticsCollectorInterface>
+  std::unique_ptr<MemoryStatisticsCollectorInterface>
       memory_stats_collector_;
 };
 
@@ -677,7 +707,7 @@ class MemoryTrackingBufferAllocator : public BufferAllocator {
   // If enforce limit is false, this always returns maximum possible value
   // for int64_t (std::numeric_limits<int64_t>::max()). Otherwise, this
   // is equivalent to calling mem_tracker_->SpareCapacity();
-  virtual size_t Available() const override;
+  size_t Available() const override;
 
  private:
 
@@ -687,16 +717,16 @@ class MemoryTrackingBufferAllocator : public BufferAllocator {
   // mem_tracker_->Consume(bytes) and always return true.
   bool TryConsume(int64_t bytes);
 
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override;
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override;
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override;
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override;
 
-  virtual void FreeInternal(Buffer* buffer) override;
+  void FreeInternal(Buffer* buffer) override;
 
   BufferAllocator* delegate_;
   std::shared_ptr<MemTracker> mem_tracker_;
@@ -718,7 +748,7 @@ class ThreadSafeBufferAllocator : public BufferAllocator {
       : delegate_(delegate) {}
   virtual ~ThreadSafeBufferAllocator() {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     lock_guard_maybe<Mutex> lock(mutex());
     return delegate()->Available();
   }
@@ -733,23 +763,22 @@ class ThreadSafeBufferAllocator : public BufferAllocator {
   const DelegateAllocatorType* delegate() const { return delegate_; }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override {
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override {
     lock_guard_maybe<Mutex> lock(mutex());
     return DelegateAllocate(delegate(), requested, minimal, originator);
   }
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override {
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
     lock_guard_maybe<Mutex> lock(mutex());
-    return DelegateReallocate(delegate(), requested, minimal, buffer,
-                              originator);
+    return DelegateReallocate(delegate(), requested, minimal, buffer, originator);
   }
 
-  virtual void FreeInternal(Buffer* buffer) override {
+  void FreeInternal(Buffer* buffer) override {
     lock_guard_maybe<Mutex> lock(mutex());
     DelegateFree(delegate(), buffer);
   }
@@ -771,7 +800,7 @@ class OwningThreadSafeBufferAllocator
   virtual ~OwningThreadSafeBufferAllocator() {}
 
  private:
-  gscoped_ptr<DelegateAllocatorType> delegate_owned_;
+  std::unique_ptr<DelegateAllocatorType> delegate_owned_;
 };
 
 class ThreadSafeMemoryLimit
@@ -823,32 +852,29 @@ class OwningBufferAllocator : public BufferAllocator {
     return this;
   }
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     return delegate_->Available();
   }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override {
+  Buffer AllocateInternal(size_t requested, size_t minimal, BufferAllocator* originator) override {
     return DelegateAllocate(delegate_, requested, minimal, originator);
   }
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override {
-    return DelegateReallocate(delegate_, requested, minimal, buffer,
-                              originator);
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
+    return DelegateReallocate(delegate_, requested, minimal, buffer, originator);
   }
 
-  virtual void FreeInternal(Buffer* buffer) override {
+  void FreeInternal(Buffer* buffer) override {
     DelegateFree(delegate_, buffer);
   }
 
   // Not using PointerVector here because we want to guarantee certain order of
   // deleting elements (starting from the ones added last).
-  vector<OwnedType*> owned_;
+  std::vector<OwnedType*> owned_;
   BufferAllocator* delegate_;
 };
 
@@ -866,14 +892,14 @@ class GuaranteeMemory : public BufferAllocator {
       : limit_(memory_quota, true, delegate),
         memory_guarantee_(memory_quota) {}
 
-  virtual size_t Available() const override {
+  size_t Available() const override {
     return memory_guarantee_ - limit_.GetUsage();
   }
 
  private:
-  virtual Buffer AllocateInternal(size_t requested,
-                                  size_t minimal,
-                                  BufferAllocator* originator) override {
+  Buffer AllocateInternal(size_t requested,
+                          size_t minimal,
+                          BufferAllocator* originator) override {
     if (requested > Available()) {
       return Buffer();
     } else {
@@ -881,17 +907,17 @@ class GuaranteeMemory : public BufferAllocator {
     }
   }
 
-  virtual bool ReallocateInternal(size_t requested,
-                                  size_t minimal,
-                                  Buffer* buffer,
-                                  BufferAllocator* originator) override {
+  bool ReallocateInternal(size_t requested,
+                          size_t minimal,
+                          Buffer* buffer,
+                          BufferAllocator* originator) override {
     int64 additional_memory = requested - (buffer != NULL ? buffer->size() : 0);
     return additional_memory <= static_cast<int64>(Available())
         && DelegateReallocate(&limit_, requested, requested,
                               buffer, originator);
   }
 
-  virtual void FreeInternal(Buffer* buffer) override {
+  void FreeInternal(Buffer* buffer) override {
     DelegateFree(&limit_, buffer);
   }
 
@@ -912,7 +938,7 @@ size_t Quota<thread_safe>::Allocate(const size_t requested,
   size_t allocation;
   if (usage_ > quota || minimal > quota - usage_) {
     // OOQ (Out of quota).
-    if (!enforced() && minimal <= numeric_limits<size_t>::max() - usage_) {
+    if (!enforced() && minimal <= std::numeric_limits<size_t>::max() - usage_) {
       // The quota is unenforced and the value of "minimal" won't cause an
       // overflow. Perform a minimal allocation.
       allocation = minimal;
@@ -928,7 +954,7 @@ size_t Quota<thread_safe>::Allocate(const size_t requested,
                  << ((allocation == 0) ? "Did not allocate any memory."
                  : "Allocated the minimal value requested.");
   } else {
-    allocation = min(requested, quota - usage_);
+    allocation = std::min(requested, quota - usage_);
   }
   usage_ += allocation;
   return allocation;
@@ -940,7 +966,7 @@ void Quota<thread_safe>::Free(size_t amount) {
   usage_ -= amount;
   // threads allocate/free memory concurrently via the same Quota object that is
   // not protected with a mutex (thread_safe == false).
-  if (usage_ > (numeric_limits<size_t>::max() - (1 << 28))) {
+  if (usage_ > (std::numeric_limits<size_t>::max() - (1 << 28))) {
     LOG(ERROR) << "Suspiciously big usage_ value: " << usage_
                << " (could be a result size_t wrapping around below 0, "
                << "for example as a result of race condition).";
@@ -988,6 +1014,18 @@ std::shared_ptr<U> shared_from(U* u) {
   return std::static_pointer_cast<U>(u->shared_from_this());
 }
 
-}  // namespace yb
+template <class U>
+std::shared_ptr<U> FakeSharedPtr(U* u) {
+  return std::shared_ptr<U>(std::shared_ptr<U>(), u);
+}
 
-#endif // YB_UTIL_MEMORY_MEMORY_H_
+class LazySharedPtrFactory {
+ public:
+  template <class T>
+  operator std::shared_ptr<T>() const { return std::make_shared<T>(); }
+};
+
+// Returns empty string if TCMalloc is not enabled.
+std::string TcMallocStats();
+
+}  // namespace yb

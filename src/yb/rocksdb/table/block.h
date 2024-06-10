@@ -20,8 +20,6 @@
 // Copyright (c) 2011 The LevelDB Authors. All rights reserved.
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
-#ifndef YB_ROCKSDB_TABLE_BLOCK_H
-#define YB_ROCKSDB_TABLE_BLOCK_H
 
 #pragma once
 #include <stddef.h>
@@ -30,6 +28,7 @@
 #include <malloc.h>
 #endif
 
+#include "yb/rocksdb/comparator.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/db/dbformat.h"
@@ -38,6 +37,8 @@
 #include "yb/rocksdb/table/format.h"
 #include "yb/rocksdb/table/internal_iterator.h"
 
+#include "yb/util/enums.h"
+
 namespace rocksdb {
 
 struct BlockContents;
@@ -45,6 +46,11 @@ class Comparator;
 class BlockIter;
 class BlockHashIndex;
 class BlockPrefixIndex;
+
+// Determines which middle point should be taken in case of even number of total points.
+// NOTE! This enum must not be changed unless all the usages are verified!
+YB_DEFINE_ENUM(MiddlePointPolicy, ((kMiddleHigh, 0))((kMiddleLow, 1)));
+
 
 class Block {
  public:
@@ -76,22 +82,59 @@ class Block {
   // the iterator will simply be set as "invalid", rather than returning
   // the key that is just pass the target key.
   //
-  // If iter is null, return new Iterator
-  // If iter is not null, update this one and return it as Iterator*
+  // If iter is null, return new InternalIterator
+  // If iter is not null, update this one and return it as InternalIterator*
+  // It MUST return an instance of BlockIter (or derived class) in case of no error.
   //
   // If total_order_seek is true, hash_index_ and prefix_index_ are ignored.
   // This option only applies for index block. For data block, hash_index_
   // and prefix_index_ are null, so this option does not matter.
+  // key_value_encoding_format specifies what kind of algorithm to use for decoding entries.
   InternalIterator* NewIterator(const Comparator* comparator,
+                                KeyValueEncodingFormat key_value_encoding_format,
                                 BlockIter* iter = nullptr,
-                                bool total_order_seek = true);
+                                bool total_order_seek = true) const;
+
+  inline InternalIterator* NewIndexIterator(
+      const Comparator* comparator, BlockIter* iter = nullptr, bool total_order_seek = true) const {
+    return NewIterator(
+        comparator, kIndexBlockKeyValueEncodingFormat, iter, total_order_seek);
+  }
+
   void SetBlockHashIndex(BlockHashIndex* hash_index);
   void SetBlockPrefixIndex(BlockPrefixIndex* prefix_index);
 
   // Report an approximation of how much memory has been used.
   size_t ApproximateMemoryUsage() const;
 
+  // Returns a middle key for this block. Parameter `middle_entry_policy` denotes which entry should
+  // be treated as a "middle entry" in case of even number of entires. This might be important as
+  // index blocks and data blocks have a bit different semantics of the stored key. Index block's
+  // entry contains a key that is greater or equal to the last key of a data block which is indexed
+  // (in most cases it contains a non-existent key which is strictky greater than the last key of
+  // a data block); so, for example, if there are two entries k0 and k1, then k0 points exactly to
+  // the middle of two data blocks, so we need to take "the lower" of these two keys. The data block
+  // always has an exsitent key, so, for example, if there are two entries k0 and k1, and if k0 is
+  // taken as a middle key, then the middle is pointing to the beginning of all the data which
+  // might be an unwanted effect in terms of tablet splitting; in this case taking k1, "the upper"
+  // of these two keys, gives a better middle key result.
+  yb::Result<std::string> GetMiddleKey(
+      KeyValueEncodingFormat key_value_encoding_format,
+      const Comparator* cmp = BytewiseComparator(),
+      MiddlePointPolicy middle_entry_policy = MiddlePointPolicy::kMiddleLow
+  ) const;
+
  private:
+  // Returns key for corresponding restart block.
+  yb::Result<Slice> GetRestartKey(
+      uint32_t restart_idx, KeyValueEncodingFormat key_value_encoding_format) const;
+
+  // Returns a key of a middle entry for the specificed restart point.
+  yb::Result<std::string> GetRestartBlockMiddleEntryKey(
+      uint32_t restart_idx, const Comparator* comparator,
+      KeyValueEncodingFormat key_value_encoding_format,
+      MiddlePointPolicy middle_restart_policy) const;
+
   BlockContents contents_;
   const char* data_;            // contents_.data.data()
   size_t size_;                 // contents_.data.size()
@@ -104,7 +147,7 @@ class Block {
   void operator=(const Block&);
 };
 
-class BlockIter : public InternalIterator {
+class BlockIter final : public InternalIterator {
  public:
   BlockIter()
       : comparator_(nullptr),
@@ -117,42 +160,44 @@ class BlockIter : public InternalIterator {
         hash_index_(nullptr),
         prefix_index_(nullptr) {}
 
-  BlockIter(const Comparator* comparator, const char* data, uint32_t restarts,
-       uint32_t num_restarts, BlockHashIndex* hash_index,
-       BlockPrefixIndex* prefix_index)
+  BlockIter(
+      const Comparator* comparator, const char* data,
+      KeyValueEncodingFormat key_value_encoding_format, uint32_t restarts, uint32_t num_restarts,
+      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index)
       : BlockIter() {
-    Initialize(comparator, data, restarts, num_restarts,
-        hash_index, prefix_index);
+    Initialize(
+        comparator, data, key_value_encoding_format, restarts, num_restarts, hash_index,
+        prefix_index);
   }
 
-  void Initialize(const Comparator* comparator, const char* data,
-      uint32_t restarts, uint32_t num_restarts, BlockHashIndex* hash_index,
-      BlockPrefixIndex* prefix_index);
+  void Initialize(
+      const Comparator* comparator, const char* data,
+      KeyValueEncodingFormat key_value_encoding_format, uint32_t restarts, uint32_t num_restarts,
+      const BlockHashIndex* hash_index, const BlockPrefixIndex* prefix_index);
 
   void SetStatus(Status s) {
     status_ = s;
   }
 
-  virtual bool Valid() const override { return current_ < restarts_; }
   virtual Status status() const override { return status_; }
-  virtual Slice key() const override {
-    assert(Valid());
-    return key_.GetKey();
+
+  virtual const KeyValueEntry& Entry() const override {
+    if (current_ < restarts_) {
+      return entry_;
+    }
+
+    return KeyValueEntry::Invalid();
   }
-  virtual Slice value() const override {
-    assert(Valid());
-    return value_;
-  }
 
-  virtual void Next() override;
+  virtual const KeyValueEntry& Next() override;
 
-  virtual void Prev() override;
+  virtual const KeyValueEntry& Prev() override;
 
-  virtual void Seek(const Slice& target) override;
+  virtual const KeyValueEntry& Seek(Slice target) override;
 
-  virtual void SeekToFirst() override;
+  virtual const KeyValueEntry& SeekToFirst() override;
 
-  virtual void SeekToLast() override;
+  virtual const KeyValueEntry& SeekToLast() override;
 
   virtual Status PinData() override {
     // block data is always pinned.
@@ -166,9 +211,20 @@ class BlockIter : public InternalIterator {
 
   virtual bool IsKeyPinned() const override { return key_.IsKeyPinned(); }
 
+  void SeekToRestart(uint32_t index);
+
+  inline uint32_t GetCurrentRestart() const {
+    return restart_index_;
+  }
+
+  ScanForwardResult ScanForward(
+      const Comparator* user_key_comparator, const Slice& upperbound,
+      KeyFilterCallback* key_filter_callback, ScanCallback* scan_callback) override;
+
  private:
   const Comparator* comparator_;
   const char* data_;       // underlying block contents
+  KeyValueEncodingFormat key_value_encoding_format_;
   uint32_t restarts_;      // Offset of restart array (list of fixed32)
   uint32_t num_restarts_;  // Number of uint32_t entries in restart array
 
@@ -176,10 +232,10 @@ class BlockIter : public InternalIterator {
   uint32_t current_;
   uint32_t restart_index_;  // Index of restart block in which current_ falls
   IterKey key_;
-  Slice value_;
+  KeyValueEntry entry_;
   Status status_;
-  BlockHashIndex* hash_index_;
-  BlockPrefixIndex* prefix_index_;
+  const BlockHashIndex* hash_index_;
+  const BlockPrefixIndex* prefix_index_;
 
   inline int Compare(const Slice& a, const Slice& b) const {
     return comparator_->Compare(a, b);
@@ -188,7 +244,7 @@ class BlockIter : public InternalIterator {
   // Return the offset in data_ just past the end of the current entry.
   inline uint32_t NextEntryOffset() const {
     // NOTE: We don't support files bigger than 2GB
-    return static_cast<uint32_t>((value_.cdata() + value_.size()) - data_);
+    return static_cast<uint32_t>(entry_.value.cend() - data_);
   }
 
   uint32_t GetRestartPoint(uint32_t index) {
@@ -203,10 +259,14 @@ class BlockIter : public InternalIterator {
 
     // ParseNextKey() starts at the end of value_, so set value_ accordingly
     uint32_t offset = GetRestartPoint(index);
-    value_ = Slice(data_ + offset, 0UL);
+    entry_ = KeyValueEntry {
+      .key = key_.GetKey(),
+      .value = Slice(data_ + offset, 0UL),
+    };
   }
 
-  void CorruptionError();
+  void SetError(const Status& error);
+  void CorruptionError(const std::string& error_details);
 
   bool ParseNextKey();
 
@@ -226,5 +286,3 @@ class BlockIter : public InternalIterator {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_TABLE_BLOCK_H

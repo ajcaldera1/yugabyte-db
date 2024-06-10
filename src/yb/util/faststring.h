@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_FASTSTRING_H_
-#define YB_UTIL_FASTSTRING_H_
+#pragma once
 
 #include <string>
 
@@ -45,17 +44,21 @@ namespace yb {
 // instead of memsetting to \0)
 class faststring {
  public:
-  faststring() :
-    data_(initial_data_),
-    len_(0),
-    capacity_(kInitialCapacity) {
+  // Tell PVS Studio it is OK that initial_data_ is uninitialized.
+  //-V:initial_data_:730
+  faststring()
+      : data_(initial_data_),
+        len_(0),
+        capacity_(kInitialCapacity) {
   }
 
   // Construct a string with the given capacity, in bytes.
+  // Tell PVS Studio it is OK that initial_data_ is uninitialized.
+  //-V:initial_data_:730
   explicit faststring(size_t capacity)
-    : data_(initial_data_),
-      len_(0),
-      capacity_(kInitialCapacity) {
+      : data_(initial_data_),
+        len_(0),
+        capacity_(kInitialCapacity) {
     if (capacity > capacity_) {
       data_ = new uint8_t[capacity];
       capacity_ = capacity;
@@ -270,5 +273,3 @@ class faststring {
 };
 
 }  // namespace yb
-
-#endif  // YB_UTIL_FASTSTRING_H_

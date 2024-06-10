@@ -27,9 +27,12 @@ import java.util.*;
 import org.yb.YBTestRunner;
 
 import org.junit.runner.RunWith;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 @RunWith(value=YBTestRunner.class)
 public class TestReturnsClause extends BaseCQLTest {
+  private static final Logger LOG = LoggerFactory.getLogger(TestReturnsClause.class);
 
 
   private String getExpectedResultColumns(Map<String, String> columns) {
@@ -93,8 +96,7 @@ public class TestReturnsClause extends BaseCQLTest {
     checkReturnStatus("UPDATE test_returns_status SET vl[2] = 'a' where h = 1 and r = 1",
                       columns,
                       false /* applied */,
-                      "Unable to replace items into list, expecting index 2, " +
-                          "reached end of list with size 0",
+                      "Unable to replace items in empty list.",
                       "NULL", "NULL", "NULL", "NULL");
 
     // Test success statement.
@@ -150,7 +152,7 @@ public class TestReturnsClause extends BaseCQLTest {
                           "VALUES (2, 2, ['a'], 2.0) IF NOT EXISTS ELSE ERROR",
                       columns,
                       false /* applied */,
-                      "Condition was not satisfied.",
+                      "Condition on table test_returns_status was not satisfied.",
                       "NULL", "NULL", "NULL", "NULL");
 
     //----------------------------------------------------------------------------------------------
@@ -171,6 +173,7 @@ public class TestReturnsClause extends BaseCQLTest {
                         "v1 int, v2 varchar, primary key (h, r)) " +
                         "WITH transactions = { 'enabled' : true };");
     session.execute("CREATE UNIQUE INDEX test_rs_idx ON test_rs_trans(v1) INCLUDE (v2)");
+    waitForReadPermsOnAllIndexes("test_rs_trans");
 
     Map<String, String> columns = new LinkedHashMap<>();
     columns.put("h", "int");
@@ -231,7 +234,7 @@ public class TestReturnsClause extends BaseCQLTest {
                           "WHERE h = 2 and r = 2 IF EXISTS ELSE ERROR",
                       columns,
                       false /* applied */,
-                      "Condition was not satisfied.",
+                      "Condition on table test_rs_trans was not satisfied.",
                       "NULL", "NULL", "NULL", "NULL");
 
     //----------------------------------------------------------------------------------------------
@@ -283,7 +286,7 @@ public class TestReturnsClause extends BaseCQLTest {
                                       "VALUES (1, 1, 1 ,'a') IF NOT EXISTS ELSE ERROR " +
                                       "RETURNS STATUS AS ROW"));
     expectedRows.add(getExpectedResultRow(false /* applied */,
-                                          "Condition was not satisfied.",
+                                          "Condition on table test_rs_batch was not satisfied.",
                                           "NULL", "NULL", "NULL", "NULL"));
 
     batch.add(new SimpleStatement("INSERT INTO test_rs_batch(h, r, v1, v2) VALUES " +
@@ -375,12 +378,14 @@ public class TestReturnsClause extends BaseCQLTest {
   }
 
   @Test
-  public void testBatchDMLWithSecondaryIndex() {
+  public void testBatchDMLWithSecondaryIndex() throws Exception {
     // Test batch DMLs on a table with secondary index.
     session.execute("CREATE TABLE test_rs_batch_trans (h int, r bigint, v1 int, v2 varchar, " +
                     "primary key (h, r)) with transactions = { 'enabled' : true };");
     session.execute(
         "CREATE UNIQUE INDEX test_rs_batch_trans_idx ON test_rs_batch_trans (v1) INCLUDE (v2);");
+
+    waitForReadPermsOnAllIndexes("test_rs_batch_trans");
 
     session.execute("INSERT INTO test_rs_batch_trans (h, r, v1, v2) VALUES (1, 1, 1, 'a');");
     session.execute("INSERT INTO test_rs_batch_trans (h, r, v1, v2) VALUES (1, 2, 2, 'b');");
@@ -401,7 +406,8 @@ public class TestReturnsClause extends BaseCQLTest {
     batch.add(new SimpleStatement("INSERT INTO test_rs_batch_trans (h, r, v1, v2) VALUES " +
                                   "(1, 1, 1 ,'a') IF NOT EXISTS ELSE ERROR " +
                                   "RETURNS STATUS AS ROW"));
-    expectedResults += "Row[false, Condition was not satisfied., NULL, NULL, NULL, NULL]";
+    expectedResults += "Row[false, Condition on table test_rs_batch_trans was not satisfied., " +
+                       "NULL, NULL, NULL, NULL]";
 
     batch.add(new SimpleStatement("INSERT INTO test_rs_batch_trans (h, r, v1, v2) VALUES " +
                                   "(3, 2, 1 ,'f') IF NOT EXISTS RETURNS STATUS AS ROW"));
@@ -420,12 +426,14 @@ public class TestReturnsClause extends BaseCQLTest {
   }
 
   @Test
-  public void testBatchDMLWithUniqueIndex() {
+  public void testBatchDMLWithUniqueIndex() throws Exception {
     // Test batch insert of a table with unique index. Verify that only 1 insert succeed for the
     // same unique index value.
     session.execute("CREATE TABLE test_unique (k int primary key, v int) " +
                     "with transactions = { 'enabled' : true };");
     session.execute("CREATE UNIQUE INDEX test_unique_idx ON test_unique (v);");
+
+    waitForReadPermsOnAllIndexes("test_unique");
 
     final int KEY_COUNT = 50;
     HashSet<Integer> allKeys = new HashSet<>();

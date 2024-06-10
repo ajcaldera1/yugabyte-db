@@ -33,19 +33,19 @@
 // they want something more sophisticated (like scan-resistance, a
 // custom eviction policy, variable cache sizing, etc.)
 
-#ifndef STORAGE_ROCKSDB_INCLUDE_CACHE_H_
-#define STORAGE_ROCKSDB_INCLUDE_CACHE_H_
+#pragma once
 
 #include <stdint.h>
+
 #include <memory>
-#include "yb/util/slice.h"
-#include "yb/rocksdb/status.h"
-#include "yb/util/cache_metrics.h"
+
 #include "yb/rocksdb/statistics.h"
+#include "yb/rocksdb/status.h"
+
+#include "yb/util/slice.h"
 
 namespace rocksdb {
 
-using std::shared_ptr;
 
 // Classifies the type of the subcache.
 enum SubCacheType {
@@ -61,9 +61,9 @@ class Cache;
 //
 // The parameter num_shard_bits defaults to 4, and strict_capacity_limit
 // defaults to false.
-extern shared_ptr<Cache> NewLRUCache(size_t capacity);
-extern shared_ptr<Cache> NewLRUCache(size_t capacity, int num_shard_bits);
-extern shared_ptr<Cache> NewLRUCache(size_t capacity, int num_shard_bits,
+extern std::shared_ptr<Cache> NewLRUCache(size_t capacity);
+extern std::shared_ptr<Cache> NewLRUCache(size_t capacity, int num_shard_bits);
+extern std::shared_ptr<Cache> NewLRUCache(size_t capacity, int num_shard_bits,
                                      bool strict_capacity_limit);
 
 using QueryId = int64_t;
@@ -73,6 +73,10 @@ constexpr QueryId kDefaultQueryId = 0;
 constexpr QueryId kInMultiTouchId = -1;
 // Query ids to represent values that should not be in any cache.
 constexpr QueryId kNoCacheQueryId = -2;
+// Maximum permissible number of bits to use for sharding the block cache.
+constexpr int kSharedLRUCacheMaxNumShardBits = 19;
+// Default value of number of bits to use for sharding the block cache.
+constexpr int kSharedLRUCacheDefaultNumShardBits = 4;
 
 class Cache {
  public:
@@ -149,10 +153,6 @@ class Cache {
 
   // Set whether to return error on insertion when cache reaches its full
   // capacity.
-  virtual void SetStrictCapacityLimit(bool strict_capacity_limit) = 0;
-
-  // Set whether to return error on insertion when cache reaches its full
-  // capacity.
   virtual bool HasStrictCapacityLimit() const = 0;
 
   // returns the maximum configured capacity of the cache
@@ -190,6 +190,12 @@ class Cache {
 
   virtual void SetMetrics(const scoped_refptr<yb::MetricEntity>& entity) = 0;
 
+  // Tries to evict specified amount of bytes from cache.
+  virtual size_t Evict(size_t required) { return 0; }
+
+  // Returns the single-touch and multi-touch cache usages for each of the shard.
+  virtual std::vector<std::pair<size_t, size_t>> TEST_GetIndividualUsages() = 0;
+
  private:
   void LRU_Remove(Handle* e);
   void LRU_Append(Handle* e);
@@ -201,5 +207,3 @@ class Cache {
 };
 
 }  // namespace rocksdb
-
-#endif  // STORAGE_ROCKSDB_UTIL_CACHE_H_

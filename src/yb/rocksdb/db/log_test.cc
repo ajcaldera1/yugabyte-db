@@ -21,6 +21,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
+#include <string>
+#include <gtest/gtest.h>
+
 #include "yb/rocksdb/db/log_reader.h"
 #include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/env.h"
@@ -28,8 +31,10 @@
 #include "yb/rocksdb/util/crc32c.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/random.h"
-#include "yb/rocksdb/util/testharness.h"
+#include "yb/util/test_macros.h"
 #include "yb/rocksdb/util/testutil.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 namespace log {
@@ -57,7 +62,8 @@ static std::string RandomSkewedString(int i, Random* rnd) {
   return BigString(NumberString(i), rnd->Skewed(17));
 }
 
-class LogTest : public ::testing::TestWithParam<int> {
+class LogTest : public RocksDBTest,
+                public ::testing::WithParamInterface<int> {
  private:
   class StringSource : public SequentialFile {
    public:
@@ -67,6 +73,7 @@ class LogTest : public ::testing::TestWithParam<int> {
     bool force_eof_;
     size_t force_eof_position_;
     bool returned_partial_;
+
     explicit StringSource(Slice& contents) : // NOLINT
       contents_(contents),
       force_error_(false),
@@ -75,7 +82,7 @@ class LogTest : public ::testing::TestWithParam<int> {
       force_eof_position_(0),
       returned_partial_(false) { }
 
-    Status Read(size_t n, Slice* result, char* scratch) override {
+    Status Read(size_t n, Slice* result, uint8_t* scratch) override {
       EXPECT_TRUE(!returned_partial_) << "must not Read() after eof/error";
 
       if (force_error_) {
@@ -123,6 +130,11 @@ class LogTest : public ::testing::TestWithParam<int> {
       contents_.remove_prefix(n);
 
       return Status::OK();
+    }
+
+    const std::string& filename() const override {
+      static const std::string kFilename = "StringSource";
+      return kFilename;
     }
   };
 
@@ -189,7 +201,7 @@ class LogTest : public ::testing::TestWithParam<int> {
   }
 
   void Write(const std::string& msg) {
-    writer_.AddRecord(Slice(msg));
+    ASSERT_OK(writer_.AddRecord(Slice(msg)));
   }
 
   size_t WrittenBytes() const {

@@ -21,6 +21,7 @@ import org.yb.client.GetTableSchemaResponse;
 import org.yb.client.YBClient;
 import org.yb.Common.PartitionSchemaPB.HashSchema;
 import org.yb.minicluster.BaseMiniClusterTest;
+import org.yb.util.BuildTypeUtil;
 import redis.clients.jedis.HostAndPort;
 import redis.clients.jedis.Jedis;
 import redis.clients.jedis.JedisCluster;
@@ -192,6 +193,10 @@ public abstract class BaseJedisTest extends BaseMiniClusterTest {
     // Create the redis table.
     miniCluster.getClient().createRedisTableOnly(tableName);
 
+    // TODO(bogdan): Fake sleep until after #4663 is fixed, as we're seeing issues with test work
+    // starting, while initial leaders are still moving.
+    Thread.sleep(BuildTypeUtil.adjustTimeout(10000));
+
     GetTableSchemaResponse tableSchema = miniCluster.getClient().getTableSchema(
         YBClient.REDIS_KEYSPACE_NAME, tableName);
 
@@ -263,7 +268,24 @@ public abstract class BaseJedisTest extends BaseMiniClusterTest {
     return numRetries;
   }
 
-  protected void readAndWriteFromDBs(Collection<String> dbs, int numKeys) throws Exception {
+  protected void setWithRetries(JedisCommands client, String key, String value) throws Exception {
+    int retries =
+        doWithRetries(MAX_RETRIES, MIN_BACKOFF_TIME_MS, MAX_BACKOFF_TIME_MS,
+            new Callable<Void>() {
+              public Void call() throws Exception {
+                assertEquals("OK", client.set(key, "v"));
+                return null;
+              }
+            });
+    if (retries > MAX_RETRIES) {
+      fail("Exceeded maximum number of retries");
+    }
+    if (retries > 1 && retries <= MAX_RETRIES) {
+      LOG.info("Set Operation on key {} took {} retries", key, retries);
+    }
+  }
+
+  protected void readAndWriteFromDBs(List<String> dbs, int numKeys) throws Exception {
     RandomStringGenerator generator = new RandomStringGenerator.Builder()
         .withinRange('a', 'z').build();
     ArrayList<String> keys = new ArrayList<String>(numKeys);
@@ -276,20 +298,7 @@ public abstract class BaseJedisTest extends BaseMiniClusterTest {
       JedisCommands client = getClientForDB(db);
       LOG.info("Writing to db " + db);
       for (String key : keys) {
-        int retries =
-            doWithRetries(MAX_RETRIES, MIN_BACKOFF_TIME_MS, MAX_BACKOFF_TIME_MS,
-                          new Callable<Void>() {
-                            public Void call() throws Exception {
-                              assertEquals("OK", client.set(key, "v"));
-                              return null;
-                            }
-                          });
-        if (retries > MAX_RETRIES) {
-          fail("Exceeded maximum number of retries");
-        }
-        if (retries > 1 && retries <= MAX_RETRIES) {
-          LOG.info("Set Operation on key {} took {} retries", key, retries);
-        }
+        setWithRetries(client, key, "v");
       }
     }
     for (String db : dbs) {

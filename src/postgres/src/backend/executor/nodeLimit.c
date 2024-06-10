@@ -26,6 +26,9 @@
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 
+/*  YB includes. */
+#include "pg_yb_utils.h"
+
 static void recompute_limits(LimitState *node);
 static int64 compute_tuples_needed(LimitState *node);
 
@@ -54,12 +57,19 @@ ExecLimit(PlanState *pstate)
 	outerPlan = outerPlanState(node);
 
 	/*
+	 * Initialize LIMIT count and offset.
+	 */
+	if (IsYugaByteEnabled()) {
+		pstate->state->yb_exec_params.limit_count = node->count;
+		pstate->state->yb_exec_params.limit_offset = node->offset;
+	}
+
+	/*
 	 * The main logic is a simple state machine.
 	 */
 	switch (node->lstate)
 	{
 		case LIMIT_INITIAL:
-
 			/*
 			 * First call for this node, so compute limit/offset. (We can't do
 			 * this any earlier, because parameters from upper nodes will not
@@ -68,9 +78,22 @@ ExecLimit(PlanState *pstate)
 			 */
 			recompute_limits(node);
 
-			/* FALL THRU */
+			/*
+			 * Update LIMIT count and offset after recomputing.
+			 */
+			if (IsYugaByteEnabled()) {
+				pstate->state->yb_exec_params.limit_count = node->count;
+				pstate->state->yb_exec_params.limit_offset = node->offset;
+			}
+			switch_fallthrough();
 
 		case LIMIT_RESCAN:
+			/*
+			 * YB: If the limit is invalid (i.e. noCount = true), we need to
+			 * use the default limit in yb. Otherwise, we don't use the default
+			 * yb limit and use the one prescribed by this node.
+			 */
+			pstate->state->yb_exec_params.limit_use_default = node->noCount;
 
 			/*
 			 * If backwards scan, just return NULL without changing state.
@@ -376,10 +399,9 @@ ExecInitLimit(Limit *node, EState *estate, int eflags)
 										  (PlanState *) limitstate);
 
 	/*
-	 * Initialize result slot and type. (XXX not actually used, but upper
-	 * nodes access it to get this node's result tupledesc...)
+	 * Initialize result type.
 	 */
-	ExecInitResultTupleSlotTL(estate, &limitstate->ps);
+	ExecInitResultTypeTL(&limitstate->ps);
 
 	/*
 	 * limit nodes do no projections, so initialize projection info for this

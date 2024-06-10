@@ -11,12 +11,10 @@
 // under the License.
 //
 
-#ifndef YB_INTEGRATION_TESTS_REDIS_TABLE_TEST_BASE_H_
-#define YB_INTEGRATION_TESTS_REDIS_TABLE_TEST_BASE_H_
+#pragma once
 
 #include <string>
 
-#include "yb/yql/redis/redisserver/redis_parser.h"
 #include "yb/integration-tests/yb_table_test_base.h"
 
 namespace yb {
@@ -27,8 +25,8 @@ class RedisTableTestBase : public YBTableTestBase {
   client::YBTableName table_name() override;
 
   void CreateTable() override;
-  void PutKeyValue(std::string key, std::string value) override;
-  void PutKeyValueWithTtlNoFlush(std::string key, std::string value, int64_t ttl);
+  void PutKeyValue(const std::string& key, const std::string& value) override;
+  void PutKeyValueWithTtlNoFlush(const std::string& key, const std::string& value, int64_t ttl);
   void GetKeyValue(const std::string& key, const std::string& value, bool expect_not_found = false);
 
   void RedisSimpleSetCommands();
@@ -36,9 +34,9 @@ class RedisTableTestBase : public YBTableTestBase {
 
   void RedisTtlSetCommands();
   void RedisTtlGetCommands();
+
+  bool enable_ysql() override { return false; }
 };
 
 }  // namespace integration_tests
 }  // namespace yb
-
-#endif  // YB_INTEGRATION_TESTS_REDIS_TABLE_TEST_BASE_H_

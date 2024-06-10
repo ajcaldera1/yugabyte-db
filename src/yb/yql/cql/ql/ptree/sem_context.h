@@ -15,17 +15,15 @@
 // Entry point for the semantic analytical process.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_SEM_CONTEXT_H_
-#define YB_YQL_CQL_QL_PTREE_SEM_CONTEXT_H_
+#pragma once
 
-#include "yb/yql/cql/ql/util/ql_env.h"
+#include "yb/client/client_fwd.h"
+
+#include "yb/common/common_types.pb.h"
+#include "yb/common/ql_datatype.h"
+
+#include "yb/yql/cql/ql/ptree/ptree_fwd.h"
 #include "yb/yql/cql/ql/ptree/process_context.h"
-#include "yb/yql/cql/ql/ptree/column_desc.h"
-#include "yb/yql/cql/ql/ptree/pt_create_table.h"
-#include "yb/yql/cql/ql/ptree/pt_alter_table.h"
-#include "yb/yql/cql/ql/ptree/pt_create_type.h"
-#include "yb/yql/cql/ql/ptree/pt_create_index.h"
-#include "yb/yql/cql/ql/ptree/sem_state.h"
 
 namespace yb {
 namespace ql {
@@ -68,21 +66,19 @@ class SemContext : public ProcessContext {
 
   //------------------------------------------------------------------------------------------------
   // Constructor & destructor.
-  SemContext(ParseTree::UniPtr parse_tree, QLEnv *ql_env);
+  SemContext(ParseTreePtr parse_tree, QLEnv *ql_env);
   virtual ~SemContext();
 
   // Memory pool for semantic analysis of the parse tree of a statement.
-  MemoryContext *PSemMem() const {
-    return parse_tree_->PSemMem();
-  }
+  MemoryContext *PSemMem() const;
 
   //------------------------------------------------------------------------------------------------
   // Symbol table support.
-  CHECKED_STATUS MapSymbol(const MCString& name, PTColumnDefinition *entry);
-  CHECKED_STATUS MapSymbol(const MCString& name, PTAlterColumnDefinition *entry);
-  CHECKED_STATUS MapSymbol(const MCString& name, PTCreateTable *entry);
-  CHECKED_STATUS MapSymbol(const MCString& name, ColumnDesc *entry);
-  CHECKED_STATUS MapSymbol(const MCString& name, PTTypeField *entry);
+  Status MapSymbol(const MCString& name, PTColumnDefinition *entry);
+  Status MapSymbol(const MCString& name, PTAlterColumnDefinition *entry);
+  Status MapSymbol(const MCString& name, PTCreateTable *entry);
+  Status MapSymbol(const MCString& name, ColumnDesc *entry);
+  Status MapSymbol(const MCString& name, PTTypeField *entry);
 
   // Access functions to current processing symbol.
   SymbolEntry *current_processing_id() {
@@ -94,21 +90,13 @@ class SemContext : public ProcessContext {
 
   //------------------------------------------------------------------------------------------------
   // Load table schema into symbol table.
-  CHECKED_STATUS LookupTable(const client::YBTableName& name,
-                             const YBLocation& loc,
-                             bool write_table,
-                             const PermissionType permission_type,
-                             std::shared_ptr<client::YBTable>* table,
-                             bool* is_system,
-                             MCVector<ColumnDesc>* col_descs = nullptr,
-                             MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
-
-  // Load index schema into symbol table.
-  CHECKED_STATUS LookupIndex(const TableId& index_id,
-                             const YBLocation& loc,
-                             std::shared_ptr<client::YBTable>* index_table,
-                             MCVector<ColumnDesc>* col_descs = nullptr,
-                             MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
+  Status LookupTable(const client::YBTableName& name,
+                     const YBLocation& loc,
+                     bool write_table,
+                     const PermissionType permission_type,
+                     std::shared_ptr<client::YBTable>* table,
+                     bool* is_system,
+                     MCVector<ColumnDesc>* col_descs = nullptr);
 
   //------------------------------------------------------------------------------------------------
   // Access functions to current processing table and column.
@@ -127,15 +115,9 @@ class SemContext : public ProcessContext {
     current_processing_id_.create_table_ = table;
   }
 
-  PTCreateIndex *current_create_index_stmt() {
-    PTCreateTable* const table = current_create_table_stmt();
-    return (table != nullptr && table->opcode() == TreeNodeOpcode::kPTCreateIndex)
-        ? static_cast<PTCreateIndex*>(table) : nullptr;
-  }
+  PTCreateIndex *current_create_index_stmt();
 
-  void set_current_create_index_stmt(PTCreateIndex *index) {
-    set_current_create_table_stmt(index);
-  }
+  void set_current_create_index_stmt(PTCreateIndex *index);
 
   PTAlterTable *current_alter_table() {
     return current_processing_id_.alter_table_;
@@ -168,7 +150,7 @@ class SemContext : public ProcessContext {
   std::shared_ptr<client::YBTable> GetTableDesc(const TableId& table_id);
 
   // Get (user-defined) type from metadata server.
-  std::shared_ptr<QLType> GetUDType(const string &keyspace_name, const string &type_name);
+  std::shared_ptr<QLType> GetUDType(const std::string &keyspace_name, const std::string &type_name);
 
   // Find column descriptor from symbol table.
   PTColumnDefinition *GetColumnDefinition(const MCString& col_name);
@@ -185,13 +167,9 @@ class SemContext : public ProcessContext {
   // DataType not QLType as arguments
   bool IsComparable(DataType lhs_type, DataType rhs_type) const;
 
-  std::string CurrentKeyspace() const {
-    return ql_env_->CurrentKeyspace();
-  }
+  std::string CurrentKeyspace() const;
 
-  std::string CurrentRoleName() const {
-    return ql_env_->CurrentRoleName();
-  }
+  std::string CurrentRoleName() const;
 
   // Access function to cache_used.
   bool cache_used() const { return cache_used_; }
@@ -201,65 +179,47 @@ class SemContext : public ProcessContext {
     return sem_state_;
   }
 
-  const std::shared_ptr<QLType>& expr_expected_ql_type() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->expected_ql_type();
-  }
+  const std::shared_ptr<QLType>& expr_expected_ql_type() const;
 
-  InternalType expr_expected_internal_type() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->expected_internal_type();
-  }
+  NullIsAllowed expected_ql_type_accepts_null() const;
 
-  WhereExprState *where_state() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->where_state();
-  }
+  InternalType expr_expected_internal_type() const;
 
-  bool processing_column_definition() const {
-    DCHECK(sem_state_) << "State variable is not set";
-    return sem_state_->processing_column_definition();
-  }
+  SelectScanInfo *scan_state() const;
 
-  const MCSharedPtr<MCString>& bindvar_name() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->bindvar_name();
-  }
+  bool void_primary_key_condition() const;
 
-  const ColumnDesc *hash_col() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->hash_col();
-  }
+  WhereExprState *where_state() const;
 
-  const ColumnDesc *lhs_col() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->lhs_col();
-  }
+  IfExprState *if_state() const;
 
-  bool processing_set_clause() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->processing_set_clause();
-  }
+  bool validate_orderby_expr() const;
 
-  bool processing_assignee() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->processing_assignee();
-  }
+  IdxPredicateState *idx_predicate_state() const;
 
-  bool processing_if_clause() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->processing_if_clause();
-  }
+  bool selecting_from_index() const;
 
-  bool allowing_aggregate() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->allowing_aggregate();
-  }
+  size_t index_select_prefix_length() const;
 
-  bool allowing_column_refs() const {
-    DCHECK(sem_state_) << "State variable is not set for the expression";
-    return sem_state_->allowing_column_refs();
-  }
+  bool processing_column_definition() const;
+
+  const MCSharedPtr<MCString>& bindvar_name() const;
+
+  const MCSharedPtr<MCVector<MCSharedPtr<MCString>>> &alternative_bindvar_names() const;
+
+  const ColumnDesc *hash_col() const;
+
+  const ColumnDesc *lhs_col() const;
+
+  bool processing_set_clause() const;
+
+  bool processing_assignee() const;
+
+  bool processing_if_clause() const;
+
+  bool allowing_aggregate() const;
+
+  bool allowing_column_refs() const;
 
   void set_sem_state(SemState *new_state, SemState **existing_state_holder) {
     *existing_state_holder = sem_state_;
@@ -270,63 +230,54 @@ class SemContext : public ProcessContext {
     sem_state_ = previous_state;
   }
 
-  PTDmlStmt *current_dml_stmt() const {
-    return current_dml_stmt_;
-  }
+  PTDmlStmt *current_dml_stmt() const;
 
-  void set_current_dml_stmt(PTDmlStmt *stmt) {
-    current_dml_stmt_ = stmt;
-  }
+  void set_current_dml_stmt(PTDmlStmt *stmt);
 
-  CHECKED_STATUS HasKeyspacePermission(const PermissionType permission,
-                                       const NamespaceName& keyspace_name);
+  void set_void_primary_key_condition(bool val);
+
+  Status HasKeyspacePermission(const PermissionType permission,
+                               const NamespaceName& keyspace_name);
 
   // Check whether the current role has the specified permission on the keyspace. Returns an
   // UNAUTHORIZED error message if not found.
-  CHECKED_STATUS CheckHasKeyspacePermission(const YBLocation& loc,
-                                            const PermissionType permission,
-                                            const NamespaceName& keyspace_name);
+  Status CheckHasKeyspacePermission(const YBLocation& loc,
+                                    const PermissionType permission,
+                                    const NamespaceName& keyspace_name);
 
   // Check whether the current role has the specified permission on the keyspace or table. Returns
   // an UNAUTHORIZED error message if not found.
-  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
-                                         const PermissionType permission,
-                                         const NamespaceName& keyspace_name,
-                                         const TableName& table_name);
+  Status CheckHasTablePermission(const YBLocation& loc,
+                                 const PermissionType permission,
+                                 const NamespaceName& keyspace_name,
+                                 const TableName& table_name);
 
   // Convenience method.
-  CHECKED_STATUS CheckHasTablePermission(const YBLocation& loc,
-                                         const PermissionType permission,
-                                         client::YBTableName table_name);
+  Status CheckHasTablePermission(const YBLocation& loc,
+                                 const PermissionType permission,
+                                 client::YBTableName table_name);
 
   // Check whether the current role has the specified permission on the role. Returns an
   // UNAUTHORIZED error message if not found.
-  CHECKED_STATUS CheckHasRolePermission(const YBLocation& loc,
-                                        const PermissionType permission,
-                                        const RoleName& role_name);
+  Status CheckHasRolePermission(const YBLocation& loc,
+                                const PermissionType permission,
+                                const RoleName& role_name);
 
   // Check whether the current role has the specified permission on 'ALL KEYSPACES'.
-  CHECKED_STATUS CheckHasAllKeyspacesPermission(const YBLocation& loc,
-                                                const PermissionType permission);
+  Status CheckHasAllKeyspacesPermission(const YBLocation& loc,
+                                        const PermissionType permission);
 
   // Check whether the current role has the specified permission on 'ALL ROLES'.
-  CHECKED_STATUS CheckHasAllRolesPermission(const YBLocation& loc,
-                                            const PermissionType permission);
+  Status CheckHasAllRolesPermission(const YBLocation& loc,
+                                    const PermissionType permission);
 
-  bool IsUncoveredIndexSelect() const {
-    if (current_dml_stmt_ == nullptr ||
-        current_dml_stmt_->opcode() != TreeNodeOpcode::kPTSelectStmt) {
-      return false;
-    }
-    // Applicable to SELECT statement only.
-    const auto* select_stmt = static_cast<const PTSelectStmt*>(current_dml_stmt_);
-    return !select_stmt->index_id().empty() && !select_stmt->covers_fully();
-  }
+  bool IsUncoveredIndexSelect() const;
+
+  bool IsPartialIndexSelect() const;
 
  private:
-  CHECKED_STATUS LoadSchema(const std::shared_ptr<client::YBTable>& table,
-                            MCVector<ColumnDesc>* col_descs = nullptr,
-                            MCVector<PTColumnDefinition::SharedPtr>* column_definitions = nullptr);
+  Status LoadSchema(const std::shared_ptr<client::YBTable>& table,
+                    MCVector<ColumnDesc>* col_descs = nullptr);
 
   // Find symbol.
   const SymbolEntry *SeekSymbol(const MCString& name) const;
@@ -343,9 +294,6 @@ class SemContext : public ProcessContext {
   // Is metadata cache used?
   bool cache_used_ = false;
 
-  // The current dml statement being processed.
-  PTDmlStmt *current_dml_stmt_ = nullptr;
-
   // sem_state_ consists of state variables that are used to process one tree node. It is generally
   // set and reset at the beginning and end of the semantic analysis of one treenode.
   SemState *sem_state_ = nullptr;
@@ -353,4 +301,3 @@ class SemContext : public ProcessContext {
 
 }  // namespace ql
 }  // namespace yb
-#endif  // YB_YQL_CQL_QL_PTREE_SEM_CONTEXT_H_

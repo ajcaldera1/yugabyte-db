@@ -17,22 +17,20 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_ROCKSDB_DB_MEMTABLE_LIST_H
-#define YB_ROCKSDB_DB_MEMTABLE_LIST_H
 
 #pragma once
 
-#include <string>
-#include <list>
-#include <vector>
-#include <set>
 #include <deque>
+#include <list>
+#include <set>
+#include <string>
+#include <vector>
 
-#include "yb/rocksdb/db/dbformat.h"
-#include "yb/rocksdb/db/filename.h"
-#include "yb/rocksdb/db/memtable.h"
-#include "yb/rocksdb/db/skiplist.h"
+#include "yb/rocksdb/rocksdb_fwd.h"
+
 #include "yb/rocksdb/db.h"
+#include "yb/rocksdb/db/dbformat.h"
+#include "yb/rocksdb/db/memtable.h"
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/types.h"
@@ -45,7 +43,6 @@ namespace rocksdb {
 class ColumnFamilyData;
 class InternalKeyComparator;
 class InstrumentedMutex;
-class MergeIteratorBuilder;
 
 // keeps a list of immutable memtables in a vector. the list is immutable
 // if refcount is bigger than one. It is used as a state for Get() and
@@ -127,10 +124,14 @@ class MemTableListVersion {
 
   void UnrefMemTable(autovector<MemTable*>* to_delete, MemTable* m);
 
+  void VerifyNumFlushginBytes() const;
+
   friend class MemTableList;
 
   // Immutable MemTables that have not yet been flushed.
   std::list<MemTable*> memlist_;
+
+  size_t total_data_size_ = 0;
 
   // MemTables that have already been flushed
   // (used during Transaction validation)
@@ -186,6 +187,10 @@ class MemTableList {
   // been flushed and logged.
   int NumNotFlushed() const;
 
+  // Returns accumulated frontier from all tables.
+  // Initial value could be passed as `frontier`.
+  UserFrontierPtr GetFrontier(UserFrontierPtr frontier, UpdateUserValueType type);
+
   // Returns total number of memtables in the list that have been
   // completely flushed and logged.
   int NumFlushed() const;
@@ -197,7 +202,8 @@ class MemTableList {
   // Returns the earliest memtables that needs to be flushed. The returned
   // memtables are guaranteed to be in the ascending order of created time.
   void PickMemtablesToFlush(autovector<MemTable*>* mems,
-                            const MemTableFilter& filter = MemTableFilter());
+                            const MemTableFilter& filter = MemTableFilter(),
+                            const MutableCFOptions* mutable_cf_options = nullptr);
 
   // Reset status of the given memtable list back to pending state so that
   // they can get picked up again on the next round of flush.
@@ -209,7 +215,7 @@ class MemTableList {
       ColumnFamilyData* cfd, const MutableCFOptions& mutable_cf_options,
       const autovector<MemTable*>& m, VersionSet* vset, InstrumentedMutex* mu,
       uint64_t file_number, autovector<MemTable*>* to_delete,
-      Directory* db_directory, LogBuffer* log_buffer);
+      Directory* db_directory, LogBuffer* log_buffer, const FileNumbersHolder& file_number_holder);
 
   // New memtables are inserted at the front of the list.
   // Takes ownership of the referenced held on *m by the caller of Add().
@@ -228,6 +234,8 @@ class MemTableList {
   // parameter). This flush request will persist until the next time
   // PickMemtablesToFlush() is called.
   void FlushRequested() { flush_requested_ = true; }
+
+  size_t TotalDataSize() const;
 
   // Copying allowed
   // MemTableList(const MemTableList&);
@@ -259,5 +267,3 @@ class MemTableList {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_MEMTABLE_LIST_H

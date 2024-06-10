@@ -29,12 +29,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/tserver/tablet_server_test_util.h"
 
 #include "yb/consensus/consensus.proxy.h"
-#include "yb/rpc/messenger.h"
 #include "yb/server/server_base.proxy.h"
+#include "yb/tserver/backup.proxy.h"
 #include "yb/tserver/tserver_admin.proxy.h"
 #include "yb/tserver/tserver_service.proxy.h"
 
@@ -42,19 +41,19 @@ namespace yb {
 namespace tserver {
 
 using consensus::ConsensusServiceProxy;
-using rpc::Messenger;
-using std::shared_ptr;
 
 void CreateTsClientProxies(const HostPort& addr,
                            rpc::ProxyCache* proxy_cache,
-                           gscoped_ptr<TabletServerServiceProxy>* proxy,
-                           gscoped_ptr<TabletServerAdminServiceProxy>* admin_proxy,
-                           gscoped_ptr<ConsensusServiceProxy>* consensus_proxy,
-                           gscoped_ptr<server::GenericServiceProxy>* generic_proxy) {
+                           std::unique_ptr<TabletServerServiceProxy>* proxy,
+                           std::unique_ptr<TabletServerAdminServiceProxy>* admin_proxy,
+                           std::unique_ptr<ConsensusServiceProxy>* consensus_proxy,
+                           std::unique_ptr<server::GenericServiceProxy>* generic_proxy,
+                           std::unique_ptr<TabletServerBackupServiceProxy>* backup_proxy) {
   proxy->reset(new TabletServerServiceProxy(proxy_cache, addr));
   admin_proxy->reset(new TabletServerAdminServiceProxy(proxy_cache, addr));
   consensus_proxy->reset(new ConsensusServiceProxy(proxy_cache, addr));
   generic_proxy->reset(new server::GenericServiceProxy(proxy_cache, addr));
+  backup_proxy->reset(new TabletServerBackupServiceProxy(proxy_cache, addr));
 }
 
 } // namespace tserver

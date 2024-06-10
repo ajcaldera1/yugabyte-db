@@ -11,13 +11,12 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_NET_TUNNEL_H
-#define YB_UTIL_NET_TUNNEL_H
+#pragma once
 
 #include <boost/asio/io_context.hpp>
 
 #include "yb/util/net/net_fwd.h"
-#include "yb/util/status.h"
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -34,8 +33,8 @@ class Tunnel {
   // Listen local and forward data to/from remote.
   // If address_checker is specified, we use it to check whether we originating address of
   // connection is acceptable.
-  CHECKED_STATUS Start(const Endpoint& local, const Endpoint& remote,
-                       AddressChecker address_checker = AddressChecker());
+  Status Start(const Endpoint& local, const Endpoint& remote,
+               AddressChecker address_checker = AddressChecker());
   void Shutdown();
 
  private:
@@ -44,5 +43,3 @@ class Tunnel {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_NET_TUNNEL_H

@@ -11,10 +11,8 @@
 // under the License.
 //
 
-#ifndef YB_MASTER_YQL_TABLES_VTABLE_H
-#define YB_MASTER_YQL_TABLES_VTABLE_H
+#pragma once
 
-#include "yb/master/master.h"
 #include "yb/master/yql_virtual_table.h"
 
 namespace yb {
@@ -23,9 +21,10 @@ namespace master {
 // VTable implementation of system_schema.tables.
 class YQLTablesVTable : public YQLVirtualTable {
  public:
-  explicit YQLTablesVTable(const Master* const master);
-  CHECKED_STATUS RetrieveData(const QLReadRequestPB& request,
-                              std::unique_ptr<QLRowBlock>* vtable) const;
+  explicit YQLTablesVTable(const TableName& table_name,
+                           const NamespaceName& namespace_name,
+                           Master * const master);
+  Result<VTableDataPtr> RetrieveData(const QLReadRequestPB& request) const override;
  protected:
   Schema CreateSchema() const;
  private:
@@ -50,8 +49,8 @@ class YQLTablesVTable : public YQLVirtualTable {
   static constexpr const char* const kReadRepairChance = "read_repair_chance";
   static constexpr const char* const kSpeculativeRetry = "speculative_retry";
   static constexpr const char* const kTransactions = "transactions";
+  static constexpr const char* const kNumTablets = "tablets";
 };
 
 }  // namespace master
 }  // namespace yb
-#endif // YB_MASTER_YQL_TABLES_VTABLE_H

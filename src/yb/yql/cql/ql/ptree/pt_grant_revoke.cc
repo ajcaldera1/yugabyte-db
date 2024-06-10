@@ -16,26 +16,32 @@
 //--------------------------------------------------------------------------------------------------
 
 #include "yb/yql/cql/ql/ptree/pt_grant_revoke.h"
-#include "yb/yql/cql/ql/ptree/sem_context.h"
+
+#include "yb/common/redis_constants_common.h"
+
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/yql/cql/ql/ptree/pt_option.h"
+#include "yb/yql/cql/ql/ptree/sem_context.h"
+#include "yb/yql/cql/ql/ptree/sem_state.h"
+#include "yb/yql/cql/ql/ptree/yb_location.h"
 
 DECLARE_bool(use_cassandra_authentication);
 
 namespace yb {
 namespace ql {
 
-using std::shared_ptr;
-using std::to_string;
+using std::string;
 using strings::Substitute;
 
 //--------------------------------------------------------------------------------------------------
 // GRANT Role Statement.
 
 PTGrantRevokeRole::PTGrantRevokeRole(MemoryContext* memctx,
-                         YBLocation::SharedPtr loc,
-                         GrantRevokeStatementType statement_type,
-                         const MCSharedPtr<MCString>& granted_role_name,
-                         const MCSharedPtr<MCString>& recipient_role_name)
+                                     YBLocation::SharedPtr loc,
+                                     client::GrantRevokeStatementType statement_type,
+                                     const MCSharedPtr<MCString>& granted_role_name,
+                                     const MCSharedPtr<MCString>& recipient_role_name)
     : TreeNode(memctx, loc),
       statement_type_(statement_type),
       granted_role_name_(granted_role_name),
@@ -47,9 +53,8 @@ PTGrantRevokeRole::~PTGrantRevokeRole() {
 Status PTGrantRevokeRole::Analyze(SemContext* sem_context) {
   if (FLAGS_use_cassandra_authentication) {
     RETURN_NOT_OK(sem_context->CheckHasRolePermission(loc(), PermissionType::AUTHORIZE_PERMISSION,
-        recipient_role_name_->data()));
-    RETURN_NOT_OK(sem_context->CheckHasRolePermission(loc(), PermissionType::AUTHORIZE_PERMISSION,
         granted_role_name_->data()));
+    // Access to 'recipient_role_name_' is not required.
   }
   return Status::OK();
 }
@@ -80,17 +85,17 @@ const std::map<std::string, PermissionType >  PTGrantRevokePermission::kPermissi
 
 PTGrantRevokePermission::PTGrantRevokePermission(MemoryContext* memctx,
                                                  YBLocation::SharedPtr loc,
-                                                 GrantRevokeStatementType statement_type,
+                                                 client::GrantRevokeStatementType statement_type,
                                                  const MCSharedPtr<MCString>& permission_name,
                                                  const ResourceType& resource_type,
                                                  const PTQualifiedName::SharedPtr& resource_name,
                                                  const PTQualifiedName::SharedPtr& role_name)
-  : TreeNode(memctx, loc),
-  statement_type_(statement_type),
-  permission_name_(permission_name),
-  complete_resource_name_(resource_name),
-  role_name_(role_name),
-  resource_type_(resource_type) {
+    : TreeNode(memctx, loc),
+      statement_type_(statement_type),
+      permission_name_(permission_name),
+      complete_resource_name_(resource_name),
+      role_name_(role_name),
+      resource_type_(resource_type) {
 }
 
 PTGrantRevokePermission::~PTGrantRevokePermission() {
@@ -124,7 +129,7 @@ Status PTGrantRevokePermission::Analyze(SemContext* sem_context) {
   }
 
   // Processing the role name.
-  RETURN_NOT_OK(role_name_->AnalyzeName(sem_context, OBJECT_ROLE));
+  RETURN_NOT_OK(role_name_->AnalyzeName(sem_context, ObjectType::ROLE));
   switch (resource_type_) {
     case ResourceType::KEYSPACE: {
       if (complete_resource_name_->QLName() == common::kRedisKeyspaceName) {
@@ -139,13 +144,13 @@ Status PTGrantRevokePermission::Analyze(SemContext* sem_context) {
       break;
     }
     case ResourceType::TABLE: {
-      RETURN_NOT_OK(complete_resource_name_->AnalyzeName(sem_context, OBJECT_TABLE));
+      RETURN_NOT_OK(complete_resource_name_->AnalyzeName(sem_context, ObjectType::TABLE));
       RETURN_NOT_OK(sem_context->CheckHasTablePermission(loc(), AUTHORIZE_PERMISSION,
           complete_resource_name_->ToTableName()));
       break;
     }
     case ResourceType::ROLE: {
-      RETURN_NOT_OK(complete_resource_name_->AnalyzeName(sem_context, OBJECT_ROLE));
+      RETURN_NOT_OK(complete_resource_name_->AnalyzeName(sem_context, ObjectType::ROLE));
       RETURN_NOT_OK(sem_context->CheckHasRolePermission(loc(), AUTHORIZE_PERMISSION,
           complete_resource_name_->QLName()));
       break;

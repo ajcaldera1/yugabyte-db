@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_DEBUG_LEAK_ANNOTATIONS_H_
-#define YB_UTIL_DEBUG_LEAK_ANNOTATIONS_H_
+#pragma once
 
 // API definitions from LLVM lsan_interface.h
 
@@ -57,12 +56,25 @@ extern "C" {
 
 namespace yb {
 namespace debug {
+
 class ScopedLSANDisabler {
  public:
-  ScopedLSANDisabler() { __lsan_disable(); }
-  ~ScopedLSANDisabler() { __lsan_enable(); }
+  ScopedLSANDisabler() {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    __lsan_disable();
+#endif
+#endif
+  }
+
+  ~ScopedLSANDisabler() {
+#if defined(__has_feature)
+#if __has_feature(address_sanitizer)
+    __lsan_enable();
+#endif
+#endif
+  }
 };
+
 } // namespace debug
 } // namespace yb
-
-#endif // YB_UTIL_DEBUG_LEAK_ANNOTATIONS_H_

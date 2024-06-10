@@ -13,48 +13,38 @@
 
 #include "yb/client/table_creator.h"
 
-#include "yb/client/client.h"
 #include "yb/client/client-internal.h"
+#include "yb/client/client.h"
+#include "yb/client/table_info.h"
 
-#include "yb/common/wire_protocol.h"
+#include "yb/common/common_util.h"
+#include "yb/common/schema_pbutil.h"
+#include "yb/common/schema.h"
+#include "yb/common/transaction.h"
 
-#include "yb/util/flag_tags.h"
+#include "yb/dockv/partition.h"
+
+#include "yb/master/master_ddl.pb.h"
+
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 #include "yb/yql/redis/redisserver/redis_constants.h"
 
-DEFINE_test_flag(int32, yb_num_total_tablets, 0,
-                 "The total number of tablets per table when a table is created.");
+using std::string;
 
 DECLARE_bool(client_suppress_created_logs);
-DECLARE_int32(yb_num_shards_per_tserver);
+DECLARE_uint32(change_metadata_backoff_max_jitter_ms);
+DECLARE_uint32(change_metadata_backoff_init_exponent);
+
+DEFINE_test_flag(bool, duplicate_create_table_request, false,
+                 "Whether a table creator should send duplicate CreateTableRequestPB to master.");
 
 namespace yb {
 namespace client {
 
-namespace {
-
-TableType ClientToPBTableType(YBTableType table_type) {
-  switch (table_type) {
-    case YBTableType::YQL_TABLE_TYPE:
-      return TableType::YQL_TABLE_TYPE;
-    case YBTableType::REDIS_TABLE_TYPE:
-      return TableType::REDIS_TABLE_TYPE;
-    case YBTableType::PGSQL_TABLE_TYPE:
-      return TableType::PGSQL_TABLE_TYPE;
-    case YBTableType::TRANSACTION_STATUS_TABLE_TYPE:
-      return TableType::TRANSACTION_STATUS_TABLE_TYPE;
-    case YBTableType::UNKNOWN_TABLE_TYPE:
-      break;
-  }
-  FATAL_INVALID_ENUM_VALUE(YBTableType, table_type);
-  // Returns a dummy value to avoid compilation warning.
-  return TableType::DEFAULT_TABLE_TYPE;
-}
-
-} // namespace
-
 YBTableCreator::YBTableCreator(YBClient* client)
-  : client_(client) {
+  : client_(client), partition_schema_(new PartitionSchemaPB), index_info_(new IndexInfoPB) {
 }
 
 YBTableCreator::~YBTableCreator() {
@@ -90,16 +80,16 @@ YBTableCreator& YBTableCreator::is_pg_shared_table() {
   return *this;
 }
 
-YBTableCreator& YBTableCreator::hash_schema(YBHashSchema hash_schema) {
+YBTableCreator& YBTableCreator::hash_schema(dockv::YBHashSchema hash_schema) {
   switch (hash_schema) {
-    case YBHashSchema::kMultiColumnHash:
-      partition_schema_.set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
+    case dockv::YBHashSchema::kMultiColumnHash:
+      partition_schema_->set_hash_schema(PartitionSchemaPB::MULTI_COLUMN_HASH_SCHEMA);
       break;
-    case YBHashSchema::kRedisHash:
-      partition_schema_.set_hash_schema(PartitionSchemaPB::REDIS_HASH_SCHEMA);
+    case dockv::YBHashSchema::kRedisHash:
+      partition_schema_->set_hash_schema(PartitionSchemaPB::REDIS_HASH_SCHEMA);
       break;
-    case YBHashSchema::kPgsqlHash:
-      partition_schema_.set_hash_schema(PartitionSchemaPB::PGSQL_HASH_SCHEMA);
+    case dockv::YBHashSchema::kPgsqlHash:
+      partition_schema_->set_hash_schema(PartitionSchemaPB::PGSQL_HASH_SCHEMA);
       break;
   }
   return *this;
@@ -110,9 +100,59 @@ YBTableCreator& YBTableCreator::num_tablets(int32_t count) {
   return *this;
 }
 
+YBTableCreator& YBTableCreator::is_colocated_via_database(bool is_colocated_via_database) {
+  is_colocated_via_database_ = is_colocated_via_database;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::tablegroup_id(const std::string& tablegroup_id) {
+  tablegroup_id_ = tablegroup_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::colocation_id(ColocationId colocation_id) {
+  colocation_id_ = colocation_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::tablespace_id(const std::string& tablespace_id) {
+  tablespace_id_ = tablespace_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::is_matview(bool is_matview) {
+  is_matview_ = is_matview;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::pg_table_id(const std::string& pg_table_id) {
+  pg_table_id_ = pg_table_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::old_rewrite_table_id(const std::string& old_rewrite_table_id) {
+  old_rewrite_table_id_ = old_rewrite_table_id;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::is_truncate(bool is_truncate) {
+  is_truncate_ = is_truncate;
+  return *this;
+}
+
 YBTableCreator& YBTableCreator::schema(const YBSchema* schema) {
   schema_ = schema;
   return *this;
+}
+
+YBTableCreator& YBTableCreator::part_of_transaction(const TransactionMetadata* txn) {
+  txn_ = txn;
+  return *this;
+}
+
+YBTableCreator &YBTableCreator::add_partition(const dockv::Partition& partition) {
+    partitions_.push_back(partition);
+    return *this;
 }
 
 YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::string>& columns,
@@ -123,7 +163,7 @@ YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::strin
 YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::string>& columns,
                                                         int32_t num_buckets, int32_t seed) {
   PartitionSchemaPB::HashBucketSchemaPB* bucket_schema =
-    partition_schema_.add_hash_bucket_schemas();
+    partition_schema_->add_hash_bucket_schemas();
   for (const string& col_name : columns) {
     bucket_schema->add_columns()->set_name(col_name);
   }
@@ -133,35 +173,59 @@ YBTableCreator& YBTableCreator::add_hash_partitions(const std::vector<std::strin
 }
 
 YBTableCreator& YBTableCreator::set_range_partition_columns(
-    const std::vector<std::string>& columns) {
+    const std::vector<std::string>& columns,
+    const std::vector<std::string>& split_rows) {
   PartitionSchemaPB::RangeSchemaPB* range_schema =
-    partition_schema_.mutable_range_schema();
+    partition_schema_->mutable_range_schema();
   range_schema->Clear();
   for (const string& col_name : columns) {
     range_schema->add_columns()->set_name(col_name);
   }
 
+  for (const auto& row : split_rows) {
+    range_schema->add_splits()->set_column_bounds(row);
+  }
   return *this;
 }
 
 YBTableCreator& YBTableCreator::replication_info(const master::ReplicationInfoPB& ri) {
-  replication_info_ = ri;
-  has_replication_info_ = true;
+  replication_info_ = std::make_unique<master::ReplicationInfoPB>(ri);
   return *this;
 }
 
 YBTableCreator& YBTableCreator::indexed_table_id(const std::string& id) {
-  indexed_table_id_ = id;
+  index_info_->set_indexed_table_id(id);
   return *this;
 }
 
 YBTableCreator& YBTableCreator::is_local_index(bool is_local_index) {
-  is_local_index_ = is_local_index;
+  index_info_->set_is_local(is_local_index);
   return *this;
 }
 
 YBTableCreator& YBTableCreator::is_unique_index(bool is_unique_index) {
-  is_unique_index_ = is_unique_index;
+  index_info_->set_is_unique(is_unique_index);
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::add_vector_options(
+    const PgVectorIdxOptionsPB& vec_options) {
+  *index_info_->mutable_vector_idx_options() = vec_options;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::is_backfill_deferred(bool is_backfill_deferred) {
+  index_info_->set_is_backfill_deferred(is_backfill_deferred);
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::skip_index_backfill(const bool skip_index_backfill) {
+  skip_index_backfill_ = skip_index_backfill;
+  return *this;
+}
+
+YBTableCreator& YBTableCreator::use_mangled_column_name(bool value) {
+  index_info_->set_use_mangled_column_name(value);
   return *this;
 }
 
@@ -175,8 +239,13 @@ YBTableCreator& YBTableCreator::wait(bool wait) {
   return *this;
 }
 
+YBTableCreator& YBTableCreator::TEST_use_old_style_create_request() {
+  TEST_use_old_style_create_request_ = true;
+  return *this;
+}
+
 Status YBTableCreator::Create() {
-  const char *object_type = indexed_table_id_.empty() ? "table" : "index";
+  const char *object_type = index_info_->has_indexed_table_id() ? "index" : "table";
   if (table_name_.table_name().empty()) {
     return STATUS_SUBSTITUTE(InvalidArgument, "Missing $0 name", object_type);
   }
@@ -190,7 +259,7 @@ Status YBTableCreator::Create() {
     CHECK(!schema_) << "Schema should not be set for redis table creation";
     redis_schema.reset(new YBSchema());
     YBSchemaBuilder b;
-    b.AddColumn(kRedisKeyColumnName)->Type(BINARY)->NotNull()->HashPrimaryKey();
+    b.AddColumn(kRedisKeyColumnName)->Type(DataType::BINARY)->NotNull()->HashPrimaryKey();
     RETURN_NOT_OK(b.Build(redis_schema.get()));
     schema(redis_schema.get());
   }
@@ -203,6 +272,7 @@ Status YBTableCreator::Create() {
   req.set_name(table_name_.table_name());
   table_name_.SetIntoNamespaceIdentifierPB(req.mutable_namespace_());
   req.set_table_type(table_type_);
+  req.set_is_colocated_via_database(is_colocated_via_database_);
 
   if (!creator_role_name_.empty()) {
     req.set_creator_role_name(creator_role_name_);
@@ -218,53 +288,102 @@ Status YBTableCreator::Create() {
     req.set_is_pg_shared_table(*is_pg_shared_table_);
   }
 
+  if (!tablegroup_id_.empty()) {
+    req.set_tablegroup_id(tablegroup_id_);
+  }
+  if (colocation_id_ != kColocationIdNotSet) {
+    req.set_colocation_id(colocation_id_);
+  }
+
+  if (!tablespace_id_.empty()) {
+    req.set_tablespace_id(tablespace_id_);
+  }
+
+  if (is_matview_) {
+    req.set_is_matview(*is_matview_);
+  }
+
+  if (!pg_table_id_.empty()) {
+    req.set_pg_table_id(pg_table_id_);
+  }
+
+  if (!old_rewrite_table_id_.empty()) {
+    req.set_old_rewrite_table_id(old_rewrite_table_id_);
+  }
+
+  if (is_truncate_) {
+    req.set_is_truncate(*is_truncate_);
+  }
+
   // Note that the check that the sum of min_num_replicas for each placement block being less or
   // equal than the overall placement info num_replicas is done on the master side and an error is
   // naturally returned if you try to create a table and the numbers mismatch. As such, it is the
   // responsibility of the client to ensure that does not happen.
-  if (has_replication_info_) {
-    req.mutable_replication_info()->CopyFrom(replication_info_);
+  if (replication_info_) {
+    req.mutable_replication_info()->CopyFrom(*replication_info_);
   }
 
   SchemaToPB(internal::GetSchema(*schema_), req.mutable_schema());
 
-  // Setup the number splits (i.e. number of tablets).
-  if (num_tablets_ <= 0) {
+  if (txn_) {
+    txn_->ToPB(req.mutable_transaction());
+    req.set_ysql_yb_ddl_rollback_enabled(YsqlDdlRollbackEnabled());
+  }
+
+  // Setup the number splits (i.e. number of splits).
+  if (num_tablets_ > 0) {
+    VLOG(1) << "num_tablets: number of tablets explicitly specified: " << num_tablets_;
+  } else if (schema_->table_properties().num_tablets() > 0) {
+    VLOG(1) << "num_tablets: number of tablets specified by user: "
+            << schema_->table_properties().num_tablets();
+    num_tablets_ = schema_->table_properties().num_tablets();
+  } else {
     if (table_name_.is_system()) {
       num_tablets_ = 1;
       VLOG(1) << "num_tablets=1: using one tablet for a system table";
     } else {
-      if (FLAGS_yb_num_total_tablets > 0) {
-        num_tablets_ = FLAGS_yb_num_total_tablets;
-        VLOG(1) << "num_tablets=" << num_tablets_
-                << ": --yb_num_total_tablets is specified.";
+      if (table_type_ == TableType::PGSQL_TABLE_TYPE && !is_pg_catalog_table_) {
+        LOG(INFO) << "Get number of tablet for YSQL user table";
+        if (replication_info_ && !tablespace_id_.empty())
+          return STATUS(InvalidArgument,
+                        "Both replication info and tablespace ID cannot "
+                        "be set when calculating number of tablets.");
+        num_tablets_ = VERIFY_RESULT(client_->NumTabletsForUserTable(
+            table_type_, &tablespace_id_, replication_info_.get()));
       } else {
-        int tserver_count = 0;
-        RETURN_NOT_OK(client_->TabletServerCount(&tserver_count, true /* primary_only */));
-        num_tablets_ = tserver_count * FLAGS_yb_num_shards_per_tserver;
-        VLOG(1) << "num_tablets = " << num_tablets_ << ": "
-                << "calculated as tserver_count * FLAGS_yb_num_shards_per_tserver ("
-                << tserver_count << " * " << FLAGS_yb_num_shards_per_tserver << ")";
+        num_tablets_ = VERIFY_RESULT(client_->NumTabletsForUserTable(
+            table_type_));
       }
     }
-  } else {
-    VLOG(1) << "num_tablets: number of tablets explicitly specified: " << num_tablets_;
   }
   req.set_num_tablets(num_tablets_);
-  req.mutable_partition_schema()->CopyFrom(partition_schema_);
 
-  if (!indexed_table_id_.empty()) {
-    req.set_indexed_table_id(indexed_table_id_);
-    req.set_is_local_index(is_local_index_);
-    req.set_is_unique_index(is_unique_index_);
+  req.mutable_partition_schema()->CopyFrom(*partition_schema_);
+
+  if (!partitions_.empty()) {
+    for (const auto& p : partitions_) {
+      auto * np = req.add_partitions();
+      p.ToPB(np);
+    }
   }
 
-  MonoTime deadline = MonoTime::Now();
-  if (timeout_.Initialized()) {
-    deadline.AddDelta(timeout_);
-  } else {
-    deadline.AddDelta(client_->default_admin_operation_timeout());
+  // Index mapping with data-table being indexed.
+  if (index_info_->has_indexed_table_id()) {
+    if (!TEST_use_old_style_create_request_) {
+      req.mutable_index_info()->CopyFrom(*index_info_);
+    }
+
+    // For compatibility reasons, set the old fields just in case we have new clients talking to
+    // old master server during rolling upgrade.
+    req.set_indexed_table_id(index_info_->indexed_table_id());
+    req.set_is_local_index(index_info_->is_local());
+    req.set_is_unique_index(index_info_->is_unique());
+    req.set_skip_index_backfill(skip_index_backfill_);
+    req.set_is_backfill_deferred(index_info_->is_backfill_deferred());
   }
+
+  auto deadline = CoarseMonoClock::Now() +
+                  (timeout_.Initialized() ? timeout_ : client_->default_admin_operation_timeout());
 
   auto s = client_->data_->CreateTable(
       client_, req, *schema_, deadline, &table_id_);
@@ -272,6 +391,18 @@ Status YBTableCreator::Create() {
   if (!s.ok() && !s.IsAlreadyPresent()) {
       RETURN_NOT_OK_PREPEND(s, strings::Substitute("Error creating $0 $1 on the master",
                                                    object_type, table_name_.ToString()));
+  }
+
+  // A client is possible to send out duplicate CREATE TABLE requests to master due to network
+  // latency issue, server too busy issue or other reasons.
+  if (PREDICT_FALSE(FLAGS_TEST_duplicate_create_table_request)) {
+    s = client_->data_->CreateTable(
+        client_, req, *schema_, deadline, &table_id_);
+
+    if (!s.ok() && !s.IsAlreadyPresent()) {
+        RETURN_NOT_OK_PREPEND(s, strings::Substitute("Error creating $0 $1 on the master",
+                                                      object_type, table_name_.ToString()));
+    }
   }
 
   // We are here because the create request succeeded or we received an IsAlreadyPresent error.
@@ -282,8 +413,16 @@ Status YBTableCreator::Create() {
 
   // Spin until the table is fully created, if requested.
   if (wait_) {
-    RETURN_NOT_OK(client_->data_->WaitForCreateTableToFinish(
-        client_, YBTableName(), table_id_, deadline));
+    if (req.has_tablegroup_id()) {
+        RETURN_NOT_OK(client_->data_->WaitForCreateTableToFinish(
+            client_, YBTableName(), table_id_, deadline,
+            FLAGS_change_metadata_backoff_max_jitter_ms,
+            FLAGS_change_metadata_backoff_init_exponent));
+    } else {
+        // TODO: Should we make the backoff loop aggresive for regular tables as well?
+        RETURN_NOT_OK(client_->data_->WaitForCreateTableToFinish(
+            client_, YBTableName(), table_id_, deadline));
+    }
   }
 
   if (s.ok() && !FLAGS_client_suppress_created_logs) {

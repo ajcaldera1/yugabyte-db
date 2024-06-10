@@ -14,13 +14,11 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-// Paranoid helpers.  This is separate from basictypes.h so that it
 // can use logging.
 
-#ifndef BASE_PARANOID_H_
-#define BASE_PARANOID_H_
+#pragma once
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/logging-inl.h"
 
@@ -102,5 +100,3 @@ inline bool IsSaneBool(bool b) {
   return *p <= 1;
 #endif
 }
-
-#endif  // BASE_PARANOID_H_

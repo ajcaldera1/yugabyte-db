@@ -124,7 +124,7 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 	 */
 	slot = MakeSingleTupleTableSlot(RelationGetDescr(trigdata->tg_relation));
 
-	ExecStoreTuple(new_row, slot, InvalidBuffer, false);
+	ExecStoreHeapTuple(new_row, slot, false);
 
 	/*
 	 * Typically the index won't have expressions, but if it does we need an
@@ -166,7 +166,7 @@ unique_key_recheck(PG_FUNCTION_ARGS)
 		 */
 		index_insert(indexRel, values, isnull, &(new_row->t_self), new_row,
 					 trigdata->tg_relation, UNIQUE_CHECK_EXISTING,
-					 indexInfo);
+					 indexInfo, false /* yb_shared_insert */);
 	}
 	else
 	{

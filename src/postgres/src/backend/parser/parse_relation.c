@@ -739,6 +739,8 @@ scanRTEForColumn(ParseState *pstate, RangeTblEntry *rte, const char *colname,
 				var = make_var(pstate, rte, attnum, location);
 				/* Require read access to the column */
 				markVarForSelectPriv(pstate, var, rte);
+				if (IsYBRelationById(rte->relid))
+					YbCheckUnsupportedSystemColumns(var, colname, rte);
 				result = (Node *) var;
 			}
 		}
@@ -2673,6 +2675,10 @@ get_rte_attribute_name(RangeTblEntry *rte, AttrNumber attnum)
 {
 	if (attnum == InvalidAttrNumber)
 		return "*";
+
+	/* The ybctid has no entry in pg_attribute */
+	if (attnum == YBTupleIdAttributeNumber)
+		return "ybctid";
 
 	/*
 	 * If there is a user-written column alias, use it.

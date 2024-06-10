@@ -10,6 +10,7 @@
 #include "utils/bytea.h"
 #include "utils/cash.h"
 #include "utils/date.h"
+#include "utils/float.h"
 #include "utils/inet.h"
 #include "utils/numeric.h"
 #include "utils/timestamp.h"
@@ -88,7 +89,7 @@ gin_btree_extract_query(FunctionCallInfo fcinfo,
 		case BTGreaterEqualStrategyNumber:
 		case BTGreaterStrategyNumber:
 			*ptr_partialmatch = true;
-			/* FALLTHROUGH */
+			switch_fallthrough();
 		case BTEqualStrategyNumber:
 			entries[0] = datum;
 			break;

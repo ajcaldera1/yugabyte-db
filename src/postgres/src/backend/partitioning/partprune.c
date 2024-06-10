@@ -37,6 +37,7 @@
 
 #include "access/hash.h"
 #include "access/nbtree.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_operator.h"
 #include "catalog/pg_opfamily.h"
 #include "catalog/pg_type.h"
@@ -50,11 +51,14 @@
 #include "optimizer/predtest.h"
 #include "optimizer/prep.h"
 #include "optimizer/var.h"
-#include "partitioning/partprune.h"
 #include "partitioning/partbounds.h"
+#include "partitioning/partprune.h"
 #include "rewrite/rewriteManip.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/rel.h"
 
+#include "pg_yb_utils.h"
 
 /*
  * Information about a clause matched with a partition key.
@@ -131,6 +135,9 @@ static PartitionPruneStep *gen_prune_step_combine(GeneratePruningStepsContext *c
 static PartitionPruneStep *gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 							GeneratePruningStepsContext *context,
 							List **keyclauses, Bitmapset *nullkeys);
+static PartitionPruneStep *gen_prune_steps_from_func_exprs(
+							GeneratePruningStepsContext *context,
+							List *exprs);
 static PartClauseMatchStatus match_clause_to_partition_key(RelOptInfo *rel,
 							  GeneratePruningStepsContext *context,
 							  Expr *clause, Expr *partkey, int partkeyidx,
@@ -172,11 +179,17 @@ static PruneStepResult *perform_pruning_base_step(PartitionPruneContext *context
 static PruneStepResult *perform_pruning_combine_step(PartitionPruneContext *context,
 							 PartitionPruneStepCombine *cstep,
 							 PruneStepResult **step_results);
+static PruneStepResult *perform_pruning_func_step(PartitionPruneContext *context,
+												  PartitionPruneStepFuncOp *step);
+static bool perform_func_expr_pruning(PartitionPruneContext *context,
+									  int partIndex,
+									  List *funcExprs);
 static bool match_boolean_partition_clause(Oid partopfamily, Expr *clause,
 							   Expr *partkey, Expr **outconst);
 static bool partkey_datum_from_expr(PartitionPruneContext *context,
 						Expr *expr, int stateidx,
 						Datum *value, bool *isnull);
+static bool canUseFunctionForPartitionPruning(Oid funcoid);
 
 
 /*
@@ -549,7 +562,7 @@ gen_partprune_steps(RelOptInfo *rel, List *clauses, bool *contradictory)
  * Callers must ensure that 'rel' is a partitioned table.
  */
 Relids
-prune_append_rel_partitions(RelOptInfo *rel)
+prune_append_rel_partitions(PlannerInfo *root, RelOptInfo *rel)
 {
 	Relids		result;
 	List	   *clauses = rel->baserestrictinfo;
@@ -584,7 +597,14 @@ prune_append_rel_partitions(RelOptInfo *rel)
 	context.stepcmpfuncs = (FmgrInfo *) palloc0(sizeof(FmgrInfo) *
 												context.partnatts *
 												list_length(pruning_steps));
-	context.ppccontext = CurrentMemoryContext;
+	context.ppccontext = GetCurrentMemoryContext();
+	context.partrelids = (Oid *) palloc0(sizeof(Oid) * rel->nparts);
+
+	for (int i = 0; i < rel->nparts; ++i)
+	{
+		uint32 rti = rel->part_rels[i]->relid;
+		context.partrelids[i] = root->simple_rte_array[rti]->relid;
+	}
 
 	/* These are not valid when being called from the planner */
 	context.partrel = NULL;
@@ -621,6 +641,7 @@ get_matching_partitions(PartitionPruneContext *context, List *pruning_steps)
 	PruneStepResult **results,
 			   *final_result;
 	ListCell   *lc;
+	bool		scan_default;
 
 	/* If there are no pruning steps then all partitions match. */
 	if (num_steps == 0)
@@ -657,6 +678,12 @@ get_matching_partitions(PartitionPruneContext *context, List *pruning_steps)
 												 results);
 				break;
 
+			case T_PartitionPruneStepFuncOp:
+				results[step->step_id] =
+					perform_pruning_func_step(context,
+											  (PartitionPruneStepFuncOp *) step);
+				break;
+
 			default:
 				elog(ERROR, "invalid pruning step type: %d",
 					 (int) nodeTag(step));
@@ -672,30 +699,39 @@ get_matching_partitions(PartitionPruneContext *context, List *pruning_steps)
 	Assert(final_result != NULL);
 	i = -1;
 	result = NULL;
+	scan_default = final_result->scan_default;
 	while ((i = bms_next_member(final_result->bound_offsets, i)) >= 0)
 	{
 		int			partindex = context->boundinfo->indexes[i];
 
-		/*
-		 * In range and hash partitioning cases, some slots may contain -1,
-		 * indicating that no partition has been defined to accept a given
-		 * range of data or for a given remainder, respectively. The default
-		 * partition, if any, in case of range partitioning, will be added to
-		 * the result, because the specified range still satisfies the query's
-		 * conditions.
-		 */
-		if (partindex >= 0)
-			result = bms_add_member(result, partindex);
+		if (partindex < 0)
+		{
+			/*
+			 * In range partitioning cases, if a partition index is -1 it
+			 * means that the bound at the offset is the upper bound for a
+			 * range not covered by any partition (other than a possible
+			 * default partition).  In hash partitioning, the same means no
+			 * partition has been defined for the corresponding remainder
+			 * value.
+			 *
+			 * In either case, the value is still part of the queried range of
+			 * values, so mark to scan the default partition if one exists.
+			 */
+			scan_default |= partition_bound_has_default(context->boundinfo);
+			continue;
+		}
+
+		result = bms_add_member(result, partindex);
 	}
 
-	/* Add the null and/or default partition if needed and if present. */
+	/* Add the null and/or default partition if needed and present. */
 	if (final_result->scan_null)
 	{
 		Assert(context->strategy == PARTITION_STRATEGY_LIST);
 		Assert(partition_bound_accepts_nulls(context->boundinfo));
 		result = bms_add_member(result, context->boundinfo->null_index);
 	}
-	if (final_result->scan_default)
+	if (scan_default)
 	{
 		Assert(context->strategy == PARTITION_STRATEGY_LIST ||
 			   context->strategy == PARTITION_STRATEGY_RANGE);
@@ -745,6 +781,8 @@ gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 	bool		generate_opsteps = false;
 	List	   *result = NIL;
 	ListCell   *lc;
+	bool generate_func_steps = false;
+	List *function_clauses = NIL;
 
 	*contradictory = false;
 
@@ -992,6 +1030,31 @@ gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 			/* done; go check the next clause. */
 			break;
 		}
+
+		/*
+		 * Check if this clause involves a function expression that can be
+		 * used for partition pruning.
+		 */
+		if (IsA(clause, FuncExpr))
+		{
+			FuncExpr   *fexpr = (FuncExpr *) clause;
+			if (canUseFunctionForPartitionPruning(fexpr->funcid))
+			{
+				generate_func_steps = true;
+				function_clauses = lappend(function_clauses, clause);
+			}
+		}
+	}
+
+	/*
+	 * If function-based pruning can be done, generate steps for it.
+	 */
+	if (generate_func_steps)
+	{
+		PartitionPruneStep *step =
+			gen_prune_steps_from_func_exprs(context, function_clauses);
+		if (step != NULL)
+			result = lappend(result, step);
 	}
 
 	/*-----------
@@ -1075,6 +1138,27 @@ gen_partprune_steps_internal(GeneratePruningStepsContext *context,
 	}
 
 	return result;
+}
+
+/*
+ * gen_prune_steps_from_func_exprs
+ *		Generate a pruning step for function calls
+ *
+ * The step is assigned a unique step identifier and added to context's 'steps'
+ * list
+ */
+static PartitionPruneStep *
+gen_prune_steps_from_func_exprs(GeneratePruningStepsContext *context,
+								List *exprs)
+{
+	PartitionPruneStepFuncOp *step =
+		makeNode(PartitionPruneStepFuncOp);
+
+	step->step.step_id = context->next_step_id++;
+	step->exprs = exprs;
+	context->steps = lappend(context->steps, step);
+
+	return (PartitionPruneStep *) step;
 }
 
 /*
@@ -1229,7 +1313,7 @@ gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 						{
 							case BTLessEqualStrategyNumber:
 								inclusive = true;
-								/* fall through */
+								switch_fallthrough();
 							case BTLessStrategyNumber:
 								if (!inclusive)
 									need_next_eq = need_next_less = false;
@@ -1239,7 +1323,7 @@ gen_prune_steps_from_opexps(PartitionScheme part_scheme,
 								break;
 							case BTGreaterEqualStrategyNumber:
 								inclusive = true;
-								/* fall through */
+								switch_fallthrough();
 							case BTGreaterStrategyNumber:
 								if (!inclusive)
 									need_next_eq = need_next_greater = false;
@@ -2209,6 +2293,11 @@ get_matching_hash_bounds(PartitionPruneContext *context,
  * get_matching_list_bounds
  *		Determine the offsets of list bounds matching the specified value,
  *		according to the semantics of the given operator strategy
+ *
+ * scan_default will be set in the returned struct, if the default partition
+ * needs to be scanned, provided one exists at all.  scan_null will be set if
+ * the special null-accepting partition needs to be scanned.
+ *
  * 'opstrategy' if non-zero must be a btree strategy number.
  *
  * 'value' contains the value to use for pruning.
@@ -2336,7 +2425,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTGreaterStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2371,7 +2460,7 @@ get_matching_list_bounds(PartitionPruneContext *context,
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTLessStrategyNumber:
 			off = partition_list_bsearch(partsupfunc,
 										 partcollation,
@@ -2411,8 +2500,13 @@ get_matching_list_bounds(PartitionPruneContext *context,
  * Each datum whose offset is in result is to be treated as the upper bound of
  * the partition that will contain the desired values.
  *
- * If default partition needs to be scanned for given values, set scan_default
- * in result if present.
+ * scan_default is set in the returned struct if a default partition exists
+ * and we're absolutely certain that it needs to be scanned.  We do *not* set
+ * it just because values match portions of the key space uncovered by
+ * partitions other than default (space which we normally assume to belong to
+ * the default partition): the final set of bounds obtained after combining
+ * multiple pruning steps might exclude it, so we infer its inclusion
+ * elsewhere.
  *
  * 'opstrategy' if non-zero must be a btree strategy number.
  *
@@ -2438,8 +2532,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 	int		   *partindices = boundinfo->indexes;
 	int			off,
 				minoff,
-				maxoff,
-				i;
+				maxoff;
 	bool		is_equal;
 	bool		inclusive = false;
 
@@ -2469,13 +2562,15 @@ get_matching_range_bounds(PartitionPruneContext *context,
 	 */
 	if (nvalues == 0)
 	{
+		/* ignore key space not covered by any partitions */
 		if (partindices[minoff] < 0)
 			minoff++;
 		if (partindices[maxoff] < 0)
 			maxoff--;
 
 		result->scan_default = partition_bound_has_default(boundinfo);
-		Assert(minoff >= 0 && maxoff >= 0);
+		Assert(partindices[minoff] >= 0 &&
+			   partindices[maxoff] >= 0);
 		result->bound_offsets = bms_add_range(NULL, minoff, maxoff);
 
 		return result;
@@ -2503,11 +2598,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 				if (nvalues == partnatts)
 				{
 					/* There can only be zero or one matching partition. */
-					if (partindices[off + 1] >= 0)
-						result->bound_offsets = bms_make_singleton(off + 1);
-					else
-						result->scan_default =
-							partition_bound_has_default(boundinfo);
+					result->bound_offsets = bms_make_singleton(off + 1);
 					return result;
 				}
 				else
@@ -2595,64 +2686,28 @@ get_matching_range_bounds(PartitionPruneContext *context,
 					maxoff = off + 1;
 				}
 
-				/*
-				 * Skip if minoff/maxoff are actually the upper bound of a
-				 * un-assigned portion of values.
-				 */
-				if (partindices[minoff] < 0 && minoff < boundinfo->ndatums)
-					minoff++;
-				if (partindices[maxoff] < 0 && maxoff >= 1)
-					maxoff--;
-
-				/*
-				 * There may exist a range of values unassigned to any
-				 * non-default partition between the datums at minoff and
-				 * maxoff.  Add the default partition in that case.
-				 */
-				if (partition_bound_has_default(boundinfo))
-				{
-					for (i = minoff; i <= maxoff; i++)
-					{
-						if (partindices[i] < 0)
-						{
-							result->scan_default = true;
-							break;
-						}
-					}
-				}
-
 				Assert(minoff >= 0 && maxoff >= 0);
 				result->bound_offsets = bms_add_range(NULL, minoff, maxoff);
 			}
-			else if (off >= 0)	/* !is_equal */
+			else
 			{
 				/*
 				 * The lookup value falls in the range between some bounds in
 				 * boundinfo.  'off' would be the offset of the greatest bound
 				 * that is <= lookup value, so add off + 1 to the result
 				 * instead as the offset of the upper bound of the only
-				 * partition that may contain the lookup value.
+				 * partition that may contain the lookup value.  If 'off' is
+				 * -1 indicating that all bounds are greater, then we simply
+				 * end up adding the first bound's offset, that is, 0.
 				 */
-				if (partindices[off + 1] >= 0)
-					result->bound_offsets = bms_make_singleton(off + 1);
-				else
-					result->scan_default =
-						partition_bound_has_default(boundinfo);
-			}
-			else
-			{
-				/*
-				 * off < 0: the lookup value is smaller than all bounds, so
-				 * only the default partition qualifies, if there is one.
-				 */
-				result->scan_default = partition_bound_has_default(boundinfo);
+				result->bound_offsets = bms_make_singleton(off + 1);
 			}
 
 			return result;
 
 		case BTGreaterEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTGreaterStrategyNumber:
 
 			/*
@@ -2716,22 +2771,24 @@ get_matching_range_bounds(PartitionPruneContext *context,
 
 					minoff = inclusive ? off : off + 1;
 				}
-
-				/*
-				 * lookup value falls in the range between some bounds in
-				 * boundinfo.  off would be the offset of the greatest bound
-				 * that is <= lookup value, so add off + 1 to the result
-				 * instead as the offset of the upper bound of the smallest
-				 * partition that may contain the lookup value.
-				 */
 				else
+				{
+
+					/*
+					 * lookup value falls in the range between some bounds in
+					 * boundinfo.  off would be the offset of the greatest
+					 * bound that is <= lookup value, so add off + 1 to the
+					 * result instead as the offset of the upper bound of the
+					 * smallest partition that may contain the lookup value.
+					 */
 					minoff = off + 1;
+				}
 			}
 			break;
 
 		case BTLessEqualStrategyNumber:
 			inclusive = true;
-			/* fall through */
+			switch_fallthrough();
 		case BTLessStrategyNumber:
 
 			/*
@@ -2743,16 +2800,7 @@ get_matching_range_bounds(PartitionPruneContext *context,
 												boundinfo,
 												nvalues, values,
 												&is_equal);
-			if (off < 0)
-			{
-				/*
-				 * All bounds are greater than the key, so we could only
-				 * expect to find the lookup key in the default partition.
-				 */
-				result->scan_default = partition_bound_has_default(boundinfo);
-				return result;
-			}
-			else
+			if (off >= 0)
 			{
 				/*
 				 * See the comment above.
@@ -2800,6 +2848,14 @@ get_matching_range_bounds(PartitionPruneContext *context,
 				else
 					maxoff = off;
 			}
+			else
+			{
+				/*
+				 * 'off' is -1 indicating that all bounds are greater, so just
+				 * set the first bound's offset as maxoff.
+				 */
+				maxoff = off + 1;
+			}
 			break;
 
 		default:
@@ -2807,58 +2863,43 @@ get_matching_range_bounds(PartitionPruneContext *context,
 			break;
 	}
 
+	Assert(minoff >= 0 && minoff <= boundinfo->ndatums);
+	Assert(maxoff >= 0 && maxoff <= boundinfo->ndatums);
+
 	/*
-	 * Skip a gap and when doing so, check if the bound contains a finite
-	 * value to decide if we need to add the default partition.  If it's an
-	 * infinite bound, we need not add the default partition, as having an
-	 * infinite bound means the partition in question catches any values that
-	 * would otherwise be in the default partition.
+	 * If the smallest partition to return has MINVALUE (negative infinity) as
+	 * its lower bound, increment it to point to the next finite bound
+	 * (supposedly its upper bound), so that we don't advertently end up
+	 * scanning the default partition.
 	 */
-	if (partindices[minoff] < 0)
+	if (minoff < boundinfo->ndatums && partindices[minoff] < 0)
 	{
 		int			lastkey = nvalues - 1;
 
-		if (minoff >= 0 &&
-			minoff < boundinfo->ndatums &&
-			boundinfo->kind[minoff][lastkey] ==
-			PARTITION_RANGE_DATUM_VALUE)
-			result->scan_default = partition_bound_has_default(boundinfo);
-
-		minoff++;
+		if (boundinfo->kind[minoff][lastkey] ==
+			PARTITION_RANGE_DATUM_MINVALUE)
+		{
+			minoff++;
+			Assert(boundinfo->indexes[minoff] >= 0);
+		}
 	}
 
 	/*
-	 * Skip a gap.  See the above comment about how we decide whether or not
-	 * to scan the default partition based whether the datum that will become
-	 * the maximum datum is finite or not.
+	 * If the previous greatest partition has MAXVALUE (positive infinity) as
+	 * its upper bound (something only possible to do with multi-column range
+	 * partitioning), we scan switch to it as the greatest partition to
+	 * return.  Again, so that we don't advertently end up scanning the
+	 * default partition.
 	 */
 	if (maxoff >= 1 && partindices[maxoff] < 0)
 	{
 		int			lastkey = nvalues - 1;
 
-		if (maxoff >= 0 &&
-			maxoff <= boundinfo->ndatums &&
-			boundinfo->kind[maxoff - 1][lastkey] ==
-			PARTITION_RANGE_DATUM_VALUE)
-			result->scan_default = partition_bound_has_default(boundinfo);
-
-		maxoff--;
-	}
-
-	if (partition_bound_has_default(boundinfo))
-	{
-		/*
-		 * There may exist a range of values unassigned to any non-default
-		 * partition between the datums at minoff and maxoff.  Add the default
-		 * partition in that case.
-		 */
-		for (i = minoff; i <= maxoff; i++)
+		if (boundinfo->kind[maxoff - 1][lastkey] ==
+			PARTITION_RANGE_DATUM_MAXVALUE)
 		{
-			if (partindices[i] < 0)
-			{
-				result->scan_default = true;
-				break;
-			}
+			maxoff--;
+			Assert(boundinfo->indexes[maxoff] >= 0);
 		}
 	}
 
@@ -3119,6 +3160,110 @@ perform_pruning_base_step(PartitionPruneContext *context,
 }
 
 /*
+ * perform_pruning_func_step
+ * 		Determines the indexes of datums that satisfy conditions specified in
+ * 		'fstep'.
+ *
+ * Result also contains whether special null-accepting and/or default
+ * partition need to be scanned.
+ */
+static PruneStepResult *
+perform_pruning_func_step(PartitionPruneContext *context,
+						  PartitionPruneStepFuncOp *fstep)
+{
+	PruneStepResult *result =
+		(PruneStepResult *) palloc0(sizeof(PruneStepResult));
+	PartitionBoundInfo boundinfo = context->boundinfo;
+	result->bound_offsets = NULL;
+
+	int        *partindices = boundinfo->indexes;
+	List	   *exprs = fstep->exprs;
+	for (int boundoffset = 0; boundoffset < boundinfo->ndatums; ++boundoffset)
+	{
+		bool isSelected =
+			perform_func_expr_pruning(context,
+									  partindices[boundoffset],
+									  exprs);
+
+		if (isSelected)
+		{
+			result->bound_offsets =
+				bms_add_member(result->bound_offsets, boundoffset);
+		}
+	}
+
+	/*
+	 * Check for the null and default partition.
+	 */
+	result->scan_default =
+		perform_func_expr_pruning(context,
+								  boundinfo->default_index,
+								  exprs);
+	result->scan_null =
+		perform_func_expr_pruning(context,
+								  boundinfo->null_index,
+								  exprs);
+	return result;
+}
+
+/*
+ * perform_func_expr_pruning
+ * 		Returns whether the partition corresponding to 'partIndex' survived
+ * 		partition pruning based on the function expressions in 'funcExprs'.
+ */
+static bool perform_func_expr_pruning(PartitionPruneContext *context,
+									  int partIndex,
+									  List *funcExprs)
+{
+	if (partIndex < 0)
+	{
+		/*
+		 * In range and hash partitioning cases, some bound offsets may map
+		 * to partIndex -1. This indicates that no partition has been defined
+		 * to accept a given range of data or for a given reminder
+		 * respectively. If such a bound does not get pruned, this usually
+		 * indicates that the default partition (if any) needs to be scanned.
+		 * Function Expression pruning is used to select a partition based on
+		 * its table properties. Therefore we will use the default partition's
+		 * table properties to determine whether to prune it or not, and do not
+		 * need to rely on bound offsets that don't map to any partitions.
+		 * Safely reject this bound offset.
+		 */
+		return false;
+	}
+	Oid partrelid = context->partrelids[partIndex];
+
+	Relation relation = relation_open(partrelid, 1);
+	const char relkind = relation->rd_rel->relkind;
+	RelationClose(relation);
+
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		/*
+		 * We should not eliminate a partitioned table.
+		 */
+		return true;
+	}
+
+	ListCell   *lc = list_head(funcExprs);
+	FuncExpr   *expr = (FuncExpr *) lfirst(lc);
+
+	/*
+	 * Currently pruning can be performed only for one function:
+	 * yb_is_local_table.
+	 */
+	Assert(expr->funcid == F_YB_IS_LOCAL_TABLE);
+
+	FmgrInfo* finfo = (FmgrInfo *) palloc0(sizeof(FmgrInfo));
+	fmgr_info_cxt(expr->funcid, finfo, context->ppccontext);
+
+	const bool isSelected =
+			BoolGetDatum(FunctionCall1(finfo,
+									   UInt32GetDatum(partrelid)));
+	return isSelected;
+}
+
+/*
  * perform_pruning_combine_step
  *		Determines the indexes of datums obtained by combining those given
  *		by the steps identified by cstep->source_stepids using the specified
@@ -3138,14 +3283,24 @@ perform_pruning_combine_step(PartitionPruneContext *context,
 
 	/*
 	 * A combine step without any source steps is an indication to not perform
-	 * any partition pruning, we just return all partitions.
+	 * any partition pruning.  Return all datum indexes in that case.
 	 */
 	result = (PruneStepResult *) palloc0(sizeof(PruneStepResult));
 	if (list_length(cstep->source_stepids) == 0)
 	{
 		PartitionBoundInfo boundinfo = context->boundinfo;
+		int			rangemax;
 
-		result->bound_offsets = bms_add_range(NULL, 0, boundinfo->ndatums - 1);
+		/*
+		 * Add all valid offsets into the boundinfo->indexes array.  For range
+		 * partitioning, boundinfo->indexes contains (boundinfo->ndatums + 1)
+		 * valid entries; otherwise there are boundinfo->ndatums.
+		 */
+		rangemax = context->strategy == PARTITION_STRATEGY_RANGE ?
+			boundinfo->ndatums : boundinfo->ndatums - 1;
+
+		result->bound_offsets =
+			bms_add_range(result->bound_offsets, 0, rangemax);
 		result->scan_default = partition_bound_has_default(boundinfo);
 		result->scan_null = partition_bound_accepts_nulls(boundinfo);
 		return result;
@@ -3339,4 +3494,13 @@ partkey_datum_from_expr(PartitionPruneContext *context,
 	}
 
 	return false;
+}
+
+static bool canUseFunctionForPartitionPruning(Oid funcoid)
+{
+	/*
+	 * For now, only one function is supported.
+	 * This is the yb_is_local_table function.
+	 */
+	return funcoid == F_YB_IS_LOCAL_TABLE;
 }

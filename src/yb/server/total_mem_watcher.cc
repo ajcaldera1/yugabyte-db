@@ -17,17 +17,19 @@
 
 #include <fstream>
 #include <chrono>
+#include <thread>
 
-#include <boost/scope_exit.hpp>
+#include "yb/util/atomic.h"
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/flags.h"
+#include "yb/util/format.h"
+#include "yb/util/logging.h"
+#include "yb/util/mem_tracker.h"
+#include "yb/util/memory/memory.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/status_format.h"
 
 #include "yb/server/total_mem_watcher.h"
-#include "yb/util/status.h"
-#include "yb/util/mem_tracker.h"
-#include "yb/util/logging.h"
-
-#ifdef TCMALLOC_ENABLED
-#include <gperftools/malloc_extension.h>
-#endif
 
 using namespace std::literals;
 
@@ -39,15 +41,15 @@ const int kDefaultMemoryLimitTerminationPercent = 300;
 const int kDefaultMemoryLimitTerminationPercent = 200;
 #endif
 
-DEFINE_int32(memory_limit_termination_threshold_pct, kDefaultMemoryLimitTerminationPercent,
+DEFINE_UNKNOWN_int32(memory_limit_termination_threshold_pct, kDefaultMemoryLimitTerminationPercent,
              "If the RSS (resident set size) of the program reaches this percentage of the "
              "root memory tracker limit, the program will exit. RSS is measured using operating "
              "system means, not the memory allocator. Set to 0 to disable this behavior.");
 
-DEFINE_int32(total_mem_watcher_interval_millis, 1000,
-             "Interval in milliseconds between checking the total memory usage of the current "
-             "process as seen by the operating system, and deciding whether to terminate in case "
-             "of excessive memory consumption.");
+DEFINE_RUNTIME_int32(total_mem_watcher_interval_millis, 1000,
+    "Interval in milliseconds between checking the total memory usage of the current "
+    "process as seen by the operating system, and deciding whether to terminate in case "
+    "of excessive memory consumption.");
 
 namespace yb {
 namespace server {
@@ -62,12 +64,15 @@ TotalMemWatcher::TotalMemWatcher() {
   }
 }
 
-TotalMemWatcher::~TotalMemWatcher() {
+void TotalMemWatcher::Shutdown() {
+  {
+    std::lock_guard l(exit_loop_mutex_);
+    exit_loop_ = true;
+  }
+  YB_PROFILE(exit_loop_cv_.notify_all());
 }
 
-void TotalMemWatcher::MemoryMonitoringLoop(
-    std::function<void()> shutdown_fn,
-    std::function<bool()> is_shutdown_finished_fn) {
+void TotalMemWatcher::MemoryMonitoringLoop(std::function<void()> trigger_termination_fn) {
   if (FLAGS_memory_limit_termination_threshold_pct > 0) {
     int64_t root_tracker_limit = MemTracker::GetRootTracker()->limit();
     LOG(INFO) << "Root memtracker limit: " << root_tracker_limit << " ("
@@ -76,8 +81,16 @@ void TotalMemWatcher::MemoryMonitoringLoop(
               << rss_termination_limit_bytes_ << " bytes ("
               << (rss_termination_limit_bytes_ / 1024 / 1024) << " MiB).";
   }
+
   while (true) {
-    std::this_thread::sleep_for(1ms * FLAGS_total_mem_watcher_interval_millis);
+    {
+      const auto timeout = GetAtomicFlag(&FLAGS_total_mem_watcher_interval_millis) * 1ms;
+      std::unique_lock lock(exit_loop_mutex_);
+      if (exit_loop_cv_.wait_for(
+              lock, timeout, [this]() REQUIRES(exit_loop_mutex_) { return exit_loop_; })) {
+        return;
+      }
+    }
 
     Status mem_check_status = Check();
     if (!mem_check_status.ok()) {
@@ -90,16 +103,7 @@ void TotalMemWatcher::MemoryMonitoringLoop(
       LOG(ERROR) << "Memory usage exceeded configured limit, terminating the process: "
                  << termination_explanation << "\nDetails:\n"
                  << GetMemoryUsageDetails();
-      shutdown_fn();
-      const int kMaxSecToWait = 10;
-      for (int secondsLeft = kMaxSecToWait;
-           secondsLeft > 0 && !is_shutdown_finished_fn();
-           --secondsLeft) {
-        LOG(INFO) << "Waiting for server to shut down (will wait up to " << secondsLeft
-                  << " seconds)";
-        std::this_thread::sleep_for(1s);
-      }
-      LOG(WARNING) << "Server is exiting";
+      trigger_termination_fn();
       return;
     }
   }
@@ -152,7 +156,7 @@ class LinuxTotalMemWatcher : public TotalMemWatcher {
     if (rss_termination_limit_bytes_ == 0) {
       return std::string();
     }
-    int64_t non_shared_rss_bytes = (statm_.resident - statm_.shared) * page_size_;
+    size_t non_shared_rss_bytes = (statm_.resident - statm_.shared) * page_size_;
     if (non_shared_rss_bytes <= rss_termination_limit_bytes_) {
       return std::string();
     }
@@ -164,10 +168,8 @@ class LinuxTotalMemWatcher : public TotalMemWatcher {
 
   std::string GetMemoryUsageDetails() override {
     std::string result;
-#ifdef TCMALLOC_ENABLED
-    char tcmalloc_stats_buf[2048];
-    MallocExtension::instance()->GetStats(tcmalloc_stats_buf, 2048);
-    result += tcmalloc_stats_buf;
+#if YB_TCMALLOC_ENABLED
+    result += TcMallocStats();
     result += "\n";
 #endif
     result += Format(

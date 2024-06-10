@@ -11,10 +11,14 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_PHYSICAL_TIME_H
-#define YB_UTIL_PHYSICAL_TIME_H
+#pragma once
 
-#include "yb/util/result.h"
+#include <functional> // For std::function
+#include <memory>
+
+#include <boost/atomic.hpp>
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 
@@ -23,6 +27,8 @@ using MicrosTime = uint64_t;
 struct PhysicalTime {
   MicrosTime time_point;
   MicrosTime max_error;
+
+  std::string ToString() const;
 };
 
 class PhysicalClock {
@@ -33,7 +39,7 @@ class PhysicalClock {
 };
 
 typedef std::shared_ptr<PhysicalClock> PhysicalClockPtr;
-typedef std::function<PhysicalClockPtr()> PhysicalClockProvider;
+typedef std::function<PhysicalClockPtr(const std::string&)> PhysicalClockProvider;
 
 // Clock with user controlled return values.
 class MockClock : public PhysicalClock {
@@ -55,7 +61,7 @@ class MockClock : public PhysicalClock {
  private:
   // Set by calls to SetMockClockWallTimeForTests().
   // For testing purposes only.
-  std::atomic<PhysicalTime> value_{{0, 0}};
+  boost::atomic<PhysicalTime> value_{{0, 0}};
 };
 
 const PhysicalClockPtr& WallClock();
@@ -65,5 +71,3 @@ const PhysicalClockPtr& AdjTimeClock();
 #endif
 
 } // namespace yb
-
-#endif // YB_UTIL_PHYSICAL_TIME_H

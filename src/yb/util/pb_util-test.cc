@@ -30,29 +30,26 @@
 // under the License.
 //
 
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <memory>
+#include <sstream>
 #include <string>
 #include <vector>
-#include <sstream>
 
-#include <boost/assign.hpp>
 #include <google/protobuf/descriptor.pb.h>
 #include <gtest/gtest.h>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/util/env_util.h"
 #include "yb/util/memenv/memenv.h"
-#include "yb/util/pb_util.h"
 #include "yb/util/pb_util-internal.h"
+#include "yb/util/pb_util.h"
 #include "yb/util/proto_container_test.pb.h"
 #include "yb/util/proto_container_test2.pb.h"
 #include "yb/util/proto_container_test3.pb.h"
-#include "yb/util/status.h"
-#include "yb/util/test_util.h"
 #include "yb/util/protobuf_util.h"
+#include "yb/util/result.h"
+#include "yb/util/status.h"
+#include "yb/util/test_macros.h"
+#include "yb/util/test_util.h"
 
 namespace yb {
 namespace pb_util {
@@ -67,6 +64,7 @@ using std::vector;
 static const char* kTestFileName = "pb_container.meta";
 static const char* kTestKeyvalName = "my-key";
 static const int kTestKeyvalValue = 1;
+static const std::string kTestString = "test-string";
 
 class TestPBUtil : public YBTest {
  public:
@@ -102,7 +100,7 @@ Status TestPBUtil::BitFlipFileByteRange(const string& path, uint64_t offset, uin
   faststring buf;
   // Read the data from disk.
   {
-    gscoped_ptr<RandomAccessFile> file;
+    std::unique_ptr<RandomAccessFile> file;
     RETURN_NOT_OK(env_->NewRandomAccessFile(path, &file));
     uint64_t size = VERIFY_RESULT(file->Size());
     Slice slice;
@@ -119,7 +117,7 @@ Status TestPBUtil::BitFlipFileByteRange(const string& path, uint64_t offset, uin
   }
 
   // Write the data back to disk.
-  gscoped_ptr<WritableFile> file;
+  std::unique_ptr<WritableFile> file;
   RETURN_NOT_OK(env_->NewWritableFile(path, &file));
   RETURN_NOT_OK(file->Append(buf));
   RETURN_NOT_OK(file->Close());
@@ -128,7 +126,7 @@ Status TestPBUtil::BitFlipFileByteRange(const string& path, uint64_t offset, uin
 }
 
 TEST_F(TestPBUtil, TestWritableFileOutputStream) {
-  gscoped_ptr<Env> env(NewMemEnv(Env::Default()));
+  std::unique_ptr<Env> env(NewMemEnv(Env::Default()));
   shared_ptr<WritableFile> file;
   ASSERT_OK(env_util::OpenFileForWrite(env.get(), "/test", &file));
 
@@ -203,7 +201,7 @@ TEST_F(TestPBUtil, TestPBContainerCorruption) {
   // Test that an empty file looks like corruption.
   {
     // Create the empty file.
-    gscoped_ptr<WritableFile> file;
+    std::unique_ptr<WritableFile> file;
     ASSERT_OK(env_->NewWritableFile(path_, &file));
     ASSERT_OK(file->Close());
   }
@@ -267,9 +265,9 @@ TEST_F(TestPBUtil, TestMultipleMessages) {
   pb.set_name("foo");
   pb.set_note("bar");
 
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(path_, &writer));
-  WritablePBContainerFile pb_writer(writer.Pass());
+  WritablePBContainerFile pb_writer(std::move(writer));
   ASSERT_OK(pb_writer.Init(pb));
 
   for (int i = 0; i < 10; i++) {
@@ -279,9 +277,9 @@ TEST_F(TestPBUtil, TestMultipleMessages) {
   ASSERT_OK(pb_writer.Close());
 
   int pbs_read = 0;
-  gscoped_ptr<RandomAccessFile> reader;
+  std::unique_ptr<RandomAccessFile> reader;
   ASSERT_OK(env_->NewRandomAccessFile(path_, &reader));
-  ReadablePBContainerFile pb_reader(reader.Pass());
+  ReadablePBContainerFile pb_reader(std::move(reader));
   ASSERT_OK(pb_reader.Init());
   for (int i = 0;; i++) {
     ProtoContainerTestPB read_pb;
@@ -305,12 +303,12 @@ TEST_F(TestPBUtil, TestInterleavedReadWrite) {
   pb.set_note("bar");
 
   // Open the file for writing and reading.
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(path_, &writer));
-  WritablePBContainerFile pb_writer(writer.Pass());
-  gscoped_ptr<RandomAccessFile> reader;
+  WritablePBContainerFile pb_writer(std::move(writer));
+  std::unique_ptr<RandomAccessFile> reader;
   ASSERT_OK(env_->NewRandomAccessFile(path_, &reader));
-  ReadablePBContainerFile pb_reader(reader.Pass());
+  ReadablePBContainerFile pb_reader(std::move(reader));
 
   // Write the header (writer) and validate it (reader).
   ASSERT_OK(pb_writer.Init(pb));
@@ -362,9 +360,9 @@ TEST_F(TestPBUtil, TestPopulateDescriptorSet) {
 
 void TestPBUtil::DumpPBCToString(const string& path, bool oneline_output,
                                  string* ret) {
-  gscoped_ptr<RandomAccessFile> reader;
+  std::unique_ptr<RandomAccessFile> reader;
   ASSERT_OK(env_->NewRandomAccessFile(path, &reader));
-  ReadablePBContainerFile pb_reader(reader.Pass());
+  ReadablePBContainerFile pb_reader(std::move(reader));
   ASSERT_OK(pb_reader.Init());
   ostringstream oss;
   ASSERT_OK(pb_reader.Dump(&oss, oneline_output));
@@ -374,7 +372,7 @@ void TestPBUtil::DumpPBCToString(const string& path, bool oneline_output,
 
 TEST_F(TestPBUtil, TestDumpPBContainer) {
   const char* kExpectedOutput =
-      "Message 0\n"
+      "yb.ProtoContainerTest3PB 0\n"
       "-------\n"
       "record_one {\n"
       "  name: \"foo\"\n"
@@ -387,7 +385,7 @@ TEST_F(TestPBUtil, TestDumpPBContainer) {
       "  }\n"
       "}\n"
       "\n"
-      "Message 1\n"
+      "yb.ProtoContainerTest3PB 1\n"
       "-------\n"
       "record_one {\n"
       "  name: \"foo\"\n"
@@ -408,9 +406,9 @@ TEST_F(TestPBUtil, TestDumpPBContainer) {
   pb.mutable_record_one()->set_name("foo");
   pb.mutable_record_two()->mutable_record()->set_name("foo");
 
-  gscoped_ptr<WritableFile> writer;
+  std::unique_ptr<WritableFile> writer;
   ASSERT_OK(env_->NewWritableFile(path_, &writer));
-  WritablePBContainerFile pb_writer(writer.Pass());
+  WritablePBContainerFile pb_writer(std::move(writer));
   ASSERT_OK(pb_writer.Init(pb));
 
   for (int i = 0; i < 2; i++) {
@@ -458,6 +456,148 @@ TEST_F(TestPBUtil, TestEnumToString) {
   }
 #endif
 }
+
+TEST_F(TestPBUtil, TestPBRequiredToRepeated) {
+  // Write the file with required fields.
+  {
+    TestObjectRequiredPB pb;
+    pb.set_string1(kTestString + "1");
+    pb.set_string2(kTestString + "2");
+    pb.mutable_record()->set_text(kTestString);
+    ASSERT_OK(WritePBContainerToPath(env_.get(), path_, pb, OVERWRITE, SYNC));
+  }
+
+  // Read it back as repeated fields, should validate and contain the expected values.
+  TestObjectRepeatedPB pb;
+  ASSERT_OK(ReadPBContainerFromPath(env_.get(), path_, &pb));
+  ASSERT_EQ(1, pb.string1_size());
+  ASSERT_EQ(1, pb.string2_size());
+  ASSERT_EQ(1, pb.record_size());
+  ASSERT_EQ(kTestString + "1", pb.string1()[0]);
+  ASSERT_EQ(kTestString + "2", pb.string2()[0]);
+  ASSERT_EQ(kTestString, pb.record()[0].text()[0]);
+
+  // Delete the file.
+  ASSERT_OK(env_->DeleteFile(path_));
+}
+
+TEST_F(TestPBUtil, TestPBRequiredToOptional) {
+  // Write the file with required fields.
+  {
+    TestObjectRequiredPB pb;
+    pb.set_string1(kTestString + "1");
+    pb.set_string2(kTestString + "2");
+    pb.mutable_record()->set_text(kTestString);
+    ASSERT_OK(WritePBContainerToPath(env_.get(), path_, pb, OVERWRITE, SYNC));
+  }
+
+  // Read it back as optional fields, should validate and contain the expected values.
+  TestObjectOptionalPB pb;
+  ASSERT_OK(ReadPBContainerFromPath(env_.get(), path_, &pb));
+  ASSERT_TRUE(pb.has_string1());
+  ASSERT_TRUE(pb.has_string2());
+  ASSERT_TRUE(pb.has_record());
+  ASSERT_TRUE(pb.record().has_text());
+  ASSERT_EQ(kTestString + "1", pb.string1());
+  ASSERT_EQ(kTestString + "2", pb.string2());
+  ASSERT_EQ(kTestString, pb.record().text());
+
+  // Delete the file.
+  ASSERT_OK(env_->DeleteFile(path_));
+}
+
+// Capture the outcome of the SCHECK into a variable.
+#define PB_FIELDS_ARE_SET(pb, ...) \
+  [&pb]() -> Status { \
+    SCHECK_PB_FIELDS_SET(pb, __VA_ARGS__); \
+    return Status::OK(); \
+  }()
+
+TEST_F(TestPBUtil, TestScheckPbFieldsAreSetMacro) {
+  ProtoContainerTestPB pb;
+  pb.set_name("foo");
+  pb.set_note("bar");
+  // value not set
+
+  ASSERT_OK(PB_FIELDS_ARE_SET(pb, name));
+  ASSERT_OK(PB_FIELDS_ARE_SET(pb, note));
+  ASSERT_NOK_STR_CONTAINS(PB_FIELDS_ARE_SET(pb, value), "Missing required arguments: [value]");
+
+  ASSERT_OK(PB_FIELDS_ARE_SET(pb, name, note));
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, name, value), "Missing required arguments: [value]");
+
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, value, note), "Missing required arguments: [value]");
+
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, name, value, note), "Missing required arguments: [value]");
+
+  pb.Clear();
+  pb.set_name("foo");
+  // value, note not set
+
+  ASSERT_OK(PB_FIELDS_ARE_SET(pb, name));
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, name, value, note), "Missing required arguments: [value, note]");
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, note, name, value), "Missing required arguments: [note, value]");
+
+  pb.Clear();
+  pb.set_note("foo");
+  // name, value not set
+
+  ASSERT_OK(PB_FIELDS_ARE_SET(pb, note));
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_ARE_SET(pb, name, value, note), "Missing required arguments: [name, value]");
+}
+
+#undef PB_FIELDS_ARE_SET
+
+// Capture the outcome of the SCHECK into a variable.
+#define PB_FIELDS_NOT_EMPTY(pb, ...) \
+  [&pb]() -> Status { \
+    SCHECK_PB_FIELDS_NOT_EMPTY(pb, __VA_ARGS__); \
+    return Status::OK(); \
+  }()
+
+TEST_F(TestPBUtil, TestScheckPbFieldsNotEmptyMacro) {
+  ProtoContainerTestPB pb;
+
+  // Empty note.
+  pb.set_note("");
+  ASSERT_NOK_STR_CONTAINS(PB_FIELDS_NOT_EMPTY(pb, note), "Empty required arguments: [note]");
+  ASSERT_OK(PB_FIELDS_NOT_EMPTY(pb, value));
+
+  // Empty repeated string field.
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_NOT_EMPTY(pb, str_list), "Empty required arguments: [str_list]");
+  pb.add_str_list("");
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_NOT_EMPTY(pb, str_list), "Empty required arguments: [str_list]");
+
+  // Empty repeated int field.
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_NOT_EMPTY(pb, str_list, int_list),
+      "Empty required arguments: [str_list, int_list]");
+
+  pb.add_int_list(0);
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_NOT_EMPTY(pb, str_list, int_list), "Empty required arguments: [str_list]");
+
+  pb.clear_str_list();
+  pb.add_str_list("test");
+
+  ASSERT_NOK_STR_CONTAINS(
+      PB_FIELDS_NOT_EMPTY(pb, name, value, note, str_list, int_list),
+      "Empty required arguments: [name, note]");
+
+  pb.set_name("name");
+  pb.set_note("note");
+  ASSERT_OK(PB_FIELDS_NOT_EMPTY(pb, name, value, note, str_list, int_list));
+}
+
+#undef PB_FIELDS_NOT_EMPTY
 
 } // namespace pb_util
 } // namespace yb

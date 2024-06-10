@@ -53,6 +53,10 @@ ForeignNext(ForeignScanState *node)
 	if (plan->operation != CMD_SELECT)
 		slot = node->fdwroutine->IterateDirectModify(node);
 	else
+		/*
+		 * YB note: for YB FDW, see comment in ybcIterateForeignScan for why
+		 * YbInstantiatePushdownParams is not called at this level.
+		 */
 		slot = node->fdwroutine->IterateForeignScan(node);
 	MemoryContextSwitchTo(oldcontext);
 
@@ -203,7 +207,7 @@ ExecInitForeignScan(ForeignScan *node, EState *estate, int eflags)
 	/*
 	 * Initialize result slot, type and projection.
 	 */
-	ExecInitResultTupleSlotTL(estate, &scanstate->ss.ps);
+	ExecInitResultTypeTL(&scanstate->ss.ps);
 	ExecAssignScanProjectionInfoWithVarno(&scanstate->ss, tlistvarno);
 
 	/*
@@ -261,7 +265,8 @@ ExecEndForeignScan(ForeignScanState *node)
 	ExecFreeExprContext(&node->ss.ps);
 
 	/* clean out the tuple table */
-	ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
+	if (node->ss.ps.ps_ResultTupleSlot)
+		ExecClearTuple(node->ss.ps.ps_ResultTupleSlot);
 	ExecClearTuple(node->ss.ss_ScanTupleSlot);
 
 	/* close the relation. */

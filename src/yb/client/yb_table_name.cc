@@ -13,52 +13,80 @@
 
 #include "yb/client/yb_table_name.h"
 
-#include <boost/functional/hash/hash.hpp>
+#include <boost/functional/hash.hpp>
 
-#include "yb/master/master_defaults.h"
-#include "yb/master/master.pb.h"
+#include "yb/util/logging.h"
+
+#include "yb/common/redis_constants_common.h"
+
+#include "yb/master/master_util.h"
+#include "yb/util/flags.h"
 
 namespace yb {
 namespace client {
 
-DEFINE_bool(yb_system_namespace_readonly, true, "Set system keyspace read-only.");
+DEFINE_RUNTIME_bool(yb_system_namespace_readonly, true, "Set system keyspace read-only.");
 
 using std::string;
 
 void YBTableName::SetIntoTableIdentifierPB(master::TableIdentifierPB* id) const {
   SetIntoNamespaceIdentifierPB(id->mutable_namespace_());
   id->set_table_name(table_name());
+  if (!table_id_.empty()) {
+    id->set_table_id(table_id_);
+  } else {
+    id->clear_table_id();
+  }
 }
 
 void YBTableName::GetFromTableIdentifierPB(const master::TableIdentifierPB& id) {
   GetFromNamespaceIdentifierPB(id.namespace_());
   table_name_ = id.table_name();
-}
-
-void YBTableName::SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const {
-  id->set_name(resolved_namespace_name());
-  if (!namespace_id_.empty()) {
-    id->set_id(namespace_id_);
+  if (id.has_table_id()) {
+    table_id_ = id.table_id();
   } else {
-    id->clear_id();
+    table_id_.clear();
   }
 }
 
+void YBTableName::SetIntoNamespaceIdentifierPB(master::NamespaceIdentifierPB* id) const {
+  if (namespace_type_ != YQL_DATABASE_UNKNOWN) {
+    id->set_database_type(namespace_type_);
+  }
+  if (!namespace_id_.empty()) {
+    id->set_id(namespace_id_);
+    if (!has_namespace()) {
+      return;
+    }
+  } else {
+    id->clear_id();
+  }
+  id->set_name(resolved_namespace_name());
+}
+
 void YBTableName::GetFromNamespaceIdentifierPB(const master::NamespaceIdentifierPB& id) {
+  namespace_type_ = id.has_database_type() ? id.database_type() : YQL_DATABASE_UNKNOWN;
   namespace_name_ = id.name();
   if (id.has_id()) {
     namespace_id_ = id.id();
   } else {
     namespace_id_.clear();
   }
+  check_db_type();
 }
 
-bool YBTableName::IsSystemNamespace(const std::string& namespace_name) {
-  return (namespace_name == master::kSystemNamespaceName            ||
-          namespace_name == master::kSystemAuthNamespaceName        ||
-          namespace_name == master::kSystemDistributedNamespaceName ||
-          namespace_name == master::kSystemSchemaNamespaceName      ||
-          namespace_name == master::kSystemTracesNamespaceName);
+bool YBTableName::is_system() const {
+  return master::IsSystemNamespace(resolved_namespace_name());
+}
+
+void YBTableName::check_db_type() {
+  if (namespace_name_ == common::kRedisKeyspaceName) {
+    namespace_type_ = YQL_DATABASE_REDIS;
+  }
+}
+
+bool YBTableName::is_redis_table() const {
+  return is_redis_namespace() && (table_name_.find(common::kRedisTableName) == 0);
 }
 
 size_t hash_value(const YBTableName& table_name) {
@@ -68,6 +96,38 @@ size_t hash_value(const YBTableName& table_name) {
   boost::hash_combine(seed, table_name.table_name());
 
   return seed;
+}
+
+const std::string& YBTableName::resolved_namespace_name() const {
+  DCHECK(has_namespace()); // At the moment the namespace name must NEVER be empty.
+                           // It must be set by set_namespace_name() before this call.
+                           // If the check fails - you forgot to call set_namespace_name().
+  return namespace_name_;
+}
+
+void YBTableName::set_namespace_id(const std::string& namespace_id) {
+  DCHECK(!namespace_id.empty());
+  namespace_id_ = namespace_id;
+}
+
+void YBTableName::set_namespace_name(const std::string& namespace_name) {
+  DCHECK(!namespace_name.empty());
+  namespace_name_ = namespace_name;
+  check_db_type();
+}
+
+void YBTableName::set_table_name(const std::string& table_name) {
+  DCHECK(!table_name.empty());
+  table_name_ = table_name;
+}
+
+void YBTableName::set_table_id(const std::string& table_id) {
+  DCHECK(!table_id.empty());
+  table_id_ = table_id;
+}
+
+void YBTableName::set_pgschema_name(const std::string& pgschema_name) {
+  pgschema_name_ = pgschema_name;
 }
 
 } // namespace client

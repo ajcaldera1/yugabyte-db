@@ -30,19 +30,18 @@
 // under the License.
 //
 
-#ifndef YB_SERVER_CLOCK_H_
-#define YB_SERVER_CLOCK_H_
+#pragma once
 
+#include <functional>
 #include <string>
 
 #include "yb/common/clock.h"
-#include "yb/common/common.pb.h"
 #include "yb/common/hybrid_time.h"
 
 #include "yb/gutil/ref_counted.h"
 
+#include "yb/util/status_fwd.h"
 #include "yb/util/monotime.h"
-#include "yb/util/status.h"
 
 namespace yb {
 class faststring;
@@ -62,7 +61,7 @@ class Clock : public ClockBase {
  public:
 
   // Initializes the clock.
-  virtual CHECKED_STATUS Init() = 0;
+  virtual Status Init() = 0;
 
   // Update the clock with a transaction timestamp originating from
   // another server. For instance replicas can call this so that,
@@ -81,15 +80,14 @@ typedef scoped_refptr<Clock> ClockPtr;
 
 template <class Request>
 void UpdateClock(const Request& request, Clock* clock) {
+  auto propagated_hybrid_time = HybridTime::FromPB(request.propagated_hybrid_time());
   // If the client sent us a hybrid_time, decode it and update the clock so that all future
   // hybrid_times are greater than the passed hybrid_time.
-  if (!request.has_propagated_hybrid_time()) {
+  if (!propagated_hybrid_time) {
     return;
   }
-  clock->Update(HybridTime(request.propagated_hybrid_time()));
+  clock->Update(propagated_hybrid_time);
 }
 
 } // namespace server
 } // namespace yb
-
-#endif /* YB_SERVER_CLOCK_H_ */

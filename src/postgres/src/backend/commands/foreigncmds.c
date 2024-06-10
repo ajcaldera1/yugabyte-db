@@ -38,6 +38,9 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 
+/* YB includes. */
+#include "pg_yb_utils.h"
+
 
 typedef struct
 {
@@ -82,11 +85,11 @@ optionListToArray(List *options)
 
 		astate = accumArrayResult(astate, PointerGetDatum(t),
 								  false, TEXTOID,
-								  CurrentMemoryContext);
+								  GetCurrentMemoryContext());
 	}
 
 	if (astate)
-		return makeArrayResult(astate, CurrentMemoryContext);
+		return makeArrayResult(astate, GetCurrentMemoryContext());
 
 	return PointerGetDatum(NULL);
 }
@@ -217,20 +220,22 @@ AlterForeignDataWrapperOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerI
 	form = (Form_pg_foreign_data_wrapper) GETSTRUCT(tup);
 
 	/* Must be a superuser to change a FDW owner */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of foreign-data wrapper \"%s\"",
 						NameStr(form->fdwname)),
-				 errhint("Must be superuser to change owner of a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+				 		 "role to change owner of a foreign-data wrapper.")));
 
 	/* New owner must also be a superuser */
-	if (!superuser_arg(newOwnerId))
+	if (!IsYbFdwUser(newOwnerId) && !superuser_arg(newOwnerId))
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to change owner of foreign-data wrapper \"%s\"",
 						NameStr(form->fdwname)),
-				 errhint("The owner of a foreign-data wrapper must be a superuser.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+				 		 "role to change owner of a foreign-data wrapper.")));
 
 	if (form->fdwowner != newOwnerId)
 	{
@@ -349,7 +354,7 @@ AlterForeignServerOwner_internal(Relation rel, HeapTuple tup, Oid newOwnerId)
 	if (form->srvowner != newOwnerId)
 	{
 		/* Superusers can always do it */
-		if (!superuser())
+		if (!IsYbFdwUser(GetUserId()) && !superuser())
 		{
 			Oid			srvId;
 			AclResult	aclresult;
@@ -576,12 +581,13 @@ CreateForeignDataWrapper(CreateFdwStmt *stmt)
 	rel = heap_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
 	/* Must be super user */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to create foreign-data wrapper \"%s\"",
 						stmt->fdwname),
-				 errhint("Must be superuser to create a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw "
+				 		 "role to create a foreign-data wrapper.")));
 
 	/* For now the owner cannot be specified on create. Use effective user ID. */
 	ownerId = GetUserId();
@@ -690,12 +696,13 @@ AlterForeignDataWrapper(AlterFdwStmt *stmt)
 	rel = heap_open(ForeignDataWrapperRelationId, RowExclusiveLock);
 
 	/* Must be super user */
-	if (!superuser())
+	if (!IsYbFdwUser(GetUserId()) && !superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("permission denied to alter foreign-data wrapper \"%s\"",
 						stmt->fdwname),
-				 errhint("Must be superuser to alter a foreign-data wrapper.")));
+				 errhint("Must be superuser or a member of the yb_fdw role to "
+				 		 "alter a foreign-data wrapper.")));
 
 	tp = SearchSysCacheCopy1(FOREIGNDATAWRAPPERNAME,
 							 CStringGetDatum(stmt->fdwname));
@@ -878,13 +885,22 @@ CreateForeignServer(CreateForeignServerStmt *stmt)
 	ownerId = GetUserId();
 
 	/*
-	 * Check that there is no other foreign server by this name. Do nothing if
-	 * IF NOT EXISTS was enforced.
+	 * Check that there is no other foreign server by this name.  If there is
+	 * one, do nothing if IF NOT EXISTS was specified.
 	 */
-	if (GetForeignServerByName(stmt->servername, true) != NULL)
+	srvId = get_foreign_server_oid(stmt->servername, true);
+	if (OidIsValid(srvId))
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * If we are in an extension script, insist that the pre-existing
+			 * object be a member of the extension, to avoid security risks.
+			 */
+			ObjectAddressSet(myself, ForeignServerRelationId, srvId);
+			checkMembershipInCurrentExtension(&myself);
+
+			/* OK to skip */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("server \"%s\" already exists, skipping",
@@ -1170,6 +1186,10 @@ CreateUserMapping(CreateUserMappingStmt *stmt)
 	{
 		if (stmt->if_not_exists)
 		{
+			/*
+			 * Since user mappings aren't members of extensions (see comments
+			 * below), no need for checkMembershipInCurrentExtension here.
+			 */
 			ereport(NOTICE,
 					(errcode(ERRCODE_DUPLICATE_OBJECT),
 					 errmsg("user mapping for \"%s\" already exists for server %s, skipping",

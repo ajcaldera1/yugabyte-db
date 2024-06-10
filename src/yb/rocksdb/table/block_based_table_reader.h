@@ -21,22 +21,20 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H
-#define YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H
+#pragma once
 
 #include <stdint.h>
-#include <memory>
-#include <utility>
-#include <string>
 
+#include <memory>
+#include <string>
+#include <utility>
+
+#include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/statistics.h"
 #include "yb/rocksdb/status.h"
-#include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table/table_reader.h"
-#include "yb/rocksdb/table/table_properties_internal.h"
-#include "yb/rocksdb/util/coding.h"
-#include "yb/rocksdb/util/file_reader_writer.h"
+
 #include "yb/util/strongly_typed_bool.h"
 
 namespace rocksdb {
@@ -51,7 +49,6 @@ class FullFilterBlockReader;
 class Footer;
 class InternalKeyComparator;
 class Iterator;
-class RandomAccessFile;
 class TableCache;
 class TableReader;
 class WritableFile;
@@ -62,7 +59,10 @@ class GetContext;
 class InternalIterator;
 class IndexReader;
 
-using std::unique_ptr;
+// Index reader special unique pointer to control the instance's way of deletion. Can be removed
+// when https://github.com/yugabyte/yugabyte-db/issues/4720 is resolved.
+using IndexReaderDeleter = std::function<void(IndexReader*)>;
+using IndexReaderCleanablePtr = std::unique_ptr<IndexReader, IndexReaderDeleter>;
 
 enum class DataIndexLoadMode {
   // Preload on Open, store in block cache or in table reader depending on
@@ -89,13 +89,11 @@ YB_DEFINE_ENUM(BlockType, (kData)(kIndex));
 // hashed components as the key specified in constructor.
 class BloomFilterAwareFileFilter : public TableAwareReadFileFilter {
  public:
-  BloomFilterAwareFileFilter(const ReadOptions& read_options, const Slice& user_key);
+  BloomFilterAwareFileFilter();
 
-  bool Filter(TableReader* reader) const override;
-
- private:
-  const ReadOptions read_options_;
-  const std::string user_key_;
+  bool Filter(
+      const ReadOptions& read_options, Slice user_key, FilterKeyCache* filter_key_cache,
+      TableReader* reader) const override;
 };
 
 // A Table is a sorted map from strings to strings.  Tables are
@@ -122,22 +120,23 @@ class BlockBasedTable : public TableReader {
   // bloom filter only filter index could be prefetched.
   // skip_filters Disables loading/accessing the filter block. Overrides prefetch_filter, so filter
   //   will be skipped if both are set.
-  static Status Open(const ImmutableCFOptions& ioptions,
-                     const EnvOptions& env_options,
-                     const BlockBasedTableOptions& table_options,
-                     const InternalKeyComparatorPtr& internal_key_comparator,
-                     unique_ptr<RandomAccessFileReader>&& base_file,
-                     uint64_t base_file_size,
-                     unique_ptr<TableReader>* table_reader,
-                     DataIndexLoadMode data_index_load_mode = DataIndexLoadMode::LAZY,
-                     PrefetchFilter prefetch_filter = PrefetchFilter::YES,
-                     bool skip_filters = false);
+  static Status Open(
+      const ImmutableCFOptions& ioptions,
+      const EnvOptions& env_options,
+      const BlockBasedTableOptions& table_options,
+      const InternalKeyComparatorPtr& internal_key_comparator,
+      std::unique_ptr<RandomAccessFileReader>&& base_file,
+      uint64_t base_file_size,
+      std::unique_ptr<TableReader>* table_reader,
+      DataIndexLoadMode data_index_load_mode = DataIndexLoadMode::LAZY,
+      PrefetchFilter prefetch_filter = PrefetchFilter::YES,
+      bool skip_filters = false);
 
   bool IsSplitSst() const override { return true; }
 
-  void SetDataFileReader(unique_ptr<RandomAccessFileReader>&& data_file) override;
+  void SetDataFileReader(std::unique_ptr<RandomAccessFileReader>&& data_file) override;
 
-  bool PrefixMayMatch(const Slice& internal_key);
+  bool PrefixMayMatch(const ReadOptions& read_options, const Slice& internal_key);
 
   // Returns a new iterator over the table contents.
   // The result of NewIterator() is initially invalid (caller must
@@ -148,8 +147,9 @@ class BlockBasedTable : public TableReader {
 
   // @param skip_filters Disables loading/accessing the filter block.
   // key should be internal key in case bloom filters are used.
-  Status Get(const ReadOptions& readOptions, const Slice& key,
-             GetContext* get_context, bool skip_filters = false) override;
+  Status Get(
+      const ReadOptions& readOptions, const Slice& key, GetContext* get_context,
+      bool skip_filters = false) override;
 
   // Pre-fetch the disk blocks that correspond to the key range specified by
   // (kbegin, kend). The call will return return error status in the event of
@@ -179,17 +179,42 @@ class BlockBasedTable : public TableReader {
   // convert SST file to a human readable form
   Status DumpTable(WritableFile* out_file) override;
 
-  // input_iter: if it is not null, update this one and return it as Iterator
+  // Get the iterator from the index reader.
+  // If input_iter is not set, return new Iterator
+  // If input_iter is set, update it and return:
+  //  - newly created data index iterator in case it was created (if we use multi-level data index,
+  //    input_iter is an iterator of the top level index, but not the whole index iterator).
+  //  - nullptr if input_iter is a data index iterator and no new iterators were created.
+  //
+  // Note: ErrorIterator with error will be returned if GetIndexReader returned an error.
+  InternalIterator* NewIndexIterator(
+      const ReadOptions& read_options, BlockIter* input_iter);
+
+  InternalIterator* NewIndexIterator(const ReadOptions& read_options) override;
+
+  // Converts an index entry (i.e. an encoded BlockHandle) into an iterator over the contents of
+  // a correspoding block. Updates and returns input_iter if the one is specified, or returns
+  // a new iterator.
   InternalIterator* NewDataBlockIterator(
       const ReadOptions& ro, const Slice& index_value, BlockType block_type,
       BlockIter* input_iter = nullptr);
 
   const ImmutableCFOptions& ioptions();
 
+  yb::Result<std::string> GetMiddleKey() override;
+
+  // Helper function that force reading block from a file and takes care about block cleanup.
+  yb::Result<std::unique_ptr<Block>> RetrieveBlockFromFile(const ReadOptions& ro,
+      const Slice& index_value, BlockType block_type);
+
   ~BlockBasedTable();
 
   bool TEST_filter_block_preloaded() const;
   bool TEST_index_reader_loaded() const;
+
+  // Helper function to correctly release index reader. Can be replaced with direct call to
+  // GetIndexReader() when https://github.com/yugabyte/yugabyte-db/issues/4720 is resolved.
+  yb::Result<IndexReaderCleanablePtr> TEST_GetIndexReader();
 
  private:
   template <class TValue>
@@ -208,10 +233,12 @@ class BlockBasedTable : public TableReader {
       BlockHandle* filter_block_handle) const;
 
   // Returns key to be added to filter or verified against filter based on internal_key.
-  Slice GetFilterKeyFromInternalKey(const Slice &internal_key) const;
+  Slice GetFilterKeyFromInternalKey(Slice internal_key) const;
 
   // Returns key to be added to filter or verified against filter based on user_key.
-  Slice GetFilterKeyFromUserKey(const Slice& user_key) const;
+  // filter_key_cache could be reused only with the same user key.
+  Slice GetFilterKeyFromUserKey(Slice user_key, FilterKeyCache* filter_key_cache) const;
+  Slice GetFilterKeyFromUserKey(Slice user_key) const;
 
   // If `no_io == true`, we will not try to read filter/index from sst file (except fixed-size
   // filter blocks) were they not present in cache yet.
@@ -221,23 +248,14 @@ class BlockBasedTable : public TableReader {
   // prefix, because prefix for the key goes to the same filter block as key itself.
   CachableEntry<FilterBlockReader> GetFilter(const QueryId query_id,
                                              bool no_io = false,
-                                             const Slice* filter_key = nullptr) const;
+                                             const Slice* filter_key = nullptr,
+                                             Statistics* statistics = nullptr) const;
 
-  // Get the iterator from the index reader.
-  // If input_iter is not set, return new Iterator
-  // If input_iter is set, update it and return:
-  //  - newly created data index iterator in case it was created (if we use multi-level data index,
-  //    input_iter is an iterator of the top level index, but not the whole index iterator).
-  //  - nullptr if input_iter is a data index iterator and no new iterators were created.
-  //
-  // Note: ErrorIterator with Status::Incomplete shall be returned if all the
-  // following conditions are met:
-  //  1. We enabled table_options.cache_index_and_filter_blocks.
-  //  2. index is not present in block cache.
-  //  3. We disallowed any io to be performed, that is, read_options ==
-  //     kBlockCacheTier
-  InternalIterator* NewIndexIterator(const ReadOptions& read_options,
-                                     BlockIter* input_iter = nullptr);
+  // Returns index reader.
+  // If index reader is not stored in either block or internal cache:
+  // - If read_options.read_tier == kBlockCacheTier: Status::Incomplete error will be returned.
+  // - If read_options.read_tier != kBlockCacheTier: new index reader will be created and cached.
+  yb::Result<CachableEntry<IndexReader>> GetIndexReader(const ReadOptions& read_options);
 
   // Read block cache from block caches (if set): block_cache and
   // block_cache_compressed.
@@ -284,13 +302,17 @@ class BlockBasedTable : public TableReader {
 
   bool NonBlockBasedFilterKeyMayMatch(FilterBlockReader* filter, const Slice& filter_key) const;
 
+  Status ReadPropertiesBlock(InternalIterator* meta_iter);
+
+  Status SetupFilter(InternalIterator* meta_iter);
+
   // Read the meta block from sst.
-  static Status ReadMetaBlock(Rep* rep, std::unique_ptr<Block>* meta_block,
-                              std::unique_ptr<InternalIterator>* iter);
+  static Status ReadMetaBlock(
+      Rep* rep, std::unique_ptr<Block>* meta_block, std::unique_ptr<InternalIterator>* iter);
 
   // Create the filter from the filter block.
   static FilterBlockReader* ReadFilterBlock(const BlockHandle& filter_block, Rep* rep,
-      size_t* filter_size = nullptr);
+      size_t* filter_size = nullptr, Statistics* statistics = nullptr);
 
   // CreateFilterIndexReader from sst
   Status CreateFilterIndexReader(std::unique_ptr<IndexReader>* filter_index_reader);
@@ -299,7 +321,13 @@ class BlockBasedTable : public TableReader {
   // instance. Used for both data and metadata files.
   static void SetupCacheKeyPrefix(Rep* rep, FileReaderWithCachePrefix* reader_with_cache_prefix);
 
-  FileReaderWithCachePrefix* GetBlockReader(BlockType block_type);
+  FileReaderWithCachePrefix* GetBlockReader(BlockType block_type) const;
+  KeyValueEncodingFormat GetKeyValueEncodingFormat(BlockType block_type) const;
+
+  // Retrieves block from file system or cache.
+  // NOTE! A caller is responsible for a block cleanup.
+  yb::Result<CachableEntry<Block>> RetrieveBlock(const ReadOptions& ro, const Slice& index_value,
+      BlockType block_type, bool use_cache = true);
 
   explicit BlockBasedTable(Rep* rep) : rep_(rep) {}
 
@@ -309,5 +337,3 @@ class BlockBasedTable : public TableReader {
 };
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_TABLE_BLOCK_BASED_TABLE_READER_H

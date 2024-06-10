@@ -11,15 +11,21 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_KV_UTIL_H
-#define YB_UTIL_KV_UTIL_H
+#pragma once
 
 #include <string>
 
+#include "yb/gutil/casts.h"
 #include "yb/gutil/endian.h"
+
+#include "yb/util/byte_buffer.h"
 #include "yb/util/slice.h"
 
 namespace yb {
+
+using KeyBuffer = ByteBuffer<0x40>;
+using ValueBuffer = ByteBuffer<0x100>;
+
 namespace util {
 
 // We are flipping the sign bit of 64-bit integers appearing as object keys in a document so that
@@ -27,19 +33,22 @@ namespace util {
 constexpr uint64_t kInt64SignBitFlipMask = 0x8000000000000000L;
 constexpr uint32_t kInt32SignBitFlipMask = 0x80000000;
 
-inline void AppendInt32ToKey(int32_t val, std::string* dest) {
+template <class Buffer>
+void AppendInt32ToKey(int32_t val, Buffer* dest) {
   char buf[sizeof(int32_t)];
   BigEndian::Store32(buf, val ^ kInt32SignBitFlipMask);
   dest->append(buf, sizeof(buf));
 }
 
-inline void AppendBigEndianUInt32(uint32_t u, std::string* dest) {
+template <class Buffer>
+void AppendBigEndianUInt32(uint32_t u, Buffer* dest) {
   char buf[sizeof(uint32_t)];
   BigEndian::Store32(buf, u);
   dest->append(buf, sizeof(buf));
 }
 
-inline void AppendFloatToKey(float val, std::string* dest, bool descending = false) {
+template <class Buffer>
+void AppendFloatToKey(float val, Buffer* dest, bool descending = false) {
   char buf[sizeof(uint32_t)];
   uint32_t v = *(reinterpret_cast<uint32_t*>(&val));
   if (v >> 31) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
@@ -56,7 +65,8 @@ inline void AppendFloatToKey(float val, std::string* dest, bool descending = fal
   dest->append(buf, sizeof(buf));
 }
 
-inline void AppendDoubleToKey(double val, std::string* dest, bool descending = false) {
+template <class Buffer>
+void AppendDoubleToKey(double val, Buffer* dest, bool descending = false) {
   char buf[sizeof(uint64_t)];
   uint64_t v = *(reinterpret_cast<uint64_t*>(&val));
   if (v >> 63) { // This is the sign bit: better than using val >= 0 (because -0, nulls denormals).
@@ -73,18 +83,28 @@ inline void AppendDoubleToKey(double val, std::string* dest, bool descending = f
   dest->append(buf, sizeof(buf));
 }
 
-inline int64_t DecodeInt32FromKey(const rocksdb::Slice& slice) {
-  uint32_t v = BigEndian::Load32(slice.data());
-  return v ^ kInt32SignBitFlipMask;
+inline int32_t DecodeInt32FromKey(const char* data) {
+  return BigEndian::Load32(data) ^ kInt32SignBitFlipMask;
 }
 
-inline int64_t DecodeInt64FromKey(const rocksdb::Slice& slice) {
-  uint64_t v = BigEndian::Load64(slice.data());
-  return v ^ kInt64SignBitFlipMask;
+inline int32_t DecodeInt32FromKey(const uint8_t* data) {
+  return BigEndian::Load32(data) ^ kInt32SignBitFlipMask;
 }
 
-inline double DecodeDoubleFromKey(const rocksdb::Slice& slice, bool descending = false) {
-  uint64_t v = BigEndian::Load64(slice.data());
+inline int32_t DecodeInt32FromKey(const Slice& slice) {
+  return DecodeInt32FromKey(slice.cdata());
+}
+
+inline int64_t DecodeInt64FromKey(const char* data) {
+  return BigEndian::Load64(data) ^ kInt64SignBitFlipMask;
+}
+
+inline int64_t DecodeInt64FromKey(const Slice& slice) {
+  return DecodeInt64FromKey(slice.cdata());
+}
+
+inline double DecodeDoubleFromKey(const char* data, bool descending = false) {
+  uint64_t v = BigEndian::Load64(data);
   if (descending) {
     // Flip the bits.
     v = ~v;
@@ -95,11 +115,15 @@ inline double DecodeDoubleFromKey(const rocksdb::Slice& slice, bool descending =
   } else {
     v = ~v;
   }
-  return *(reinterpret_cast<double*>(&v));
+  return bit_cast<double>(v);
 }
 
-inline float DecodeFloatFromKey(const rocksdb::Slice& slice, bool descending = false) {
-  uint32_t v = BigEndian::Load32(slice.data());
+inline double DecodeDoubleFromKey(const Slice& slice, bool descending = false) {
+  return DecodeDoubleFromKey(slice.cdata(), descending);
+}
+
+inline float DecodeFloatFromKey(const char* data, bool descending = false) {
+  uint32_t v = BigEndian::Load32(data);
   if (descending) {
     // Flip the bits.
     v = ~v;
@@ -110,13 +134,18 @@ inline float DecodeFloatFromKey(const rocksdb::Slice& slice, bool descending = f
   } else {
     v = ~v;
   }
-  return *(reinterpret_cast<float*>(&v));
+  return bit_cast<float>(v);
+}
+
+inline float DecodeFloatFromKey(const Slice& slice, bool descending = false) {
+  return DecodeFloatFromKey(slice.cdata(), descending);
 }
 
 // Encode and append the given signed 64-bit integer to the destination string holding a RocksDB
 // key being constructed. We are flipping the sign bit so that negative numbers sort before positive
 // ones.
-inline void AppendInt64ToKey(int64_t val, std::string* dest) {
+template <class Buffer>
+inline void AppendInt64ToKey(int64_t val, Buffer* dest) {
   char buf[sizeof(uint64_t)];
   // Flip the sign bit so that negative values sort before positive ones when compared as
   // big-endian byte sequences.
@@ -124,7 +153,8 @@ inline void AppendInt64ToKey(int64_t val, std::string* dest) {
   dest->append(buf, sizeof(buf));
 }
 
-inline void AppendBigEndianUInt64(uint64_t u, std::string* dest) {
+template <class Buffer>
+inline void AppendBigEndianUInt64(uint64_t u, Buffer* dest) {
   char buf[sizeof(uint64_t)];
   BigEndian::Store64(buf, u);
   dest->append(buf, sizeof(buf));
@@ -132,5 +162,3 @@ inline void AppendBigEndianUInt64(uint64_t u, std::string* dest) {
 
 } // namespace util
 } // namespace yb
-
-#endif // YB_UTIL_KV_UTIL_H

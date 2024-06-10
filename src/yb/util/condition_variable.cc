@@ -16,13 +16,9 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include "yb/util/condition_variable.h"
 
-#include <errno.h>
-#include <sys/time.h>
-
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/util/errno.h"
 #include "yb/util/monotime.h"

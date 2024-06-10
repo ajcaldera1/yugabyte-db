@@ -16,7 +16,7 @@ package org.yb.client;
 import com.google.protobuf.Message;
 import org.yb.annotations.InterfaceAudience;
 import org.yb.util.Pair;
-import org.jboss.netty.buffer.ChannelBuffer;
+import io.netty.buffer.ByteBuf;
 import org.yb.server.ServerBase;
 
 @InterfaceAudience.Public
@@ -24,6 +24,7 @@ class SetFlagRequest extends YRpc<SetFlagResponse> {
 
   private String flag;
   private String value;
+  private boolean force = false;
 
   public SetFlagRequest(String flag, String value) {
     super(null);
@@ -31,12 +32,20 @@ class SetFlagRequest extends YRpc<SetFlagResponse> {
     this.value = value;
   }
 
+  public SetFlagRequest(String flag, String value, boolean force) {
+    super(null);
+    this.flag = flag;
+    this.value = value;
+    this.force = force;
+  }
+
   @Override
-  ChannelBuffer serialize(Message header) {
+  ByteBuf serialize(Message header) {
     assert header.isInitialized();
     final ServerBase.SetFlagRequestPB.Builder builder = ServerBase.SetFlagRequestPB.newBuilder();
     builder.setFlag(flag);
     builder.setValue(value);
+    builder.setForce(force);
 
     return toChannelBuffer(header, builder.build());
   }

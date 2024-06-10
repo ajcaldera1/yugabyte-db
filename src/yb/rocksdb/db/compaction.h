@@ -21,8 +21,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef YB_ROCKSDB_DB_COMPACTION_H
-#define YB_ROCKSDB_DB_COMPACTION_H
 
 #pragma once
 
@@ -32,7 +30,12 @@
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/util/mutable_cf_options.h"
 #include "yb/rocksdb/db/version_edit.h"
-#include "yb/util/result.h"
+
+namespace yb {
+
+class PriorityThreadPoolSuspender;
+
+}
 
 namespace rocksdb {
 
@@ -59,6 +62,7 @@ struct LightweightBoundaries {
   size_t num_user_values;
   UserBoundaryTag* user_tags;
   Slice* user_values;
+  uint64_t hybrid_time = 0;
 
   Slice user_key() const { return ExtractUserKey(key); }
 
@@ -80,9 +84,10 @@ struct FdWithBoundaries {
   FileDescriptor fd;
   LightweightBoundaries smallest; // smallest boundaries in this file
   LightweightBoundaries largest;  // largest boundaries in this file
+  // Data provided by user that will be passed to iterator replacer.
+  Slice user_filter_data;
 
-  explicit FdWithBoundaries(Arena* arena, const FileMetaData& source)
-      : fd(source.fd), smallest(arena, source.smallest), largest(arena, source.largest) {}
+  FdWithBoundaries(Arena* arena, const FileMetaData& source);
 };
 
 // Data structure to store an array of FdWithKeyRange in one level
@@ -100,15 +105,15 @@ struct LevelFilesBrief {
 // A Compaction encapsulates information about a compaction.
 class Compaction {
  public:
-  Compaction(VersionStorageInfo* input_version,
-             const MutableCFOptions& mutable_cf_options,
-             std::vector<CompactionInputFiles> inputs, int output_level,
-             uint64_t target_file_size, uint64_t max_grandparent_overlap_bytes,
-             uint32_t output_path_id, CompressionType compression,
-             std::vector<FileMetaData*> grandparents,
-             bool manual_compaction = false, double score = -1,
-             bool deletion_compaction = false,
-             CompactionReason compaction_reason = CompactionReason::kUnknown);
+  static std::unique_ptr<Compaction> Create(
+      VersionStorageInfo* input_version, const MutableCFOptions& mutable_cf_options,
+      std::vector<CompactionInputFiles> inputs, int output_level, uint64_t target_file_size,
+      uint64_t max_grandparent_overlap_bytes, uint32_t output_path_id, CompressionType compression,
+      std::vector<FileMetaData*> grandparents,
+      Logger* info_log,
+      bool manual_compaction = false, double score = -1,
+      bool deletion_compaction = false,
+      CompactionReason compaction_reason = CompactionReason::kUnknown);
 
   // No copying allowed
   Compaction(const Compaction&) = delete;
@@ -289,9 +294,22 @@ class Compaction {
 
   Slice GetLargestUserKey() const { return largest_user_key_; }
 
-  CompactionReason compaction_reason() { return compaction_reason_; }
+  CompactionReason compaction_reason() const { return compaction_reason_; }
+
+  yb::PriorityThreadPoolSuspender* suspender() { return suspender_; }
+  void SetSuspender(yb::PriorityThreadPoolSuspender* value) { suspender_ = value; }
 
  private:
+  Compaction(VersionStorageInfo* input_version,
+             const MutableCFOptions& mutable_cf_options,
+             std::vector<CompactionInputFiles> inputs, int output_level,
+             uint64_t target_file_size, uint64_t max_grandparent_overlap_bytes,
+             uint32_t output_path_id, CompressionType compression,
+             std::vector<FileMetaData*> grandparents,
+             bool manual_compaction, double score,
+             bool deletion_compaction,
+             CompactionReason compaction_reason);
+
   // mark (or clear) all files that are being compacted
   void MarkFilesBeingCompacted(bool mark_as_compacted);
 
@@ -311,10 +329,10 @@ class Compaction {
 
   const int start_level_;    // the lowest level to be compacted
   const int output_level_;  // levels to which output files are stored
-  uint64_t max_output_file_size_;
-  uint64_t max_grandparent_overlap_bytes_;
+  uint64_t max_output_file_size_ = 0;
+  uint64_t max_grandparent_overlap_bytes_ = 0;
   MutableCFOptions mutable_cf_options_;
-  Version* input_version_;
+  Version* input_version_ = nullptr;
   uint64_t input_version_number_ = 0;
   bool input_version_level0_non_overlapping_ = false;
   VersionSet* vset_ = nullptr;
@@ -353,7 +371,7 @@ class Compaction {
 
   // True if we can do trivial move in Universal multi level
   // compaction
-  bool is_trivial_move_;
+  bool is_trivial_move_ = false;
 
   bool IsCompactionStyleUniversal() const;
 
@@ -368,11 +386,11 @@ class Compaction {
 
   // Reason for compaction
   CompactionReason compaction_reason_;
+
+  yb::PriorityThreadPoolSuspender* suspender_ = nullptr;
 };
 
 // Utility function
 extern uint64_t TotalFileSize(const std::vector<FileMetaData*>& files);
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_COMPACTION_H

@@ -106,6 +106,9 @@ typedef struct
 
 extern WalSndCtlData *WalSndCtl;
 
+extern uint64_t YbWalSndTotalTimeInYBDecodeMicros;
+extern uint64_t YbWalSndTotalTimeInReorderBufferMicros;
+extern uint64_t YbWalSndTotalTimeInSendingMicros;
 
 extern void WalSndSetState(WalSndState state);
 
@@ -118,6 +121,7 @@ extern int	replication_yylex(void);
 extern void replication_yyerror(const char *str) pg_attribute_noreturn();
 extern void replication_scanner_init(const char *query_string);
 extern void replication_scanner_finish(void);
+extern bool replication_scanner_is_replication_command(void);
 
 extern Node *replication_parse_result;
 

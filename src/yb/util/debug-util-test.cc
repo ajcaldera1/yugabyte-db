@@ -32,34 +32,44 @@
 
 #include <signal.h>
 
-#include <string>
-#include <vector>
 #include <regex>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <vector>
+#include <set>
 
-#include <boost/scope_exit.hpp>
-
-#include <glog/logging.h>
-#include <glog/stl_logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/util/countdown_latch.h"
 #include "yb/util/debug-util.h"
+#include "yb/util/debug/long_operation_tracker.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/stack_trace_tracker.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
-
-#include "yb/util/debug/long_operation_tracker.h"
+#include "yb/util/tsan_util.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/lockfree.h"
+#include "yb/util/random_util.h"
+#include "yb/util/tostring.h"
 
 using std::string;
 using std::vector;
 
 using namespace std::literals;
 
+DECLARE_bool(track_stack_traces);
+DECLARE_bool(TEST_disable_thread_stack_collection_wait);
+
 namespace yb {
 
 class DebugUtilTest : public YBTest {
  protected:
-  void WaitForSleeperThreadNameInStackTrace(int64_t thread_id) {
+  void WaitForSleeperThreadNameInStackTrace(ThreadIdForStack thread_id) {
     string stack;
     for (int i = 0; i < 10000; i++) {
       stack = DumpThreadStack(thread_id);
@@ -74,29 +84,38 @@ TEST_F(DebugUtilTest, TestStackTrace) {
   StackTrace t;
   t.Collect(1);
   string trace = t.Symbolize();
+  LOG(INFO) << "Trace:\n" << trace;
   ASSERT_STR_CONTAINS(trace, "yb::DebugUtilTest_TestStackTrace_Test::TestBody");
+  ASSERT_STR_CONTAINS(trace, "testing::internal::UnitTestImpl::RunAllTests()");
+  ASSERT_STR_CONTAINS(trace, "main");
 }
 
 TEST_F(DebugUtilTest, TestGetStackTrace) {
   string stack_trace = GetStackTrace();
 
-  const std::string kExpectedLineFormatNoFileLineReStr = R"#(^\s*@\s+0x[0-9a-f]+\s+.*)#";
+  const std::string kExpectedLineFormatNoFileLineReStr = R"#(\s*@\s+0x[0-9a-f]+\s+.*)#";
   SCOPED_TRACE(Format("Regex with no file/line: $0", kExpectedLineFormatNoFileLineReStr));
-  const std::string kFileLineReStr = R"#( \(\S+:\d+\))#";
+  const std::string kFileLineReStr = R"#(\S+:\d+:)#";
+  const std::string kFileLineInBracesReStr = R"#( \(\S+:\d+\))#";
 
-  const std::regex kExpectedLineFormatNoFileLineRe(kExpectedLineFormatNoFileLineReStr + "$");
+  const std::regex kExpectedLineFormatNoFileLineRe("^" + kExpectedLineFormatNoFileLineReStr + "$");
   const std::regex kExpectedLineFormatWithFileLineRe(
-      kExpectedLineFormatNoFileLineReStr + kFileLineReStr + "$");
+      "^" + kFileLineReStr + kExpectedLineFormatNoFileLineReStr + "$");
+  const std::regex kExpectedLineFormatWithFileLineInBracesRe(
+      "^" + kExpectedLineFormatNoFileLineReStr + kFileLineInBracesReStr + "$");
   const std::regex kNilUnknownRe(R"#(^\s*@\s+\(nil\)\s+\(unknown\)$)#");
 
   // Expected line format:
-  // @ 0x41255d yb::DebugUtilTest_TestGetStackTrace_Test::TestBody() (yb/util/debug-util-test.cc:73)
+  // @ 0x41255d yb::DebugUtilTest_TestGetStackTrace_Test::TestBody() (yb/util/debug-util-test.cc:85)
+  // or
+  // ../../src/yb/util/debug-util-test.cc:85: @ 0x270715
+  // yb::DebugUtilTest_TestGetStackTrace_Test::TestBody()
   SCOPED_TRACE(Format("Stack trace to be checked:\n:$0", stack_trace));
   std::stringstream ss(stack_trace);
   std::smatch match;
 
-  int with_file_line = 0;
-  int without_file_line = 0;
+  int with_file_line __attribute__((unused)) = 0;
+  int without_file_line  __attribute__((unused)) = 0;
   int unmatched = 0;
   int num_lines = 0;
   std::ostringstream debug_info;
@@ -105,7 +124,8 @@ TEST_F(DebugUtilTest, TestGetStackTrace) {
   while (ss) {
     const auto line = next_line;
     std::getline(ss, next_line);
-    if (std::regex_match(line, match, kExpectedLineFormatWithFileLineRe)) {
+    if (std::regex_match(line, match, kExpectedLineFormatWithFileLineRe) ||
+        std::regex_match(line, match, kExpectedLineFormatWithFileLineInBracesRe)) {
       ++with_file_line;
       debug_info << "Line matched regex with file/line number: " << line << std::endl;
     } else if (std::regex_match(line, match, kExpectedLineFormatNoFileLineRe)) {
@@ -133,9 +153,33 @@ TEST_F(DebugUtilTest, TestGetStackTrace) {
 // on the tgkill syscall which is not portable.
 //
 // TODO: it might be possible to enable other tests in this section to work on macOS.
+
+TEST_F(DebugUtilTest, TestStackTraceInvalidTid) {
+#if defined(__linux__)
+  ThreadIdForStack bad_tid = 1;
+#else
+  ThreadIdForStack bad_tid = reinterpret_cast<ThreadIdForStack>(1);
+#endif
+  string s = DumpThreadStack(bad_tid);
+  ASSERT_STR_CONTAINS(s, "Unable to deliver signal");
+}
+
+TEST_F(DebugUtilTest, TestStackTraceSelf) {
+  string s = DumpThreadStack(Thread::CurrentThreadIdForStack());
+  ASSERT_STR_CONTAINS(s, "yb::DebugUtilTest_TestStackTraceSelf_Test::TestBody()");
+}
+
 #if defined(__linux__)
 
+TEST_F(DebugUtilTest, TestStackTraceMainThread) {
+  string s = DumpThreadStack(getpid());
+  ASSERT_STR_CONTAINS(s, "yb::DebugUtilTest_TestStackTraceMainThread_Test::TestBody()");
+}
+
+#endif
+
 namespace {
+
 void SleeperThread(CountDownLatch* l) {
   // We use an infinite loop around WaitFor() instead of a normal Wait()
   // so that this test passes in TSAN. Without this, we run into this TSAN
@@ -152,22 +196,8 @@ bool IsSignalHandlerRegistered(int signum) {
   CHECK_EQ(0, sigaction(signum, nullptr, &cur_action));
   return cur_action.sa_handler != SIG_DFL;
 }
+
 } // anonymous namespace
-
-TEST_F(DebugUtilTest, TestStackTraceInvalidTid) {
-  string s = DumpThreadStack(1);
-  ASSERT_STR_CONTAINS(s, "Unable to deliver signal");
-}
-
-TEST_F(DebugUtilTest, TestStackTraceSelf) {
-  string s = DumpThreadStack(Thread::CurrentThreadId());
-  ASSERT_STR_CONTAINS(s, "yb::DebugUtilTest_TestStackTraceSelf_Test::TestBody()");
-}
-
-TEST_F(DebugUtilTest, TestStackTraceMainThread) {
-  string s = DumpThreadStack(getpid());
-  ASSERT_STR_CONTAINS(s, "yb::DebugUtilTest_TestStackTraceMainThread_Test::TestBody()");
-}
 
 TEST_F(DebugUtilTest, TestSignalStackTrace) {
   CountDownLatch l(1);
@@ -176,7 +206,7 @@ TEST_F(DebugUtilTest, TestSignalStackTrace) {
 
   // We have to loop a little bit because it takes a little while for the thread
   // to start up and actually call our function.
-  WaitForSleeperThreadNameInStackTrace(t->tid());
+  WaitForSleeperThreadNameInStackTrace(t->tid_for_stack());
 
   // Test that we can change the signal and that the stack traces still work,
   // on the new signal.
@@ -191,7 +221,7 @@ TEST_F(DebugUtilTest, TestSignalStackTrace) {
 
   // Stack traces should work using the new handler. We've had a test failure here when we ust had
   // a one-time check, so we do the same waiting loop as in the beginning of the test.
-  WaitForSleeperThreadNameInStackTrace(t->tid());
+  WaitForSleeperThreadNameInStackTrace(t->tid_for_stack());
 
   // Switch back to SIGUSR2 and ensure it changes back.
   ASSERT_OK(SetStackTraceSignal(SIGUSR2));
@@ -200,7 +230,7 @@ TEST_F(DebugUtilTest, TestSignalStackTrace) {
 
   // Stack traces should work using the new handler. Also has a test failure here, so using a retry
   // loop.
-  WaitForSleeperThreadNameInStackTrace(t->tid());
+  WaitForSleeperThreadNameInStackTrace(t->tid_for_stack());
 
   // Register our own signal handler on SIGUSR1, and ensure that
   // we get a bad Status if we try to use it.
@@ -210,7 +240,7 @@ TEST_F(DebugUtilTest, TestSignalStackTrace) {
   signal(SIGUSR1, SIG_IGN);
 
   // Stack traces should be disabled
-  ASSERT_STR_CONTAINS(DumpThreadStack(t->tid()), "Unable to take thread stack");
+  ASSERT_STR_CONTAINS(DumpThreadStack(t->tid_for_stack()), "Unable to take thread stack");
 
   // Re-enable so that other tests pass.
   ASSERT_OK(SetStackTraceSignal(SIGUSR2));
@@ -220,22 +250,71 @@ TEST_F(DebugUtilTest, TestSignalStackTrace) {
   t->Join();
 }
 
+#if defined(__linux__)
+
 // Test which dumps all known threads within this process.
 // We don't validate the results in any way -- but this verifies that we can
 // dump library threads such as the libc timer_thread and properly time out.
 TEST_F(DebugUtilTest, TestDumpAllThreads) {
-  vector<pid_t> tids;
+  std::vector<pid_t> tids;
   ASSERT_OK(ListThreads(&tids));
   for (pid_t tid : tids) {
     LOG(INFO) << DumpThreadStack(tid);
   }
 }
 
+#endif
+
 // This will probably be really slow on Mac OS X, so only enabling on Linux.
 TEST_F(DebugUtilTest, TestGetStackTraceInALoop) {
   for (int i = 1; i <= 10000; ++i) {
     GetStackTrace();
   }
+}
+
+// TODO: enable this test when we fully fix https://github.com/yugabyte/yugabyte-db/issues/6672.
+TEST_F(DebugUtilTest, YB_DISABLE_TEST(GetStackTraceParallelWithDumpThreadStack)) {
+  std::atomic<ThreadIdForStack> get_stack_trace_thread_id;
+
+  CountDownLatch get_stack_trace_thread_started(1);
+  CountDownLatch dump_started(1);
+
+  std::thread thread1([&] {
+    get_stack_trace_thread_id = Thread::CurrentThreadIdForStack();
+    get_stack_trace_thread_started.CountDown();
+    dump_started.Wait();
+    LOG(INFO) << "Starting GetStacktrace loop";
+    for (int i = 0; i < 10000; i++) {
+      const auto s = GetStackTrace();
+      if (i == 0) {
+        LOG(INFO) << "My stack trace: " << s;
+      }
+    }
+  });
+
+  get_stack_trace_thread_started.Wait();
+  std::vector<std::thread> dump_threads;
+  for (int t = 0; t < 10; ++t) {
+    dump_threads.emplace_back([&] {
+      const auto thread_id = get_stack_trace_thread_id.load();
+      LOG(INFO) << "Starting dump loop";
+      for (int i = 0; i < 10000; ++i) {
+        const auto s = ThreadStack(thread_id);
+        if (i == 0) {
+          LOG(INFO) << (s.ok() ? "Got stacktrace" : AsString(s.status()));
+        }
+      }
+    });
+  }
+  LOG(INFO) << "Started dump loops";
+  std::this_thread::sleep_for(1s);
+  dump_started.CountDown();
+
+  thread1.join();
+  for (auto& thread : dump_threads) {
+    thread.join();
+  }
+  LOG(INFO) << "Done";
 }
 
 TEST_F(DebugUtilTest, TestConcurrentStackTrace) {
@@ -258,30 +337,147 @@ TEST_F(DebugUtilTest, TestConcurrentStackTrace) {
     thread.join();
   }
 }
-#endif
+
+TEST_F(DebugUtilTest, TestStackTraceSignalDuringAllocation) {
+  constexpr size_t kNumThreads = 10;
+  TestThreadHolder thread_holder;
+  // Each thread has a queue from which it consumes entries. Each thread will add entries to
+  // a random thread's queue.
+
+  struct Entry : public MPSCQueueEntry<Entry> {
+    char* bytes = nullptr;
+
+    explicit Entry(char* bytes_) : bytes(bytes_) {}
+    ~Entry() {
+      if (bytes) {
+        free(bytes);
+        bytes = nullptr;
+      }
+    }
+  };
+
+  std::vector<std::unique_ptr<MPSCQueue<Entry>>> queues;
+  for (size_t i = 0; i < kNumThreads; ++i) {
+    queues.push_back(std::make_unique<MPSCQueue<Entry>>());
+  }
+
+  std::mutex thread_ids_mutex;
+  std::vector<ThreadIdForStack> thread_ids;
+
+  CountDownLatch start_latch(kNumThreads);
+
+  for (size_t i = 0; i < kNumThreads; ++i) {
+    thread_holder.AddThreadFunctor([
+        &thread_ids_mutex,
+        &start_latch,
+        &thread_ids,
+        &queues,
+        thread_index = i,
+        &stop = thread_holder.stop_flag()
+      ]() {
+      {
+        std::lock_guard lock(thread_ids_mutex);
+        thread_ids.push_back(Thread::CurrentThreadIdForStack());
+      }
+      start_latch.CountDown();
+      while (!stop.load(std::memory_order_acquire)) {
+        if (RandomUniformBool()) {
+          // Allocate between 1 and 16 KB, with some random jitter.
+          size_t allocation_size =
+              (1L << RandomUniformInt(0, 10)) * RandomUniformInt(1, 16) + RandomUniformInt(1, 128);
+          char* bytes = pointer_cast<char*>(malloc(allocation_size));
+          size_t target_thread = RandomUniformInt<size_t>(0, kNumThreads - 1);
+          Entry* entry = new Entry(bytes);
+          queues[target_thread]->Push(entry);
+        } else {
+          Entry* entry = queues[thread_index]->Pop();
+          delete entry;
+        }
+      }
+    });
+  }
+  // Wait until all threads start running.
+  start_latch.Wait();
+  auto deadline = MonoTime::Now() + 10s;
+
+  // Keep dumping thread stacks.
+  while (MonoTime::Now() < deadline) {
+    for (size_t i = 0; i < 100; ++i) {
+      auto stacks = ThreadStacks(thread_ids);
+      int num_ok = 0;
+      int num_errors = 0;
+      int num_empty_stacks = 0;
+      std::set<std::string> error_statuses;
+      for (const auto& stack : stacks) {
+        if (stack.ok()) {
+          if (*stack) {
+            num_ok++;
+          } else {
+            num_empty_stacks++;
+          }
+        } else {
+          error_statuses.insert(stack.status().ToString());
+          num_errors++;
+        }
+      }
+      if (num_errors || num_empty_stacks) {
+        LOG(WARNING) << "OK stacks: " << num_ok << ", error stacks: " << num_errors
+                     << ", empty stacks: " << num_empty_stacks
+                     << ", errors statuses: " << ToString(error_statuses);
+      }
+    }
+  }
+  thread_holder.Stop();
+  thread_holder.JoinAll();
+
+  for (size_t i = 0; i < kNumThreads; ++i) {
+    auto& queue = queues[i];
+    while (auto* entry = queue->Pop()) {
+      delete entry;
+    }
+  }
+}
 
 TEST_F(DebugUtilTest, LongOperationTracker) {
-  struct TestLogSink : public google::LogSink {
+  class TestLogSink : public google::LogSink {
+   public:
     void send(google::LogSeverity severity, const char* full_filename,
               const char* base_filename, int line,
               const struct ::tm* tm_time,
               const char* message, size_t message_len) override {
-      log_messages.emplace_back(message, message_len);
+      std::lock_guard lock(mutex_);
+      log_messages_.emplace_back(message, message_len);
     }
 
-    std::vector<std::string> log_messages;
+    size_t MessagesSize() {
+      std::lock_guard lock(mutex_);
+      return log_messages_.size();
+    }
+
+    std::string MessageAt(size_t idx) {
+      std::lock_guard lock(mutex_);
+      return log_messages_[idx];
+    }
+
+   private:
+    std::mutex mutex_;
+    std::vector<std::string> log_messages_;
   };
 
-  const auto kTimeMultiplier = RegularBuildVsSanitizers(1, 10);
+#ifndef NDEBUG
+  const auto kTimeMultiplier = RegularBuildVsSanitizers(3, 10);
+#else
+  const auto kTimeMultiplier = 1;
+#endif
 
   const auto kShortDuration = 100ms * kTimeMultiplier;
-  const auto kMidDuration = 300ms * kTimeMultiplier;
-  const auto kLongDuration = 500ms * kTimeMultiplier;
+  const auto kMidDuration = 400ms * kTimeMultiplier;
+  const auto kLongDuration = 1000ms * kTimeMultiplier;
   TestLogSink log_sink;
   google::AddLogSink(&log_sink);
-  BOOST_SCOPE_EXIT(&log_sink) {
+  auto se = ScopeExit([&log_sink] {
     google::RemoveLogSink(&log_sink);
-  } BOOST_SCOPE_EXIT_END;
+  });
 
   {
     LongOperationTracker tracker("Op1", kLongDuration);
@@ -299,9 +495,105 @@ TEST_F(DebugUtilTest, LongOperationTracker) {
 
   std::this_thread::sleep_for(kLongDuration);
 
-  ASSERT_EQ(log_sink.log_messages.size(), 2);
-  ASSERT_STR_CONTAINS(log_sink.log_messages[0], "Op2");
-  ASSERT_STR_CONTAINS(log_sink.log_messages[1], "Op4");
+  if (IsSanitizer()) {
+    ASSERT_EQ(log_sink.MessagesSize(), 0);
+  } else {
+    ASSERT_EQ(log_sink.MessagesSize(), 4);
+    ASSERT_STR_CONTAINS(log_sink.MessageAt(0), "Op2");
+    ASSERT_STR_CONTAINS(log_sink.MessageAt(1), "Op2");
+    ASSERT_STR_CONTAINS(log_sink.MessageAt(2), "Op4");
+    ASSERT_STR_CONTAINS(log_sink.MessageAt(3), "Op4");
+  }
+}
+
+TEST_F(DebugUtilTest, YB_DISABLE_TEST_ON_MACOS(TestGetStackTraceWhileCreatingThreads)) {
+  // This test makes sure we can collect stack traces while threads are being created.
+  // We create 10 threads that create threads in a loop. Then we create 100 threads that collect
+  // stack traces from the other 10 threads.
+  std::atomic<bool> stop = false;
+  TestThreadHolder thread_holder;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_thread_stack_collection_wait) = true;
+
+  // Run this once so that all first time initialization routines are executed.
+  DumpThreadStack(Thread::CurrentThreadIdForStack());
+
+  std::set<ThreadIdForStack> thread_ids_to_dump;
+  auto dump_threads_fn = [&thread_ids_to_dump, &stop]() {
+    int64_t count = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      for (auto& tid : thread_ids_to_dump) {
+        DumpThreadStack(tid);
+        count++;
+      }
+    }
+    LOG(INFO) << "Dumped " << count << " threads";
+  };
+
+  auto create_threads_fn = [&stop]() {
+    int64_t count = 0, failed = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      scoped_refptr<Thread> thread;
+      auto s = Thread::Create(
+          "test", "test thread", []() {}, &thread);
+      if (!s.ok()) {
+        failed++;
+        continue;
+      }
+      thread->Join();
+      count++;
+    }
+    LOG(INFO) << "Successfully created " << count << " threads, Failed to create " << failed
+              << " threads";
+  };
+
+  std::vector<scoped_refptr<Thread>> thread_creator_threads;
+  for (int i = 0; i < 10; i++) {
+    scoped_refptr<Thread> t;
+    ASSERT_OK(Thread::Create("test", "test thread", create_threads_fn, &t));
+    thread_ids_to_dump.insert(t->tid_for_stack());
+    thread_creator_threads.push_back(std::move(t));
+  }
+
+  for (int i = 0; i < 100; i++) {
+    thread_holder.AddThreadFunctor(dump_threads_fn);
+  }
+
+  SleepFor(1min);
+
+  stop.store(true, std::memory_order_release);
+
+  for (auto& creator_thread : thread_creator_threads) {
+    creator_thread->Join();
+  }
+  thread_holder.Stop();
+}
+
+TEST_F(DebugUtilTest, TestTrackedStackTraces) {
+  constexpr size_t kNumIterations = 100;
+  constexpr size_t kWeight = 10;
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_track_stack_traces) = true;
+
+  for (size_t i = 0; i < kNumIterations; ++i) {
+    TrackStackTrace(StackTraceTrackingGroup::kDebugging, kWeight);
+  }
+
+  DumpTrackedStackTracesToLog(StackTraceTrackingGroup::kDebugging);
+
+  auto traces = GetTrackedStackTraces();
+  // There may be I/O traces tracked during test setup, but kDebugging should never be in
+  // checked in code, so we can rely on there only be one kDebugging trace.
+  bool found_debugging_trace = false;
+  for (size_t i = 0; i < traces.size(); ++i) {
+    auto& trace = traces[i];
+    if (trace.group == StackTraceTrackingGroup::kDebugging) {
+      ASSERT_FALSE(found_debugging_trace);
+      found_debugging_trace = true;
+      ASSERT_EQ(trace.count, kNumIterations);
+      ASSERT_EQ(trace.weight, kNumIterations * kWeight);
+    }
+  }
+  ASSERT_TRUE(found_debugging_trace);
 }
 
 } // namespace yb

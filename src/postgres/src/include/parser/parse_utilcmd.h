@@ -32,4 +32,14 @@ extern IndexStmt *generateClonedIndexStmt(RangeVar *heapRel, Oid heapOid,
 						const AttrNumber *attmap, int attmap_length,
 						Oid *constraintOid);
 
+extern CreateStatsStmt *YbGenerateClonedExtStatsStmt(RangeVar *heapRel,
+													 Oid heapRelid,
+													 Oid source_statsid);
+extern void YBTransformPartitionSplitValue(ParseState *pstate,
+										   List *split_point,
+										   Form_pg_attribute *attrs,
+										   int attr_count,
+										   PartitionRangeDatum **datums,
+										   int *datum_count);
+
 #endif							/* PARSE_UTILCMD_H */

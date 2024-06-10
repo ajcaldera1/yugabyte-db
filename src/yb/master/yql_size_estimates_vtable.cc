@@ -11,35 +11,40 @@
 // under the License.
 //
 
-#include "yb/master/catalog_manager.h"
 #include "yb/master/yql_size_estimates_vtable.h"
+
+#include "yb/dockv/partition.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
+#include "yb/master/master_client.pb.h"
+
+#include "yb/util/status_log.h"
+#include "yb/util/yb_partition.h"
+
+using std::string;
 
 namespace yb {
 namespace master {
 
-YQLSizeEstimatesVTable::YQLSizeEstimatesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSizeEstimatesTableName, master, CreateSchema()) {
+YQLSizeEstimatesVTable::YQLSizeEstimatesVTable(const TableName& table_name,
+                                               const NamespaceName& namespace_name,
+                                               Master * const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLSizeEstimatesVTable::RetrieveData(const QLReadRequestPB& request,
-                                      std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
-  std::vector<scoped_refptr<TableInfo> > tables;
-  CatalogManager* catalog_manager = master_->catalog_manager();
-  catalog_manager->GetAllTables(&tables, true);
+Result<VTableDataPtr> YQLSizeEstimatesVTable::RetrieveData(const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
+  auto* catalog_manager = &this->catalog_manager();
 
-  InetAddress remote_endpoint;
-  RETURN_NOT_OK(remote_endpoint.FromString(request.remote_endpoint().host()));
-
-  for (scoped_refptr<TableInfo> table : tables) {
+  auto tables = catalog_manager->GetTables(GetTablesMode::kVisibleToClient);
+  for (const auto& table : tables) {
     Schema schema;
     RETURN_NOT_OK(table->GetSchema(&schema));
 
     // Get namespace for table.
-    NamespaceIdentifierPB nsId;
-    nsId.set_id(table->namespace_id());
-    scoped_refptr<NamespaceInfo> nsInfo;
-    RETURN_NOT_OK(master_->catalog_manager()->FindNamespace(nsId, &nsInfo));
+    auto ns_info = VERIFY_RESULT(catalog_manager->FindNamespaceById(table->namespace_id()));
 
     // Hide non-YQL tables.
     if (table->GetTableType() != TableType::YQL_TABLE_TYPE) {
@@ -47,28 +52,27 @@ Status YQLSizeEstimatesVTable::RetrieveData(const QLReadRequestPB& request,
     }
 
     // Get tablets for table.
-    std::vector<scoped_refptr<TabletInfo> > tablets;
-    table->GetAllTablets(&tablets);
+    auto tablets = table->GetTablets();
     for (const scoped_refptr<TabletInfo>& tablet : tablets) {
-      TabletLocationsPB tabletLocationsPB;
-      Status s = catalog_manager->GetTabletLocations(tablet->id(), &tabletLocationsPB);
+      TabletLocationsPB tablet_locations_pb;
+      Status s = catalog_manager->GetTabletLocations(tablet->id(), &tablet_locations_pb);
       // Skip not-found tablets: they might not be running yet or have been deleted.
       if (!s.ok()) {
         continue;
       }
 
-      QLRow &row = (*vtable)->Extend();
-      RETURN_NOT_OK(SetColumnValue(kKeyspaceName, nsInfo->name(), &row));
+      auto &row = vtable->Extend();
+      RETURN_NOT_OK(SetColumnValue(kKeyspaceName, ns_info->name(), &row));
       RETURN_NOT_OK(SetColumnValue(kTableName, table->name(), &row));
 
-      const PartitionPB &partition = tabletLocationsPB.partition();
+      const PartitionPB &partition = tablet_locations_pb.partition();
       uint16_t yb_start_hash = !partition.partition_key_start().empty() ?
-          PartitionSchema::DecodeMultiColumnHashValue(partition.partition_key_start()) : 0;
+          dockv::PartitionSchema::DecodeMultiColumnHashValue(partition.partition_key_start()) : 0;
       string cql_start_hash = std::to_string(YBPartition::YBToCqlHashCode(yb_start_hash));
       RETURN_NOT_OK(SetColumnValue(kRangeStart, cql_start_hash, &row));
 
       uint16_t yb_end_hash = !partition.partition_key_end().empty() ?
-          PartitionSchema::DecodeMultiColumnHashValue(partition.partition_key_end()) : 0;
+          dockv::PartitionSchema::DecodeMultiColumnHashValue(partition.partition_key_end()) : 0;
       string cql_end_hash = std::to_string(YBPartition::YBToCqlHashCode(yb_end_hash));
       RETURN_NOT_OK(SetColumnValue(kRangeEnd, cql_end_hash, &row));
 
@@ -83,7 +87,7 @@ Status YQLSizeEstimatesVTable::RetrieveData(const QLReadRequestPB& request,
     }
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema YQLSizeEstimatesVTable::CreateSchema() const {

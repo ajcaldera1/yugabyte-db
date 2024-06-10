@@ -24,6 +24,7 @@
 #include "utils/resowner.h"
 #include "utils/snapshot.h"
 
+#include "utils/yb_inheritscache.h"
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 /* support for buffer refcount management */
@@ -96,13 +97,10 @@ extern void ResourceOwnerRememberJIT(ResourceOwner owner,
 extern void ResourceOwnerForgetJIT(ResourceOwner owner,
 					   Datum handle);
 
-/* support for YugaByte statement refcount management */
-extern void ResourceOwnerEnlargeYugaByteStmts(ResourceOwner owner);
-extern void ResourceOwnerRememberYugaByteStmt(
-	ResourceOwner owner,
-	YBCPgStatement yb_stmt);
-extern void ResourceOwnerForgetYugaByteStmt(
-	ResourceOwner owner,
-	YBCPgStatement yb_stmt);
+extern void ResourceOwnerEnlargeYbPgInheritsRefs(ResourceOwner owner);
+extern void ResourceOwnerRememberYbPgInheritsRef(ResourceOwner owner,
+		YbPgInheritsCacheEntry entry);
+extern void ResourceOwnerForgetYbPgInheritsRef(ResourceOwner owner,
+        YbPgInheritsCacheEntry entry);
 
 #endif							/* RESOWNER_PRIVATE_H */

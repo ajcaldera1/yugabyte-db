@@ -34,12 +34,9 @@
 
 #include <cmath>
 #include <cstdlib>
-#include <cstring>
 #include <random>
 
-#include "yb/util/env.h"
 #include "yb/util/random.h"
-#include <boost/thread/tss.hpp>
 
 namespace yb {
 
@@ -71,16 +68,29 @@ uint32_t GetRandomSeed32() {
 
 std::vector<uint8_t> RandomBytes(size_t len, std::mt19937_64* rng) {
   std::vector<uint8_t> data(len);
-  std::generate(data.begin(), data.end(), [=] { return RandomUniformInt(0, UCHAR_MAX, rng); });
+  std::generate(data.begin(), data.end(), [=] {
+    return RandomUniformInt<uint8_t>(0, std::numeric_limits<uint8_t>::max(), rng);
+  });
   return data;
 }
 
-std::string RandomHumanReadableString(int len, Random* rnd) {
+std::string RandomString(size_t len, std::mt19937_64* rng) {
+  std::string str;
+  str.reserve(len);
+  while (len > 0) {
+    str += static_cast<char>(
+        RandomUniformInt<uint8_t>(0, std::numeric_limits<uint8_t>::max(), rng));
+    len--;
+  }
+  return str;
+}
+
+std::string RandomHumanReadableString(size_t len, Random* rnd) {
   // TODO: https://yugabyte.atlassian.net/browse/ENG-1508: Avoid code duplication in yb::Random and
   // rocksdb::Random. Currently this does not allow to reuse the same function in both code bases.
   std::string ret;
   ret.resize(len);
-  for (int i = 0; i < len; ++i) {
+  for (size_t i = 0; i < len; ++i) {
     ret[i] = static_cast<char>('a' + rnd->Uniform(26));
   }
   return ret;
@@ -95,17 +105,32 @@ std::string RandomHumanReadableString(size_t len, std::mt19937_64* rng) {
 }
 
 namespace {
+
 thread_local std::unique_ptr<std::mt19937_64> thread_local_random_ptr;
-}
+thread_local bool random_initializing = false;
+
+} // namespace
 
 std::mt19937_64& ThreadLocalRandom() {
   auto* result = thread_local_random_ptr.get();
   if (result) {
     return *result;
   }
+
+  random_initializing = true;
   thread_local_random_ptr.reset(result = new std::mt19937_64);
+  random_initializing = false;
+
   Seed(result);
   return *result;
+}
+
+bool RandomUniformBool(std::mt19937_64* rng) {
+  return RandomUniformInt(0, 1, rng) != 0;
+}
+
+bool IsRandomInitializingInThisThread() {
+  return random_initializing;
 }
 
 } // namespace yb

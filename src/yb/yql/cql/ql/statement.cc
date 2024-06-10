@@ -15,15 +15,17 @@
 
 #include "yb/yql/cql/ql/statement.h"
 
+#include "yb/util/result.h"
+
+#include "yb/yql/cql/ql/ptree/list_node.h"
+#include "yb/yql/cql/ql/ptree/pt_dml.h"
 #include "yb/yql/cql/ql/ql_processor.h"
+#include "yb/yql/cql/ql/util/errcodes.h"
 
 namespace yb {
 namespace ql {
 
-using std::list;
-using std::shared_ptr;
 using std::string;
-using std::unique_ptr;
 
 Statement::Statement(const string& keyspace, const string& text)
     : keyspace_(keyspace), text_(text) {
@@ -36,7 +38,7 @@ Status Statement::Prepare(QLProcessor *processor, const MemTrackerPtr& mem_track
                           const bool internal, PreparedResult::UniPtr *result) {
   // Prepare the statement (parse and semantically analysis). Do so within an exclusive lock.
   if (!prepared_.load(std::memory_order_acquire)) {
-    std::lock_guard<std::mutex> guard(parse_tree_mutex_);
+    std::lock_guard guard(parse_tree_mutex_);
 
     if (parse_tree_ == nullptr) {
       ParseTree::UniPtr parse_tree;
@@ -85,9 +87,8 @@ Result<const ParseTree&> Statement::GetParseTree() const {
 
 Status Statement::ExecuteAsync(QLProcessor* processor, const StatementParameters& params,
                                StatementExecutedCallback cb) const {
-  const Result<const ParseTree&> parse_tree = GetParseTree();
-  RETURN_NOT_OK(parse_tree);
-  processor->ExecuteAsync(*parse_tree, params, std::move(cb));
+  const ParseTree& parse_tree = VERIFY_RESULT(GetParseTree());
+  processor->ExecuteAsync(parse_tree, params, std::move(cb));
   return Status::OK();
 }
 

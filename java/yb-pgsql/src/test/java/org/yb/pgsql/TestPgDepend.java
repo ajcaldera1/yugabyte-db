@@ -17,7 +17,7 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.yb.util.YBTestRunnerNonTsanOnly;
+import org.yb.YBTestRunner;
 
 import java.sql.ResultSet;
 import java.sql.SQLException;
@@ -28,14 +28,21 @@ import java.util.List;
 
 import static org.yb.AssertionWrappers.*;
 
-@RunWith(value=YBTestRunnerNonTsanOnly.class)
+@RunWith(value=YBTestRunner.class)
 public class TestPgDepend extends BasePgSQLTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestPgDepend.class);
 
+  private static final int PG_ATTRDEF_OID = 2604;
+  private static final int PG_CLASS_OID = 1259;
+  private static final int PG_AUTH_ID_OID = 1260;
+  private static final int PG_NAMESPACE_OID = 2615;
+  private static final int PUBLIC_NAMESPACE_OID = 2200;
+
   @Test
   public void testPgDependInsertion() throws SQLException {
-    createSimpleTable("test");
     try (Statement statement = connection.createStatement()) {
+      createSimpleTable(statement, "test");
+
       // Create an Index for the table.
       statement.execute("CREATE UNIQUE INDEX test_h on test(h)");
 
@@ -58,8 +65,9 @@ public class TestPgDepend extends BasePgSQLTest {
 
   @Test
   public void testTableWithIndexDeletion() throws SQLException {
-    createSimpleTable("test");
     try (Statement statement = connection.createStatement()) {
+      createSimpleTable(statement, "test");
+
       // Create an Index for the table.
       statement.execute("CREATE INDEX test_h on test(h)");
 
@@ -95,7 +103,7 @@ public class TestPgDepend extends BasePgSQLTest {
       assertFalse(rs.next());
 
       // Check that we can create a new index with the same name.
-      createSimpleTable("test");
+      createSimpleTable(statement, "test");
       statement.execute("CREATE INDEX test_h on test(h)");
     }
   }
@@ -111,11 +119,9 @@ public class TestPgDepend extends BasePgSQLTest {
       rs.next();
       int oidTable = rs.getInt("oid");
 
-      int pgSequenceOid = 1259;
-
       // Get the parent sequence's oid.
       rs = statement.executeQuery("SELECT objid FROM pg_depend "
-                                  + "WHERE classid=" + pgSequenceOid + "AND refobjid=" + oidTable);
+                                  + "WHERE classid=" + PG_CLASS_OID + "AND refobjid=" + oidTable);
 
       rs.next();
       int oidSequence = rs.getInt("objid");
@@ -139,8 +145,9 @@ public class TestPgDepend extends BasePgSQLTest {
 
   @Test
   public void testTableWithViewDeletionWithCascade() throws SQLException {
-    createSimpleTable("test");
     try (Statement statement = connection.createStatement()) {
+      createSimpleTable(statement, "test");
+
       // Create an index for the table.
       statement.execute("CREATE INDEX test_h on test(h)");
 
@@ -163,7 +170,9 @@ public class TestPgDepend extends BasePgSQLTest {
       int oidView = rs.getInt("oid");
 
       // Test dropping the table (without CASCADE). -- expecting an error
-      runInvalidQuery(statement, "DROP TABLE test");
+      runInvalidQuery(statement,
+          "DROP TABLE test",
+          "cannot drop table test because other objects depend on it");
 
       // Test dropping the table (with CASCADE).
       statement.execute("DROP TABLE test CASCADE");
@@ -183,15 +192,15 @@ public class TestPgDepend extends BasePgSQLTest {
       assertFalse(rs.next());
 
       // Check that we can create a new view with the same name.
-      createSimpleTable("test");
+      createSimpleTable(statement, "test");
       statement.execute("CREATE VIEW test_view AS SELECT * FROM test");
     }
   }
 
   @Test
   public void testViewDeletionWithCascade() throws SQLException {
-    createSimpleTable("test");
     try (Statement statement = connection.createStatement()) {
+      createSimpleTable(statement, "test");
 
       // Create a view on the table.
       statement.execute("CREATE VIEW test_view AS SELECT * FROM test");
@@ -210,7 +219,9 @@ public class TestPgDepend extends BasePgSQLTest {
       int oidView2 = rs.getInt("oid");
 
       // Test dropping test_view (without CASCADE). -- expecting an error
-      runInvalidQuery(statement, "DROP VIEW test_view");
+      runInvalidQuery(statement,
+          "DROP VIEW test_view",
+          "cannot drop view test_view because other objects depend on it");
 
       // Test dropping test_view (with CASCADE).
       statement.execute("DROP VIEW test_view CASCADE");
@@ -246,23 +257,71 @@ public class TestPgDepend extends BasePgSQLTest {
       rs.next();
       int oidTable = rs.getInt("oid");
 
-      int pgTypeOid = 1247;
-
-      // Get the OID of the table column type
-      rs = statement.executeQuery("SELECT objid FROM pg_depend "
-                                  + " WHERE classid=" + pgTypeOid + " AND refobjid=" + oidSequence);
+      // Get the OID of the column default's entry in pg_attrdef.
+      rs = statement.executeQuery("SELECT objid FROM pg_depend WHERE " +
+          "classid=" + PG_ATTRDEF_OID + " AND refobjid=" + oidSequence);
       rs.next();
       int oidColType = rs.getInt("objid");
 
       // Test dropping the sequence (without CASCADE). -- expecting an error
-      runInvalidQuery(statement, "DROP SEQUENCE seq_test");
+      runInvalidQuery(statement, "DROP SEQUENCE seq_test", "depends on sequence seq_test");
 
       // Test dropping the sequence (with CASCADE).
       statement.execute("DROP SEQUENCE seq_test CASCADE");
 
-      // Check that we have deleted the table column to sequence type dependency in pg_depend.
+      // Check that we have deleted the column default to sequence type dependency in pg_depend.
       rs = statement.executeQuery("SELECT * FROM pg_depend "
                                   + "WHERE objid=" + oidColType + " AND refobjid=" + oidSequence);
+      assertFalse(rs.next());
+    }
+  }
+
+  @Test
+  public void testPinnedSystemTables() throws SQLException {
+    try (Statement statement = connection.createStatement()) {
+
+      // Check that we cannot drop system tables.
+      runInvalidQuery(statement, "DROP TABLE pg_class", "permission denied");
+      runInvalidQuery(statement, "DROP TABLE pg_database", "permission denied");
+
+      // Check that there are pinned entries in pg_depend.
+      ResultSet rs = statement.executeQuery("SELECT count(*) AS num_pinned FROM pg_depend " +
+                                                "WHERE deptype = 'p'");
+      assertTrue(rs.next());
+      assertTrue(rs.getInt("num_pinned") > 50);
+
+
+      // Check that there are pinned entries in pg_shdepend.
+      rs = statement.executeQuery("SELECT count(*) AS num_pinned FROM pg_shdepend " +
+                                                "WHERE deptype = 'p'");
+      assertTrue(rs.next());
+      assertTrue(rs.getInt("num_pinned") > 3);
+
+
+      // Create a simple table and get its oid.
+      statement.execute("CREATE TABLE pin_test(a int PRIMARY KEY, b int)");
+      rs = statement.executeQuery("SELECT oid FROM pg_class where relname = 'pin_test'");
+      assertTrue(rs.next());
+      int tableOid = rs.getInt("oid");
+
+      // Check that it does not add superfluous entries in pg_depend.
+      // - The public namespace is not pinned so that is the only expected entry.
+      rs = statement.executeQuery("SELECT * FROM pg_depend where objid = " + tableOid);
+      assertTrue(rs.next());
+      assertEquals(PG_NAMESPACE_OID, rs.getInt("refclassid"));
+      assertEquals(PUBLIC_NAMESPACE_OID, rs.getInt("refobjid"));
+      assertFalse(rs.next());
+
+      // Check that it does not add superfluous entries in pg_shdepend.
+      // - The test user (TEST_PG_USER) is not pinned so that is the only expected entry.
+      rs = statement.executeQuery("SELECT oid FROM pg_authid WHERE " +
+                                      "rolname = '" + TEST_PG_USER + "'");
+      assertTrue(rs.next());
+      int testUserOid = rs.getInt("oid");
+      rs = statement.executeQuery("SELECT * FROM pg_shdepend where objid = " + tableOid);
+      assertTrue(rs.next());
+      assertEquals(PG_AUTH_ID_OID, rs.getInt("refclassid"));
+      assertEquals(testUserOid, rs.getInt("refobjid"));
       assertFalse(rs.next());
     }
   }

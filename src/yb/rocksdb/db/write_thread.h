@@ -18,25 +18,27 @@
 // under the License.
 //
 
-#ifndef YB_ROCKSDB_DB_WRITE_THREAD_H
-#define YB_ROCKSDB_DB_WRITE_THREAD_H
 
 #pragma once
 
 #include <assert.h>
 #include <stdint.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
-#include <vector>
+#include <stack>
+#include <string>
 #include <type_traits>
+#include <vector>
+
 #include "yb/rocksdb/db/write_callback.h"
-#include "yb/rocksdb/types.h"
 #include "yb/rocksdb/status.h"
-#include "yb/rocksdb/write_batch.h"
+#include "yb/rocksdb/types.h"
 #include "yb/rocksdb/util/autovector.h"
 #include "yb/rocksdb/util/instrumented_mutex.h"
+#include "yb/rocksdb/write_batch_base.h"
 
 namespace rocksdb {
 
@@ -297,5 +299,3 @@ class WriteThread {
 };
 
 }  // namespace rocksdb
-
-#endif // YB_ROCKSDB_DB_WRITE_THREAD_H

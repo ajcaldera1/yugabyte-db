@@ -25,18 +25,17 @@
 #endif
 
 #include "yb/rocksdb/db/filename.h"
+
 #include <inttypes.h>
 
-#include <ctype.h>
 #include <stdio.h>
 #include <vector>
-#include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/env.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/logging.h"
-#include "yb/rocksdb/util/stop_watch.h"
-#include "yb/util/string_util.h"
-#include "yb/rocksdb/util/sync_point.h"
+
+#include "yb/util/sync_point.h"
+#include "yb/util/test_kill.h"
 
 namespace rocksdb {
 
@@ -99,6 +98,10 @@ std::string ArchivedLogFileName(const std::string& name, uint64_t number) {
 
 std::string MakeTableFileName(const std::string& path, uint64_t number) {
   return MakeFileName(path, number, kRocksDbTFileExt);
+}
+
+std::string MakeTableDataFilePath(const std::string& path, uint64_t number) {
+  return MakeFileName(path, number, kRocksDbTSBlockFileExt);
 }
 
 std::string Rocks2LevelTableFileName(const std::string& fullname) {
@@ -376,16 +379,16 @@ Status SetCurrentFile(Env* env, const std::string& dbname,
   std::string tmp = TempFileName(dbname, descriptor_number);
   Status s = WriteStringToFile(env, contents.ToString() + "\n", tmp, !disable_data_sync);
   if (s.ok()) {
-    TEST_KILL_RANDOM("SetCurrentFile:0", rocksdb_kill_odds * REDUCE_ODDS2);
+    TEST_KILL_RANDOM("SetCurrentFile:0", test_kill_odds * REDUCE_ODDS2);
     s = env->RenameFile(tmp, CurrentFileName(dbname));
-    TEST_KILL_RANDOM("SetCurrentFile:1", rocksdb_kill_odds * REDUCE_ODDS2);
+    TEST_KILL_RANDOM("SetCurrentFile:1", test_kill_odds * REDUCE_ODDS2);
   }
   if (s.ok()) {
     if (directory_to_fsync != nullptr && !disable_data_sync) {
-      directory_to_fsync->Fsync();
+      RETURN_NOT_OK(directory_to_fsync->Fsync());
     }
   } else {
-    env->DeleteFile(tmp);
+    env->CleanupFile(tmp);
   }
   return s;
 }
@@ -400,18 +403,17 @@ Status SetIdentityFile(Env* env, const std::string& dbname) {
     s = env->RenameFile(tmp, IdentityFileName(dbname));
   }
   if (!s.ok()) {
-    env->DeleteFile(tmp);
+    env->CleanupFile(tmp);
   }
   return s;
 }
 
 Status SyncManifest(Env* env, const DBOptions* db_options,
                     WritableFileWriter* file) {
-  TEST_KILL_RANDOM("SyncManifest:0", rocksdb_kill_odds * REDUCE_ODDS2);
+  TEST_KILL_RANDOM("SyncManifest:0", test_kill_odds * REDUCE_ODDS2);
   if (db_options->disableDataSync) {
     return Status::OK();
   } else {
-    StopWatch sw(env, db_options->statistics.get(), MANIFEST_FILE_SYNC_MICROS);
     return file->Sync(db_options->use_fsync);
   }
 }

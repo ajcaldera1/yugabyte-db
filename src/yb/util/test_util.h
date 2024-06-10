@@ -30,22 +30,21 @@
 // under the License.
 //
 // Base test class, with various utility functions.
-#ifndef YB_UTIL_TEST_UTIL_H
-#define YB_UTIL_TEST_UTIL_H
+#pragma once
+
+#include <dirent.h>
 
 #include <atomic>
 #include <string>
 
 #include <gtest/gtest.h>
 
-#include "yb/gutil/gscoped_ptr.h"
-
+#include "yb/util/enums.h"
 #include "yb/util/env.h"
 #include "yb/util/monotime.h"
-#include "yb/util/result.h"
 #include "yb/util/port_picker.h"
-#include "yb/util/test_macros.h"
-#include "yb/util/tsan_util.h"
+#include "yb/util/logging.h"
+#include "yb/util/test_macros.h" // For convenience
 
 #define ASSERT_EVENTUALLY(expr) do { \
   AssertEventually(expr); \
@@ -54,9 +53,17 @@
 
 namespace yb {
 
+class CurlGlobalInitializer;
+
+namespace rpc {
+
+class Messenger;
+
+} // namespace rpc
+
 // Our test string literals contain "\x00" that is treated as a C-string null-terminator.
 // So we need to call the std::string constructor that takes the length argument.
-#define BINARY_STRING(s) string((s), sizeof(s) - 1)
+#define BINARY_STRING(s) std::string((s), sizeof(s) - 1)
 
 class YBTest : public ::testing::Test {
  public:
@@ -77,12 +84,13 @@ class YBTest : public ::testing::Test {
 
   uint16_t AllocateFreePort() { return port_picker_.AllocateFreePort(); }
 
-  gscoped_ptr<Env> env_;
+  std::unique_ptr<Env> env_;
   google::FlagSaver flag_saver_;  // Reset flags on every test.
   PortPicker port_picker_;
 
  private:
   std::string test_dir_;
+  std::unique_ptr<CurlGlobalInitializer> global_curl_;
 };
 
 // Returns true if slow tests are runtime-enabled.
@@ -146,15 +154,15 @@ void LogVectorDiff(const std::vector<T>& expected, const std::vector<T>& actual)
       smaller_vector = &expected;
     }
 
-    for (int i = smaller_vector->size();
-         i < min(smaller_vector->size() + 16, bigger_vector->size());
+    for (auto i = smaller_vector->size();
+         i < std::min(smaller_vector->size() + 16, bigger_vector->size());
          ++i) {
       LOG(WARNING) << bigger_vector_desc << "[" << i << "]: " << (*bigger_vector)[i];
     }
   }
   int num_differences_logged = 0;
   size_t num_differences_left = 0;
-  size_t min_size = min(expected.size(), actual.size());
+  size_t min_size = std::min(expected.size(), actual.size());
   for (size_t i = 0; i < min_size; ++i) {
     if (expected[i] != actual[i]) {
       if (num_differences_logged < 16) {
@@ -176,44 +184,59 @@ void LogVectorDiff(const std::vector<T>& expected, const std::vector<T>& actual)
   }
 }
 
-namespace test_util {
-
-constexpr int kDefaultInitialWaitMs = 1;
-constexpr double kDefaultWaitDelayMultiplier = 1.1;
-constexpr int kDefaultMaxWaitDelayMs = 2000;
-
-} // namespace test_util
-
-// Waits for the given condition to be true or until the provided deadline happens.
-CHECKED_STATUS Wait(
-    std::function<Result<bool>()> condition,
-    MonoTime deadline,
-    const std::string& description,
-    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
-    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
-    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
-
-// Waits for the given condition to be true or until the provided timeout has expired.
-CHECKED_STATUS WaitFor(
-    std::function<Result<bool>()> condition,
-    MonoDelta timeout,
-    const std::string& description,
-    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
-    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
-    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
-
-void AssertLoggedWaitFor(
-    std::function<Result<bool>()> condition,
-    MonoDelta timeout,
-    const string& description,
-    MonoDelta initial_delay = MonoDelta::FromMilliseconds(test_util::kDefaultInitialWaitMs),
-    double delay_multiplier = test_util::kDefaultWaitDelayMultiplier,
-    MonoDelta max_delay = MonoDelta::FromMilliseconds(test_util::kDefaultMaxWaitDelayMs));
-
 // Return the path of a yb-tool.
-std::string GetToolPath(const std::string& tool_name);
+std::string GetToolPath(const std::string& rel_path, const std::string& tool_name);
 
-int CalcNumTablets(int num_tablet_servers);
+inline std::string GetToolPath(const std::string& tool_name) {
+  return GetToolPath("../bin", tool_name);
+}
+
+inline std::string GetPgToolPath(const std::string& tool_name) {
+  return GetToolPath("../postgres/bin", tool_name);
+}
+
+// For now this assumes that YB Controller binaries are present in build/ybc.
+inline std::string GetYbcToolPath(const std::string& tool_name) {
+  return GetToolPath("../../ybc", tool_name);
+}
+
+std::string GetCertsDir();
+
+// Read YB_TEST_YB_CONTROLLER from env.
+// If true, spawn YBC servers for backup operations.
+bool UseYbController();
+
+/*
+Returns true if YB_DISABLE_MINICLUSTER_TESTS is set true.
+We disable the Minicluster backup tests when we use YB Controller for backups.
+This is because the varz endpoint in MiniTabletServer is not functional currently which causes the
+backups to fail.
+TODO: Re-enable the tests once GH#21689 is done.
+*/
+bool DisableMiniClusterBackupTests();
+
+void AddExtraFlagsFromEnvVar(const char* env_var_name, std::vector<std::string>* args_dest);
+
+int CalcNumTablets(size_t num_tablet_servers);
+
+template<uint32_t limit>
+struct LengthLimitedStringPrinter {
+  explicit LengthLimitedStringPrinter(const std::string& str_)
+      : str(str_) {
+  }
+  const std::string& str;
+};
+
+using Max500CharsPrinter = LengthLimitedStringPrinter<500>;
+
+template<uint32_t limit>
+std::ostream& operator<<(std::ostream& os, const LengthLimitedStringPrinter<limit>& printer) {
+  const auto& s = printer.str;
+  if (s.length() <= limit) {
+    return os << s;
+  }
+  return os.write(s.c_str(), limit) << "... (" << (s.length() - limit) << " more characters)";
+}
 
 class StopOnFailure {
  public:
@@ -236,8 +259,14 @@ class StopOnFailure {
   std::atomic<bool>& stop_;
 };
 
-// Waits specified duration or when stop switches to true.
-void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop);
+YB_DEFINE_ENUM(CorruptionType, (kZero)(kXor55));
+
+// Corrupt bytes_to_corrupt bytes at specified offset. If offset is negative, treats it as
+// an offset relative to the end of file. Also fixes specified region to not exceed the file before
+// corrupting data.
+Status CorruptFile(
+    const std::string& file_path, int64_t offset, size_t bytes_to_corrupt,
+    CorruptionType corruption_type);
 
 } // namespace yb
 
@@ -245,5 +274,3 @@ void WaitStopped(const CoarseDuration& duration, std::atomic<bool>* stop);
 #define TEST_F_EX(test_case_name, test_name, parent_class) \
   GTEST_TEST_(test_case_name, test_name, parent_class, \
               ::testing::internal::GetTypeId<test_case_name>())
-
-#endif  // YB_UTIL_TEST_UTIL_H

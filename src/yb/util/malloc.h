@@ -29,10 +29,9 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_MALLOC_H
-#define YB_UTIL_MALLOC_H
+#pragma once
 
-#include <cstddef>
+#include <cstdlib>
 
 namespace yb {
 
@@ -42,6 +41,14 @@ namespace yb {
 // on const pointers (i.e. "this" in a const method).
 size_t malloc_usable_size(const void* obj);
 
-} // namespace yb
+// Wrapper for malloc() which checks the return pointer.
+// If the pointer is nullptr, assert with the requested size.
+char* malloc_with_check(size_t size);
 
-#endif // YB_UTIL_MALLOC_H
+struct FreeDeleter {
+  inline void operator()(void* ptr) const {
+    free(ptr);
+  }
+};
+
+} // namespace yb

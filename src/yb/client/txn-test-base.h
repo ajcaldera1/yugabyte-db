@@ -13,19 +13,36 @@
 //
 //
 
-#ifndef YB_CLIENT_TXN_TEST_BASE_H
-#define YB_CLIENT_TXN_TEST_BASE_H
+#pragma once
+
+#include <stdint.h>
+
+#include <functional>
+#include <set>
+#include <string>
+#include <type_traits>
+#include <unordered_set>
+#include <utility>
+
+#include <boost/range/iterator_range.hpp>
 
 #include "yb/client/ql-dml-test-base.h"
+#include "yb/client/transaction_manager.h"
+
+#include "yb/common/entity_ids.h"
 
 #include "yb/server/hybrid_clock.h"
 #include "yb/server/skewed_clock.h"
+
+#include "yb/util/enums.h"
+#include "yb/util/math_util.h"
 
 namespace yb {
 namespace client {
 
 constexpr size_t kNumRows = 5;
 extern const MonoDelta kTransactionApplyTime;
+extern const MonoDelta kIntentsCleanupTime;
 
 // We use different sign to distinguish inserted and updated values for testing.
 int32_t GetMultiplier(const WriteOpType op_type);
@@ -48,57 +65,90 @@ void DisableTransactionTimeout();
 
 YB_STRONGLY_TYPED_BOOL(SetReadTime);
 
-class TransactionTestBase : public KeyValueTableTest {
+
+template <class MiniClusterType>
+class TransactionTestBase : public KeyValueTableTest<MiniClusterType> {
  protected:
   void SetUp() override;
 
+  void CreateTable();
+  Status CreateTable(const Schema& schema);
+
   virtual uint64_t log_segment_size_bytes() const;
 
-  void WriteRows(
+  Status WriteRows(
       const YBSessionPtr& session, size_t transaction = 0,
-      const WriteOpType op_type = WriteOpType::INSERT);
+      const WriteOpType op_type = WriteOpType::INSERT,
+      Flush flush = Flush::kTrue);
 
   void VerifyRow(int line, const YBSessionPtr& session, int32_t key, int32_t value,
-                 const std::string& column = kValueColumn);
+                 const std::string& column = KeyValueTableTest<MiniClusterType>::kValueColumn);
 
   void WriteData(const WriteOpType op_type = WriteOpType::INSERT, size_t transaction = 0);
 
   void WriteDataWithRepetition();
 
+  // Create a new transaction using transaction_manager_.
   YBTransactionPtr CreateTransaction(SetReadTime set_read_time = SetReadTime::kFalse);
 
+  // Create a new transaction using transaction_manager2_.
   YBTransactionPtr CreateTransaction2(SetReadTime set_read_time = SetReadTime::kFalse);
 
   void VerifyRows(const YBSessionPtr& session,
                   size_t transaction = 0,
                   const WriteOpType op_type = WriteOpType::INSERT,
-                  const std::string& column = kValueColumn);
+                  const std::string& column = KeyValueTableTest<MiniClusterType>::kValueColumn);
 
-  YBqlReadOpPtr ReadRow(const YBSessionPtr& session,
-                        int32_t key,
-                        const std::string& column = kValueColumn);
+  YBqlReadOpPtr ReadRow(
+      const YBSessionPtr& session,
+      int32_t key,
+      const std::string& column = kValueColumn);
 
-  void VerifyData(size_t num_transactions = 1, const WriteOpType op_type = WriteOpType::INSERT,
-                  const std::string& column = kValueColumn);
+  void VerifyData(
+      size_t num_transactions = 1, const WriteOpType op_type = WriteOpType::INSERT,
+      const std::string& column = KeyValueTableTest<MiniClusterType>::kValueColumn);
+
+  void VerifyData(
+      const WriteOpType op_type,
+      const std::string& column = kValueColumn) {
+    VerifyData(/* num_transactions= */ 1, op_type, column);
+  }
 
   bool HasTransactions();
 
-  size_t CountIntents();
+  size_t CountRunningTransactions();
 
-  void CheckNoRunningTransactions();
+  void AssertNoRunningTransactions();
 
   bool CheckAllTabletsRunning();
 
-  virtual IsolationLevel GetIsolationLevel() = 0;
+  IsolationLevel GetIsolationLevel();
+
+  void SetIsolationLevel(IsolationLevel isolation_level);
+
+  using KeyValueTableTest<MiniClusterType>::kKeyColumn;
+  using KeyValueTableTest<MiniClusterType>::kValueColumn;
+  using KeyValueTableTest<MiniClusterType>::cluster_;
+  using KeyValueTableTest<MiniClusterType>::client_;
+  using KeyValueTableTest<MiniClusterType>::table_;
 
   std::shared_ptr<server::SkewedClock> skewed_clock_{
       std::make_shared<server::SkewedClock>(WallClock())};
   server::ClockPtr clock_{new server::HybridClock(skewed_clock_)};
   boost::optional<TransactionManager> transaction_manager_;
   boost::optional<TransactionManager> transaction_manager2_;
+
+  bool create_table_ = true;
+  IsolationLevel isolation_level_ = IsolationLevel::SNAPSHOT_ISOLATION;
+};
+
+template <uint64_t LogSizeBytes, class Base>
+class TransactionCustomLogSegmentSizeTest : public Base {
+  // We need multiple log segments in this test.
+  uint64_t log_segment_size_bytes() const override {
+    return LogSizeBytes;
+  }
 };
 
 } // namespace client
 } // namespace yb
-
-#endif // YB_CLIENT_TXN_TEST_BASE_H

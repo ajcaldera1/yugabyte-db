@@ -92,6 +92,10 @@ plpgsql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source)
 
 			if (pg_strcasecmp(tok, "shadowed_variables") == 0)
 				extrachecks |= PLPGSQL_XCHECK_SHADOWVAR;
+			else if (pg_strcasecmp(tok, "too_many_rows") == 0)
+				extrachecks |= PLPGSQL_XCHECK_TOOMANYROWS;
+			else if (pg_strcasecmp(tok, "strict_multi_assignment") == 0)
+				extrachecks |= PLPGSQL_XCHECK_STRICTMULTIASSIGNMENT;
 			else if (pg_strcasecmp(tok, "all") == 0 || pg_strcasecmp(tok, "none") == 0)
 			{
 				GUC_check_errdetail("Key word \"%s\" cannot be combined with other key words.", tok);
@@ -324,7 +328,7 @@ plpgsql_inline_handler(PG_FUNCTION_ARGS)
 	MemSet(&flinfo, 0, sizeof(flinfo));
 	fake_fcinfo.flinfo = &flinfo;
 	flinfo.fn_oid = InvalidOid;
-	flinfo.fn_mcxt = CurrentMemoryContext;
+	flinfo.fn_mcxt = GetCurrentMemoryContext();
 
 	/* Create a private EState for simple-expression execution */
 	simple_eval_estate = CreateExecutorState();
@@ -482,7 +486,7 @@ plpgsql_validator(PG_FUNCTION_ARGS)
 		MemSet(&flinfo, 0, sizeof(flinfo));
 		fake_fcinfo.flinfo = &flinfo;
 		flinfo.fn_oid = funcoid;
-		flinfo.fn_mcxt = CurrentMemoryContext;
+		flinfo.fn_mcxt = GetCurrentMemoryContext();
 		if (is_dml_trigger)
 		{
 			MemSet(&trigdata, 0, sizeof(trigdata));

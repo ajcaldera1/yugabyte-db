@@ -24,9 +24,13 @@
 #include <utility>
 #include <vector>
 
+#include <gtest/gtest.h>
+
+#include "yb/rocksdb/db/builder.h"
 #include "yb/rocksdb/db/db_impl.h"
 #include "yb/rocksdb/db/dbformat.h"
 #include "yb/rocksdb/db/table_properties_collector.h"
+#include "yb/rocksdb/flush_block_policy.h"
 #include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/table.h"
 #include "yb/rocksdb/table/block_based_table_factory.h"
@@ -35,12 +39,15 @@
 #include "yb/rocksdb/table/table_builder.h"
 #include "yb/rocksdb/util/coding.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
-#include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
+
+#include "yb/util/test_macros.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
-class TablePropertiesTest : public testing::Test,
+class TablePropertiesTest : public RocksDBTest,
                             public testing::WithParamInterface<bool> {
  public:
   void SetUp() override { backward_mode_ = GetParam(); }
@@ -60,10 +67,10 @@ void MakeBuilder(const Options& options, const ImmutableCFOptions& ioptions,
   unique_ptr<WritableFile> wf(new test::StringSink);
   writable->reset(new WritableFileWriter(std::move(wf), EnvOptions()));
 
-  builder->reset(NewTableBuilder(
+  *builder = NewTableBuilder(
       ioptions, internal_comparator, int_tbl_prop_collector_factories,
       kTestColumnFamilyId /* column_family_id */, writable->get(),
-      options.compression, options.compression_opts));
+      options.compression, options.compression_opts);
 }
 }  // namespace
 
@@ -282,7 +289,7 @@ void TestCustomizedTablePropertiesCollector(
     builder->Add(ikey.Encode(), kv.second);
   }
   ASSERT_OK(builder->Finish());
-  writer->Flush();
+  ASSERT_OK(writer->Flush());
 
   // -- Step 2: Read properties
   test::StringSink* fwf =
@@ -355,7 +362,6 @@ TEST_P(TablePropertiesTest, CustomizedTablePropertiesCollector) {
                                            kBlockBasedTableMagicNumber,
                                            encode_as_internal, options, ikc);
 
-#ifndef ROCKSDB_LITE  // PlainTable is not supported in Lite
     // test plain table
     PlainTableOptions plain_table_options;
     plain_table_options.user_key_len = 8;
@@ -367,7 +373,6 @@ TEST_P(TablePropertiesTest, CustomizedTablePropertiesCollector) {
     TestCustomizedTablePropertiesCollector(backward_mode_,
                                            kPlainTableMagicNumber,
                                            encode_as_internal, options, ikc);
-#endif  // !ROCKSDB_LITE
   }
 }
 
@@ -425,7 +430,7 @@ void TestInternalKeyPropertiesCollector(
     }
 
     ASSERT_OK(builder->Finish());
-    writable->Flush();
+    ASSERT_OK(writable->Flush());
 
     test::StringSink* fwf =
         static_cast<test::StringSink*>(writable->writable_file());
@@ -484,7 +489,6 @@ TEST_P(TablePropertiesTest, InternalKeyPropertiesCollector) {
         std::make_shared<BlockBasedTableFactory>());
   }
 
-#ifndef ROCKSDB_LITE  // PlainTable is not supported in Lite
   PlainTableOptions plain_table_options;
   plain_table_options.user_key_len = 8;
   plain_table_options.bloom_bits_per_key = 8;
@@ -493,7 +497,6 @@ TEST_P(TablePropertiesTest, InternalKeyPropertiesCollector) {
   TestInternalKeyPropertiesCollector(
       backward_mode_, kPlainTableMagicNumber, false /* not sanitize */,
       std::make_shared<PlainTableFactory>(plain_table_options));
-#endif  // !ROCKSDB_LITE
 }
 
 INSTANTIATE_TEST_CASE_P(InternalKeyPropertiesCollector, TablePropertiesTest,

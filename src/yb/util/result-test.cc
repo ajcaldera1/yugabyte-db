@@ -226,5 +226,85 @@ TEST_F(ResultTest, VerifyResultMacro) {
   ASSERT_TRUE(s.IsInternalError());
 }
 
+struct NonCopyableNonMovable {
+  NonCopyableNonMovable() = default;
+  NonCopyableNonMovable(const NonCopyableNonMovable&) = delete;
+  NonCopyableNonMovable& operator=(const NonCopyableNonMovable&) = delete;
+};
+
+class MoveCounter {
+ public:
+  MoveCounter() = default;
+  MoveCounter(const MoveCounter&) = delete;
+
+  MoveCounter(const MoveCounter&&) {
+    ++counter_;
+  }
+
+  MoveCounter& operator=(const MoveCounter&) = delete;
+
+  MoveCounter& operator=(MoveCounter&&) {
+    ++counter_;
+    return *this;
+  }
+
+  static size_t counter() {
+    return counter_;
+  }
+
+ private:
+  static size_t counter_;
+};
+
+size_t MoveCounter::counter_ = 0;
+
+// Next function won't compile in case VERIFY_RESULT will try to create copy of Result's data
+Status VerifyResultMacroReferenceNoCopyHelper() {
+  static const NonCopyableNonMovable data;
+  const auto& r ATTRIBUTE_UNUSED = VERIFY_RESULT_REF(Result<const NonCopyableNonMovable&>(data));
+  return Status::OK();
+}
+
+Status VerifyResultMacroMoveCountHelper() {
+  const auto result ATTRIBUTE_UNUSED = VERIFY_RESULT(Result<MoveCounter>(MoveCounter()));
+  return Status::OK();
+}
+
+TEST_F(ResultTest, VerifyResultMacroReferenceNoCopy) {
+  ASSERT_OK(VerifyResultMacroReferenceNoCopyHelper());
+}
+
+TEST_F(ResultTest, VerifyResultMacroMoveCount) {
+  ASSERT_OK(VerifyResultMacroMoveCountHelper());
+  ASSERT_EQ(2, MoveCounter::counter());
+}
+
+namespace {
+
+template<typename T>
+void TestNotOk(T t) {
+  const auto LogPrefix = []() -> std::string { return "prefix"; };
+  WARN_NOT_OK(t, "boo");
+  WARN_WITH_PREFIX_NOT_OK(t, "foo");
+  ERROR_NOT_OK(t, "moo");
+}
+
+} // namespace
+
+TEST_F(ResultTest, NotOk) {
+  Result<std::string> good_result = "good";
+  Result<std::string> bad_result = STATUS(InternalError, "bad");
+
+  LOG(INFO) << "Checking OK because it's mandatory: " << bad_result.ok();
+
+  // Result
+  TestNotOk<Result<std::string>>(good_result);
+  TestNotOk<Result<std::string>>(bad_result);
+
+  // Status
+  TestNotOk<Status>(Status::OK());
+  TestNotOk<Status>(bad_result.status());
+}
+
 } // namespace test
 } // namespace yb

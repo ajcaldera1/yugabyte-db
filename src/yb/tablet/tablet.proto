@@ -36,20 +36,34 @@ package yb.tablet;
 option java_package = "org.yb.tablet";
 
 import "yb/common/common.proto";
-import "yb/tablet/metadata.proto";
+import "yb/common/common_types.proto";
+import "yb/tablet/tablet_types.proto";
 
 message TabletStatusPB {
   required string tablet_id = 1;
+  optional string namespace_name = 15;
   required string table_name = 2;
-  optional TabletStatePB state = 3 [ default = UNKNOWN ];
-  optional tablet.TabletDataState tablet_data_state = 8 [ default = TABLET_DATA_UNKNOWN ];
+  required string table_id = 10;
+  optional RaftGroupStatePB state = 3 [ default = UNKNOWN ];
+  optional TabletDataState tablet_data_state = 8 [ default = TABLET_DATA_UNKNOWN ];
   required string last_status = 4;
   // DEPRECATED.
   optional bytes start_key = 5;
   // DEPRECATED.
   optional bytes end_key = 6;
   optional int64 estimated_on_disk_size = 7;
+  optional int64 consensus_metadata_disk_size = 11;
+  optional int64 wal_files_disk_size = 12;
+  optional int64 sst_files_disk_size = 13;
+  optional int64 uncompressed_sst_files_disk_size = 14;
   optional PartitionPB partition = 9;
+  optional TableType table_type = 16;
+  // Is the tablet hidden.
+  optional bool is_hidden = 17;
+  optional bool parent_data_compacted = 18; // See KvStoreInfoPB.
+  // A list of all tables that are colocated on this tablet.
+  repeated bytes colocated_table_ids = 19;
+  optional string pgschema_name = 20;
 }
 
 // Used to present the maintenance manager's internal state.
@@ -77,6 +91,7 @@ message MaintenanceManagerStatusPB {
   // List of all the operations.
   repeated MaintenanceOpPB registered_operations = 2;
 
-  // This list isn't in order of anything. Can contain the same operation mutiple times.
+  // This list is not guaranteed to be in any particular order. Can contain the same operation
+  // multiple times.
   repeated CompletedOpPB completed_operations = 3;
 }

@@ -22,14 +22,17 @@
 #include "catalog/pg_constraint.h"
 #include "catalog/pg_depend.h"
 #include "catalog/pg_extension.h"
+#include "catalog/pg_yb_tablegroup_d.h"
 #include "commands/extension.h"
-#include "miscadmin.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
+#include "utils/syscache.h"
 #include "utils/tqual.h"
 
+/* YB includes. */
 #include "pg_yb_utils.h"
+#include "miscadmin.h"
 
 static bool isObjectPinned(const ObjectAddress *object, Relation rel);
 
@@ -112,7 +115,7 @@ recordMultipleDependencies(const ObjectAddress *depender,
 			if (indstate == NULL)
 				indstate = CatalogOpenIndexes(dependDesc);
 
-			CatalogTupleInsertWithInfo(dependDesc, tup, indstate);
+			CatalogTupleInsertWithInfo(dependDesc, tup, indstate, false /* yb_shared_insert */);
 
 			heap_freetuple(tup);
 		}
@@ -126,15 +129,23 @@ recordMultipleDependencies(const ObjectAddress *depender,
 
 /*
  * If we are executing a CREATE EXTENSION operation, mark the given object
- * as being a member of the extension.  Otherwise, do nothing.
+ * as being a member of the extension, or check that it already is one.
+ * Otherwise, do nothing.
  *
  * This must be called during creation of any user-definable object type
  * that could be a member of an extension.
  *
- * If isReplace is true, the object already existed (or might have already
- * existed), so we must check for a pre-existing extension membership entry.
- * Passing false is a guarantee that the object is newly created, and so
- * could not already be a member of any extension.
+ * isReplace must be true if the object already existed, and false if it is
+ * newly created.  In the former case we insist that it already be a member
+ * of the current extension.  In the latter case we can skip checking whether
+ * it is already a member of any extension.
+ *
+ * Note: isReplace = true is typically used when updating a object in
+ * CREATE OR REPLACE and similar commands.  We used to allow the target
+ * object to not already be an extension member, instead silently absorbing
+ * it into the current extension.  However, this was both error-prone
+ * (extensions might accidentally overwrite free-standing objects) and
+ * a security hazard (since the object would retain its previous ownership).
  */
 void
 recordDependencyOnCurrentExtension(const ObjectAddress *object,
@@ -152,6 +163,12 @@ recordDependencyOnCurrentExtension(const ObjectAddress *object,
 		{
 			Oid			oldext;
 
+			/*
+			 * Side note: these catalog lookups are safe only because the
+			 * object is a pre-existing one.  In the not-isReplace case, the
+			 * caller has most likely not yet done a CommandCounterIncrement
+			 * that would make the new object visible.
+			 */
 			oldext = getExtensionOfObject(object->classId, object->objectId);
 			if (OidIsValid(oldext))
 			{
@@ -165,6 +182,13 @@ recordDependencyOnCurrentExtension(const ObjectAddress *object,
 								getObjectDescription(object),
 								get_extension_name(oldext))));
 			}
+			/* It's a free-standing object, so reject */
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("%s is not a member of extension \"%s\"",
+							getObjectDescription(object),
+							get_extension_name(CurrentExtensionObject)),
+					 errdetail("An extension is not allowed to replace an object that it does not own.")));
 		}
 
 		/* OK, record it as a member of CurrentExtensionObject */
@@ -173,6 +197,97 @@ recordDependencyOnCurrentExtension(const ObjectAddress *object,
 		extension.objectSubId = 0;
 
 		recordDependencyOn(object, &extension, DEPENDENCY_EXTENSION);
+	}
+}
+
+/*
+ * Record a DEPENDENCY_PIN for the given referenced object.
+ * This is the only dependency created for system relations and their rowtypes.
+ * Note that this is not used during initdb.
+ *
+ * shared_insert means that the record will be inserted in ALL databases.
+ */
+void
+YbRecordPinDependency(const ObjectAddress *referenced, bool shared_insert)
+{
+	Relation	dependDesc;
+	CatalogIndexState indstate;
+	HeapTuple	tup;
+	bool		nulls[Natts_pg_depend];
+	Datum		values[Natts_pg_depend];
+
+	Assert(!IsBootstrapProcessingMode());
+
+	dependDesc = heap_open(DependRelationId, RowExclusiveLock);
+
+	memset(nulls, false, sizeof(nulls));
+
+	values[Anum_pg_depend_classid - 1]  = InvalidOid;
+	values[Anum_pg_depend_objid - 1]    = InvalidOid;
+	values[Anum_pg_depend_objsubid - 1] = InvalidOid;
+
+	values[Anum_pg_depend_refclassid - 1]  = ObjectIdGetDatum(referenced->classId);
+	values[Anum_pg_depend_refobjid - 1]    = ObjectIdGetDatum(referenced->objectId);
+	values[Anum_pg_depend_refobjsubid - 1] = Int32GetDatum(referenced->objectSubId);
+
+	values[Anum_pg_depend_deptype - 1] = CharGetDatum(DEPENDENCY_PIN);
+
+	tup = heap_form_tuple(dependDesc->rd_att, values, nulls);
+
+	indstate = CatalogOpenIndexes(dependDesc);
+
+	CatalogTupleInsertWithInfo(dependDesc, tup, indstate, shared_insert);
+
+	heap_freetuple(tup);
+
+	CatalogCloseIndexes(indstate);
+
+	heap_close(dependDesc, RowExclusiveLock);
+
+	YbPinObjectIfNeeded(referenced->classId, referenced->objectId,
+						false /* shared_dependency */);
+}
+
+/*
+ * If we are executing a CREATE EXTENSION operation, check that the given
+ * object is a member of the extension, and throw an error if it isn't.
+ * Otherwise, do nothing.
+ *
+ * This must be called whenever a CREATE IF NOT EXISTS operation (for an
+ * object type that can be an extension member) has found that an object of
+ * the desired name already exists.  It is insecure for an extension to use
+ * IF NOT EXISTS except when the conflicting object is already an extension
+ * member; otherwise a hostile user could substitute an object with arbitrary
+ * properties.
+ */
+void
+checkMembershipInCurrentExtension(const ObjectAddress *object)
+{
+	/*
+	 * This is actually the same condition tested in
+	 * recordDependencyOnCurrentExtension; but we want to issue a
+	 * differently-worded error, and anyway it would be pretty confusing to
+	 * call recordDependencyOnCurrentExtension in these circumstances.
+	 */
+
+	/* Only whole objects can be extension members */
+	Assert(object->objectSubId == 0);
+
+	if (creating_extension)
+	{
+		Oid			oldext;
+
+		oldext = getExtensionOfObject(object->classId, object->objectId);
+		/* If already a member of this extension, OK */
+		if (oldext == CurrentExtensionObject)
+			return;
+		/* Else complain */
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s is not a member of extension \"%s\"",
+						getObjectDescription(object),
+						get_extension_name(CurrentExtensionObject)),
+				 errdetail("An extension may only use CREATE ... IF NOT EXISTS to skip object creation if the conflicting object is one that it already owns.")));
 	}
 }
 
@@ -227,6 +342,40 @@ deleteDependencyRecordsFor(Oid classId, Oid objectId,
 	heap_close(depRel, RowExclusiveLock);
 
 	return count;
+}
+
+/*
+ * tablegroupHasDependents -- check if the specified tablegroup has any dependents
+ */
+bool
+tablegroupHasDependents(Oid tablegroupId)
+{
+	Relation	depRel;
+	ScanKeyData key[2];
+	SysScanDesc scan;
+	HeapTuple	tup;
+	bool		found = false;
+
+	depRel = heap_open(DependRelationId, RowExclusiveLock);
+
+	ScanKeyInit(&key[0],
+				Anum_pg_depend_refclassid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(YbTablegroupRelationId));
+	ScanKeyInit(&key[1],
+				Anum_pg_depend_refobjid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(tablegroupId));
+
+	scan = systable_beginscan(depRel, DependReferenceIndexId, true,
+							  NULL, 2, key);
+
+	found = HeapTupleIsValid(tup = systable_getnext(scan));
+
+	systable_endscan(scan);
+	heap_close(depRel, RowExclusiveLock);
+
+	return found;
 }
 
 /*
@@ -389,6 +538,10 @@ changeDependencyFor(Oid classId, Oid objectId,
 static bool
 isObjectPinned(const ObjectAddress *object, Relation rel)
 {
+	if (IsYugaByteEnabled() && !YBCIsInitDbModeEnvVarSet())
+		return YbIsObjectPinned(object->classId, object->objectId,
+								false /* shared_dependency */);
+
 	bool		ret = false;
 	SysScanDesc scan;
 	HeapTuple	tup;

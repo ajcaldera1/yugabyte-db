@@ -42,6 +42,7 @@
 #include "nodes/nodeFuncs.h"
 #include "optimizer/clauses.h"
 #include "optimizer/planner.h"
+#include "pg_yb_utils.h"
 #include "pgstat.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -352,6 +353,32 @@ ExecBuildProjectionInfo(List *targetList,
 						PlanState *parent,
 						TupleDesc inputDesc)
 {
+	return ExecBuildProjectionInfoExt(targetList,
+									  econtext,
+									  slot,
+									  true,
+									  parent,
+									  inputDesc);
+}
+
+/*
+ *		ExecBuildProjectionInfoExt
+ *
+ * As above, with one additional option.
+ *
+ * If assignJunkEntries is true (the usual case), resjunk entries in the tlist
+ * are not handled specially: they are evaluated and assigned to the proper
+ * column of the result slot.  If assignJunkEntries is false, resjunk entries
+ * are evaluated, but their result is discarded without assignment.
+ */
+ProjectionInfo *
+ExecBuildProjectionInfoExt(List *targetList,
+						   ExprContext *econtext,
+						   TupleTableSlot *slot,
+						   bool assignJunkEntries,
+						   PlanState *parent,
+						   TupleDesc inputDesc)
+{
 	ProjectionInfo *projInfo = makeNode(ProjectionInfo);
 	ExprState  *state;
 	ExprEvalStep scratch = {0};
@@ -388,7 +415,8 @@ ExecBuildProjectionInfo(List *targetList,
 		 */
 		if (tle->expr != NULL &&
 			IsA(tle->expr, Var) &&
-			((Var *) tle->expr)->varattno > 0)
+			((Var *) tle->expr)->varattno > 0 &&
+			(assignJunkEntries || !tle->resjunk))
 		{
 			/* Non-system Var, but how safe is it? */
 			variable = (Var *) tle->expr;
@@ -451,6 +479,10 @@ ExecBuildProjectionInfo(List *targetList,
 			 */
 			ExecInitExprRec(tle->expr, state,
 							&state->resvalue, &state->resnull);
+
+			/* This makes it easy to discard resjunk results when told to. */
+			if (!assignJunkEntries && tle->resjunk)
+				continue;
 
 			/*
 			 * Column might be referenced multiple times in upper nodes, so
@@ -1129,7 +1161,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				scratch.opcode = EEOP_FIELDSELECT;
 				scratch.d.fieldselect.fieldnum = fselect->fieldnum;
 				scratch.d.fieldselect.resulttype = fselect->resulttype;
-				scratch.d.fieldselect.argdesc = NULL;
+				scratch.d.fieldselect.rowcache.cacheptr = NULL;
 
 				ExprEvalPushStep(state, &scratch);
 				break;
@@ -1139,7 +1171,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 			{
 				FieldStore *fstore = (FieldStore *) node;
 				TupleDesc	tupDesc;
-				TupleDesc  *descp;
+				ExprEvalRowtypeCache *rowcachep;
 				Datum	   *values;
 				bool	   *nulls;
 				int			ncolumns;
@@ -1155,9 +1187,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				values = (Datum *) palloc(sizeof(Datum) * ncolumns);
 				nulls = (bool *) palloc(sizeof(bool) * ncolumns);
 
-				/* create workspace for runtime tupdesc cache */
-				descp = (TupleDesc *) palloc(sizeof(TupleDesc));
-				*descp = NULL;
+				/* create shared composite-type-lookup cache struct */
+				rowcachep = palloc(sizeof(ExprEvalRowtypeCache));
+				rowcachep->cacheptr = NULL;
 
 				/* emit code to evaluate the composite input value */
 				ExecInitExprRec(fstore->arg, state, resv, resnull);
@@ -1165,7 +1197,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				/* next, deform the input tuple into our workspace */
 				scratch.opcode = EEOP_FIELDSTORE_DEFORM;
 				scratch.d.fieldstore.fstore = fstore;
-				scratch.d.fieldstore.argdesc = descp;
+				scratch.d.fieldstore.rowcache = rowcachep;
 				scratch.d.fieldstore.values = values;
 				scratch.d.fieldstore.nulls = nulls;
 				scratch.d.fieldstore.ncolumns = ncolumns;
@@ -1222,7 +1254,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				/* finally, form result tuple */
 				scratch.opcode = EEOP_FIELDSTORE_FORM;
 				scratch.d.fieldstore.fstore = fstore;
-				scratch.d.fieldstore.argdesc = descp;
+				scratch.d.fieldstore.rowcache = rowcachep;
 				scratch.d.fieldstore.values = values;
 				scratch.d.fieldstore.nulls = nulls;
 				scratch.d.fieldstore.ncolumns = ncolumns;
@@ -1368,17 +1400,24 @@ ExecInitExprRec(Expr *node, ExprState *state,
 		case T_ConvertRowtypeExpr:
 			{
 				ConvertRowtypeExpr *convert = (ConvertRowtypeExpr *) node;
+				ExprEvalRowtypeCache *rowcachep;
+
+				/* cache structs must be out-of-line for space reasons */
+				rowcachep = palloc(2 * sizeof(ExprEvalRowtypeCache));
+				rowcachep[0].cacheptr = NULL;
+				rowcachep[1].cacheptr = NULL;
 
 				/* evaluate argument into step's result area */
 				ExecInitExprRec(convert->arg, state, resv, resnull);
 
 				/* and push conversion step */
 				scratch.opcode = EEOP_CONVERT_ROWTYPE;
-				scratch.d.convert_rowtype.convert = convert;
-				scratch.d.convert_rowtype.indesc = NULL;
-				scratch.d.convert_rowtype.outdesc = NULL;
+				scratch.d.convert_rowtype.inputtype =
+					exprType((Node *) convert->arg);
+				scratch.d.convert_rowtype.outputtype = convert->resulttype;
+				scratch.d.convert_rowtype.incache = &rowcachep[0];
+				scratch.d.convert_rowtype.outcache = &rowcachep[1];
 				scratch.d.convert_rowtype.map = NULL;
-				scratch.d.convert_rowtype.initialized = false;
 
 				ExprEvalPushStep(state, &scratch);
 				break;
@@ -1683,33 +1722,47 @@ ExecInitExprRec(Expr *node, ExprState *state,
 				ListCell   *lc;
 				int			off;
 
+				FunctionCallInfo *fcinfos =
+					palloc0(sizeof(FunctionCallInfo) * nopers);
+				PGFunction *fn_addrs = palloc0(sizeof(PGFunction) * nopers);
+
 				/*
 				 * Iterate over each field, prepare comparisons.  To handle
 				 * NULL results, prepare jumps to after the expression.  If a
 				 * comparison yields a != 0 result, jump to the final step.
 				 */
 				Assert(list_length(rcexpr->largs) == nopers);
-				Assert(list_length(rcexpr->rargs) == nopers);
 				Assert(list_length(rcexpr->opfamilies) == nopers);
 				Assert(list_length(rcexpr->inputcollids) == nopers);
+
+				bool yb_is_for_row_in =
+					IsYugaByteEnabled() && rcexpr->rctype == ROWCOMPARE_EQ;
+
+				if (yb_is_for_row_in)
+					Assert(IsA(rcexpr->rargs, ArrayExpr));
+				else
+					Assert(list_length(castNode(List, rcexpr->rargs)) == nopers);
 
 				off = 0;
 				for (off = 0,
 					 l_left_expr = list_head(rcexpr->largs),
-					 l_right_expr = list_head(rcexpr->rargs),
+					 l_right_expr = yb_is_for_row_in ? NULL :
+					 	list_head(castNode(List, rcexpr->rargs)),
 					 l_opno = list_head(rcexpr->opnos),
 					 l_opfamily = list_head(rcexpr->opfamilies),
 					 l_inputcollid = list_head(rcexpr->inputcollids);
 					 off < nopers;
 					 off++,
 					 l_left_expr = lnext(l_left_expr),
-					 l_right_expr = lnext(l_right_expr),
+					 l_right_expr = yb_is_for_row_in ? NULL :
+					 	lnext(l_right_expr),
 					 l_opno = lnext(l_opno),
 					 l_opfamily = lnext(l_opfamily),
 					 l_inputcollid = lnext(l_inputcollid))
 				{
 					Expr	   *left_expr = (Expr *) lfirst(l_left_expr);
-					Expr	   *right_expr = (Expr *) lfirst(l_right_expr);
+					Expr	   *right_expr = (Expr *)
+						yb_is_for_row_in ? NULL : lfirst(l_right_expr);
 					Oid			opno = lfirst_oid(l_opno);
 					Oid			opfamily = lfirst_oid(l_opfamily);
 					Oid			inputcollid = lfirst_oid(l_inputcollid);
@@ -1740,6 +1793,9 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					InitFunctionCallInfoData(*fcinfo, finfo, 2,
 											 inputcollid, NULL, NULL);
 
+					fcinfos[off] = fcinfo;
+					fn_addrs[off] = finfo->fn_addr;
+
 					/*
 					 * If we enforced permissions checks on index support
 					 * functions, we'd need to make a check here.  But the
@@ -1750,20 +1806,44 @@ ExecInitExprRec(Expr *node, ExprState *state,
 					/* evaluate left and right args directly into fcinfo */
 					ExecInitExprRec(left_expr, state,
 									&fcinfo->arg[0], &fcinfo->argnull[0]);
-					ExecInitExprRec(right_expr, state,
-									&fcinfo->arg[1], &fcinfo->argnull[1]);
+					/*
+					 * YB: If this for for a row IN condition, then we can't
+					 * treat the right hand side as a singular row. It is an
+					 * array whose evaluation bytecode
+					 * is emitted later after we emit the bytecode for the LHS.
+					 */
+					if (!yb_is_for_row_in)
+					{
+						ExecInitExprRec(right_expr, state,
+										&fcinfo->arg[1], &fcinfo->argnull[1]);
 
-					scratch.opcode = EEOP_ROWCOMPARE_STEP;
-					scratch.d.rowcompare_step.finfo = finfo;
-					scratch.d.rowcompare_step.fcinfo_data = fcinfo;
-					scratch.d.rowcompare_step.fn_addr = finfo->fn_addr;
-					/* jump targets filled below */
-					scratch.d.rowcompare_step.jumpnull = -1;
-					scratch.d.rowcompare_step.jumpdone = -1;
+						scratch.opcode = EEOP_ROWCOMPARE_STEP;
+						scratch.d.rowcompare_step.finfo = finfo;
+						scratch.d.rowcompare_step.fcinfo_data = fcinfo;
+						scratch.d.rowcompare_step.fn_addr = finfo->fn_addr;
+						/* jump targets filled below */
+						scratch.d.rowcompare_step.jumpnull = -1;
+						scratch.d.rowcompare_step.jumpdone = -1;
 
+						ExprEvalPushStep(state, &scratch);
+						adjust_jumps = lappend_int(adjust_jumps,
+												state->steps_len - 1);
+					}
+				}
+
+				if (yb_is_for_row_in)
+				{
+					ExecInitExprRec((Expr *) rcexpr->rargs, state, resv, resnull);
+					/*
+					 * YB: This bytecode op will read the evaluated RHS array from the return value,
+					 * much like the operation for EEOP_SCALARARRAYOP.
+					 */
+					scratch.opcode = EEOP_ROWARRAY_COMPARE;
+					scratch.d.row_array_compare.fcinfos = fcinfos;
+					scratch.d.row_array_compare.fn_addrs = fn_addrs;
+					scratch.d.row_array_compare.ncols = nopers;
 					ExprEvalPushStep(state, &scratch);
-					adjust_jumps = lappend_int(adjust_jumps,
-											   state->steps_len - 1);
+					break;
 				}
 
 				/*
@@ -2013,7 +2093,7 @@ ExecInitExprRec(Expr *node, ExprState *state,
 						 (int) ntest->nulltesttype);
 				}
 				/* initialize cache in case it's a row test */
-				scratch.d.nulltest_row.argdesc = NULL;
+				scratch.d.nulltest_row.rowcache.cacheptr = NULL;
 
 				/* first evaluate argument into result variable */
 				ExecInitExprRec(ntest->arg, state,
@@ -2711,7 +2791,7 @@ ExecInitCoerceToDomain(ExprEvalStep *scratch, CoerceToDomain *ctest,
 		palloc(sizeof(DomainConstraintRef));
 	InitDomainConstraintRef(ctest->resulttype,
 							constraint_ref,
-							CurrentMemoryContext,
+							GetCurrentMemoryContext(),
 							false);
 
 	/*

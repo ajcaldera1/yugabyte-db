@@ -39,8 +39,10 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
-#include "pg_yb_utils.h"
+/* YB includes. */
 #include "executor/ybcModifyTable.h"
+#include "miscadmin.h"
+#include "pg_yb_utils.h"
 
 /* We use a list of these to detect recursion in RewriteQuery */
 typedef struct rewrite_event
@@ -82,8 +84,11 @@ static List *matchLocks(CmdType event, RuleLock *rulelocks,
 		   int varno, Query *parsetree, bool *hasUpdate);
 static Query *fireRIRrules(Query *parsetree, List *activeRIRs);
 static bool view_has_instead_trigger(Relation view, CmdType event);
-static Bitmapset *adjust_view_column_set(Bitmapset *cols, List *targetlist);
 
+static Bitmapset *adjust_view_column_set(Bitmapset *cols,
+                                         List *targetlist,
+                                         Relation view_rel,
+                                         Oid base_relid);
 
 /*
  * AcquireRewriteLocks -
@@ -756,13 +761,30 @@ rewriteTargetListIU(List *targetList,
 		{
 			/* Normal attr: stash it into new_tles[] */
 			attrno = old_tle->resno;
-			if (attrno < 1 || attrno > numattrs)
+			if ((!IsYsqlUpgrade && attrno < 1) || attrno > numattrs)
 				elog(ERROR, "bogus resno %d in targetlist", attrno);
-			att_tup = TupleDescAttr(target_relation->rd_att, attrno - 1);
 
 			/* put attrno into attrno_list even if it's dropped */
 			if (attrno_list)
 				*attrno_list = lappend_int(*attrno_list, attrno);
+
+			/* Pass system column as-is. */
+			if (IsYsqlUpgrade && attrno < 1)
+			{
+				if (attrno != ObjectIdAttributeNumber)
+					elog(ERROR, "can't reference system columns other than oid");
+
+				if (commandType != CMD_INSERT)
+					elog(ERROR, "can't UPDATE oid");
+
+				if (old_tle == NULL || !old_tle->expr || IsA(old_tle->expr, SetToDefault))
+					elog(ERROR, "oid should have a value specified");
+
+				new_tlist = lappend(new_tlist, old_tle);
+				continue;
+			}
+
+			att_tup = TupleDescAttr(target_relation->rd_att, attrno - 1);
 
 			/* We can (and must) ignore deleted attributes */
 			if (att_tup->attisdropped)
@@ -1320,9 +1342,12 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 	if (IsYBRelation(target_relation))
 	{
 		/*
-		 * If there are secondary indices on the target table, return the whole row also.
+		 * If there are secondary indices on the target table, or if we have a 
+		 * row-level trigger corresponding to the operations, then also return 
+		 * the whole row.
 		 */	
-		if (YBCRelHasSecondaryIndices(target_relation))
+		if (YBRelHasOldRowTriggers(target_relation, parsetree->commandType) ||
+		    YBRelHasSecondaryIndices(target_relation))
 		{
 			var = makeWholeRowVar(target_rte,
 								  parsetree->resultRelation,
@@ -1346,7 +1371,7 @@ rewriteTargetListUD(Query *parsetree, RangeTblEntry *target_rte,
 					  -1,
 					  InvalidOid,
 					  0);
-		attrname = "ybctid";			
+		attrname = "ybctid";
 	}
 	else if (target_relation->rd_rel->relkind == RELKIND_RELATION ||
 		target_relation->rd_rel->relkind == RELKIND_MATVIEW ||
@@ -2666,13 +2691,14 @@ relation_is_updatable(Oid reloid,
 			rtr = (RangeTblRef *) linitial(viewquery->jointree->fromlist);
 			base_rte = rt_fetch(rtr->rtindex, viewquery->rtable);
 			Assert(base_rte->rtekind == RTE_RELATION);
-
 			if (base_rte->relkind != RELKIND_RELATION &&
 				base_rte->relkind != RELKIND_PARTITIONED_TABLE)
 			{
 				baseoid = base_rte->relid;
 				include_cols = adjust_view_column_set(updatable_cols,
-													  viewquery->targetList);
+				                                      viewquery->targetList,
+				                                      rel,
+				                                      base_rte->relid);
 				auto_events &= relation_is_updatable(baseoid,
 													 include_triggers,
 													 include_cols);
@@ -2696,16 +2722,21 @@ relation_is_updatable(Oid reloid,
  * relation (as per the checks above in view_query_is_auto_updatable).
  */
 static Bitmapset *
-adjust_view_column_set(Bitmapset *cols, List *targetlist)
+adjust_view_column_set(Bitmapset *cols,
+                       List *targetlist,
+                       Relation view_rel,
+                       Oid base_relid)
 {
 	Bitmapset  *result = NULL;
 	int			col;
+	AttrNumber view_lowattrno = YBGetFirstLowInvalidAttributeNumber(view_rel);
+	AttrNumber base_lowattrno = YBGetFirstLowInvalidAttributeNumberFromOid(base_relid);
 
 	col = -1;
 	while ((col = bms_next_member(cols, col)) >= 0)
 	{
 		/* bit numbers are offset by FirstLowInvalidHeapAttributeNumber */
-		AttrNumber	attno = col + FirstLowInvalidHeapAttributeNumber;
+		AttrNumber	attno = col + view_lowattrno;
 
 		if (attno == InvalidAttrNumber)
 		{
@@ -2727,7 +2758,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 					continue;
 				var = castNode(Var, tle->expr);
 				result = bms_add_member(result,
-										var->varattno - FirstLowInvalidHeapAttributeNumber);
+				                        var->varattno - base_lowattrno);
 			}
 		}
 		else
@@ -2744,7 +2775,7 @@ adjust_view_column_set(Bitmapset *cols, List *targetlist)
 				Var		   *var = (Var *) tle->expr;
 
 				result = bms_add_member(result,
-										var->varattno - FirstLowInvalidHeapAttributeNumber);
+				                        var->varattno - base_lowattrno);
 			}
 			else
 				elog(ERROR, "attribute number %d not found in view targetlist",
@@ -3018,10 +3049,14 @@ rewriteTargetView(Query *parsetree, Relation view)
 		   bms_is_empty(new_rte->updatedCols));
 
 	new_rte->insertedCols = adjust_view_column_set(view_rte->insertedCols,
-												   view_targetlist);
+	                                               view_targetlist,
+	                                               view,
+	                                               new_rte->relid);
 
 	new_rte->updatedCols = adjust_view_column_set(view_rte->updatedCols,
-												  view_targetlist);
+	                                              view_targetlist,
+	                                              view,
+	                                              new_rte->relid);
 
 	/*
 	 * Move any security barrier quals from the view RTE onto the new target

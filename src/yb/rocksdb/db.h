@@ -21,25 +21,22 @@
 // under the License.
 //
 
-#ifndef YB_ROCKSDB_DB_H
-#define YB_ROCKSDB_DB_H
+#pragma once
 
 #include <stdint.h>
 #include <stdio.h>
+
 #include <memory>
-#include <vector>
 #include <string>
 #include <unordered_map>
-#include "yb/rocksdb/immutable_options.h"
+#include <vector>
+
 #include "yb/rocksdb/iterator.h"
 #include "yb/rocksdb/listener.h"
 #include "yb/rocksdb/metadata.h"
 #include "yb/rocksdb/options.h"
-#include "yb/rocksdb/snapshot.h"
-#include "yb/rocksdb/thread_status.h"
 #include "yb/rocksdb/transaction_log.h"
 #include "yb/rocksdb/types.h"
-#include "yb/util/result.h"
 
 #ifdef _WIN32
 // Windows API macro interference
@@ -63,7 +60,7 @@ class WriteBatch;
 class Env;
 class EventListener;
 
-using std::unique_ptr;
+YB_STRONGLY_TYPED_BOOL(SkipLastEntry);
 
 extern const char kDefaultColumnFamilyName[];
 
@@ -103,6 +100,8 @@ struct Range {
   Range(const Slice& s, const Slice& l) : start(s), limit(l) { }
 };
 
+YB_DEFINE_ENUM(FlushAbility, (kNoNewData)(kHasNewData)(kAlreadyFlushing))
+
 // A collections of table properties objects, where
 //  key: is the table's file name.
 //  value: the table properties object of the given table.
@@ -129,9 +128,6 @@ class DB {
   // that modify data, like put/delete, will return error.
   // If the db is opened in read only mode, then no compactions
   // will happen.
-  //
-  // Not supported in ROCKSDB_LITE, in which case the function will
-  // return Status::NotSupported.
   static Status OpenForReadOnly(const Options& options,
       const std::string& name, DB** dbptr,
       bool error_if_log_file_exist = false);
@@ -141,9 +137,6 @@ class DB {
   // database that should be opened. However, you always need to specify default
   // column family. The default column family name is 'default' and it's stored
   // in rocksdb::kDefaultColumnFamilyName
-  //
-  // Not supported in ROCKSDB_LITE, in which case the function will
-  // return Status::NotSupported.
   static Status OpenForReadOnly(
       const DBOptions& db_options, const std::string& name,
       const std::vector<ColumnFamilyDescriptor>& column_families,
@@ -321,6 +314,16 @@ class DB {
   virtual Iterator* NewIterator(const ReadOptions& options) {
     return NewIterator(options, DefaultColumnFamily());
   }
+
+  virtual std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry,
+      ColumnFamilyHandle* column_family) = 0;
+
+  std::unique_ptr<Iterator> NewIndexIterator(
+      const ReadOptions& options, SkipLastEntry skip_last_index_entry) {
+    return NewIndexIterator(options, skip_last_index_entry, DefaultColumnFamily());
+  }
+
   // Returns iterators from a consistent database state across multiple
   // column families. Iterators are heap allocated and need to be deleted
   // before the db is deleted
@@ -342,7 +345,6 @@ class DB {
   // use "snapshot" after this call.
   virtual void ReleaseSnapshot(const Snapshot* snapshot) = 0;
 
-#ifndef ROCKSDB_LITE
   // Contains all valid property arguments for GetProperty().
   //
   // NOTE: Property names cannot end in numbers since those are interpreted as
@@ -493,7 +495,6 @@ class DB {
     //      specified level "N" at the target column family.
     static const std::string kAggregatedTablePropertiesAtLevel;
   };
-#endif /* ROCKSDB_LITE */
 
   // DB implementations can export properties about their state via this method.
   // If "property" is a valid property understood by this DB implementation (see
@@ -619,13 +620,17 @@ class DB {
 
   virtual Status SetOptions(
       ColumnFamilyHandle* /*column_family*/,
-      const std::unordered_map<std::string, std::string>& /*new_options*/) {
+      const std::unordered_map<std::string, std::string>& /*new_options*/,
+      bool dump_options = true) {
     return STATUS(NotSupported, "Not implemented");
   }
   virtual Status SetOptions(
-      const std::unordered_map<std::string, std::string>& new_options) {
-    return SetOptions(DefaultColumnFamily(), new_options);
+      const std::unordered_map<std::string, std::string>& new_options, bool dump_options = true) {
+    return SetOptions(DefaultColumnFamily(), new_options, dump_options);
   }
+
+  virtual void SetDisableFlushOnShutdown(bool disable_flush_on_shutdown) {}
+  virtual void StartShutdown() {}
 
   // CompactFiles() inputs a list of files specified by file numbers and
   // compacts them to the specified level. Note that the behavior is different
@@ -726,7 +731,8 @@ class DB {
   // The sequence number of the most recent transaction.
   virtual SequenceNumber GetLatestSequenceNumber() const = 0;
 
-#ifndef ROCKSDB_LITE
+  // The file number that will be used for the next new file.
+  virtual uint64_t GetNextFileNumber() const = 0;
 
   // Prevent file deletions. Compactions will continue to occur,
   // but no obsolete files will be deleted. Calling this multiple
@@ -776,7 +782,7 @@ class DB {
   // cleared aggressively and the iterator might keep getting invalid before
   // an update is read.
   virtual Status GetUpdatesSince(
-      SequenceNumber seq_number, unique_ptr<TransactionLogIterator>* iter,
+      SequenceNumber seq_number, std::unique_ptr<TransactionLogIterator>* iter,
       const TransactionLogIterator::ReadOptions&
           read_options = TransactionLogIterator::ReadOptions()) = 0;
 
@@ -787,12 +793,26 @@ class DB {
   // path relative to the db directory. eg. 000001.sst, /archive/000003.log
   virtual Status DeleteFile(std::string name) = 0;
 
-  // Returns the total combined size of all the SST Files in the rocksdb instance.
-  virtual uint64_t GetTotalSSTFileSize() { return 0; }
-  virtual uint64_t GetUncompressedSSTFileSize() { return 0; }
+  // Returns the total combined size of all the SST Files for the current version in the rocksdb
+  // instance.
+  virtual uint64_t GetCurrentVersionSstFilesSize() { return 0; }
+  virtual uint64_t GetCurrentVersionSstFilesUncompressedSize() { return 0; }
+  virtual std::pair<uint64_t, uint64_t> GetCurrentVersionSstFilesAllSizes() {
+    return std::pair<uint64_t, uint64_t>(0, 0);
+  }
 
-  // Returns a list of all table files with their level, start key
-  // and end key
+  // Returns total number of SST Files.
+  virtual uint64_t GetCurrentVersionNumSSTFiles() { return 0; }
+
+  // Returns the combined size of all the SST Files data blocks for the current version in the
+  // rocksdb instance.
+  virtual uint64_t GetCurrentVersionDataSstFilesSize() { return 0; }
+
+  // Returns number of memtables not flushed in default column family memtable list.
+  virtual int GetCfdImmNumNotFlushed() { return 0; }
+
+  // Returns a list of all table files for the current version with their level, start key and end
+  // key.
   virtual void GetLiveFilesMetaData(std::vector<LiveFileMetaData>* /*metadata*/) {}
 
   std::vector<LiveFileMetaData> GetLiveFilesMetaData() {
@@ -803,13 +823,23 @@ class DB {
 
   virtual UserFrontierPtr GetFlushedFrontier() { return nullptr; }
 
-  virtual CHECKED_STATUS ModifyFlushedFrontier(
+  virtual Status ModifyFlushedFrontier(
       UserFrontierPtr values,
       FrontierModificationMode mode) {
     return Status::OK();
   }
 
-  virtual bool HasSomethingToFlush() { return true; }
+  virtual FlushAbility GetFlushAbility() { return FlushAbility::kHasNewData; }
+
+  // Might return stale frontiers if invoked after records have been written to the memtable, but
+  // before frontiers are updated.
+  virtual UserFrontierPtr GetMutableMemTableFrontier(UpdateUserValueType type) { return nullptr; }
+
+  virtual UserFrontierPtr CalcMemTableFrontier(UpdateUserValueType type) {
+    return nullptr;
+  }
+
+  virtual void ListenFilesChanged(std::function<void()> listener) {}
 
   // Obtains the meta data of the specified column family of the DB.
   // STATUS(NotFound, "") will be returned if the current DB does not have
@@ -825,6 +855,12 @@ class DB {
       ColumnFamilyMetaData* metadata) {
     GetColumnFamilyMetaData(DefaultColumnFamily(), metadata);
   }
+
+  // Obtains all column family options and corresponding names,
+  // dropped columns are not included into the resulting collections.
+  virtual void GetColumnFamiliesOptions(
+      std::vector<std::string>* column_family_names,
+      std::vector<ColumnFamilyOptions>* column_family_options) = 0;
 
   // Load table file located at "file_path" into "column_family", a pointer to
   // ExternalSstFileInfo can be used instead of "file_path" to do a blind add
@@ -853,7 +889,6 @@ class DB {
     return AddFile(DefaultColumnFamily(), file_info, move_file);
   }
 
-#endif  // ROCKSDB_LITE
 
   // Sets the globally unique ID created at database creation time by invoking
   // Env::GenerateUniqueId(), in identity. Returns Status::OK if identity could
@@ -863,7 +898,6 @@ class DB {
   // Returns default column family handle
   virtual ColumnFamilyHandle* DefaultColumnFamily() const = 0;
 
-#ifndef ROCKSDB_LITE
   virtual Status GetPropertiesOfAllTables(ColumnFamilyHandle* column_family,
                                           TablePropertiesCollection* props) = 0;
   virtual Status GetPropertiesOfAllTables(TablePropertiesCollection* props) {
@@ -872,12 +906,21 @@ class DB {
   virtual Status GetPropertiesOfTablesInRange(
       ColumnFamilyHandle* column_family, const Range* range, std::size_t n,
       TablePropertiesCollection* props) = 0;
-#endif  // ROCKSDB_LITE
 
   // Needed for StackableDB
   virtual DB* GetRootDB() { return this; }
 
-  virtual CHECKED_STATUS Import(const std::string& source_dir) {
+  virtual Status Import(const std::string& source_dir) {
+    return STATUS(NotSupported, "");
+  }
+
+  virtual bool NeedsDelay() { return false; }
+
+  // Returns approximate middle key (see Version::GetMiddleKey).
+  virtual yb::Result<std::string> GetMiddleKey() = 0;
+
+  // Returns a table reader for the largest SST file.
+  virtual yb::Result<TableReader*> TEST_GetLargestSstTableReader() {
     return STATUS(NotSupported, "");
   }
 
@@ -894,14 +937,10 @@ class DB {
 // Be very careful using this method.
 Status DestroyDB(const std::string& name, const Options& options);
 
-#ifndef ROCKSDB_LITE
 // If a DB cannot be opened, you may attempt to call this method to
 // resurrect as much of the contents of the database as possible.
 // Some data may be lost, so be careful when calling this function
 // on a database that contains important information.
 Status RepairDB(const std::string& dbname, const Options& options);
-#endif
 
 }  // namespace rocksdb
-
-#endif  // YB_ROCKSDB_DB_H

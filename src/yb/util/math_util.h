@@ -12,9 +12,9 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_MATH_UTIL_H_
-#define YB_UTIL_MATH_UTIL_H_
+#pragma once
 
+#include <limits>
 #include <vector>
 
 namespace yb {
@@ -23,13 +23,18 @@ namespace yb {
 double standard_deviation(std::vector<double> data);
 
 template <class T>
+constexpr T constexpr_max(const T& lhs) {
+  return lhs;
+}
+
+template <class T>
 constexpr T constexpr_max(const T& lhs, const T& rhs) {
   return lhs > rhs ? lhs : rhs;
 }
 
 template <class T1, class T2, class... Args>
-constexpr T1 constexpr_max(const T1& t1, const T2& t2, const Args&&... args) {
-  return constexpr_max(t1, constexpr_max(t2, args...));
+constexpr T1 constexpr_max(const T1& t1, const T2& t2, Args&&... args) {
+  return constexpr_max(t1, constexpr_max(t2, std::forward<Args>(args)...));
 }
 
 template <class T>
@@ -37,6 +42,23 @@ constexpr T ceil_div(const T& n, const T& div) {
   return (n + div - 1) / div;
 }
 
-}  // namespace yb
+template <class T>
+T max_if_negative(T value) {
+  if (value < 0) {
+    return std::numeric_limits<T>::max();
+  }
+  return value;
+}
 
-#endif // YB_UTIL_MATH_UTIL_H_
+template <class T>
+T fit_bounds(const T& value, const T& min, const T& max) {
+  if (value < min) {
+    return min;
+  }
+  if (value > max) {
+    return max;
+  }
+  return value;
+}
+
+}  // namespace yb

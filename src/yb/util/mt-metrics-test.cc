@@ -29,24 +29,23 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include <functional>
 #include <vector>
 
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
 #include "yb/gutil/atomicops.h"
 #include "yb/gutil/ref_counted.h"
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/debug/leakcheck_disabler.h"
-#include "yb/util/jsonwriter.h"
 #include "yb/util/metrics.h"
 #include "yb/util/monotime.h"
+#include "yb/util/status_log.h"
+#include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
+#include "yb/util/flags.h"
 
-DEFINE_int32(mt_metrics_test_num_threads, 4,
+DEFINE_NON_RUNTIME_int32(mt_metrics_test_num_threads, 4,
              "Number of threads to spawn in mt metrics tests");
 
 METRIC_DEFINE_entity(test_entity);
@@ -55,6 +54,7 @@ namespace yb {
 
 using debug::ScopedLeakCheckDisabler;
 using std::vector;
+using std::string;
 
 class MultiThreadedMetricsTest : public YBTest {
  public:
@@ -115,7 +115,8 @@ void MultiThreadedMetricsTest::RegisterCounters(
     string name = strings::Substitute("$0_$1_$2", name_prefix, tid, i);
     auto proto = new CounterPrototype(MetricPrototype::CtorArgs(
         "test_entity", strdup(name.c_str()), "Test Counter",
-        MetricUnit::kOperations, "test counter"));
+        MetricUnit::kOperations, "test counter",
+        MetricLevel::kInfo));
     proto->Instantiate(metric_entity)->Increment();
   }
 }

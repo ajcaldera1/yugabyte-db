@@ -25,18 +25,41 @@
  *--------------------------------------------------------------------------------------------------
  */
 
-#ifndef YBCEXPR_H
-#define YBCEXPR_H
+#pragma once
+
+#include "postgres.h"
+#include "nodes/execnodes.h"
 
 #include "yb/yql/pggate/ybc_pg_typedefs.h"
 
 #include "yb/yql/pggate/ybc_pggate.h"
 
 // Construct column reference expression.
-extern YBCPgExpr YBCNewColumnRef(YBCPgStatement ybc_stmt, int16_t attr_num, int attr_typid,
-																 const YBCPgTypeAttrs *type_attrs);
+extern YBCPgExpr YBCNewColumnRef(YBCPgStatement ybc_stmt, int16_t attr_num,
+								 int attr_typid, int attr_collation,
+								 const YBCPgTypeAttrs *type_attrs);
 
 // Construct constant expression using the given datatype "type_id" and value "datum".
-extern YBCPgExpr YBCNewConstant(YBCPgStatement ybc_stmt, Oid type_id, Datum datum, bool is_null);
+extern YBCPgExpr YBCNewConstant(YBCPgStatement ybc_stmt, Oid type_id,
+								Oid collation_id, Datum datum, bool is_null);
 
-#endif							/* YBCEXPR_H */
+// Construct virtual constant expression using the given datatype "type_id" and virtual "datum".
+extern YBCPgExpr YBCNewConstantVirtual(YBCPgStatement ybc_stmt, Oid type_id,
+									   YBCPgDatumKind kind);
+extern YBCPgExpr YBCNewTupleExpr(YBCPgStatement ybc_stmt, const YBCPgTypeAttrs *type_attrs,
+								 int num_elems, YBCPgExpr *elems);
+
+extern Expr *YbExprInstantiateParams(Expr* expr, EState *estate);
+extern PushdownExprs *YbInstantiatePushdownParams(PushdownExprs *pushdown,
+												  EState *estate);
+
+extern bool YbCanPushdownExpr(Expr *pg_expr, List **params);
+
+extern bool YbIsTransactionalExpr(Node *pg_expr);
+
+YBCPgExpr YBCNewEvalExprCall(YBCPgStatement ybc_stmt, Expr *pg_expr);
+
+extern YbPgExecOutParam *YbCreateExecOutParam();
+
+extern void YbWriteExecOutParam(YbPgExecOutParam *out_param,
+								const YbcPgExecOutParamValue *value);

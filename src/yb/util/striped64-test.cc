@@ -29,23 +29,23 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-
 #include <memory>
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
 
-#include "yb/gutil/strings/substitute.h"
 #include "yb/util/monotime.h"
+#include "yb/util/status_log.h"
 #include "yb/util/striped64.h"
 #include "yb/util/test_util.h"
 #include "yb/util/thread.h"
+#include "yb/util/flags.h"
 
 namespace yb {
 
 // These flags are used by the multi-threaded tests, can be used for microbenchmarking.
-DEFINE_int32(num_operations, 10*1000, "Number of operations to perform");
-DEFINE_int32(num_threads, 2, "Number of worker threads");
+DEFINE_NON_RUNTIME_int32(num_operations, 10 * 1000, "Number of operations to perform");
+DEFINE_NON_RUNTIME_int32(num_threads, 2, "Number of worker threads");
 
 // Test some basic operations
 TEST(Striped64Test, TestBasic) {
@@ -118,7 +118,7 @@ class MultiThreadTest {
 
   int64_t num_operations_;
   // This is rounded down to the nearest even number
-  int32_t num_threads_;
+  int64_t num_threads_;
   thread_vec_t threads_;
 };
 

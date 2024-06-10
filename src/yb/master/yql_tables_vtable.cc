@@ -13,25 +13,31 @@
 
 #include "yb/master/yql_tables_vtable.h"
 
+#include "yb/common/ql_type.h"
 #include "yb/common/ql_value.h"
-#include "yb/master/catalog_manager.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
+
+#include "yb/util/status_log.h"
 
 namespace yb {
 namespace master {
 
-YQLTablesVTable::YQLTablesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSchemaTablesTableName, master, CreateSchema()) {
+YQLTablesVTable::YQLTablesVTable(const TableName& table_name,
+                                 const NamespaceName& namespace_name,
+                                 Master* const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
-                                     std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
-  std::vector<scoped_refptr<TableInfo> > tables;
-  master_->catalog_manager()->GetAllTables(&tables, true);
-  for (scoped_refptr<TableInfo> table : tables) {
+Result<VTableDataPtr> YQLTablesVTable::RetrieveData(const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
 
+  auto tables = catalog_manager().GetTables(GetTablesMode::kVisibleToClient);
+  for (const auto& table : tables) {
     // Skip non-YQL tables.
-    if (!CatalogManager::IsYcqlTable(*table)) {
+    if (!IsYcqlTable(*table)) {
       continue;
     }
 
@@ -41,14 +47,11 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
     }
 
     // Get namespace for table.
-    NamespaceIdentifierPB nsId;
-    nsId.set_id(table->namespace_id());
-    scoped_refptr<NamespaceInfo> nsInfo;
-    RETURN_NOT_OK(master_->catalog_manager()->FindNamespace(nsId, &nsInfo));
+    auto ns_info = VERIFY_RESULT(catalog_manager().FindNamespaceById(table->namespace_id()));
 
     // Create appropriate row for the table;
-    QLRow& row = (*vtable)->Extend();
-    RETURN_NOT_OK(SetColumnValue(kKeyspaceName, nsInfo->name(), &row));
+    auto& row = vtable->Extend();
+    RETURN_NOT_OK(SetColumnValue(kKeyspaceName, ns_info->name(), &row));
     RETURN_NOT_OK(SetColumnValue(kTableName, table->name(), &row));
 
     // Create appropriate flags entry.
@@ -59,9 +62,8 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
     RETURN_NOT_OK(SetColumnValue(kFlags, flags_set, &row));
 
     // Create appropriate table uuid entry.
-    Uuid uuid;
     // Note: table id is in host byte order.
-    RETURN_NOT_OK(uuid.FromHexString(table->id()));
+    auto uuid = VERIFY_RESULT(Uuid::FromHexString(table->id()));
     RETURN_NOT_OK(SetColumnValue(kId, uuid, &row));
 
     // Set the values for the table properties.
@@ -76,6 +78,11 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
         schema.table_properties().DefaultTimeToLive() / MonoTime::kMillisecondsPerSecond);
     RETURN_NOT_OK(SetColumnValue(kDefaultTimeToLive, cql_ttl, &row));
 
+    if (schema.table_properties().HasNumTablets()) {
+      int32_t num_tablets = schema.table_properties().num_tablets();
+      RETURN_NOT_OK(SetColumnValue(kNumTablets, num_tablets, &row));
+    }
+
     QLValue txn;
     txn.set_map_value();
     txn.add_map_key()->set_string_value("enabled");
@@ -84,7 +91,7 @@ Status YQLTablesVTable::RetrieveData(const QLReadRequestPB& request,
     RETURN_NOT_OK(SetColumnValue(kTransactions, txn.value(), &row));
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema YQLTablesVTable::CreateSchema() const {
@@ -114,6 +121,7 @@ Schema YQLTablesVTable::CreateSchema() const {
   CHECK_OK(builder.AddColumn(kSpeculativeRetry, QLType::Create(DataType::STRING)));
   CHECK_OK(builder.AddColumn(kTransactions,
                              QLType::CreateTypeMap(DataType::STRING, DataType::STRING)));
+  CHECK_OK(builder.AddColumn(kNumTablets, QLType::Create(DataType::INT32)));
   return builder.Build();
 }
 

@@ -31,12 +31,13 @@
 //
 // Classes used internally by pb_util.h.
 // This header should not be included by anything but pb_util and its tests.
-#ifndef YB_UTIL_PB_UTIL_INTERNAL_H
-#define YB_UTIL_PB_UTIL_INTERNAL_H
+#pragma once
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 #include <google/protobuf/io/zero_copy_stream.h>
+
 #include "yb/util/env.h"
+#include "yb/util/status.h"
 
 namespace yb {
 namespace pb_util {
@@ -78,7 +79,7 @@ class SequentialFileFileInputStream : public google::protobuf::io::ZeroCopyInput
   size_t buffer_used_;
   size_t buffer_offset_;
   const size_t buffer_size_;
-  gscoped_ptr<uint8_t[]> buffer_;
+  std::unique_ptr<uint8_t[]> buffer_;
 
   size_t total_read_;
   SequentialFile *rfile_;
@@ -125,7 +126,7 @@ class WritableFileOutputStream : public google::protobuf::io::ZeroCopyOutputStre
 
   size_t buffer_offset_;
   const size_t buffer_size_;
-  gscoped_ptr<uint8_t[]> buffer_;
+  std::unique_ptr<uint8_t[]> buffer_;
 
   size_t flushed_;
   WritableFile *wfile_;
@@ -134,4 +135,3 @@ class WritableFileOutputStream : public google::protobuf::io::ZeroCopyOutputStre
 } // namespace internal
 } // namespace pb_util
 } // namespace yb
-#endif

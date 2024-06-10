@@ -211,7 +211,7 @@ MJExamineQuals(List *mergeclauses,
 		clause->rexpr = ExecInitExpr((Expr *) lsecond(qual->args), parent);
 
 		/* Set up sort support data */
-		clause->ssup.ssup_cxt = CurrentMemoryContext;
+		clause->ssup.ssup_cxt = GetCurrentMemoryContext();
 		clause->ssup.ssup_collation = collation;
 		if (opstrategy == BTLessStrategyNumber)
 			clause->ssup.ssup_reverse = false;
@@ -1512,7 +1512,7 @@ ExecInitMergeJoin(MergeJoin *node, EState *estate, int eflags)
 	/*
 	 * Initialize result slot, type and projection.
 	 */
-	ExecInitResultTupleSlotTL(estate, &mergestate->js.ps);
+	ExecInitResultTupleSlotTL(&mergestate->js.ps);
 	ExecAssignProjectionInfo(&mergestate->js.ps, NULL);
 
 	/*

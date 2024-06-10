@@ -72,7 +72,6 @@
 //   Store per-table metadata (smallest, largest, largest-seq#, ...)
 //   in the table's meta section to speed up ScanTable.
 
-#ifndef ROCKSDB_LITE
 
 #ifndef __STDC_FORMAT_MACROS
 #define __STDC_FORMAT_MACROS
@@ -96,7 +95,13 @@
 #include "yb/rocksdb/options.h"
 #include "yb/rocksdb/immutable_options.h"
 #include "yb/rocksdb/table/scoped_arena_iterator.h"
+#include "yb/rocksdb/table/table_reader.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
+#include "yb/rocksdb/util/logging.h"
+
+#include "yb/util/status_log.h"
+
+using std::unique_ptr;
 
 namespace rocksdb {
 
@@ -305,7 +310,7 @@ class Repairer {
       Arena arena;
       ScopedArenaIterator iter(mem->NewIterator(ro, &arena));
       status = BuildTable(dbname_,
-                          env_,
+                          options_,
                           ioptions_,
                           env_options_,
                           table_cache_,
@@ -318,9 +323,8 @@ class Repairer {
                           kMaxSequenceNumber,
                           kNoCompression,
                           CompressionOptions(),
-                          /* paranoid_file_checks */ false,
-                          /* internal_stats */ nullptr,
-                          options_.boundary_extractor.get());
+                          /* paranoid_file_checks = */ false,
+                          /* internal_stats = */ nullptr);
     }
     delete mem->Unref();
     delete cf_mems_default;
@@ -368,7 +372,7 @@ class Repairer {
     if (status.ok()) {
       TableReader* reader;
       InternalIterator* iter = table_cache_->NewIterator(
-          ReadOptions(), env_options_, icmp_, t->meta.fd, &reader);
+          ReadOptions(), env_options_, icmp_, t->meta.fd, t->meta.UserFilter(), &reader);
       t->meta.fd.total_file_size = base_file_size +
           (reader->IsSplitSst() ? reader->GetTableProperties()->data_size : 0);
       bool empty = true;
@@ -448,9 +452,7 @@ class Repairer {
       status = log.AddRecord(record);
     }
 
-    if (!status.ok()) {
-      env_->DeleteFile(tmp);
-    } else {
+    if (status.ok()) {
       // Discard older manifests
       for (size_t i = 0; i < manifests_.size(); i++) {
         ArchiveFile(dbname_ + "/" + manifests_[i]);
@@ -460,9 +462,10 @@ class Repairer {
       status = env_->RenameFile(tmp, DescriptorFileName(dbname_, 1));
       if (status.ok()) {
         status = SetCurrentFile(env_, dbname_, 1, nullptr, options_.disableDataSync);
-      } else {
-        env_->DeleteFile(tmp);
       }
+    }
+    if (!status.ok()) {
+      env_->CleanupFile(tmp);
     }
     return status;
   }
@@ -478,7 +481,7 @@ class Repairer {
       new_dir.assign(fname.data(), slash - fname.data());
     }
     new_dir.append("/lost");
-    env_->CreateDir(new_dir);  // Ignore error
+    WARN_NOT_OK(env_->CreateDir(new_dir), "Failed to create dir " + new_dir);
     std::string new_file = new_dir;
     new_file.append("/");
     new_file.append((slash == nullptr) ? fname.c_str() : slash + 1);
@@ -496,5 +499,3 @@ Status RepairDB(const std::string& dbname, const Options& options) {
 }
 
 }  // namespace rocksdb
-
-#endif  // ROCKSDB_LITE

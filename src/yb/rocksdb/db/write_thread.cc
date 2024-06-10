@@ -19,12 +19,17 @@
 //
 
 #include "yb/rocksdb/db/write_thread.h"
+#include <thread>
+
 #include <chrono>
 #include <limits>
-#include <thread>
-#include "yb/rocksdb/db/column_family.h"
+
+#include "yb/rocksdb/db/write_batch_internal.h"
 #include "yb/rocksdb/port/port.h"
-#include "yb/rocksdb/util/sync_point.h"
+#include "yb/rocksdb/util/random.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/sync_point.h"
 
 namespace rocksdb {
 
@@ -190,10 +195,10 @@ void WriteThread::SetState(Writer* w, uint8_t new_state) {
       !w->state.compare_exchange_strong(state, new_state)) {
     assert(state == STATE_LOCKED_WAITING);
 
-    std::lock_guard<std::mutex> guard(w->StateMutex());
+    std::lock_guard guard(w->StateMutex());
     assert(w->state.load(std::memory_order_relaxed) != new_state);
     w->state.store(new_state, std::memory_order_relaxed);
-    w->StateCV().notify_one();
+    YB_PROFILE(w->StateCV().notify_one());
   }
 }
 
@@ -234,13 +239,13 @@ void WriteThread::JoinBatchGroup(Writer* w) {
   bool linked_as_leader;
   LinkOne(w, &linked_as_leader);
 
-  TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait", w);
+  DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:Wait", w);
 
   if (!linked_as_leader) {
     AwaitState(w,
                STATE_GROUP_LEADER | STATE_PARALLEL_FOLLOWER | STATE_COMPLETED,
                &ctx);
-    TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:DoneWaiting", w);
+    DEBUG_ONLY_TEST_SYNC_POINT_CALLBACK("WriteThread::JoinBatchGroup:DoneWaiting", w);
   }
 }
 
@@ -342,7 +347,7 @@ bool WriteThread::CompleteParallelWorker(Writer* w) {
 
   auto* pg = w->parallel_group;
   if (!w->status.ok()) {
-    std::lock_guard<std::mutex> guard(w->StateMutex());
+    std::lock_guard guard(w->StateMutex());
     pg->status = w->status;
   }
 
@@ -441,7 +446,7 @@ void WriteThread::EnterUnbatched(Writer* w, InstrumentedMutex* mu) {
   LinkOne(w, &linked_as_leader);
   if (!linked_as_leader) {
     mu->Unlock();
-    TEST_SYNC_POINT("WriteThread::EnterUnbatched:Wait");
+    DEBUG_ONLY_TEST_SYNC_POINT("WriteThread::EnterUnbatched:Wait");
     AwaitState(w, STATE_GROUP_LEADER, &ctx);
     mu->Lock();
   }

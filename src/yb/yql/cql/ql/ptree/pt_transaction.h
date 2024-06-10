@@ -15,8 +15,9 @@
 // Tree node definitions for TRANSACTION statements.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_TRANSACTION_H_
-#define YB_YQL_CQL_QL_PTREE_PT_TRANSACTION_H_
+#pragma once
+
+#include "yb/common/transaction.pb.h"
 
 #include "yb/yql/cql/ql/ptree/list_node.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
@@ -38,7 +39,7 @@ class PTStartTransaction : public TreeNode {
 
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  PTStartTransaction(MemoryContext *memctx, YBLocation::SharedPtr loc);
+  PTStartTransaction(MemoryContext *memctx, YBLocationPtr loc);
   virtual ~PTStartTransaction();
 
   template<typename... TypeArgs>
@@ -55,7 +56,7 @@ class PTStartTransaction : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
   // Node type.
   virtual TreeNodeOpcode opcode() const override {
@@ -75,7 +76,7 @@ class PTCommit : public TreeNode {
 
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  PTCommit(MemoryContext *memctx, YBLocation::SharedPtr loc);
+  PTCommit(MemoryContext *memctx, YBLocationPtr loc);
   virtual ~PTCommit();
 
   template<typename... TypeArgs>
@@ -85,7 +86,7 @@ class PTCommit : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
   // Node type.
   virtual TreeNodeOpcode opcode() const override {
@@ -95,5 +96,3 @@ class PTCommit : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_TRANSACTION_H_

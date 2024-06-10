@@ -36,27 +36,30 @@
 #include <unordered_map>
 
 #include <boost/optional.hpp>
-
-#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
-#include "yb/common/wire_protocol.h"
 #include "yb/common/wire_protocol-test-util.h"
+#include "yb/common/wire_protocol.h"
+
 #include "yb/gutil/strings/substitute.h"
-#include "yb/integration-tests/external_mini_cluster-itest-base.h"
+
 #include "yb/integration-tests/cluster_verifier.h"
+#include "yb/integration-tests/external_mini_cluster-itest-base.h"
 #include "yb/integration-tests/test_workload.h"
 
-using yb::consensus::RaftPeerPB;
+#include "yb/rpc/rpc_controller.h"
+
+#include "yb/tserver/tserver_service.proxy.h"
+
+#include "yb/util/countdown_latch.h"
+
+using yb::consensus::PeerMemberType;
 using yb::itest::TServerDetails;
 using yb::tablet::TABLET_DATA_READY;
 using yb::tablet::TABLET_DATA_TOMBSTONED;
 using yb::tserver::ListTabletsResponsePB;
-using std::shared_ptr;
 using std::string;
-using std::unordered_map;
 using std::vector;
-using strings::Substitute;
 
 namespace yb {
 
@@ -70,9 +73,11 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false" };
   int num_tservers = 5;
-  vector<string> master_flags;
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
-  master_flags.push_back("--replication_factor=5");
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--replication_factor=5",
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags, num_tservers));
 
   TestWorkload workload(cluster_.get());
@@ -89,7 +94,7 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
   string tablet_id = tablets[0].tablet_status().tablet_id();
 
   // Wait until all replicas are up and running.
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
                                             tablet_id, timeout));
   }
@@ -121,7 +126,7 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
     ASSERT_EQ(1, active_ts_map.erase(cluster_->tablet_server(i)->uuid()));
   }
   // This will time out, but should take effect.
-  Status s = itest::AddServer(leader_ts, tablet_id, follower_ts, RaftPeerPB::PRE_VOTER,
+  Status s = itest::AddServer(leader_ts, tablet_id, follower_ts, PeerMemberType::PRE_VOTER,
                               boost::none, MonoDelta::FromSeconds(5), NULL,
                               false /* retry */);
   ASSERT_TRUE(s.IsTimedOut());
@@ -141,8 +146,10 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneEvictedReplica) {
 TEST_F(TabletReplacementITest, TestMasterTombstoneOldReplicaOnReport) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false" };
-  vector<string> master_flags;
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -159,7 +166,7 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneOldReplicaOnReport) {
   string tablet_id = tablets[0].tablet_status().tablet_id();
 
   // Wait until all replicas are up and running.
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
                                             tablet_id, timeout));
   }
@@ -178,8 +185,7 @@ TEST_F(TabletReplacementITest, TestMasterTombstoneOldReplicaOnReport) {
   // Remove the follower from the config and wait for the Master to notice the
   // config change.
   ASSERT_OK(itest::RemoveServer(leader_ts, tablet_id, follower_ts, boost::none, timeout));
-  ASSERT_OK(itest::WaitForNumVotersInConfigOnMaster(cluster_->master_proxy(), tablet_id, 2,
-                                                    timeout));
+  ASSERT_OK(itest::WaitForNumVotersInConfigOnMaster(cluster_.get(), tablet_id, 2, timeout));
 
   // Shut down the remaining tablet servers and restart the dead one.
   cluster_->tablet_server(0)->Shutdown();
@@ -201,7 +207,10 @@ TEST_F(TabletReplacementITest, TestEvictAndReplaceDeadFollower) {
   MonoDelta timeout = MonoDelta::FromSeconds(30);
   vector<string> ts_flags = { "--enable_leader_failure_detection=false",
                               "--follower_unavailable_considered_failed_sec=5" };
-  vector<string> master_flags = { "--catalog_manager_wait_for_new_tablets_to_elect_leader=false" };
+  vector<string> master_flags = {
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -217,7 +226,7 @@ TEST_F(TabletReplacementITest, TestEvictAndReplaceDeadFollower) {
   string tablet_id = tablets[0].tablet_status().tablet_id();
 
   // Wait until all replicas are up and running.
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
                                             tablet_id, timeout));
   }
@@ -254,13 +263,16 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   }
 
   MonoDelta timeout = MonoDelta::FromSeconds(30);
-  vector<string> ts_flags;
-  ts_flags.push_back("--enable_leader_failure_detection=false");
-  vector<string> master_flags;
+  vector<string> ts_flags = {
+    "--enable_leader_failure_detection=false"s,
+  };
   // We will manage doing the AddServer() manually, in order to make this test
   // more deterministic.
-  master_flags.push_back("--master_tombstone_evicted_tablet_replicas=false");
-  master_flags.push_back("--catalog_manager_wait_for_new_tablets_to_elect_leader=false");
+  vector<string> master_flags = {
+    "--master_tombstone_evicted_tablet_replicas=false"s,
+    "--catalog_manager_wait_for_new_tablets_to_elect_leader=false"s,
+    "--use_create_table_leader_hint=false"s,
+  };
   ASSERT_NO_FATALS(StartCluster(ts_flags, master_flags));
 
   TestWorkload workload(cluster_.get());
@@ -277,7 +289,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   string tablet_id = tablets[0].tablet_status().tablet_id();
 
   // Wait until all replicas are up and running.
-  for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
+  for (size_t i = 0; i < cluster_->num_tablet_servers(); i++) {
     ASSERT_OK(itest::WaitUntilTabletRunning(ts_map_[cluster_->tablet_server(i)->uuid()].get(),
                                             tablet_id, timeout));
   }
@@ -292,7 +304,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   // Delay tablet applies in order to delay COMMIT messages to trigger KUDU-1233.
   // Then insert another row.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server_by_uuid(leader_ts->uuid()),
-                              "tablet_inject_latency_on_apply_write_txn_ms", "5000"));
+                              "TEST_tablet_inject_latency_on_apply_write_txn_ms", "5000"));
 
   // Kick off an async insert, which will be delayed for 5 seconds. This is
   // normally enough time to evict a replica, tombstone it, add it back, and
@@ -316,7 +328,7 @@ TEST_F(TabletReplacementITest, TestRemoteBoostrapWithPendingConfigChangeCommits)
   ASSERT_OK(itest::RemoveServer(leader_ts, tablet_id, ts_to_remove, boost::none, timeout));
   ASSERT_OK(itest::DeleteTablet(ts_to_remove, tablet_id, TABLET_DATA_TOMBSTONED,
                                 boost::none, timeout));
-  ASSERT_OK(itest::AddServer(leader_ts, tablet_id, ts_to_remove, RaftPeerPB::PRE_VOTER,
+  ASSERT_OK(itest::AddServer(leader_ts, tablet_id, ts_to_remove, PeerMemberType::PRE_VOTER,
                              boost::none, timeout));
   ASSERT_OK(itest::WaitUntilTabletRunning(ts_to_remove, tablet_id, timeout));
 

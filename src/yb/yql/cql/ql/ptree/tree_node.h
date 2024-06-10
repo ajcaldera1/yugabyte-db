@@ -18,18 +18,19 @@
 // defined in parser_gram.y will create these nodes and link them together to form parse tree.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_TREE_NODE_H_
-#define YB_YQL_CQL_QL_PTREE_TREE_NODE_H_
+#pragma once
 
-#include "yb/yql/cql/ql/ptree/yb_location.h"
-#include "yb/yql/cql/ql/ptree/pt_option.h"
-#include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/util/enums.h"
-#include "yb/util/status.h"
+
 #include "yb/util/memory/mc_types.h"
+
+#include "yb/yql/cql/ql/ptree/ptree_fwd.h"
+
+#include "yb/util/status_fwd.h"
 
 namespace yb {
 namespace ql {
+
 class SemContext;
 
 YB_DEFINE_ENUM(TreeNodeOpcode,
@@ -68,6 +69,8 @@ YB_DEFINE_ENUM(TreeNodeOpcode,
                (kPTOrderBy)
                (kPTRoleOption)
                (kPTExplainStmt)
+               (kPTInsertValuesClause)
+               (kPTInsertJsonClause)
 
                // Expressions.
                (kPTExpr)
@@ -88,7 +91,7 @@ class TreeNode : public MCBase {
 
   //------------------------------------------------------------------------------------------------
   // Public functions.
-  explicit TreeNode(MemoryContext *memctx = nullptr, YBLocation::SharedPtr loc = nullptr);
+  explicit TreeNode(MemoryContext *memctx = nullptr, YBLocationPtr loc = nullptr);
   virtual ~TreeNode();
 
   // Node type.
@@ -101,10 +104,15 @@ class TreeNode : public MCBase {
   }
 
   // Run semantics analysis on this node.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context);
+  virtual Status Analyze(SemContext *sem_context);
 
   // Is this a DML statement?
   virtual bool IsDml() const {
+    return false;
+  }
+
+  // Is this treenode a top level node that is used to query data from tablet server?
+  virtual bool IsTopLevelReadNode() const {
     return false;
   }
 
@@ -115,7 +123,7 @@ class TreeNode : public MCBase {
   void set_loc(const TreeNode& other) {
     loc_ = other.loc_;
   }
-  const YBLocation::SharedPtr& loc_ptr() const {
+  const YBLocationPtr& loc_ptr() const {
     return loc_;
   }
 
@@ -124,12 +132,10 @@ class TreeNode : public MCBase {
   }
 
  protected:
-  YBLocation::SharedPtr loc_;
+  YBLocationPtr loc_;
 
   bool internal_ = false;
 };
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_TREE_NODE_H_

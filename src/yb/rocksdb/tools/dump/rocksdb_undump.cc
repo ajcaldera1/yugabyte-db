@@ -18,30 +18,15 @@
 // under the License.
 //
 
-#if !(defined GFLAGS) || defined(ROCKSDB_LITE)
-
-#include <cstdio>
-int main() {
-#ifndef GFLAGS
-  fprintf(stderr, "Please install gflags to run rocksdb tools\n");
-#endif
-#ifdef ROCKSDB_LITE
-  fprintf(stderr, "DbUndumpTool is not supported in ROCKSDB_LITE\n");
-#endif
-  return 1;
-}
-
-#else
-
-#include <gflags/gflags.h>
+#include "yb/util/flags.h"
 #include "yb/rocksdb/convenience.h"
 #include "yb/rocksdb/db_dump_tool.h"
 
-DEFINE_string(dump_location, "", "Path to the dump file that will be loaded");
-DEFINE_string(db_path, "", "Path to the db that we will undump the file into");
-DEFINE_bool(compact, false, "Compact the db after loading the dumped file");
-DEFINE_string(db_options, "",
-              "Options string used to open the database that will be loaded");
+DEFINE_NON_RUNTIME_string(dump_location, "", "Path to the dump file that will be loaded");
+DEFINE_NON_RUNTIME_string(db_path, "", "Path to the db that we will undump the file into");
+DEFINE_NON_RUNTIME_bool(compact, false, "Compact the db after loading the dumped file");
+DEFINE_NON_RUNTIME_string(db_options, "",
+    "Options string used to open the database that will be loaded");
 
 int main(int argc, char **argv) {
   GFLAGS::ParseCommandLineFlags(&argc, &argv, true);
@@ -74,4 +59,3 @@ int main(int argc, char **argv) {
   }
   return 0;
 }
-#endif  // !(defined GFLAGS) || defined(ROCKSDB_LITE)

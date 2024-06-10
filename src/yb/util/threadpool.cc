@@ -32,12 +32,10 @@
 
 #include <algorithm>
 #include <functional>
-#include <iostream>
 #include <limits>
 #include <memory>
 
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include "yb/util/flags.h"
 
 #include "yb/gutil/callback.h"
 #include "yb/gutil/macros.h"
@@ -45,8 +43,11 @@
 #include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
 #include "yb/gutil/sysinfo.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/errno.h"
+#include "yb/util/logging.h"
 #include "yb/util/metrics.h"
-#include "yb/util/stopwatch.h"
 #include "yb/util/thread.h"
 #include "yb/util/threadpool.h"
 #include "yb/util/trace.h"
@@ -55,6 +56,10 @@ namespace yb {
 
 using strings::Substitute;
 using std::unique_ptr;
+using std::deque;
+
+
+ThreadPoolMetrics::~ThreadPoolMetrics() = default;
 
 ////////////////////////////////////////////////////////
 // ThreadPoolBuilder
@@ -100,13 +105,7 @@ ThreadPoolBuilder& ThreadPoolBuilder::set_idle_timeout(const MonoDelta& idle_tim
   return *this;
 }
 
-Status ThreadPoolBuilder::Build(gscoped_ptr<ThreadPool>* pool) const {
-  pool->reset(new ThreadPool(*this));
-  RETURN_NOT_OK((*pool)->Init());
-  return Status::OK();
-}
-
-Status ThreadPoolBuilder::Build(unique_ptr<ThreadPool>* pool) const {
+Status ThreadPoolBuilder::Build(std::unique_ptr<ThreadPool>* pool) const {
   pool->reset(new ThreadPool(*this));
   RETURN_NOT_OK((*pool)->Init());
   return Status::OK();
@@ -213,18 +212,18 @@ void ThreadPoolToken::Wait() {
 }
 
 bool ThreadPoolToken::WaitUntil(const MonoTime& until) {
-  return WaitFor(until - MonoTime::Now());
-}
-
-bool ThreadPoolToken::WaitFor(const MonoDelta& delta) {
   MutexLock unique_lock(pool_->lock_);
   pool_->CheckNotPoolThreadUnlocked();
   while (IsActive()) {
-    if (!not_running_cond_.TimedWait(delta)) {
+    if (!not_running_cond_.WaitUntil(until)) {
       return false;
     }
   }
   return true;
+}
+
+bool ThreadPoolToken::WaitFor(const MonoDelta& delta) {
+  return WaitUntil(MonoTime::Now() + delta);
 }
 
 void ThreadPoolToken::Transition(ThreadPoolTokenState new_state) {
@@ -324,6 +323,12 @@ Status ThreadPool::Init() {
   for (int i = 0; i < min_threads_; i++) {
     Status status = CreateThreadUnlocked();
     if (!status.ok()) {
+      if (i != 0) {
+        YB_LOG_EVERY_N_SECS(WARNING, 5) << "Cannot create thread: " << status << ", will try later";
+        // Cannot create enough threads now, will try later.
+        break;
+      }
+      unique_lock.Unlock();
       Shutdown();
       return status;
     }
@@ -444,7 +449,7 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
   }
 
   if (PREDICT_FALSE(!token->MaySubmitNewTasks())) {
-    return STATUS(ServiceUnavailable, "Thread pool token was shut down.", "", ESHUTDOWN);
+    return STATUS(ServiceUnavailable, "Thread pool token was shut down.", "", Errno(ESHUTDOWN));
   }
 
   // Size limit check.
@@ -454,7 +459,7 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
     return STATUS(ServiceUnavailable,
                   Substitute("Thread pool is at capacity ($0/$1 tasks running, $2/$3 tasks queued)",
                              num_threads_, max_threads_, total_queued_tasks_, max_queue_size_),
-                  "", ESHUTDOWN);
+                  "", Errno(ESHUTDOWN));
   }
 
   // Should we create another thread?
@@ -469,18 +474,18 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
   int threads_from_this_submit =
       token->IsActive() && token->mode() == ExecutionMode::SERIAL ? 0 : 1;
   int inactive_threads = num_threads_ - active_threads_;
-  int additional_threads = (queue_.size() + threads_from_this_submit) - inactive_threads;
+  int64_t additional_threads = (queue_.size() + threads_from_this_submit) - inactive_threads;
   if (additional_threads > 0 && num_threads_ < max_threads_) {
     Status status = CreateThreadUnlocked();
     if (!status.ok()) {
+      // If we failed to create a thread, but there are still some other
+      // worker threads, log a warning message and continue.
+      LOG(WARNING) << "Thread pool failed to create thread: " << status << ", num_threads: "
+                   << num_threads_ << ", max_threads: " << max_threads_;
       if (num_threads_ == 0) {
         // If we have no threads, we can't do any work.
         return status;
       }
-      // If we failed to create a thread, but there are still some other
-      // worker threads, log a warning message and continue.
-      LOG(WARNING) << "Thread pool failed to create thread: "
-                   << status.ToString();
     }
   }
 
@@ -509,13 +514,13 @@ Status ThreadPool::DoSubmit(const std::shared_ptr<Runnable> task, ThreadPoolToke
   int length_at_submit = total_queued_tasks_++;
 
   guard.Unlock();
-  not_empty_.Signal();
+  YB_PROFILE(not_empty_.Signal());
 
-  if (metrics_.queue_length_histogram) {
-    metrics_.queue_length_histogram->Increment(length_at_submit);
+  if (metrics_.queue_length_stats) {
+    metrics_.queue_length_stats->Increment(length_at_submit);
   }
-  if (token->metrics_.queue_length_histogram) {
-    token->metrics_.queue_length_histogram->Increment(length_at_submit);
+  if (token->metrics_.queue_length_stats) {
+    token->metrics_.queue_length_stats->Increment(length_at_submit);
   }
 
   return Status::OK();
@@ -529,18 +534,17 @@ void ThreadPool::Wait() {
 }
 
 bool ThreadPool::WaitUntil(const MonoTime& until) {
-  MonoDelta relative = until.GetDeltaSince(MonoTime::Now());
-  return WaitFor(relative);
-}
-
-bool ThreadPool::WaitFor(const MonoDelta& delta) {
   MutexLock unique_lock(lock_);
   while ((!queue_.empty()) || (active_threads_ > 0)) {
-    if (!idle_cond_.TimedWait(delta)) {
+    if (!idle_cond_.WaitUntil(until)) {
       return false;
     }
   }
   return true;
+}
+
+bool ThreadPool::WaitFor(const MonoDelta& delta) {
+  return WaitUntil(MonoTime::Now() + delta);
 }
 
 void ThreadPool::DispatchThread(bool permanent) {
@@ -595,11 +599,11 @@ void ThreadPool::DispatchThread(bool permanent) {
     // Update metrics
     MonoTime now(MonoTime::Now());
     int64_t queue_time_us = (now - task.submit_time).ToMicroseconds();
-    if (metrics_.queue_time_us_histogram) {
-      metrics_.queue_time_us_histogram->Increment(queue_time_us);
+    if (metrics_.queue_time_us_stats) {
+      metrics_.queue_time_us_stats->Increment(queue_time_us);
     }
-    if (token->metrics_.queue_time_us_histogram) {
-      token->metrics_.queue_time_us_histogram->Increment(queue_time_us);
+    if (token->metrics_.queue_time_us_stats) {
+      token->metrics_.queue_time_us_stats->Increment(queue_time_us);
     }
 
     // Execute the task
@@ -608,11 +612,11 @@ void ThreadPool::DispatchThread(bool permanent) {
       task.runnable->Run();
       int64_t wall_us = GetMonoTimeMicros() - start_wall_us;
 
-      if (metrics_.run_time_us_histogram) {
-        metrics_.run_time_us_histogram->Increment(wall_us);
+      if (metrics_.run_time_us_stats) {
+        metrics_.run_time_us_stats->Increment(wall_us);
       }
-      if (token->metrics_.run_time_us_histogram) {
-        token->metrics_.run_time_us_histogram->Increment(wall_us);
+      if (token->metrics_.run_time_us_stats) {
+        token->metrics_.run_time_us_stats->Increment(wall_us);
       }
     }
     // Destruct the task while we do not hold the lock.
@@ -642,7 +646,7 @@ void ThreadPool::DispatchThread(bool permanent) {
       }
     }
     if (--active_threads_ == 0) {
-      idle_cond_.Broadcast();
+      YB_PROFILE(idle_cond_.Broadcast());
     }
   }
 
@@ -681,6 +685,40 @@ void ThreadPool::CheckNotPoolThreadUnlocked() {
     LOG(FATAL) << Substitute("Thread belonging to thread pool '$0' with "
         "name '$1' called pool function that would result in deadlock",
         name_, current->name());
+  }
+}
+
+Status TaskRunner::Init(int concurrency) {
+  ThreadPoolBuilder builder("Task Runner");
+  if (concurrency > 0) {
+    builder.set_max_threads(concurrency);
+  }
+  return builder.Build(&thread_pool_);
+}
+
+Status TaskRunner::Wait(StopWaitIfFailed stop_wait_if_failed) {
+  UniqueLock lock(mutex_);
+  WaitOnConditionVariable(&cond_, &lock, [this, &stop_wait_if_failed] {
+    return (running_tasks_ == 0 || (stop_wait_if_failed && failed_.load()));
+  });
+  return first_failure_;
+}
+
+void TaskRunner::CompleteTask(const Status& status) {
+  bool is_first_failure = false;
+  if (!status.ok()) {
+    bool expected = false;
+    if (failed_.compare_exchange_strong(expected, true)) {
+      is_first_failure = true;
+      std::lock_guard lock(mutex_);
+      first_failure_ = status;
+    } else {
+      LOG(WARNING) << status.message() << std::endl;
+    }
+  }
+  if (--running_tasks_ == 0 || is_first_failure) {
+    std::lock_guard lock(mutex_);
+    YB_PROFILE(cond_.notify_one());
   }
 }
 

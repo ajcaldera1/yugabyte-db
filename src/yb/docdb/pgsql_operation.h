@@ -11,50 +11,67 @@
 // under the License.
 //
 
-#ifndef YB_DOCDB_PGSQL_OPERATION_H
-#define YB_DOCDB_PGSQL_OPERATION_H
+#pragma once
 
-#include "yb/common/pgsql_resultset.h"
-#include "yb/common/ql_rowwise_iterator_interface.h"
+#include <functional>
+#include <utility>
+
+#include <boost/container/small_vector.hpp>
+
+#include "yb/common/pgsql_protocol.pb.h"
 
 #include "yb/docdb/doc_expr.h"
-#include "yb/docdb/doc_key.h"
 #include "yb/docdb/doc_operation.h"
+#include "yb/docdb/docdb_statistics.h"
+#include "yb/docdb/intent_aware_iterator.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
 
-namespace yb {
+#include "yb/dockv/doc_key.h"
+#include "yb/dockv/pg_row.h"
+#include "yb/dockv/reader_projection.h"
 
-class IndexInfo;
+#include "yb/util/operation_counter.h"
+#include "yb/util/strongly_typed_bool.h"
+#include "yb/util/write_buffer.h"
 
-namespace common {
+namespace yb::docdb {
 
-class YQLStorageIf;
+YB_STRONGLY_TYPED_BOOL(IsUpsert);
 
-}
-
-namespace docdb {
+bool ShouldYsqlPackRow(bool has_cotable_id);
 
 class PgsqlWriteOperation :
     public DocOperationBase<DocOperationType::PGSQL_WRITE_OPERATION, PgsqlWriteRequestPB>,
     public DocExprExecutor {
  public:
-  PgsqlWriteOperation(const Schema& schema,
-                      const TransactionOperationContextOpt& txn_op_context,
-                      const IndexInfo* index_info)
-      : schema_(schema),
-        txn_op_context_(txn_op_context),
-        index_info_(index_info) {
-  }
+  PgsqlWriteOperation(std::reference_wrapper<const PgsqlWriteRequestPB> request,
+                      DocReadContextPtr doc_read_context,
+                      const TransactionOperationContext& txn_op_context,
+                      rpc::Sidecars* sidecars);
 
   // Initialize PgsqlWriteOperation. Content of request will be swapped out by the constructor.
-  CHECKED_STATUS Init(PgsqlWriteRequestPB* request, PgsqlResponsePB* response);
-  bool RequireReadSnapshot() const override { return request_.has_column_refs(); }
+  Status Init(PgsqlResponsePB* response);
+  bool RequireReadSnapshot() const override {
+    // For YSQL the the standard operations (INSERT/UPDATE/DELETE) will read/check the primary key.
+    // We use UPSERT stmt type for specific requests when we can guarantee we can skip the read.
+    return request_.stmt_type() != PgsqlWriteRequestPB::PGSQL_UPSERT;
+  }
+
   const PgsqlWriteRequestPB& request() const { return request_; }
   PgsqlResponsePB* response() const { return response_; }
 
-  const PgsqlResultSet& resultset() const { return resultset_; }
+  Result<bool> HasDuplicateUniqueIndexValue(const DocOperationApplyData& data);
+  Result<bool> HasDuplicateUniqueIndexValueBackward(const DocOperationApplyData& data);
+  Result<bool> HasDuplicateUniqueIndexValue(
+      const DocOperationApplyData& data,
+      const ReadHybridTime& read_time);
+  Result<HybridTime> FindOldestOverwrittenTimestamp(
+      IntentAwareIterator* iter,
+      const dockv::SubDocKey& sub_doc_key,
+      HybridTime min_hybrid_time);
 
   // Execute write.
-  CHECKED_STATUS Apply(const DocOperationApplyData& data) override;
+  Status Apply(const DocOperationApplyData& data) override;
 
  private:
   void ClearResponse() override {
@@ -63,35 +80,49 @@ class PgsqlWriteOperation :
     }
   }
 
-  // Insert, update, and delete operations.
-  CHECKED_STATUS ApplyInsert(const DocOperationApplyData& data);
-  CHECKED_STATUS ApplyUpdate(const DocOperationApplyData& data);
-  CHECKED_STATUS ApplyDelete(const DocOperationApplyData& data);
+  // Insert, update, delete, and colocated truncate operations.
+  Status ApplyInsert(
+      const DocOperationApplyData& data, IsUpsert is_upsert = IsUpsert::kFalse);
+  Status ApplyUpdate(const DocOperationApplyData& data);
+  Status ApplyDelete(const DocOperationApplyData& data, const bool is_persist_needed);
+  Status ApplyTruncateColocated(const DocOperationApplyData& data);
+  Status ApplyFetchSequence(const DocOperationApplyData& data);
 
-  CHECKED_STATUS DeleteRow(const DocPath& row_path, DocWriteBatch* doc_write_batch,
-                           const ReadHybridTime& read_ht, CoarseTimePoint deadline);
+  Status DeleteRow(const dockv::DocPath& row_path, DocWriteBatch* doc_write_batch,
+                   const ReadOperationData& read_operation_data);
 
   // Reading current row before operating on it.
-  CHECKED_STATUS ReadColumns(const DocOperationApplyData& data,
-                             const QLTableRow::SharedPtr& table_row) {
-    return ReadColumns(data, table_row, *range_doc_key_);
-  }
+  // Returns true if row was present.
+  Result<bool> ReadRow(const DocOperationApplyData& data, dockv::PgTableRow* table_row);
+  Result<bool> ReadRow(
+      const DocOperationApplyData& data, const dockv::DocKey& doc_key,
+      dockv::PgTableRow* table_row);
 
-  CHECKED_STATUS ReadColumns(const DocOperationApplyData& data,
-                             const QLTableRow::SharedPtr& table_row,
-                             const DocKey& key);
-
-  CHECKED_STATUS PopulateResultSet(const QLTableRow::SharedPtr& table_row);
+  Status PopulateResultSet(const dockv::PgTableRow* table_row);
 
   // Reading path to operate on.
-  CHECKED_STATUS GetDocPaths(
-      GetDocPathsMode mode, DocPathsToLock *paths, IsolationLevel *level) const override;
+  Status GetDocPaths(GetDocPathsMode mode,
+                     DocPathsToLock *paths,
+                     IsolationLevel *level) const override;
+
+  class RowPackContext;
+
+  Status InsertColumn(
+      const DocOperationApplyData& data, const PgsqlColumnValuePB& column_value,
+      RowPackContext* pack_context);
+
+  Status UpdateColumn(
+      const DocOperationApplyData& data, const dockv::PgTableRow& table_row,
+      const PgsqlColumnValuePB& column_value, dockv::PgTableRow* returning_table_row,
+      qlexpr::QLExprResult* result, RowPackContext* pack_context);
+
+  const dockv::ReaderProjection& projection() const;
 
   //------------------------------------------------------------------------------------------------
   // Context.
-  const Schema& schema_;
-  const TransactionOperationContextOpt txn_op_context_;
-  const IndexInfo* index_info_;
+  DocReadContextPtr doc_read_context_;
+  mutable std::optional<dockv::ReaderProjection> projection_;
+  const TransactionOperationContext txn_op_context_;
 
   // Input arguments.
   PgsqlResponsePB* response_ = nullptr;
@@ -99,69 +130,108 @@ class PgsqlWriteOperation :
   // TODO(neil) Output arguments.
   // UPDATE, DELETE, INSERT operations should return total number of new or changed rows.
 
-  // State variables.
-  // Doc key and encoded doc key for hashed key (i.e. without range columns). Present when there is
-  // a static column being written.
-  boost::optional<DocKey> hashed_doc_key_;
-  RefCntPrefix encoded_hashed_doc_key_;
-
-  // Doc key and encoded doc key for primary key (i.e. with range columns). Present when there is a
-  // non-static column being written or when writing the primary key alone (i.e. range columns are
-  // present or table does not have range columns).
-  boost::optional<DocKey> range_doc_key_;
-  RefCntPrefix encoded_range_doc_key_;
+  // Doc key and encoded doc key for the primary key.
+  dockv::DocKey doc_key_;
+  RefCntPrefix encoded_doc_key_;
 
   // Rows result requested.
-  PgsqlResultSet resultset_;
+  rpc::Sidecars* const sidecars_;
+
+  int64_t result_rows_ = 0;
+  WriteBufferPos row_num_pos_;
+  WriteBuffer* write_buffer_ = nullptr;
+  const bool ysql_skip_row_lock_for_update_;
 };
 
 class PgsqlReadOperation : public DocExprExecutor {
  public:
   // Construct and access methods.
   PgsqlReadOperation(const PgsqlReadRequestPB& request,
-                     const TransactionOperationContextOpt& txn_op_context)
+                     const TransactionOperationContext& txn_op_context)
       : request_(request), txn_op_context_(txn_op_context) {
   }
 
   const PgsqlReadRequestPB& request() const { return request_; }
   PgsqlResponsePB& response() { return response_; }
 
-  CHECKED_STATUS Execute(const common::YQLStorageIf& ql_storage,
-                         CoarseTimePoint deadline,
-                         const ReadHybridTime& read_time,
-                         const Schema& schema,
-                         const Schema *index_schema,
-                         PgsqlResultSet *result_set,
-                         HybridTime *restart_read_ht);
+  // Driver of the execution for READ operators for the given conditions in Protobuf request.
+  // The protobuf request carries two different types of arguments.
+  // - Scalar argument: The query condition is represented by one set of values. For example, each
+  //   of the following scalar protobuf requests will carry one "ybctid" (ROWID).
+  //     SELECT ... WHERE ybctid = y1;
+  //     SELECT ... WHERE ybctid = y2;
+  //     SELECT ... WHERE ybctid = y3;
+  //
+  // - Batch argument: The query condition is represented by many sets of values. For example, a
+  //   batch protobuf will carry many ybctids.
+  //     SELECT ... WHERE ybctid IN (y1, y2, y3)
+  Result<size_t> Execute(const YQLStorageIf& ql_storage,
+                         const ReadOperationData& read_operation_data,
+                         bool is_explicit_request_read_time,
+                         const DocReadContext& doc_read_context,
+                         const DocReadContext* index_doc_read_context,
+                         std::reference_wrapper<const ScopedRWOperation> pending_op,
+                         WriteBuffer* result_buffer,
+                         HybridTime* restart_read_ht,
+                         const DocDBStatistics* statistics = nullptr);
 
-  CHECKED_STATUS GetTupleId(QLValue *result) const override;
+  Status GetSpecialColumn(ColumnIdRep column_id, QLValuePB* result);
 
-  CHECKED_STATUS GetIntents(const Schema& schema, KeyValueWriteBatchPB* out);
+  Status GetIntents(const Schema& schema, IsolationLevel level, LWKeyValueWriteBatchPB* out);
 
  private:
-  CHECKED_STATUS PopulateResultSet(const QLTableRow::SharedPtr& table_row,
-                                   PgsqlResultSet *result_set);
+  // Execute a READ operator for a given scalar argument.
+  Result<size_t> ExecuteScalar(const YQLStorageIf& ql_storage,
+                               const ReadOperationData& read_operation_data,
+                               bool is_explicit_request_read_time,
+                               const DocReadContext& doc_read_context,
+                               const DocReadContext* index_doc_read_context,
+                               std::reference_wrapper<const ScopedRWOperation> pending_op,
+                               WriteBuffer* result_buffer,
+                               HybridTime* restart_read_ht,
+                               bool* has_paging_state,
+                               const DocDBStatistics* statistics);
 
-  CHECKED_STATUS EvalAggregate(const QLTableRow::SharedPtr& table_row);
+  // Execute a READ operator for a given batch of ybctids.
+  Result<size_t> ExecuteBatchYbctid(const YQLStorageIf& ql_storage,
+                                    const ReadOperationData& read_operation_data,
+                                    const DocReadContext& doc_read_context,
+                                    std::reference_wrapper<const ScopedRWOperation> pending_op,
+                                    WriteBuffer* result_buffer,
+                                    HybridTime* restart_read_ht,
+                                    const DocDBStatistics* statistics);
 
-  CHECKED_STATUS PopulateAggregate(const QLTableRow::SharedPtr& table_row,
-                                   PgsqlResultSet *resultset);
+  Result<size_t> ExecuteSample(const YQLStorageIf& ql_storage,
+                               const ReadOperationData& read_operation_data,
+                               bool is_explicit_request_read_time,
+                               const DocReadContext& doc_read_context,
+                               std::reference_wrapper<const ScopedRWOperation> pending_op,
+                               WriteBuffer* result_buffer,
+                               HybridTime* restart_read_ht,
+                               bool* has_paging_state,
+                               const DocDBStatistics* statistics);
+
+  Status PopulateResultSet(const dockv::PgTableRow& table_row,
+                           WriteBuffer *result_buffer);
+
+  Status EvalAggregate(const dockv::PgTableRow& table_row);
+
+  Status PopulateAggregate(WriteBuffer *result_buffer);
 
   // Checks whether we have processed enough rows for a page and sets the appropriate paging
   // state in the response object.
-  CHECKED_STATUS SetPagingStateIfNecessary(const common::YQLRowwiseIteratorIf* iter,
-                                           const PgsqlResultSet* resultset,
-                                           const size_t row_count_limit);
+  Result<bool> SetPagingState(
+      YQLRowwiseIteratorIf* iter, const Schema& schema, const ReadHybridTime& read_time);
 
   //------------------------------------------------------------------------------------------------
   const PgsqlReadRequestPB& request_;
-  const TransactionOperationContextOpt txn_op_context_;
+  const TransactionOperationContext txn_op_context_;
+  boost::container::small_vector<dockv::PgWireEncoderEntry, 0x10> target_encoders_;
   PgsqlResponsePB response_;
-  common::YQLRowwiseIteratorIf::UniPtr table_iter_;
-  common::YQLRowwiseIteratorIf::UniPtr index_iter_;
+  YQLRowwiseIteratorIf::UniPtr table_iter_;
+  YQLRowwiseIteratorIf::UniPtr index_iter_;
+  uint64_t scanned_table_rows_ = 0;
+  uint64_t scanned_index_rows_ = 0;
 };
 
-}  // namespace docdb
-}  // namespace yb
-
-#endif // YB_DOCDB_PGSQL_OPERATION_H
+}  // namespace yb::docdb

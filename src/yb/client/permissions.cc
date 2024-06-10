@@ -11,15 +11,22 @@
 // under the License.
 //
 
+#include "yb/client/permissions.h"
+
 #include <atomic>
 
 #include "yb/client/client.h"
-#include "yb/client/permissions.h"
+
+#include "yb/master/master_dcl.pb.h"
+
+#include "yb/rpc/scheduler.h"
+
+#include "yb/util/callsite_profiling.h"
+#include "yb/util/result.h"
 
 DECLARE_int32(update_permissions_cache_msecs);
 
 namespace yb {
-
 namespace client {
 
 namespace internal {
@@ -36,8 +43,16 @@ RolePermissions::RolePermissions(const master::RolePermissionInfoPB& role_permis
   // For each resource, extract its permissions and store it in the role's permissions map.
   for (const auto &resource_permissions : role_permission_info_pb.resource_permissions()) {
     DCHECK(resource_permissions.has_permissions());
-    resource_permissions_[resource_permissions.canonical_resource()] =
-        resource_permissions.permissions();
+    VLOG(1) << "Processing permissions " << resource_permissions.ShortDebugString();
+
+    auto it = resource_permissions_.find(resource_permissions.canonical_resource());
+    if (it == resource_permissions_.end()) {
+      resource_permissions_[resource_permissions.canonical_resource()] =
+          resource_permissions.permissions();
+    } else {
+      // permissions is a bitmap representing the permissions.
+      it->second |= resource_permissions.permissions();
+    }
   }
 }
 
@@ -59,7 +74,7 @@ bool RolePermissions::HasAllRolesPermission(PermissionType permission) const {
   return all_roles_permissions_.test(permission);
 }
 
-PermissionsCache::PermissionsCache(std::shared_ptr<YBClient> client,
+PermissionsCache::PermissionsCache(client::YBClient* client,
                                    bool automatically_update_cache) : client_(client) {
   if (!automatically_update_cache) {
     return;
@@ -108,6 +123,7 @@ void PermissionsCache::ScheduleGetPermissionsFromMaster(bool now) {
 
 void PermissionsCache::UpdateRolesPermissions(const GetPermissionsResponsePB& resp) {
   auto new_roles_permissions_map = std::make_shared<RolesPermissionsMap>();
+  auto new_roles_auth_info_map = std::make_shared<RolesAuthInfoMap>();
 
   // Populate the cache.
   // Get all the roles in the response. They should have at least one piece of information:
@@ -117,6 +133,14 @@ void PermissionsCache::UpdateRolesPermissions(const GetPermissionsResponsePB& re
                                                      RolePermissions(role_permissions));
     LOG_IF(DFATAL, !result.second) << "Error inserting permissions for role "
                                    << role_permissions.role();
+
+    RoleAuthInfo role_auth_info;
+    role_auth_info.salted_hash = role_permissions.salted_hash();
+    role_auth_info.can_login = role_permissions.can_login();
+    auto result2 = new_roles_auth_info_map->emplace(role_permissions.role(),
+                                                    std::move(role_auth_info));
+    LOG_IF(DFATAL, !result2.second) << "Error inserting authentication info for role "
+                                   << role_permissions.role();
   }
 
   {
@@ -125,16 +149,18 @@ void PermissionsCache::UpdateRolesPermissions(const GetPermissionsResponsePB& re
     if (version_ < resp.version()) {
       std::atomic_store_explicit(&roles_permissions_map_, std::move(new_roles_permissions_map),
           std::memory_order_release);
+      std::atomic_store_explicit(&roles_auth_info_map_, std::move(new_roles_auth_info_map),
+          std::memory_order_release);
       // Set the permissions cache's version.
       version_ = resp.version();
     }
   }
   {
     // We need to hold the mutex before modifying ready_ to avoid a race condition with cond_.
-    std::lock_guard<std::mutex> l(mtx_);
+    std::lock_guard l(mtx_);
     ready_.store(true, std::memory_order_release);
   }
-  cond_.notify_all();
+  YB_PROFILE(cond_.notify_all());
 }
 
 void PermissionsCache::GetPermissionsFromMaster() {
@@ -154,6 +180,28 @@ void PermissionsCache::GetPermissionsFromMaster() {
   }
 }
 
+Result<std::string> PermissionsCache::salted_hash(const RoleName& role_name) {
+  std::shared_ptr<RolesAuthInfoMap> roles_auth_info_map;
+  roles_auth_info_map = std::atomic_load_explicit(&roles_auth_info_map_,
+    std::memory_order_acquire);
+  auto it = roles_auth_info_map->find(role_name);
+  if (it == roles_auth_info_map->end()) {
+    return STATUS(NotFound, "Role not found");
+  }
+  return it->second.salted_hash;
+}
+
+Result<bool> PermissionsCache::can_login(const RoleName& role_name) {
+  std::shared_ptr<RolesAuthInfoMap> roles_auth_info_map;
+  roles_auth_info_map = std::atomic_load_explicit(&roles_auth_info_map_,
+    std::memory_order_acquire);
+  auto it = roles_auth_info_map->find(role_name);
+  if (it == roles_auth_info_map->end()) {
+    return STATUS(NotFound, "Role not found");
+  }
+  return it->second.can_login;
+}
+
 bool PermissionsCache::HasCanonicalResourcePermission(const std::string& canonical_resource,
                                                       const ql::ObjectType& object_type,
                                                       const RoleName& role_name,
@@ -171,12 +219,12 @@ bool PermissionsCache::HasCanonicalResourcePermission(const std::string& canonic
 
   // Check if the requested permission has been granted to 'ALL KEYSPACES' or to 'ALL ROLES'.
   const auto& role_permissions = role_permissions_iter->second;
-  if (object_type == ql::ObjectType::OBJECT_SCHEMA || object_type == ql::ObjectType::OBJECT_TABLE) {
+  if (object_type == ql::ObjectType::SCHEMA || object_type == ql::ObjectType::TABLE) {
     if (role_permissions.HasAllKeyspacesPermission(permission)) {
       // Found.
       return true;
     }
-  } else if (object_type == ql::ObjectType::OBJECT_ROLE) {
+  } else if (object_type == ql::ObjectType::ROLE) {
     if (role_permissions.HasAllRolesPermission(permission)) {
       // Found.
       return true;

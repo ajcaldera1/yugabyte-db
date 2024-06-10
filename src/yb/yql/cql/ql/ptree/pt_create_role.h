@@ -15,10 +15,8 @@
 // Tree node definitions for CREATE ROLE statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_CREATE_ROLE_H
-#define YB_YQL_CQL_QL_PTREE_PT_CREATE_ROLE_H
+#pragma once
 
-#include "yb/common/schema.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
 #include "yb/yql/cql/ql/ptree/pt_name.h"
 #include "yb/util/crypt.h"
@@ -44,7 +42,7 @@ class PTRoleOption : public TreeNode {
 
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  explicit PTRoleOption(MemoryContext* memctx = nullptr, YBLocation::SharedPtr loc = nullptr)
+  explicit PTRoleOption(MemoryContext* memctx = nullptr, YBLocationPtr loc = nullptr)
       : TreeNode(memctx, loc) {
   }
   virtual ~PTRoleOption() {
@@ -71,7 +69,7 @@ class PTRolePassword : public PTRoleOption {
   // Constructor and destructor.
 
   PTRolePassword(MemoryContext* memctx,
-                 YBLocation::SharedPtr loc,
+                 YBLocationPtr loc,
                  const MCSharedPtr<MCString>& password);
 
   virtual ~PTRolePassword();
@@ -86,7 +84,7 @@ class PTRolePassword : public PTRoleOption {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override {
+  virtual Status Analyze(SemContext* sem_context) override {
     return Status::OK();
   }
 
@@ -110,7 +108,7 @@ class PTRoleLogin : public PTRoleOption {
   // Constructor and destructor.
 
   PTRoleLogin(MemoryContext *memctx,
-              YBLocation::SharedPtr loc,
+              YBLocationPtr loc,
               bool login);
 
   virtual ~PTRoleLogin();
@@ -125,7 +123,7 @@ class PTRoleLogin : public PTRoleOption {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override {
+  virtual Status Analyze(SemContext* sem_context) override {
     return Status::OK();
   }
 
@@ -148,7 +146,7 @@ class PTRoleSuperuser : public PTRoleOption {
   // Constructor and destructor.
 
   PTRoleSuperuser(MemoryContext *memctx,
-                  YBLocation::SharedPtr loc,
+                  YBLocationPtr loc,
                   bool superuser);
 
   virtual ~PTRoleSuperuser();
@@ -163,7 +161,7 @@ class PTRoleSuperuser : public PTRoleOption {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override {
+  virtual Status Analyze(SemContext* sem_context) override {
     return Status::OK();
   }
 
@@ -188,7 +186,7 @@ class PTCreateRole : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTCreateRole(MemoryContext* memctx,
-               YBLocation::SharedPtr loc,
+               YBLocationPtr loc,
                const MCSharedPtr<MCString>& name,
                const PTRoleOptionListNode::SharedPtr& roleOptions,
                bool create_if_not_exists);
@@ -206,7 +204,7 @@ class PTCreateRole : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext* sem_context) override;
+  virtual Status Analyze(SemContext* sem_context) override;
   void PrintSemanticAnalysisResult(SemContext* sem_context);
 
   // Role name.
@@ -244,5 +242,3 @@ class PTCreateRole : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif // YB_YQL_CQL_QL_PTREE_PT_CREATE_ROLE_H

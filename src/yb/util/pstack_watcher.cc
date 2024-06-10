@@ -34,22 +34,22 @@
 
 #include <stdio.h>
 #include <sys/types.h>
-#include <unistd.h>
 
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "yb/gutil/strings/substitute.h"
+#include "yb/util/callsite_profiling.h"
 #include "yb/util/env.h"
 #include "yb/util/errno.h"
+#include "yb/util/status_log.h"
 #include "yb/util/status.h"
 #include "yb/util/subprocess.h"
+#include "yb/util/thread.h"
 
 namespace yb {
 
-using std::shared_ptr;
 using std::string;
 using std::vector;
 using strings::Substitute;
@@ -68,7 +68,7 @@ void PstackWatcher::Shutdown() {
   {
     MutexLock guard(lock_);
     running_ = false;
-    cond_.Broadcast();
+    YB_PROFILE(cond_.Broadcast());
   }
   if (thread_) {
     CHECK_OK(ThreadJoiner(thread_.get()).Join());
@@ -96,7 +96,7 @@ void PstackWatcher::Run() {
 
   WARN_NOT_OK(DumpStacks(DUMP_FULL), "Unable to print pstack from watcher");
   running_ = false;
-  cond_.Broadcast();
+  YB_PROFILE(cond_.Broadcast());
 }
 
 Status PstackWatcher::HasProgram(const char* progname) {
@@ -185,21 +185,21 @@ Status PstackWatcher::RunPstack(const std::string& progname, pid_t pid) {
 Status PstackWatcher::RunStackDump(const string& prog, const vector<string>& argv) {
   printf("************************ BEGIN STACKS **************************\n");
   if (fflush(stdout) == EOF) {
-    return STATUS(IOError, "Unable to flush stdout", ErrnoToString(errno), errno);
+    return STATUS(IOError, "Unable to flush stdout", Errno(errno));
   }
   Subprocess pstack_proc(prog, argv);
   RETURN_NOT_OK_PREPEND(pstack_proc.Start(), "RunStackDump proc.Start() failed");
   if (::close(pstack_proc.ReleaseChildStdinFd()) == -1) {
-    return STATUS(IOError, "Unable to close child stdin", ErrnoToString(errno), errno);
+    return STATUS(IOError, "Unable to close child stdin", Errno(errno));
   }
   int ret;
   RETURN_NOT_OK_PREPEND(pstack_proc.Wait(&ret), "RunStackDump proc.Wait() failed");
   if (ret == -1) {
-    return STATUS(RuntimeError, "RunStackDump proc.Wait() error", ErrnoToString(errno), errno);
+    return STATUS(RuntimeError, "RunStackDump proc.Wait() error", Errno(errno));
   }
   printf("************************* END STACKS ***************************\n");
   if (fflush(stdout) == EOF) {
-    return STATUS(IOError, "Unable to flush stdout", ErrnoToString(errno), errno);
+    return STATUS(IOError, "Unable to flush stdout", Errno(errno));
   }
 
   return Status::OK();

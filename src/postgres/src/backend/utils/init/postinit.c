@@ -44,6 +44,7 @@
 #include "catalog/indexing.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_auth_members.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_db_role_setting.h"
 #include "catalog/pg_tablespace.h"
@@ -77,7 +78,16 @@
 #include "utils/timeout.h"
 #include "utils/tqual.h"
 
+#include <arpa/inet.h>
 #include "pg_yb_utils.h"
+#include "catalog/pg_yb_catalog_version.h"
+#include "catalog/pg_yb_profile.h"
+#include "catalog/pg_yb_role_profile.h"
+#include "catalog/pg_yb_tablegroup.h"
+#include "catalog/yb_catalog_version.h"
+#include "common/ip.h"
+#include "utils/builtins.h"
+#include "utils/yb_inheritscache.h"
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
 static HeapTuple GetDatabaseTupleByOid(Oid dboid);
@@ -92,6 +102,7 @@ static bool ThereIsAtLeastOneRole(void);
 static void process_startup_options(Port *port, bool am_superuser);
 static void process_settings(Oid databaseid, Oid roleid);
 
+static void YbSetAshClientAddrAndPort();
 
 /*** InitPostgres support ***/
 
@@ -438,9 +449,11 @@ InitCommunication(void)
 	{
 		/*
 		 * We're running a postgres bootstrap process or a standalone backend.
-		 * Create private "shmem" and semaphores.
+		 * Though we won't listen on PostPortNumber, use it to select a shmem
+		 * key.  This increases the chance of detecting a leftover live
+		 * backend of this DataDir.
 		 */
-		CreateSharedMemoryAndSemaphores(true, 0);
+		CreateSharedMemoryAndSemaphores(PostPortNumber);
 	}
 }
 
@@ -573,13 +586,18 @@ BaseInit(void)
  * As of PostgreSQL 8.2, we expect InitProcess() was already called, so we
  * already have a PGPROC struct ... but it's not completely filled in yet.
  *
+ * YB extension: session_id. If greater than zero, connect local YbSession
+ * to existing YBClientSession instance in TServer, rather than requesting new.
+ * Helpful to initialize background worker backends that need to share state.
+ *
  * Note:
  *		Be very careful with the order of calls in the InitPostgres function.
  * --------------------------------
  */
-void
-InitPostgres(const char *in_dbname, Oid dboid, const char *username,
-			 Oid useroid, char *out_dbname, bool override_allow_connections)
+static void
+InitPostgresImpl(const char *in_dbname, Oid dboid, const char *username,
+				 Oid useroid, char *out_dbname, uint64_t *session_id,
+				 bool override_allow_connections)
 {
 	bool		bootstrap = IsBootstrapProcessingMode();
 	bool		am_superuser;
@@ -629,6 +647,8 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 */
 	InitBufferPoolBackend();
 
+	MyProc->ybInitializationCompleted = true;
+
 	/*
 	 * Initialize local process's access to XLOG.
 	 */
@@ -663,6 +683,9 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	InitCatalogCache();
 	InitPlanCache();
 
+	if (YBIsEnabledInPostgresEnvVar())
+		YbInitPgInheritsCache();
+
 	/* Initialize portal manager */
 	EnablePortalManager();
 
@@ -670,12 +693,57 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	if (!bootstrap)
 		pgstat_initialize();
 
+	/*
+	 * Set client_addr and client_host in ASH metadata which will remain
+	 * constant throughout the session. We don't want to do this during
+	 * bootstrap because it won't have client address anyway.
+	 */
+	if (YbAshIsClientAddrSet())
+		YbSetAshClientAddrAndPort();
+
 	/* Connect to YugaByte cluster. */
 	if (bootstrap)
-		YBInitPostgresBackend("postgres", "", username);
+		YBInitPostgresBackend("postgres", "", username, session_id);
 	else
-		YBInitPostgresBackend("postgres", in_dbname, username);
+		YBInitPostgresBackend("postgres", in_dbname, username, session_id);
 
+	if (IsYugaByteEnabled() && !bootstrap)
+	{
+		HandleYBStatus(YBCPgTableExists(TemplateDbOid,
+										YbRoleProfileRelationId,
+										&YbLoginProfileCatalogsExist));
+
+		/* TODO (dmitry): Next call of the YBIsDBCatalogVersionMode function is
+		 * kind of a hack and must be removed. This function is called before
+		 * starting prefetching because for now switching into DB catalog
+		 * version mode is impossible in case prefething is started.
+		 */
+		YBIsDBCatalogVersionMode();
+		YBCPgResetCatalogReadTime();
+		YBCStartSysTablePrefetchingNoCache();
+		YbRegisterSysTableForPrefetching(AuthIdRelationId);   // pg_authid
+		YbRegisterSysTableForPrefetching(DatabaseRelationId); // pg_database
+
+		if (*YBCGetGFlags()->ysql_enable_profile && YbLoginProfileCatalogsExist)
+		{
+			YbRegisterSysTableForPrefetching(
+				YbProfileRelationId);     // pg_yb_profile
+			YbRegisterSysTableForPrefetching(
+				YbRoleProfileRelationId); // pg_yb_role_profile
+		}
+		YbTryRegisterCatalogVersionTableForPrefetching();
+
+		HandleYBStatus(YBCPrefetchRegisteredSysTables());
+		/*
+		 * If per database catalog version mode is enabled, this will load the
+		 * catalog version of template1. It is fine because at this time we
+		 * only read shared relations and therefore can use any database OID.
+		 * We will update yb_catalog_cache_version to match MyDatabaseId once
+		 * the latter is resolved so we will never use the catalog version of
+		 * template1 to query relations that are private to MyDatabaseId.
+		 */
+		YbUpdateCatalogCacheVersion(YbGetMasterCatalogVersion());
+	}
 	/*
 	 * Load relcache entries for the shared system catalogs.  This must create
 	 * at least entries for pg_database and catalogs used for authentication.
@@ -769,6 +837,13 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		PerformAuthentication(MyProcPort);
 		InitializeSessionUserId(username, useroid);
 		am_superuser = superuser();
+
+		/*
+		 * In YSQL upgrade mode (uses tserver auth method), we allow connecting to
+		 * databases with disabled connections (normally it's just template0).
+		 */
+		override_allow_connections = override_allow_connections ||
+									 MyProcPort->yb_is_tserver_auth_method;
 	}
 
 	/*
@@ -915,6 +990,19 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 		return;
 	}
 
+	if (MyDatabaseId != TemplateDbOid && YBIsDBCatalogVersionMode())
+	{
+		/*
+		 * Here we assume that the entire table pg_yb_catalog_version is
+		 * prefetched. Note that in this case YbGetMasterCatalogVersion()
+		 * returns the prefetched catalog version of MyDatabaseId which is
+		 * consistent with all the other tables that are prefetched.
+		 */
+		uint64_t master_catalog_version = YbGetMasterCatalogVersion();
+		Assert(master_catalog_version > YB_CATCACHE_VERSION_UNINITIALIZED);
+		YbUpdateCatalogCacheVersion(master_catalog_version);
+	}
+
 	/*
 	 * Now, take a writer's lock on the database we are trying to connect to.
 	 * If there is a concurrently running DROP DATABASE on that database, this
@@ -954,6 +1042,10 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 */
 	MyProc->databaseId = MyDatabaseId;
 
+	/* YB: Set the dbid in ASH metadata */
+	if (IsYugaByteEnabled() && yb_ash_enable_infra)
+		YbAshSetDatabaseId(MyDatabaseId);
+
 	/*
 	 * We established a catalog snapshot while reading pg_authid and/or
 	 * pg_database; but until we have set up MyDatabaseId, we won't react to
@@ -961,13 +1053,16 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 * if the snapshot has been invalidated.  Assume it's no good anymore.
 	 */
 	InvalidateCatalogSnapshot();
+	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
+		YBCStopSysTablePrefetching();
 
 	/*
 	 * Recheck pg_database to make sure the target database hasn't gone away.
 	 * If there was a concurrent DROP DATABASE, this ensures we will die
 	 * cleanly without creating a mess.
+	 * In YB mode DB existance is checked on cache load/refresh.
 	 */
-	if (!bootstrap)
+	if (!IsYugaByteEnabled() && !bootstrap)
 	{
 		HeapTuple	tuple;
 
@@ -1020,16 +1115,21 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	 *
 	 * Load relcache entries for the system catalogs.  This must create at
 	 * least the minimum set of "nailed-in" cache entries.
-	 *
-	 * In YugaByte mode initialize the catalog cache version to the latest
-	 * version from the master (except during initdb).
+	 */
+	// See if tablegroup catalog exists - needs to happen before cache fully initialized.
+	if (IsYugaByteEnabled() && !bootstrap)
+		HandleYBStatus(YBCPgTableExists(
+			MyDatabaseId, YbTablegroupRelationId, &YbTablegroupCatalogExists));
+
+	RelationCacheInitializePhase3();
+
+	/*
+	 * Also cache whether the database is colocated for optimization purposes.
 	 */
 	if (IsYugaByteEnabled() && !IsBootstrapProcessingMode())
 	{
-		YBCPgGetCatalogMasterVersion(ybc_pg_session,
-		                             (uint64_t *) &yb_catalog_cache_version);
+		MyDatabaseColocated = YbIsDatabaseColocated(MyDatabaseId, &MyColocatedDatabaseLegacy);
 	}
-	RelationCacheInitializePhase3();
 
 	/* set up ACL framework (so CheckMyDatabase can check permissions) */
 	initialize_acl();
@@ -1079,6 +1179,33 @@ InitPostgres(const char *in_dbname, Oid dboid, const char *username,
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
+}
+
+static void
+YbEnsureSysTablePrefetchingStopped()
+{
+	if (IsYugaByteEnabled() && YBCIsSysTablePrefetchingStarted())
+		YBCStopSysTablePrefetching();
+}
+
+void
+InitPostgres(const char *in_dbname, Oid dboid, const char *username,
+			 Oid useroid, char *out_dbname, uint64_t *session_id,
+			 bool override_allow_connections)
+{
+	PG_TRY();
+	{
+		InitPostgresImpl(
+			in_dbname, dboid, username, useroid, out_dbname, session_id,
+			override_allow_connections);
+	}
+	PG_CATCH();
+	{
+		YbEnsureSysTablePrefetchingStopped();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	YbEnsureSysTablePrefetchingStopped();
 }
 
 /*
@@ -1260,4 +1387,76 @@ ThereIsAtLeastOneRole(void)
 	heap_close(pg_authid_rel, AccessShareLock);
 
 	return result;
+}
+
+/*
+ * Sets the client address and port for ASH metadata.
+ * If the address family is not AF_INET or AF_INET6, then the PGPPROC ASH metadata
+ * fields for client address and port don't mean anything. Otherwise, if
+ * pg_getnameinfo_all returns non-zero value, a warning is printed with the error
+ * code and ASH keeps working without client address and port for the current PG
+ * backend.
+ *
+ * ASH samples only normal backends and this excludes background workers.
+ * So it's fine in that case to not set the client address.
+ */
+static void
+YbSetAshClientAddrAndPort()
+{
+	/* Background workers which creates a postgres backend may have null MyProcPort. */
+	if (MyProcPort == NULL)
+	{
+		Assert(MyProc->isBackgroundWorker == true);
+		return;
+	}
+
+	LWLockAcquire(&MyProc->yb_ash_metadata_lock, LW_EXCLUSIVE);
+
+	/* Set the address family and null the client_addr and client_port */
+	MyProc->yb_ash_metadata.addr_family = MyProcPort->raddr.addr.ss_family;
+	MemSet(MyProc->yb_ash_metadata.client_addr, 0, 16);
+	MyProc->yb_ash_metadata.client_port = 0;
+
+	switch (MyProcPort->raddr.addr.ss_family)
+	{
+		case AF_INET:
+#ifdef HAVE_IPV6
+		case AF_INET6:
+#endif
+			break;
+		default:
+			LWLockRelease(&MyProc->yb_ash_metadata_lock);
+			return;
+	}
+
+	char		remote_host[NI_MAXHOST];
+	int			ret;
+
+	ret = pg_getnameinfo_all(&MyProcPort->raddr.addr, MyProcPort->raddr.salen,
+							 remote_host, sizeof(remote_host),
+							 NULL, 0,
+							 NI_NUMERICHOST | NI_NUMERICSERV);
+
+	if (ret != 0)
+	{
+		ereport(WARNING,
+				(errmsg("pg_getnameinfo_all while setting ash metadata failed"),
+				 errdetail("%s\naddress family: %u",
+						   gai_strerror(ret),
+						   MyProcPort->raddr.addr.ss_family)));
+
+		LWLockRelease(&MyProc->yb_ash_metadata_lock);
+		return;
+	}
+
+	clean_ipv6_addr(MyProcPort->raddr.addr.ss_family, remote_host);
+
+	/* Setting ip address */
+	inet_pton(MyProcPort->raddr.addr.ss_family, remote_host,
+			  MyProc->yb_ash_metadata.client_addr);
+
+	/* Setting port */
+	MyProc->yb_ash_metadata.client_port = atoi(MyProcPort->remote_port);
+
+	LWLockRelease(&MyProc->yb_ash_metadata_lock);
 }

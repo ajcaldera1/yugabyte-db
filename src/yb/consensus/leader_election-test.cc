@@ -30,19 +30,21 @@
 // under the License.
 //
 
-#include "yb/consensus/leader_election.h"
-
 #include <functional>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "yb/consensus/consensus_peers.h"
 #include "yb/consensus/consensus-test-util.h"
+#include "yb/consensus/consensus_peers.h"
+#include "yb/consensus/leader_election.h"
 #include "yb/consensus/metadata.pb.h"
+
+#include "yb/gutil/casts.h"
 #include "yb/gutil/map-util.h"
-#include "yb/gutil/stl_util.h"
 #include "yb/gutil/strings/substitute.h"
+
+#include "yb/util/status_log.h"
 #include "yb/util/test_macros.h"
 #include "yb/util/test_util.h"
 
@@ -54,7 +56,6 @@ class Messenger;
 
 namespace consensus {
 
-using std::shared_ptr;
 using std::string;
 using std::unordered_map;
 using std::vector;
@@ -110,8 +111,8 @@ class FromMapPeerProxyFactory : public PeerProxyFactory {
     used_peer_proxy_.clear();
   }
 
-  shared_ptr<rpc::Messenger> messenger() const override {
-    return shared_ptr<rpc::Messenger>();
+  Messenger* messenger() const override {
+    return nullptr;
   }
 
  private:
@@ -163,11 +164,11 @@ class LeaderElectionTest : public YBTest {
 
   RaftConfigPB config_;
   ProxyMap proxies_;
-  gscoped_ptr<PeerProxyFactory> proxy_factory_;
-  gscoped_ptr<ThreadPool> pool_;
+  std::unique_ptr<PeerProxyFactory> proxy_factory_;
+  std::unique_ptr<ThreadPool> pool_;
 
   CountDownLatch latch_;
-  gscoped_ptr<ElectionResult> result_;
+  std::unique_ptr<ElectionResult> result_;
 };
 
 void LeaderElectionTest::ElectionCallback(const ElectionResult& result) {
@@ -197,21 +198,21 @@ void LeaderElectionTest::InitNoOpPeerProxies(int num_voters,
   ASSERT_EQ(voter_uuids_.size(), num_voters + num_pre_voters + num_pre_observers + num_observers);
   for (const string& uuid : voter_uuids_) {
     RaftPeerPB* peer_pb = config_.add_peers();
-    RaftPeerPB::MemberType member_type;
+    PeerMemberType member_type;
     if (num_voters > 0) {
-      member_type = RaftPeerPB::VOTER;
+      member_type = PeerMemberType::VOTER;
       num_voters--;
     } else if (num_pre_voters > 0) {
-      member_type = RaftPeerPB::PRE_VOTER;
+      member_type = PeerMemberType::PRE_VOTER;
       num_pre_voters--;
     } else if (num_pre_observers > 0) {
-      member_type = RaftPeerPB::PRE_OBSERVER;
+      member_type = PeerMemberType::PRE_OBSERVER;
       num_pre_observers--;
     } else if (num_observers > 0) {
-      member_type = RaftPeerPB::OBSERVER;
+      member_type = PeerMemberType::OBSERVER;
       num_observers--;
     } else {
-      member_type = RaftPeerPB::UNKNOWN_MEMBER_TYPE;
+      member_type = PeerMemberType::UNKNOWN_MEMBER_TYPE;
       LOG(FATAL) << "Invalid member type";
     }
     peer_pb->set_member_type(member_type);
@@ -237,21 +238,21 @@ void LeaderElectionTest::InitDelayableMockedProxies(int num_voters,
   ASSERT_EQ(voter_uuids_.size(), num_voters + num_pre_voters + num_pre_observers + num_observers);
   for (const string& uuid : voter_uuids_) {
     RaftPeerPB* peer_pb = config_.add_peers();
-    RaftPeerPB::MemberType member_type;
+    PeerMemberType member_type;
     if (num_voters > 0) {
-      member_type = RaftPeerPB::VOTER;
+      member_type = PeerMemberType::VOTER;
       num_voters--;
     } else if (num_pre_voters > 0) {
-      member_type = RaftPeerPB::PRE_VOTER;
+      member_type = PeerMemberType::PRE_VOTER;
       num_pre_voters--;
     } else if (num_pre_observers >0) {
-      member_type = RaftPeerPB::PRE_OBSERVER;
+      member_type = PeerMemberType::PRE_OBSERVER;
       num_pre_observers--;
     } else if (num_observers > 0) {
-      member_type = RaftPeerPB::OBSERVER;
+      member_type = PeerMemberType::OBSERVER;
       num_observers--;
     } else {
-      member_type = RaftPeerPB::UNKNOWN_MEMBER_TYPE;
+      member_type = PeerMemberType::UNKNOWN_MEMBER_TYPE;
       LOG(FATAL) << "Invalid member type";
     }
     peer_pb->set_member_type(member_type);
@@ -323,7 +324,7 @@ LeaderElectionPtr LeaderElectionTest::SetUpElectionWithGrantDenyErrorVotes(
   int num_grant_followers = num_grant - 1;
 
   // Set up mocked responses based on the params specified in the method arguments.
-  int voter_index = 0;
+  size_t voter_index = 0;
   while (voter_index < voter_uuids_.size()) {
     VoteResponsePB response;
     if (num_grant_followers > 0) {
@@ -425,7 +426,7 @@ TEST_F(LeaderElectionTest, TestHigherTermBeforeDecision) {
 
   // This guy has a higher term.
   down_cast<DelayablePeerProxy<MockedPeerProxy>*>(proxies_[voter_uuids_[0]])
-      ->Respond(TestPeerProxy::kRequestVote);
+      ->Respond(TestPeerProxy::Method::kRequestVote);
   latch_.Wait();
 
   ASSERT_EQ(kElectionTerm, result_->election_term);
@@ -436,7 +437,7 @@ TEST_F(LeaderElectionTest, TestHigherTermBeforeDecision) {
 
   // This guy will vote "yes".
   down_cast<DelayablePeerProxy<MockedPeerProxy>*>(proxies_[voter_uuids_[1]])
-      ->Respond(TestPeerProxy::kRequestVote);
+      ->Respond(TestPeerProxy::Method::kRequestVote);
 
   pool_->Wait(); // Wait for the election callbacks to finish before we destroy proxies.
 }
@@ -450,7 +451,7 @@ TEST_F(LeaderElectionTest, TestHigherTermAfterDecision) {
 
   // This guy will vote "yes".
   down_cast<DelayablePeerProxy<MockedPeerProxy>*>(proxies_[voter_uuids_[1]])
-      ->Respond(TestPeerProxy::kRequestVote);
+      ->Respond(TestPeerProxy::Method::kRequestVote);
   latch_.Wait();
 
   ASSERT_EQ(kElectionTerm, result_->election_term);
@@ -461,7 +462,7 @@ TEST_F(LeaderElectionTest, TestHigherTermAfterDecision) {
 
   // This guy has a higher term.
   down_cast<DelayablePeerProxy<MockedPeerProxy>*>(proxies_[voter_uuids_[0]])
-      ->Respond(TestPeerProxy::kRequestVote);
+      ->Respond(TestPeerProxy::Method::kRequestVote);
 
   pool_->Wait(); // Wait for the election callbacks to finish before we destroy proxies.
 }

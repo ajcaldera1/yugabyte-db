@@ -97,6 +97,7 @@
 #include "postgres.h"
 
 #include <limits.h>
+#include <unistd.h>
 
 #include "access/htup_details.h"
 #include "access/xact.h"
@@ -113,6 +114,7 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#include "pg_yb_utils.h"
 
 
 /*
@@ -259,7 +261,9 @@ AddInvalidationMessage(InvalidationChunk **listHdr,
 		*listHdr = chunk;
 	}
 	/* Okay, add message to current chunk */
-	chunk->msgs[chunk->nitems] = *msg;
+	SharedInvalidationMessage *dest = &chunk->msgs[chunk->nitems];
+	*dest = *msg;
+	dest->yb_header.sender_pid = getpid();
 	chunk->nitems++;
 }
 
@@ -530,6 +534,21 @@ RegisterRelcacheInvalidation(Oid dbId, Oid relId)
 	 */
 	if (relId == InvalidOid || RelationIdIsInInitFile(relId))
 		transInvalInfo->RelcacheInitFileInval = true;
+
+	if (IsYugaByteEnabled() &&
+		YBIsDBCatalogVersionMode() &&
+		relId == InvalidOid &&
+		YBCPgIsDdlMode() &&
+		!(*YBCGetGFlags()->ysql_disable_global_impact_ddl_statements))
+	{
+		/*
+		 * Note: A InvalidOid relId means we are invalidating whole relcache,
+		 * which includes all the shared relations. If relId isn't InvalidOid,
+		 * we detect global impact DDL at write path (see YBCExecWriteStmt).
+		 */
+		Assert(dbId == InvalidOid);
+		YbSetIsGlobalDDL();
+	}
 }
 
 /*
@@ -555,6 +574,10 @@ RegisterSnapshotInvalidation(Oid dbId, Oid relId)
 void
 LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 {
+	/* In YB mode all messages originated by other processes are silently ignored */
+	if (IsYugaByteEnabled() && msg->yb_header.sender_pid != getpid())
+		return;
+
 	if (msg->id >= 0)
 	{
 		if (msg->cc.dbId == MyDatabaseId || msg->cc.dbId == InvalidOid)
@@ -629,24 +652,16 @@ LocalExecuteInvalidationMessage(SharedInvalidationMessage *msg)
 }
 
 /*
- *		InvalidateSystemCaches
+ *		CallSystemCacheCallbacks
  *
- *		This blows away all tuples in the system catalog caches and
- *		all the cached relation descriptors and smgr cache entries.
- *		Relation descriptors that have positive refcounts are then rebuilt.
- *
- *		We call this when we see a shared-inval-queue overflow signal,
- *		since that tells us we've lost some shared-inval messages and hence
- *		don't know what needs to be invalidated.
+ *		Calls all syscache and relcache invalidation callbacks.
+ *		This is useful when the entire cache is being reloaded or
+ *		invalidated, rather than a single cache entry.
  */
 void
-InvalidateSystemCaches(void)
+CallSystemCacheCallbacks(void)
 {
 	int			i;
-
-	InvalidateCatalogSnapshot();
-	ResetCatalogCaches();
-	RelationCacheInvalidate();	/* gets smgr and relmap too */
 
 	for (i = 0; i < syscache_callback_count; i++)
 	{
@@ -661,6 +676,33 @@ InvalidateSystemCaches(void)
 
 		ccitem->function(ccitem->arg, InvalidOid);
 	}
+}
+
+/*
+ *		InvalidateSystemCaches
+ *
+ *		This blows away all tuples in the system catalog caches and
+ *		all the cached relation descriptors and smgr cache entries.
+ *		Relation descriptors that have positive refcounts are then rebuilt.
+ *
+ *		We call this when we see a shared-inval-queue overflow signal,
+ *		since that tells us we've lost some shared-inval messages and hence
+ *		don't know what needs to be invalidated.
+ */
+void
+InvalidateSystemCaches(void)
+{
+	if (IsYugaByteEnabled()) {
+		// In case of YugaByte it is necessary to refresh YB caches by calling 'YBRefreshCache'.
+		// But it can't be done here as 'YBRefreshCache' can't be called from within the transaction.
+		// Resetting catalog version will force cache refresh as soon as possible.
+		YbResetCatalogCacheVersion();
+		return;
+	}
+	InvalidateCatalogSnapshot();
+	ResetCatalogCaches();
+	RelationCacheInvalidate();	/* gets smgr and relmap too */
+	CallSystemCacheCallbacks();
 }
 
 
@@ -938,6 +980,11 @@ ProcessCommittedInvalidationMessages(SharedInvalidationMessage *msgs,
  * about CurrentCmdInvalidMsgs too, since those changes haven't touched
  * the caches yet.
  *
+ * YB Note: The above message for handling not isCommit is not true for YB
+ * as we use aggressive caching. Any changes made as part of
+ * CurrentCmdInvalidMsgs would have been applied to the cache and will need to
+ * be invalidated as well.
+ *
  * In any case, reset the various lists to empty.  We need not physically
  * free memory here, since TopTransactionContext is about to be emptied
  * anyway.
@@ -976,6 +1023,15 @@ AtEOXact_Inval(bool isCommit)
 	}
 	else
 	{
+		/*
+		 * Yugabyte uses aggressive caching, therefore even modifications
+		 * in CurrentCmdInvalidMsgs would have been applied to the cache.
+		 */
+		if (IsYugaByteEnabled())
+		{
+			AppendInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
+									   &transInvalInfo->CurrentCmdInvalidMsgs);
+		}
 		ProcessInvalidationMessages(&transInvalInfo->PriorCmdInvalidMsgs,
 									LocalExecuteInvalidationMessage);
 	}

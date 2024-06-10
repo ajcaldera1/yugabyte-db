@@ -28,12 +28,12 @@
 #include "optimizer/prep.h"
 #include "optimizer/var.h"
 #include "partitioning/partbounds.h"
+#include "pg_yb_utils.h"
 #include "rewrite/rewriteManip.h"
 #include "utils/fmgroids.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
-
 
 static Oid	get_partition_parent_worker(Relation inhRel, Oid relid);
 static void get_partition_ancestors_worker(Relation inhRel, Oid relid,
@@ -175,9 +175,10 @@ map_partition_varattnos(List *expr, int fromrel_varno,
 	{
 		AttrNumber *part_attnos;
 
-		part_attnos = convert_tuples_by_name_map(RelationGetDescr(to_rel),
-												 RelationGetDescr(from_rel),
-												 gettext_noop("could not convert row type"));
+		part_attnos = convert_tuples_by_name_map(
+			RelationGetDescr(to_rel), RelationGetDescr(from_rel),
+			gettext_noop("could not convert row type"),
+			false /* yb_ignore_type_mismatch */);
 		expr = (List *) map_variable_attnos((Node *) expr,
 											fromrel_varno, 0,
 											part_attnos,
@@ -225,8 +226,8 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
 
 		if (partattno != 0)
 		{
-			if (bms_is_member(partattno - FirstLowInvalidHeapAttributeNumber,
-							  attnums))
+			if (bms_is_member(partattno - YBGetFirstLowInvalidAttributeNumber(rel),
+			                  attnums))
 			{
 				if (used_in_expr)
 					*used_in_expr = false;
@@ -240,7 +241,11 @@ has_partition_attrs(Relation rel, Bitmapset *attnums, bool *used_in_expr)
 			Bitmapset  *expr_attrs = NULL;
 
 			/* Find all attributes referenced */
-			pull_varattnos(expr, 1, &expr_attrs);
+			/* pull_varattnos_min_attr offsets attributes by min_attr - 1. Therefore pass
+			 * YBGetFirstLowInvalidAttributeNumber + 1.
+			 */
+			pull_varattnos_min_attr(expr, 1, &expr_attrs,
+			                        YBGetFirstLowInvalidAttributeNumber(rel) + 1);
 			partexprs_item = lnext(partexprs_item);
 
 			if (bms_overlap(attnums, expr_attrs))

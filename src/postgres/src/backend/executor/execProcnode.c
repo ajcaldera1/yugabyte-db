@@ -113,6 +113,10 @@
 #include "executor/nodeValuesscan.h"
 #include "executor/nodeWindowAgg.h"
 #include "executor/nodeWorktablescan.h"
+#include "executor/nodeYbBatchedNestloop.h"
+#include "executor/nodeYbBitmapIndexscan.h"
+#include "executor/nodeYbBitmapTablescan.h"
+#include "executor/nodeYbSeqscan.h"
 #include "nodes/nodeFuncs.h"
 #include "miscadmin.h"
 
@@ -209,6 +213,11 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 												   estate, eflags);
 			break;
 
+		case T_YbSeqScan:
+			result = (PlanState *) ExecInitYbSeqScan((YbSeqScan *) node,
+													 estate, eflags);
+			break;
+
 		case T_SampleScan:
 			result = (PlanState *) ExecInitSampleScan((SampleScan *) node,
 													  estate, eflags);
@@ -229,9 +238,19 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 														   estate, eflags);
 			break;
 
+		case T_YbBitmapIndexScan:
+			result = (PlanState *) ExecInitYbBitmapIndexScan((YbBitmapIndexScan *) node,
+														   estate, eflags);
+			break;
+
 		case T_BitmapHeapScan:
 			result = (PlanState *) ExecInitBitmapHeapScan((BitmapHeapScan *) node,
 														  estate, eflags);
+			break;
+
+		case T_YbBitmapTableScan:
+			result = (PlanState *) ExecInitYbBitmapTableScan((YbBitmapTableScan *) node,
+															 estate, eflags);
 			break;
 
 		case T_TidScan:
@@ -290,6 +309,12 @@ ExecInitNode(Plan *node, EState *estate, int eflags)
 		case T_NestLoop:
 			result = (PlanState *) ExecInitNestLoop((NestLoop *) node,
 													estate, eflags);
+			break;
+
+		case T_YbBatchedNestLoop:
+			result = (PlanState *) ExecInitYbBatchedNestLoop(
+				(YbBatchedNestLoop *) node,
+				estate, eflags);
 			break;
 
 		case T_MergeJoin:
@@ -446,7 +471,6 @@ ExecProcNodeFirst(PlanState *node)
 	return node->ExecProcNode(node);
 }
 
-
 /*
  * ExecProcNode wrapper that performs instrumentation calls.  By keeping
  * this a separate function, we avoid overhead in the normal case where
@@ -462,6 +486,7 @@ ExecProcNodeInstr(PlanState *node)
 	result = node->ExecProcNodeReal(node);
 
 	InstrStopNode(node->instrument, TupIsNull(result) ? 0.0 : 1.0);
+	YbUpdateSessionStats(&node->instrument->yb_instr);
 
 	return result;
 }
@@ -506,6 +531,11 @@ MultiExecProcNode(PlanState *node)
 			result = MultiExecBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
+		case T_YbBitmapIndexScanState:
+			result = MultiExecYbBitmapIndexScan(
+				(YbBitmapIndexScanState *) node);
+			break;
+
 		case T_BitmapAndState:
 			result = MultiExecBitmapAnd((BitmapAndState *) node);
 			break;
@@ -519,6 +549,13 @@ MultiExecProcNode(PlanState *node)
 			result = NULL;
 			break;
 	}
+
+	/*
+	 * Specifically this is required after the MultiExecBitmapIndexScan, but it
+	 * doesn't hurt to call it here after any of the above.
+	 */
+	if (IsYugaByteEnabled() && node->instrument)
+		YbUpdateSessionStats(&node->instrument->yb_instr);
 
 	return result;
 }
@@ -601,6 +638,10 @@ ExecEndNode(PlanState *node)
 			ExecEndSeqScan((SeqScanState *) node);
 			break;
 
+		case T_YbSeqScanState:
+			ExecEndYbSeqScan((YbSeqScanState *) node);
+			break;
+
 		case T_SampleScanState:
 			ExecEndSampleScan((SampleScanState *) node);
 			break;
@@ -625,8 +666,16 @@ ExecEndNode(PlanState *node)
 			ExecEndBitmapIndexScan((BitmapIndexScanState *) node);
 			break;
 
+		case T_YbBitmapIndexScanState:
+			ExecEndYbBitmapIndexScan((YbBitmapIndexScanState *) node);
+			break;
+
 		case T_BitmapHeapScanState:
 			ExecEndBitmapHeapScan((BitmapHeapScanState *) node);
+			break;
+
+		case T_YbBitmapTableScanState:
+			ExecEndYbBitmapTableScan((YbBitmapTableScanState *) node);
 			break;
 
 		case T_TidScanState:
@@ -674,6 +723,10 @@ ExecEndNode(PlanState *node)
 			 */
 		case T_NestLoopState:
 			ExecEndNestLoop((NestLoopState *) node);
+			break;
+
+		case T_YbBatchedNestLoopState:
+			ExecEndYbBatchedNestLoop((YbBatchedNestLoopState *) node);
 			break;
 
 		case T_MergeJoinState:
@@ -781,6 +834,9 @@ ExecShutdownNode(PlanState *node)
 			break;
 		case T_HashJoinState:
 			ExecShutdownHashJoin((HashJoinState *) node);
+			break;
+		case T_LockRowsState:
+			ExecShutdownLockRows((LockRowsState *) node);
 			break;
 		default:
 			break;
@@ -904,6 +960,18 @@ ExecSetTupleBound(int64 tuples_needed, PlanState *child_node)
 		gstate->tuples_needed = tuples_needed;
 
 		ExecSetTupleBound(tuples_needed, outerPlanState(child_node));
+	}
+	else if (IsA(child_node, YbBatchedNestLoopState))
+	{
+		YbBatchedNestLoopState *bnl_state =
+			(YbBatchedNestLoopState *) child_node;
+		if (bnl_state->bnl_is_sorted)
+		{
+			if (tuples_needed < 0)
+				bnl_state->bound = 0;
+			else
+				bnl_state->bound = tuples_needed;
+		}
 	}
 
 	/*

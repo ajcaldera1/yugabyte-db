@@ -15,14 +15,11 @@
 // Tree node definitions for DROP statement.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_DROP_H_
-#define YB_YQL_CQL_QL_PTREE_PT_DROP_H_
+#pragma once
 
 #include "yb/yql/cql/ql/ptree/list_node.h"
-#include "yb/yql/cql/ql/ptree/tree_node.h"
-#include "yb/yql/cql/ql/ptree/pt_type.h"
 #include "yb/yql/cql/ql/ptree/pt_name.h"
-#include "yb/yql/cql/ql/ptree/pt_option.h"
+#include "yb/yql/cql/ql/ptree/tree_node.h"
 
 namespace yb {
 namespace ql {
@@ -40,7 +37,7 @@ class PTDropStmt : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTDropStmt(MemoryContext *memctx,
-             YBLocation::SharedPtr loc,
+             YBLocationPtr loc,
              ObjectType drop_type,
              PTQualifiedNameListNode::SharedPtr names,
              bool drop_if_exists);
@@ -58,7 +55,7 @@ class PTDropStmt : public TreeNode {
   }
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
   void PrintSemanticAnalysisResult(SemContext *sem_context);
 
   ObjectType drop_type() const {
@@ -88,5 +85,3 @@ class PTDropStmt : public TreeNode {
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_DROP_H_

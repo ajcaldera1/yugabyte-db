@@ -30,13 +30,11 @@
 // under the License.
 //
 
-#ifndef YB_UTIL_DEBUG_REF_COUNTED_H_
-#define YB_UTIL_DEBUG_REF_COUNTED_H_
+#pragma once
 
-#include <glog/logging.h>
+#include "yb/util/logging.h"
 
 #include "yb/gutil/ref_counted.h"
-#include "yb/util/debug-util.h"
 
 namespace yb {
 
@@ -67,5 +65,3 @@ class DebugRefCountedThreadSafe : public RefCountedThreadSafe<T, Traits> {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_DEBUG_REF_COUNTED_H_

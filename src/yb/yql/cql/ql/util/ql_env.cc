@@ -15,43 +15,58 @@
 // QLEnv represents the environment where SQL statements are being processed.
 //--------------------------------------------------------------------------------------------------
 
+#include "yb/yql/cql/ql/util/ql_env.h"
+
 #include "yb/client/client.h"
 #include "yb/client/meta_data_cache.h"
 #include "yb/client/permissions.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
+#include "yb/client/table_alterer.h"
+#include "yb/client/table_creator.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_pool.h"
 
-#include "yb/master/catalog_manager.h"
-#include "yb/yql/cql/ql/ptree/pt_grant_revoke.h"
-#include "yb/yql/cql/ql/util/ql_env.h"
+#include "yb/common/ql_type.h"
 
-DEFINE_bool(use_cassandra_authentication, false, "If to require authentication on startup.");
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
+#include "yb/util/status_log.h"
+#include "yb/util/flags.h"
+
+DEFINE_UNKNOWN_bool(use_cassandra_authentication, false,
+    "If to require authentication on startup.");
+DEFINE_UNKNOWN_bool(ycql_cache_login_info, false, "Use authentication information cached locally.");
+DEFINE_UNKNOWN_bool(ycql_require_drop_privs_for_truncate, false,
+            "Require DROP TABLE permission in order to truncate table");
+DEFINE_RUNTIME_bool(ycql_use_local_transaction_tables, false,
+                    "Whether or not to use local transaction tables when possible for YCQL "
+                    "transactions.");
+DEFINE_RUNTIME_bool(ycql_allow_local_calls_in_curr_thread, true,
+                    "Whether or not to allow local calls on the RPC thread.");
 
 namespace yb {
 namespace ql {
 
 using std::string;
 using std::shared_ptr;
-using std::weak_ptr;
+using std::unique_ptr;
 
-using client::TransactionManager;
-using client::YBClient;
 using client::YBSession;
 using client::YBSessionPtr;
 using client::YBTable;
-using client::YBTransaction;
 using client::YBTransactionPtr;
 using client::YBMetaDataCache;
 using client::YBTableCreator;
 using client::YBTableAlterer;
 using client::YBTableName;
 
-QLEnv::QLEnv(shared_ptr<YBClient> client,
+QLEnv::QLEnv(client::YBClient* client,
              shared_ptr<YBMetaDataCache> cache,
              const server::ClockPtr& clock,
              TransactionPoolProvider transaction_pool_provider)
-    : client_(std::move(client)),
+    : client_(client),
       metadata_cache_(std::move(cache)),
       clock_(std::move(clock)),
       transaction_pool_provider_(std::move(transaction_pool_provider)) {
@@ -60,90 +75,106 @@ QLEnv::QLEnv(shared_ptr<YBClient> client,
 QLEnv::~QLEnv() {}
 
 //------------------------------------------------------------------------------------------------
-YBTableCreator* QLEnv::NewTableCreator() {
+unique_ptr<YBTableCreator> QLEnv::NewTableCreator() {
   return client_->NewTableCreator();
 }
 
-YBTableAlterer* QLEnv::NewTableAlterer(const YBTableName& table_name) {
+unique_ptr<YBTableAlterer> QLEnv::NewTableAlterer(const YBTableName& table_name) {
   return client_->NewTableAlterer(table_name);
 }
 
-CHECKED_STATUS QLEnv::TruncateTable(const string& table_id) {
+Status QLEnv::TruncateTable(const string& table_id) {
   return client_->TruncateTable(table_id);
 }
 
-CHECKED_STATUS QLEnv::DeleteTable(const YBTableName& name) {
+Status QLEnv::DeleteTable(const YBTableName& name) {
   return client_->DeleteTable(name);
 }
 
-CHECKED_STATUS QLEnv::DeleteIndexTable(const YBTableName& name, YBTableName* indexed_table_name) {
+Status QLEnv::DeleteIndexTable(const YBTableName& name, YBTableName* indexed_table_name) {
   return client_->DeleteIndexTable(name, indexed_table_name);
 }
 
 //------------------------------------------------------------------------------------------------
 Result<YBTransactionPtr> QLEnv::NewTransaction(const YBTransactionPtr& transaction,
-                                               const IsolationLevel isolation_level) {
+                                               const IsolationLevel isolation_level,
+                                               CoarseTimePoint deadline) {
   if (transaction) {
     DCHECK(transaction->IsRestartRequired());
     return transaction->CreateRestartedTransaction();
   }
   if (transaction_pool_ == nullptr) {
     if (transaction_pool_provider_) {
-      transaction_pool_ = transaction_pool_provider_();
+      transaction_pool_ = &transaction_pool_provider_();
     } else {
       return STATUS(InternalError, "No transaction pool provider");
     }
   }
-  auto result = transaction_pool_->Take();
+  auto result = transaction_pool_->Take(
+      client::ForceGlobalTransaction(!FLAGS_ycql_use_local_transaction_tables), deadline);
   RETURN_NOT_OK(result->Init(isolation_level));
   return result;
 }
 
-YBSessionPtr QLEnv::NewSession() {
-  return std::make_shared<YBSession>(client_, clock_);
+YBSessionPtr QLEnv::NewSession(CoarseTimePoint deadline) {
+  auto session = std::make_shared<YBSession>(client_, deadline, clock_);
+  session->set_allow_local_calls_in_curr_thread(FLAGS_ycql_allow_local_calls_in_curr_thread);
+  return session;
 }
 
 //------------------------------------------------------------------------------------------------
-shared_ptr<YBTable> QLEnv::GetTableDesc(const YBTableName& table_name, bool* cache_used) {
+client::YBTablePtr QLEnv::GetTableDesc(const YBTableName& table_name, bool* cache_used) {
   // Hide tables in system_redis keyspace.
   if (table_name.is_redis_namespace()) {
     return nullptr;
   }
-  shared_ptr<YBTable> yb_table;
-  Status s = metadata_cache_->GetTable(table_name, &yb_table, cache_used);
+  auto res = metadata_cache_->GetTableEx(table_name);
 
-  if (!s.ok()) {
-    VLOG(3) << "GetTableDesc: Server returns an error: " << s.ToString();
+  if (!res.ok()) {
+    VLOG(3) << "GetTableDesc: Server returns an error: " << res.status().ToString();
     return nullptr;
   }
 
-  return yb_table;
+  *cache_used = res->cache_used;
+  return res->table;
 }
 
-shared_ptr<YBTable> QLEnv::GetTableDesc(const TableId& table_id, bool* cache_used) {
-  shared_ptr<YBTable> yb_table;
-  Status s = metadata_cache_->GetTable(table_id, &yb_table, cache_used);
+client::YBTablePtr QLEnv::GetTableDesc(const TableId& table_id, bool* cache_used) {
+  auto res = metadata_cache_->GetTableEx(table_id);
 
-  if (!s.ok()) {
-    VLOG(3) << "GetTableDesc: Server returns an error: " << s.ToString();
+  if (!res.ok()) {
+    VLOG(3) << "GetTableDesc: Server returns an error: " << res.status().ToString();
     return nullptr;
   }
 
-  return yb_table;
+  *cache_used = res->cache_used;
+  return res->table;
+}
+
+Result<SchemaVersion> QLEnv::GetCachedTableSchemaVersion(const TableId& table_id) {
+  bool cache_used = false;
+  const shared_ptr<YBTable> yb_table = GetTableDesc(table_id, &cache_used);
+  SCHECK_FORMAT(yb_table, NotFound, "Cannot get table $0 from cache", table_id);
+  return yb_table->schema().version();
+}
+
+Result<SchemaVersion> QLEnv::GetUpToDateTableSchemaVersion(const TableId& table_id) {
+  // Force update the metadata cache.
+  RemoveCachedTableDesc(table_id);
+  return GetCachedTableSchemaVersion(table_id);
 }
 
 shared_ptr<QLType> QLEnv::GetUDType(const std::string& keyspace_name,
-                                      const std::string& type_name,
-                                      bool* cache_used) {
-  shared_ptr<QLType> ql_type = std::make_shared<QLType>(keyspace_name, type_name);
-  Status s = metadata_cache_->GetUDType(keyspace_name, type_name, &ql_type, cache_used);
+                                    const std::string& type_name,
+                                    bool* cache_used) {
+  auto result = metadata_cache_->GetUDType(keyspace_name, type_name);
 
-  if (!s.ok()) {
-    VLOG(3) << "GetTypeDesc: Server returned an error: " << s.ToString();
+  if (!result) {
+    VLOG(3) << "GetTypeDesc: Server returned an error: " << result.status().ToString();
     return nullptr;
   }
-
-  return ql_type;
+  *cache_used = result->second;
+  return std::move(result->first);
 }
 
 void QLEnv::RemoveCachedTableDesc(const YBTableName& table_name) {
@@ -159,7 +190,7 @@ void QLEnv::RemoveCachedUDType(const std::string& keyspace_name, const std::stri
 }
 
 //------------------------------------------------------------------------------------------------
-Status QLEnv::GrantRevokePermission(GrantRevokeStatementType statement_type,
+Status QLEnv::GrantRevokePermission(client::GrantRevokeStatementType statement_type,
                                     const PermissionType& permission,
                                     const ResourceType& resource_type,
                                     const std::string& canonical_resource,
@@ -228,7 +259,7 @@ Status QLEnv::DeleteRole(const std::string& role_name) {
   return client_->DeleteRole(role_name, CurrentRoleName());
 }
 
-Status QLEnv::GrantRevokeRole(GrantRevokeStatementType statement_type,
+Status QLEnv::GrantRevokeRole(client::GrantRevokeStatementType statement_type,
                               const std::string& granted_role_name,
                               const std::string& recipient_role_name) {
   return client_->GrantRevokeRole(statement_type, granted_role_name, recipient_role_name);
@@ -243,7 +274,15 @@ Status QLEnv::HasResourcePermission(const string& canonical_name,
       "Permissions check is not allowed when use_cassandra_authentication flag is disabled"));
   return metadata_cache_->HasResourcePermission(canonical_name, object_type, CurrentRoleName(),
                                                 permission, keyspace, table,
-                                                client::internal::CacheCheckMode::RETRY);
+                                                client::CacheCheckMode::RETRY);
+}
+
+Result<std::string> QLEnv::RoleSaltedHash(const RoleName& role_name) {
+  return metadata_cache_->RoleSaltedHash(role_name);
+}
+
+Result<bool> QLEnv::RoleCanLogin(const RoleName& role_name) {
+  return metadata_cache_->RoleCanLogin(role_name);
 }
 
 Status QLEnv::HasTablePermission(const NamespaceName& keyspace_name,
@@ -259,7 +298,7 @@ Status QLEnv::HasTablePermission(const client::YBTableName table_name,
 }
 
 Status QLEnv::HasRolePermission(const RoleName& role_name, const PermissionType permission) {
-  return HasResourcePermission(get_canonical_role(role_name), OBJECT_ROLE, permission);
+  return HasResourcePermission(get_canonical_role(role_name), ObjectType::ROLE, permission);
 }
 
 //------------------------------------------------------------------------------------------------

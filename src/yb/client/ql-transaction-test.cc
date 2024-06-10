@@ -13,28 +13,43 @@
 //
 //
 
-#include "yb/client/txn-test-base.h"
-
-#include <boost/scope_exit.hpp>
-
+#include "yb/client/error.h"
+#include "yb/client/schema.h"
 #include "yb/client/session.h"
+#include "yb/client/table.h"
 #include "yb/client/table_alterer.h"
 #include "yb/client/transaction.h"
 #include "yb/client/transaction_rpc.h"
+#include "yb/client/txn-test-base.h"
+#include "yb/client/yb_op.h"
+
+#include "yb/common/ql_value.h"
 
 #include "yb/consensus/consensus.h"
+#include "yb/consensus/log.h"
+
+#include "yb/rocksdb/db.h"
 
 #include "yb/rpc/rpc.h"
 
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_bootstrap_if.h"
 #include "yb/tablet/tablet_peer.h"
 #include "yb/tablet/transaction_coordinator.h"
 
 #include "yb/tserver/mini_tablet_server.h"
+#include "yb/tserver/server_main_util.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_service.pb.h"
 
+#include "yb/util/async_util.h"
+#include "yb/util/backoff_waiter.h"
 #include "yb/util/random_util.h"
+#include "yb/util/scope_exit.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/test_thread_holder.h"
+#include "yb/util/tsan_util.h"
 
 #include "yb/yql/cql/ql/util/errcodes.h"
 #include "yb/yql/cql/ql/util/statement_result.h"
@@ -42,63 +57,94 @@
 using namespace std::literals;
 
 using yb::tablet::GetTransactionTimeout;
-using yb::tablet::TabletPeer;
 
-DECLARE_uint64(transaction_heartbeat_usec);
-DECLARE_uint64(log_segment_size_bytes);
-DECLARE_int32(log_min_seconds_to_retain);
-DECLARE_uint64(max_clock_skew_usec);
-DECLARE_bool(transaction_allow_rerequest_status_in_tests);
-DECLARE_uint64(transaction_delay_status_reply_usec_in_tests);
+DECLARE_bool(TEST_disable_proactive_txn_cleanup_on_abort);
+DECLARE_bool(TEST_fail_in_apply_if_no_metadata);
+DECLARE_bool(TEST_master_fail_transactional_tablet_lookups);
+DECLARE_bool(TEST_transaction_allow_rerequest_status);
+DECLARE_bool(delete_intents_sst_files);
+DECLARE_bool(enable_load_balancing);
+DECLARE_bool(fail_on_out_of_range_clock_skew);
 DECLARE_bool(flush_rocksdb_on_shutdown);
-DECLARE_bool(transaction_disable_proactive_cleanup_in_tests);
-DECLARE_uint64(aborted_intent_cleanup_ms);
-DECLARE_int32(remote_bootstrap_max_chunk_size);
-DECLARE_int32(master_inject_latency_on_transactional_tablet_lookups_ms);
-DECLARE_int64(transaction_rpc_timeout_ms);
 DECLARE_bool(rocksdb_disable_compactions);
-DECLARE_int32(delay_init_tablet_peer_ms);
+DECLARE_bool(enable_ondisk_compression);
+DECLARE_int32(TEST_delay_init_tablet_peer_ms);
+DECLARE_int32(log_min_seconds_to_retain);
+DECLARE_int32(intents_flush_max_delay_ms);
+DECLARE_int32(remote_bootstrap_max_chunk_size);
+DECLARE_int64(transaction_rpc_timeout_ms);
+DECLARE_int64(db_block_cache_size_bytes);
+DECLARE_int64(db_write_buffer_size);
+DECLARE_uint64(TEST_transaction_delay_status_reply_usec_in_tests);
+DECLARE_uint64(aborted_intent_cleanup_ms);
+DECLARE_uint64(max_clock_skew_usec);
+DECLARE_uint64(transaction_heartbeat_usec);
+DECLARE_bool(TEST_load_transactions_sync);
+DECLARE_uint64(TEST_inject_sleep_before_applying_intents_ms);
+DECLARE_bool(TEST_skip_process_apply);
+DECLARE_bool(TEST_skip_remove_intent);
 
 namespace yb {
 namespace client {
 
-class QLTransactionTest : public TransactionTestBase {
+struct WriteConflictsOptions {
+  bool do_restarts = false;
+  size_t active_transactions = 50;
+  int total_keys = 5;
+  bool non_txn_writes = false;
+};
+
+class QLTransactionTest : public TransactionTestBase<MiniCluster> {
  protected:
+  void SetUp() override {
+    SetIsolationLevel(IsolationLevel::SNAPSHOT_ISOLATION);
+    TransactionTestBase::SetUp();
+  }
+
   // We write data with first transaction then try to read it another one.
   // If commit is true, then first transaction is committed and second should be restarted.
   // Otherwise second transaction would see pending intents from first one and should not restart.
   void TestReadRestart(bool commit = true);
 
-  void TestWriteConflicts(bool do_restarts);
+  void TestWriteConflicts(const WriteConflictsOptions& options);
 
-  IsolationLevel GetIsolationLevel() override {
-    return IsolationLevel::SNAPSHOT_ISOLATION;
-  }
+  void TestReadOnlyTablets(IsolationLevel isolation_level,
+                           bool perform_write,
+                           bool written_intents_expected);
 
-  CHECKED_STATUS WaitTransactionsCleaned() {
+  Status WaitTransactionsCleaned() {
     return WaitFor(
       [this] { return !HasTransactions(); }, kTransactionApplyTime, "Transactions cleaned");
   }
+
+  Status WaitIntentsCleaned() {
+    return WaitFor(
+      [this] { return CountIntents(cluster_.get()) == 0; }, kIntentsCleanupTime, "Intents cleaned");
+  }
 };
+
+typedef TransactionCustomLogSegmentSizeTest<0, QLTransactionTest>
+    QLTransactionBigLogSegmentSizeTest;
 
 TEST_F(QLTransactionTest, Simple) {
   ASSERT_NO_FATALS(WriteData());
   ASSERT_NO_FATALS(VerifyData());
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, LookupTabletFailure) {
-  FLAGS_master_inject_latency_on_transactional_tablet_lookups_ms =
-      TransactionRpcTimeout().ToMilliseconds() + 500;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_master_fail_transactional_tablet_lookups) = true;
 
   auto txn = CreateTransaction();
   auto result = WriteRow(CreateSession(txn), 0 /* key */, 1 /* value */);
 
-  ASSERT_TRUE(!result.ok() && result.status().IsTimedOut()) << "Result: " << result;
+  ASSERT_TRUE(!result.ok() && result.status().IsTimedOut()) << "Result: " << AsString(result);
 }
 
 TEST_F(QLTransactionTest, ReadWithTimeInFuture) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_fail_on_out_of_range_clock_skew) = false;
+
   WriteData();
   server::SkewedClockDeltaChanger delta_changer(100ms, skewed_clock_);
   for (size_t i = 0; i != 100; ++i) {
@@ -107,7 +153,7 @@ TEST_F(QLTransactionTest, ReadWithTimeInFuture) {
     VerifyRows(session);
   }
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, WriteSameKey) {
@@ -131,24 +177,24 @@ void QLTransactionTest::TestReadRestart(bool commit) {
 
   {
     auto write_txn = CreateTransaction();
-    WriteRows(CreateSession(write_txn));
+    ASSERT_OK(WriteRows(CreateSession(write_txn)));
     if (commit) {
       ASSERT_OK(write_txn->CommitFuture().get());
     }
-    BOOST_SCOPE_EXIT(write_txn, commit) {
+    auto se = ScopeExit([write_txn, commit] {
       if (!commit) {
         write_txn->Abort();
       }
-    } BOOST_SCOPE_EXIT_END;
+    });
 
     server::SkewedClockDeltaChanger delta_changer(-100ms, skewed_clock_);
 
     auto txn1 = CreateTransaction2(SetReadTime::kTrue);
-    BOOST_SCOPE_EXIT(txn1, commit) {
+    auto se2 = ScopeExit([txn1, commit] {
       if (!commit) {
         txn1->Abort();
       }
-    } BOOST_SCOPE_EXIT_END;
+    });
     auto session = CreateSession(txn1);
     if (commit) {
       for (size_t r = 0; r != kNumRows; ++r) {
@@ -158,9 +204,9 @@ void QLTransactionTest::TestReadRestart(bool commit) {
                       << "Bad row: " << row;
       }
       auto txn2 = ASSERT_RESULT(txn1->CreateRestartedTransaction());
-      BOOST_SCOPE_EXIT(txn2) {
+      auto se = ScopeExit([txn2] {
         txn2->Abort();
-      } BOOST_SCOPE_EXIT_END;
+      });
       session->SetTransaction(txn2);
       VerifyRows(session);
       VerifyData();
@@ -177,7 +223,7 @@ void QLTransactionTest::TestReadRestart(bool commit) {
 
 TEST_F(QLTransactionTest, ReadRestart) {
   TestReadRestart();
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, ReadRestartWithIntents) {
@@ -186,7 +232,7 @@ TEST_F(QLTransactionTest, ReadRestartWithIntents) {
 }
 
 TEST_F(QLTransactionTest, ReadRestartWithPendingIntents) {
-  FLAGS_transaction_allow_rerequest_status_in_tests = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_transaction_allow_rerequest_status) = false;
   DisableApplyingIntents();
   TestReadRestart(false /* commit */);
 }
@@ -206,7 +252,7 @@ TEST_F(QLTransactionTest, ReadRestartNonTransactional) {
   for (size_t i = 0; i != kTotalTransactions; ++i) {
     SCOPED_TRACE(Format("Transaction $0", i));
     auto txn = CreateTransaction();
-    WriteRows(CreateSession(txn), i);
+    ASSERT_OK(WriteRows(CreateSession(txn), i));
     ASSERT_OK(txn->CommitFuture().get());
     ASSERT_NO_FATALS(VerifyRows(CreateSession(), i));
 
@@ -248,7 +294,7 @@ TEST_F(QLTransactionTest, WriteRestart) {
       table_.SetInt32Condition(cond, kValueColumn, QLOperator::QL_OP_EQUAL, old_value);
       req->mutable_column_refs()->add_ids(table_.ColumnId(kValueColumn));
       LOG(INFO) << "Updating value";
-      auto status = session->ApplyAndFlush(op);
+      auto status = session->TEST_ApplyAndFlush(op);
       ASSERT_OK(status);
       if (!retry) {
         ASSERT_EQ(QLResponsePB::YQL_STATUS_RESTART_REQUIRED_ERROR, op->response().status());
@@ -266,7 +312,7 @@ TEST_F(QLTransactionTest, WriteRestart) {
   VerifyData(1, WriteOpType::UPDATE, kExtraColumn);
 
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 // Check that we could write to transaction that were restarted.
@@ -275,7 +321,7 @@ TEST_F(QLTransactionTest, WriteAfterReadRestart) {
   SetAtomicFlag(250000ULL, &FLAGS_max_clock_skew_usec);
 
   auto write_txn = CreateTransaction();
-  WriteRows(CreateSession(write_txn));
+  ASSERT_OK(WriteRows(CreateSession(write_txn)));
   ASSERT_OK(write_txn->CommitFuture().get());
 
   server::SkewedClockDeltaChanger delta_changer(-kClockDelta, skewed_clock_);
@@ -299,7 +345,7 @@ TEST_F(QLTransactionTest, WriteAfterReadRestart) {
     auto result = WriteRow(
         session, KeyForTransactionAndIndex(0, r),
         ValueForTransactionAndIndex(0, r, WriteOpType::UPDATE), WriteOpType::UPDATE);
-    ASSERT_TRUE(!result.ok() && result.status().IsTryAgain()) << result;
+    ASSERT_OK(result);
   }
 
   txn2->Abort();
@@ -309,14 +355,14 @@ TEST_F(QLTransactionTest, WriteAfterReadRestart) {
 
 TEST_F(QLTransactionTest, Child) {
   auto txn = CreateTransaction();
-  TransactionManager manager2(client_, clock_, client::LocalTabletFilter());
+  TransactionManager manager2(client_.get(), clock_, client::LocalTabletFilter());
   auto data_pb = txn->PrepareChildFuture(ForceConsistentRead::kFalse).get();
   ASSERT_OK(data_pb);
   auto data = ChildTransactionData::FromPB(*data_pb);
   ASSERT_OK(data);
   auto txn2 = std::make_shared<YBTransaction>(&manager2, std::move(*data));
 
-  WriteRows(CreateSession(txn2), 0);
+  ASSERT_OK(WriteRows(CreateSession(txn2), 0));
   auto result = txn2->FinishChild();
   ASSERT_OK(result);
   ASSERT_OK(txn->ApplyChildResult(*result));
@@ -325,7 +371,7 @@ TEST_F(QLTransactionTest, Child) {
 
   ASSERT_NO_FATALS(VerifyData());
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, ChildReadRestart) {
@@ -333,7 +379,7 @@ TEST_F(QLTransactionTest, ChildReadRestart) {
 
   {
     auto write_txn = CreateTransaction();
-    WriteRows(CreateSession(write_txn));
+    ASSERT_OK(WriteRows(CreateSession(write_txn)));
     ASSERT_OK(write_txn->CommitFuture().get());
   }
 
@@ -347,7 +393,7 @@ TEST_F(QLTransactionTest, ChildReadRestart) {
 
   server::ClockPtr clock3(new server::HybridClock(skewed_clock_));
   ASSERT_OK(clock3->Init());
-  TransactionManager manager3(client_, clock3, client::LocalTabletFilter());
+  TransactionManager manager3(client_.get(), clock3, client::LocalTabletFilter());
   auto child_txn = std::make_shared<YBTransaction>(&manager3, std::move(*data));
 
   auto session = CreateSession(child_txn);
@@ -372,7 +418,7 @@ TEST_F(QLTransactionTest, ChildReadRestart) {
   ASSERT_NO_FATALS(VerifyData());
 
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, InsertUpdate) {
@@ -391,42 +437,34 @@ TEST_F(QLTransactionTest, Cleanup) {
   ASSERT_OK(WaitTransactionsCleaned());
   VerifyData();
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, Heartbeat) {
   auto txn = CreateTransaction();
   auto session = CreateSession(txn);
-  WriteRows(session);
+  ASSERT_OK(WriteRows(session));
   std::this_thread::sleep_for(GetTransactionTimeout() * 2);
-  CountDownLatch latch(1);
-  txn->Commit([&latch](const Status& status) {
-    EXPECT_OK(status);
-    latch.CountDown();
-  });
-  latch.Wait();
+  ASSERT_OK(txn->CommitFuture().get());
   VerifyData();
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, Expire) {
   SetDisableHeartbeatInTests(true);
   auto txn = CreateTransaction();
   auto session = CreateSession(txn);
-  WriteRows(session);
+  ASSERT_OK(WriteRows(session));
   std::this_thread::sleep_for(GetTransactionTimeout() * 2);
-  CountDownLatch latch(1);
-  txn->Commit([&latch](const Status& status) {
-    EXPECT_TRUE(status.IsExpired()) << "Bad status: " << status.ToString();
-    latch.CountDown();
-  });
-  latch.Wait();
+  auto commit_status = txn->CommitFuture().get();
+  ASSERT_TRUE(commit_status.IsExpired()) << "Bad status: " << commit_status;
   std::this_thread::sleep_for(std::chrono::microseconds(FLAGS_transaction_heartbeat_usec * 2));
   ASSERT_OK(cluster_->CleanTabletLogs());
   ASSERT_FALSE(HasTransactions());
 }
 
 TEST_F(QLTransactionTest, PreserveLogs) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_rpc_timeout_ms) = 60000;
   SetDisableHeartbeatInTests(true);
   DisableTransactionTimeout();
   std::vector<std::shared_ptr<YBTransaction>> transactions;
@@ -434,7 +472,7 @@ TEST_F(QLTransactionTest, PreserveLogs) {
   for (size_t i = 0; i != kTransactions; ++i) {
     auto txn = CreateTransaction();
     auto session = CreateSession(txn);
-    WriteRows(session, i);
+    ASSERT_OK(WriteRows(session, i));
     transactions.push_back(std::move(txn));
     std::this_thread::sleep_for(100ms);
   }
@@ -450,7 +488,22 @@ TEST_F(QLTransactionTest, PreserveLogs) {
   }
   latch.Wait();
   VerifyData(kTransactions);
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
+  auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+  uint64_t max_active_segment_sequence_number = 0;
+  for (const auto& peer : peers) {
+    if (peer->TEST_table_type() != TableType::TRANSACTION_STATUS_TABLE_TYPE) {
+      continue;
+    }
+    auto current_active_segment_sequence_number = peer->log()->active_segment_sequence_number();
+    LOG(INFO) << peer->LogPrefix() << "active segment: "
+              << current_active_segment_sequence_number;
+    max_active_segment_sequence_number = std::max(
+        max_active_segment_sequence_number, current_active_segment_sequence_number);
+  }
+
+  // Ensure that we had enough log segments, otherwise this test is pretty useless.
+  ASSERT_GE(max_active_segment_sequence_number, kTransactions / 4);
 }
 
 TEST_F(QLTransactionTest, ResendApplying) {
@@ -464,26 +517,26 @@ TEST_F(QLTransactionTest, ResendApplying) {
   ASSERT_OK(WaitTransactionsCleaned());
   VerifyData();
   ASSERT_OK(cluster_->RestartSync());
-  CheckNoRunningTransactions();
+  AssertNoRunningTransactions();
 }
 
 TEST_F(QLTransactionTest, ConflictResolution) {
-  constexpr size_t kTotalTransactions = 5;
-  constexpr size_t kNumRows = 10;
+  constexpr int kTotalTransactions = 5;
+  constexpr int kNumRows = 10;
   std::vector<YBTransactionPtr> transactions;
   std::vector<YBSessionPtr> sessions;
   std::vector<std::vector<YBqlWriteOpPtr>> write_ops(kTotalTransactions);
 
   CountDownLatch latch(kTotalTransactions);
-  for (size_t i = 0; i != kTotalTransactions; ++i) {
+  for (int i = 0; i != kTotalTransactions; ++i) {
     transactions.push_back(CreateTransaction());
     auto session = CreateSession(transactions.back());
     sessions.push_back(session);
-    for (size_t r = 0; r != kNumRows; ++r) {
+    for (int r = 0; r != kNumRows; ++r) {
       write_ops[i].push_back(ASSERT_RESULT(WriteRow(
           sessions.back(), r, i, WriteOpType::INSERT, Flush::kFalse)));
     }
-    session->FlushAsync([&latch](const Status& status) { latch.CountDown(); });
+    session->FlushAsync([&latch](FlushStatus* flush_status) { latch.CountDown(); });
   }
   latch.Wait();
 
@@ -522,7 +575,7 @@ TEST_F(QLTransactionTest, ConflictResolution) {
 
   auto session = CreateSession();
   std::vector<int32_t> values;
-  for (size_t r = 0; r != kNumRows; ++r) {
+  for (int r = 0; r != kNumRows; ++r) {
     auto row = SelectRow(session, r);
     ASSERT_OK(row);
     values.push_back(*row);
@@ -534,31 +587,86 @@ TEST_F(QLTransactionTest, ConflictResolution) {
 
 TEST_F(QLTransactionTest, SimpleWriteConflict) {
   auto transaction = CreateTransaction();
-  WriteRows(CreateSession(transaction));
-  WriteRows(CreateSession());
+  ASSERT_OK(WriteRows(CreateSession(transaction)));
+  ASSERT_OK(WriteRows(CreateSession()));
 
   ASSERT_NOK(transaction->CommitFuture().get());
 }
 
-void QLTransactionTest::TestWriteConflicts(bool do_restarts) {
+void QLTransactionTest::TestReadOnlyTablets(IsolationLevel isolation_level,
+                                            bool perform_write,
+                                            bool written_intents_expected) {
+  SetIsolationLevel(isolation_level);
+
+  YBTransactionPtr txn = CreateTransaction();
+  YBSessionPtr session = CreateSession(txn);
+
+  ReadRow(session, 0 /* key */);
+  if (perform_write) {
+    ASSERT_OK(WriteRow(session, 1 /* key */, 1 /* value */, WriteOpType::INSERT, Flush::kFalse));
+  }
+  ASSERT_OK(session->TEST_Flush());
+
+  // Verify intents were written if expected.
+  if (written_intents_expected) {
+    ASSERT_GT(CountIntents(cluster_.get()), 0);
+  } else {
+    ASSERT_EQ(CountIntents(cluster_.get()), 0);
+  }
+
+  // Commit and verify transaction and intents were applied/cleaned up.
+  ASSERT_OK(txn->CommitFuture().get());
+  ASSERT_OK(WaitTransactionsCleaned());
+  ASSERT_OK(WaitIntentsCleaned());
+}
+
+TEST_F(QLTransactionTest, ReadOnlyTablets) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_fail_in_apply_if_no_metadata) = true;
+
+  // In snapshot isolation, tablets only read from will not have metadata written, so applying
+  // intents on this tablet would cause the test to fail.
+  TestReadOnlyTablets(IsolationLevel::SNAPSHOT_ISOLATION,
+                      false /* perform_write */,
+                      false /* written_intents_expected */);
+
+  // Writes always write intents, so metadata should be written and intents should be applied
+  // on this tablet.
+  TestReadOnlyTablets(IsolationLevel::SNAPSHOT_ISOLATION,
+                      true /* perform_write */,
+                      true /* written_intents_expected */);
+
+  // In serializable isolation, reads write intents, so metadata should be written and intents
+  // should be applied on this tablet.
+  TestReadOnlyTablets(IsolationLevel::SERIALIZABLE_ISOLATION,
+                      false /* perform_write */,
+                      true /* written_intents_expected */);
+}
+
+void QLTransactionTest::TestWriteConflicts(const WriteConflictsOptions& options) {
   struct ActiveTransaction {
     YBTransactionPtr transaction;
     YBSessionPtr session;
-    std::future<Status> flush_future;
+    std::future<FlushStatus> flush_future;
     std::future<Status> commit_future;
+
+    std::string ToString() const {
+      ANNOTATE_IGNORE_READS_BEGIN();
+      auto str = transaction ? transaction->ToString() : "no-txn";
+      ANNOTATE_IGNORE_READS_END();
+      return str;
+    }
   };
 
-  constexpr size_t kActiveTransactions = 50;
   constexpr auto kTestTime = 60s;
-  constexpr int kTotalKeys = 5;
   std::vector<ActiveTransaction> active_transactions;
 
   auto stop = std::chrono::steady_clock::now() + kTestTime;
 
   std::thread restart_thread;
 
-  if (do_restarts) {
+  if (options.do_restarts) {
     restart_thread = std::thread([this, stop] {
+        CDSAttacher attacher;
         int it = 0;
         while (std::chrono::steady_clock::now() < stop) {
           std::this_thread::sleep_for(5s);
@@ -569,7 +677,7 @@ void QLTransactionTest::TestWriteConflicts(bool do_restarts) {
 
   int value = 0;
   size_t tries = 0;
-  size_t committed = 0;
+  size_t written = 0;
   size_t flushed = 0;
   for (;;) {
     auto expired = std::chrono::steady_clock::now() >= stop;
@@ -579,20 +687,24 @@ void QLTransactionTest::TestWriteConflicts(bool do_restarts) {
       }
       LOG(INFO) << "Time expired, remaining transactions: " << active_transactions.size();
       for (const auto& txn : active_transactions) {
-        LOG(INFO) << "TXN: " << txn.transaction->ToString() << ", "
+        LOG(INFO) << "TXN: " << txn.ToString() << ", "
                   << (!txn.commit_future.valid() ? "Flushing" : "Committing");
       }
     }
-    while (!expired && active_transactions.size() < kActiveTransactions) {
-      auto key = RandomUniformInt(1, kTotalKeys);
+    while (!expired && active_transactions.size() < options.active_transactions) {
+      auto key = RandomUniformInt<int>(1, options.total_keys);
       ActiveTransaction active_txn;
-      active_txn.transaction = CreateTransaction();
+      if (!options.non_txn_writes || RandomUniformBool()) {
+        active_txn.transaction = CreateTransaction();
+      }
       active_txn.session = CreateSession(active_txn.transaction);
       const auto op = table_.NewInsertOp();
       auto* const req = op->mutable_request();
       QLAddInt32HashValue(req, key);
-      table_.AddInt32ColumnValue(req, kValueColumn, ++value);
-      ASSERT_OK(active_txn.session->Apply(op));
+      const auto val = ++value;
+      table_.AddInt32ColumnValue(req, kValueColumn, val);
+      LOG(INFO) << "TXN: " << active_txn.ToString() << " write " << key << " = " << val;
+      active_txn.session->Apply(op);
       active_txn.flush_future = active_txn.session->FlushFuture();
 
       ++tries;
@@ -602,22 +714,28 @@ void QLTransactionTest::TestWriteConflicts(bool do_restarts) {
     auto w = active_transactions.begin();
     for (auto i = active_transactions.begin(); i != active_transactions.end(); ++i) {
       if (!i->commit_future.valid()) {
-        if (i->flush_future.wait_for(0s) == std::future_status::ready) {
-          auto flush_status = i->flush_future.get();
+        if (IsReady(i->flush_future)) {
+          auto flush_status = i->flush_future.get().status;
           if (!flush_status.ok()) {
-            LOG(INFO) << "Flush failed: " << flush_status;
+            LOG(INFO) << "TXN: " << i->ToString() << ", flush failed: " << flush_status;
             continue;
           }
           ++flushed;
+          LOG(INFO) << "TXN: " << i->ToString() << ", flushed";
+          if (!i->transaction) {
+            ++written;
+            continue;
+          }
           i->commit_future = i->transaction->CommitFuture();
         }
-      } else if (i->commit_future.wait_for(0s) == std::future_status::ready) {
+      } else if (IsReady(i->commit_future)) {
         auto commit_status = i->commit_future.get();
         if (!commit_status.ok()) {
-          LOG(INFO) << "Commit failed: " << commit_status;
+          LOG(INFO) << "TXN: " << i->ToString() << ", commit failed: " << commit_status;
           continue;
         }
-        ++committed;
+        LOG(INFO) << "TXN: " << i->ToString() << ", committed";
+        ++written;
         continue;
       }
 
@@ -631,31 +749,40 @@ void QLTransactionTest::TestWriteConflicts(bool do_restarts) {
     std::this_thread::sleep_for(expired ? 1s : 100ms);
   }
 
-  if (do_restarts) {
+  if (options.do_restarts) {
     restart_thread.join();
   }
 
-  LOG(INFO) << "Committed: " << committed << ", flushed: " << flushed << ", tries: " << tries;
+  LOG(INFO) << "Written: " << written << ", flushed: " << flushed << ", tries: " << tries;
 
-  ASSERT_GE(committed, kTotalKeys);
-  ASSERT_GT(flushed, committed);
-  ASSERT_GT(flushed, kActiveTransactions);
+  ASSERT_GE(written, options.total_keys);
+  ASSERT_GT(flushed, written);
+  ASSERT_GT(flushed, options.active_transactions);
   ASSERT_GT(tries, flushed);
 }
 
-class WriteConflictsTest : public QLTransactionTest {
- protected:
-  uint64_t log_segment_size_bytes() const override {
-    return 0;
-  }
-};
-
-TEST_F_EX(QLTransactionTest, WriteConflicts, WriteConflictsTest) {
-  TestWriteConflicts(false /* do_restarts */);
+TEST_F_EX(QLTransactionTest, WriteConflicts, QLTransactionBigLogSegmentSizeTest) {
+  WriteConflictsOptions options = {
+    .do_restarts = false,
+  };
+  TestWriteConflicts(options);
 }
 
-TEST_F_EX(QLTransactionTest, WriteConflictsWithRestarts, WriteConflictsTest) {
-  TestWriteConflicts(true /* do_restarts */);
+TEST_F_EX(QLTransactionTest, WriteConflictsWithRestarts, QLTransactionBigLogSegmentSizeTest) {
+  WriteConflictsOptions options = {
+    .do_restarts = true,
+  };
+  TestWriteConflicts(options);
+}
+
+TEST_F_EX(QLTransactionTest, MixedWriteConflicts, QLTransactionBigLogSegmentSizeTest) {
+  WriteConflictsOptions options = {
+    .do_restarts = false,
+    .active_transactions = 3,
+    .total_keys = 1,
+    .non_txn_writes = true,
+  };
+  TestWriteConflicts(options);
 }
 
 TEST_F(QLTransactionTest, ResolveIntentsWriteReadUpdateRead) {
@@ -694,6 +821,12 @@ TEST_F(QLTransactionTest, ResolveIntentsWriteReadWithinTransactionAndRollback) {
     VERIFY_ROW(session, 1, 11);
     VERIFY_ROW(session, 2, 12);
 
+    // Need to wait transaction to be replicated to all tablet replicas, otherwise direct intents
+    // cleanup could not happen.
+    ASSERT_OK(WaitFor([this] {
+      return CountRunningTransactions() == 6;
+    }, 10s, "Wait transactions replicated to all tablet replicas"));
+
     txn->Abort();
   }
 
@@ -706,15 +839,15 @@ TEST_F(QLTransactionTest, ResolveIntentsWriteReadWithinTransactionAndRollback) {
     VERIFY_ROW(session, 2, 2);
   }
 
-  ASSERT_EQ(CountIntents(), 0);
+  ASSERT_OK(WaitIntentsCleaned());
 
   ASSERT_OK(cluster_->RestartSync());
 }
 
 TEST_F(QLTransactionTest, CheckCompactionAbortCleanup) {
   SetAtomicFlag(0ULL, &FLAGS_max_clock_skew_usec); // To avoid read restart in this test.
-  FLAGS_transaction_disable_proactive_cleanup_in_tests = true;
-  FLAGS_aborted_intent_cleanup_ms = 1000; // 1 sec
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_proactive_txn_cleanup_on_abort) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_aborted_intent_cleanup_ms) = 1000; // 1 sec
 
   // Write { 1 -> 1, 2 -> 2 }.
   {
@@ -741,12 +874,8 @@ TEST_F(QLTransactionTest, CheckCompactionAbortCleanup) {
 
   ASSERT_OK(WaitTransactionsCleaned());
 
-  std::this_thread::sleep_for(std::chrono::microseconds(FLAGS_aborted_intent_cleanup_ms));
-  tserver::TSTabletManager::TabletPeers peers;
-  cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletPeers(&peers);
-  for (std::shared_ptr<tablet::TabletPeer>  peer : peers) {
-    peer->tablet()->ForceRocksDBCompactInTest();
-  }
+  std::this_thread::sleep_for(std::chrono::milliseconds(FLAGS_aborted_intent_cleanup_ms));
+  ASSERT_OK(cluster_->CompactTablets());
 
   // Should read { 1 -> 1, 2 -> 2 }, since T1 has been aborted.
   {
@@ -755,7 +884,7 @@ TEST_F(QLTransactionTest, CheckCompactionAbortCleanup) {
     VERIFY_ROW(session, 2, 2);
   }
 
-  ASSERT_EQ(CountIntents(), 0);
+  ASSERT_OK(WaitIntentsCleaned());
 
   ASSERT_OK(cluster_->RestartSync());
 }
@@ -763,21 +892,34 @@ TEST_F(QLTransactionTest, CheckCompactionAbortCleanup) {
 class QLTransactionTestWithDisabledCompactions : public QLTransactionTest {
  public:
   void SetUp() override {
-    FLAGS_rocksdb_disable_compactions = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_disable_compactions) = true;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_ondisk_compression) = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_db_block_cache_size_bytes) = DB_CACHE_SIZE_CACHE_DISABLED;
     QLTransactionTest::SetUp();
   }
 };
 
 TEST_F_EX(QLTransactionTest, IntentsCleanupAfterRestart, QLTransactionTestWithDisabledCompactions) {
   SetAtomicFlag(0ULL, &FLAGS_max_clock_skew_usec); // To avoid read restart in this test.
-  FLAGS_transaction_disable_proactive_cleanup_in_tests = true;
-  FLAGS_aborted_intent_cleanup_ms = 1000; // 1 sec
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_disable_proactive_txn_cleanup_on_abort) = true;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_aborted_intent_cleanup_ms) = 1000; // 1 sec
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_delete_intents_sst_files) = false;
 
-  const int kTransactions = 10;
+#ifndef NDEBUG
+  constexpr int kTransactions = 10;
+#else
+  constexpr int kTransactions = 20;
+#endif
+  // Empirically determined constant.
+  constexpr int kBytesPerRow = 75;
+  constexpr int kRequiredCompactedBytes = kTransactions * kNumRows * kBytesPerRow;
+  LOG(INFO) << "Required compact read bytes: " << kRequiredCompactedBytes
+            << ", num tablets: " << this->table_->GetPartitionCount()
+            << ", num transactions: " << kTransactions;
 
   LOG(INFO) << "Write values";
 
-  for (size_t i = 0; i != kTransactions; ++i) {
+  for (int i = 0; i != kTransactions; ++i) {
     SCOPED_TRACE(Format("Transaction $0", i));
     auto txn = CreateTransaction();
     auto session = CreateSession(txn);
@@ -787,7 +929,7 @@ TEST_F_EX(QLTransactionTest, IntentsCleanupAfterRestart, QLTransactionTestWithDi
     ASSERT_OK(cluster_->FlushTablets(tablet::FlushMode::kAsync));
 
     // Need some time for flush to be initiated.
-    std::this_thread::sleep_for(100ms);
+    std::this_thread::sleep_for(1s);
 
     txn->Abort();
   }
@@ -797,25 +939,30 @@ TEST_F_EX(QLTransactionTest, IntentsCleanupAfterRestart, QLTransactionTestWithDi
   LOG(INFO) << "Shutdown cluster";
   cluster_->Shutdown();
 
-  std::this_thread::sleep_for(FLAGS_aborted_intent_cleanup_ms * 1ms);
+  std::this_thread::sleep_for(1ms * ANNOTATE_UNPROTECTED_READ(FLAGS_aborted_intent_cleanup_ms));
 
-  FLAGS_delay_init_tablet_peer_ms = 100;
-  FLAGS_rocksdb_disable_compactions = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_delay_init_tablet_peer_ms) = 100;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_rocksdb_disable_compactions) = false;
 
   LOG(INFO) << "Start cluster";
   ASSERT_OK(cluster_->StartSync());
 
-  ASSERT_OK(WaitFor([cluster = cluster_.get()] {
-    auto peers = ListTabletPeers(cluster, ListPeersFilter::kAll);
-    int64_t bytes = 0;
+  ASSERT_OK(WaitFor([this, counter = 0UL]() mutable {
+    LOG(INFO) << "Wait iteration #" << ++counter;
+    const auto peers = ListTableActiveTabletLeadersPeers(cluster_.get(), this->table_->id());
+    uint64_t bytes = 0;
     for (const auto& peer : peers) {
-      if (peer->tablet()) {
-        bytes += peer->tablet()->rocksdb_statistics()->getTickerCount(rocksdb::COMPACT_READ_BYTES);
+      uint64_t read_bytes = 0;
+      const auto tablet = peer->shared_tablet();
+      if (tablet) {
+        read_bytes = tablet->intentsdb_statistics()->getTickerCount(rocksdb::COMPACT_READ_BYTES);
       }
+      bytes += read_bytes;
+      LOG(INFO) << "T " << peer->tablet_id() << ": Compact read bytes: " << read_bytes;
     }
     LOG(INFO) << "Compact read bytes: " << bytes;
 
-    return bytes >= 5_KB;
+    return bytes >= kRequiredCompactedBytes;
   }, 10s, "Enough compactions happen"));
 }
 
@@ -922,14 +1069,13 @@ TEST_F(QLTransactionTest, ResolveIntentsCheckConsistency) {
 //
 // It is don't for multiple keys sequentially. So those keys are located on different tablets
 // and tablet servers, and we test different cases of clock skew.
-TEST_F(QLTransactionTest, CorrectStatusRequestBatching) {
+TEST_F_EX(QLTransactionTest, CorrectStatusRequestBatching, QLTransactionBigLogSegmentSizeTest) {
   const auto kClockSkew = 100ms;
   constexpr auto kMinWrites = RegularBuildVsSanitizers(25, 1);
   constexpr auto kMinReads = 10;
   constexpr size_t kConcurrentReads = RegularBuildVsSanitizers<size_t>(20, 5);
 
-  FLAGS_transaction_delay_status_reply_usec_in_tests = 200000;
-  FLAGS_log_segment_size_bytes = 0;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_transaction_delay_status_reply_usec_in_tests) = 200000;
   SetAtomicFlag(std::chrono::microseconds(kClockSkew).count() * 3, &FLAGS_max_clock_skew_usec);
 
   auto delta_changers = SkewClocks(cluster_.get(), kClockSkew);
@@ -939,6 +1085,7 @@ TEST_F(QLTransactionTest, CorrectStatusRequestBatching) {
     std::atomic<int32_t> value(0);
 
     std::thread write_thread([this, key, &stop, &value] {
+      CDSAttacher attacher;
       auto session = CreateSession();
       while (!stop) {
         auto txn = CreateTransaction();
@@ -961,12 +1108,13 @@ TEST_F(QLTransactionTest, CorrectStatusRequestBatching) {
 
     for (size_t i = 0; i != kConcurrentReads; ++i) {
       read_threads.emplace_back([this, key, &stop, &value, &read = reads[i]] {
+        CDSAttacher attacher;
         auto session = CreateSession();
         StopOnFailure stop_on_failure(&stop);
         while (!stop) {
           auto value_before_start = value.load();
           YBqlReadOpPtr op = ReadRow(session, key);
-          ASSERT_OK(session->Flush());
+          ASSERT_OK(session->TEST_Flush());
           ASSERT_EQ(op->response().status(), QLResponsePB::YQL_STATUS_OK)
                         << op->response().ShortDebugString();
           auto rowblock = yb::ql::RowsResult(op.get()).GetRowBlock();
@@ -1011,7 +1159,7 @@ TEST_F(QLTransactionTest, CorrectStatusRequestBatching) {
 
 struct TransactionState {
   YBTransactionPtr transaction;
-  std::shared_future<TransactionMetadata> metadata_future;
+  std::shared_future<Result<TransactionMetadata>> metadata_future;
   std::future<Status> commit_future;
   std::future<Result<tserver::GetTransactionStatusResponsePB>> status_future;
   TransactionMetadata metadata;
@@ -1024,28 +1172,31 @@ struct TransactionState {
     auto resp = status_future.get();
     ASSERT_OK(resp);
 
-    if (resp->status() == TransactionStatus::ABORTED) {
+    ASSERT_EQ(1, resp->status().size());
+    ASSERT_EQ(1, resp->status_hybrid_time().size());
+
+    if (resp->status(0) == TransactionStatus::ABORTED) {
       ASSERT_TRUE(commit_future.valid());
       transaction = nullptr;
       return;
     }
 
-    auto new_time = HybridTime(resp->status_hybrid_time());
+    auto new_time = HybridTime(resp->status_hybrid_time()[0]);
     if (last_status == TransactionStatus::PENDING) {
-      if (resp->status() == TransactionStatus::PENDING) {
+      if (resp->status(0) == TransactionStatus::PENDING) {
         ASSERT_GE(new_time, status_time);
       } else {
-        ASSERT_EQ(TransactionStatus::COMMITTED, resp->status());
+        ASSERT_EQ(TransactionStatus::COMMITTED, resp->status(0));
         ASSERT_GT(new_time, status_time);
       }
     } else {
       ASSERT_EQ(last_status, TransactionStatus::COMMITTED);
-      ASSERT_EQ(resp->status(), TransactionStatus::COMMITTED)
-          << "Bad transaction status: " << TransactionStatus_Name(resp->status());
+      ASSERT_EQ(resp->status(0), TransactionStatus::COMMITTED)
+          << "Bad transaction status: " << TransactionStatus_Name(resp->status(0));
       ASSERT_EQ(status_time, new_time);
     }
     status_time = new_time;
-    last_status = resp->status();
+    last_status = resp->status(0);
   }
 };
 
@@ -1075,9 +1226,16 @@ TEST_F(QLTransactionTest, StatusEvolution) {
       {
         auto session = CreateSession(txn);
         // Insert using different keys to avoid conflicts.
-        ASSERT_OK(WriteRow(session, states.size(), states.size()));
+        int idx = narrow_cast<int>(states.size());
+        ASSERT_OK(WriteRow(session, idx, idx));
       }
-      states.push_back({ txn, txn->TEST_GetMetadata() });
+      states.push_back(TransactionState{
+          .transaction = txn,
+          .metadata_future = txn->GetMetadata(TransactionRpcDeadline()),
+          .commit_future = {},
+          .status_future = {},
+          .metadata = {}
+      });
       ++active_transactions;
       --transactions_to_create;
     }
@@ -1100,15 +1258,16 @@ TEST_F(QLTransactionTest, StatusEvolution) {
         continue;
       }
       if (state.metadata.isolation == IsolationLevel::NON_TRANSACTIONAL) {
-        if (state.metadata_future.wait_for(0s) != std::future_status::ready) {
+        if (!IsReady(state.metadata_future)) {
           continue;
         }
-        state.metadata = state.metadata_future.get();
+        state.metadata = ASSERT_RESULT(Copy(state.metadata_future.get()));
       }
       tserver::GetTransactionStatusRequestPB req;
       req.set_tablet_id(state.metadata.status_tablet);
-      req.set_transaction_id(state.metadata.transaction_id.data,
-                             state.metadata.transaction_id.size());
+      req.add_transaction_id()->assign(
+          pointer_cast<const char*>(state.metadata.transaction_id.data()),
+          state.metadata.transaction_id.size());
       state.status_future = rpc::WrapRpcFuture<tserver::GetTransactionStatusResponsePB>(
           GetTransactionStatus, &rpcs)(
               TransactionRpcDeadline(), nullptr /* tablet */, client_.get(), &req);
@@ -1154,21 +1313,20 @@ TEST_F(QLTransactionTest, StatusEvolution) {
 // Such read is inconsistent.
 //
 // This test addresses this issue.
-TEST_F(QLTransactionTest, WaitRead) {
-  constexpr size_t kWriteThreads = 10;
+TEST_F_EX(QLTransactionTest, WaitRead, QLTransactionBigLogSegmentSizeTest) {
+  constexpr int kWriteThreads = 10;
   constexpr size_t kCycles = 100;
   constexpr size_t kConcurrentReads = 4;
 
   SetAtomicFlag(0ULL, &FLAGS_max_clock_skew_usec); // To avoid read restart in this test.
 
-  std::atomic<bool> stop(false);
-  std::vector<std::thread> threads;
+  TestThreadHolder thread_holder;
 
-  for (size_t i = 0; i != kWriteThreads; ++i) {
-    threads.emplace_back([this, i, &stop] {
+  for (int i = 0; i != kWriteThreads; ++i) {
+    thread_holder.AddThreadFunctor([this, i, &stop = thread_holder.stop_flag()] {
       auto session = CreateSession();
       int32_t value = 0;
-      while (!stop) {
+      while (!stop.load()) {
         ASSERT_OK(WriteRow(session, i, ++value));
       }
     });
@@ -1184,13 +1342,13 @@ TEST_F(QLTransactionTest, WaitRead) {
   for (size_t i = 0; i != kCycles; ++i) {
     latch.Reset(kConcurrentReads);
     for (size_t j = 0; j != kConcurrentReads; ++j) {
-      values[j].clear();
+      reads[j].clear();
       auto session = CreateSession(CreateTransaction());
-      for (size_t key = 0; key != kWriteThreads; ++key) {
+      for (int key = 0; key != kWriteThreads; ++key) {
         reads[j].push_back(ReadRow(session, key));
       }
-      session->FlushAsync([&latch](const Status& status) {
-        ASSERT_OK(status);
+      session->FlushAsync([&latch](FlushStatus* flush_status) {
+        ASSERT_OK(flush_status->status);
         latch.CountDown();
       });
     }
@@ -1216,10 +1374,7 @@ TEST_F(QLTransactionTest, WaitRead) {
     }
   }
 
-  stop = true;
-  for (auto& thread : threads) {
-    thread.join();
-  }
+  thread_holder.Stop();
 }
 
 TEST_F(QLTransactionTest, InsertDelete) {
@@ -1269,12 +1424,12 @@ TEST_F(QLTransactionTest, InsertDeleteWithClusterRestart) {
   }
 }
 
-TEST_F(QLTransactionTest, ChangeLeader) {
+TEST_F_EX(QLTransactionTest, ChangeLeader, QLTransactionBigLogSegmentSizeTest) {
   constexpr size_t kThreads = 2;
   constexpr auto kTestTime = 5s;
 
   DisableTransactionTimeout();
-  FLAGS_transaction_rpc_timeout_ms = MonoDelta(1min).ToMicroseconds();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_transaction_rpc_timeout_ms) = MonoDelta(1min).ToMilliseconds();
 
   std::vector<std::thread> threads;
   std::atomic<bool> stopped{false};
@@ -1282,10 +1437,11 @@ TEST_F(QLTransactionTest, ChangeLeader) {
   std::atomic<int> expirations{0};
   for (size_t i = 0; i != kThreads; ++i) {
     threads.emplace_back([this, i, &stopped, &successes, &expirations] {
+      CDSAttacher attacher;
       size_t idx = i;
       while (!stopped) {
         auto txn = CreateTransaction();
-        WriteRows(CreateSession(txn), idx, WriteOpType::INSERT);
+        ASSERT_OK(WriteRows(CreateSession(txn), idx, WriteOpType::INSERT));
         auto status = txn->CommitFuture().get();
         if (status.ok()) {
           ++successes;
@@ -1302,19 +1458,18 @@ TEST_F(QLTransactionTest, ChangeLeader) {
 
   auto test_finish = std::chrono::steady_clock::now() + kTestTime;
   while (std::chrono::steady_clock::now() < test_finish) {
-    for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
-      std::vector<tablet::TabletPeerPtr> peers;
-      cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers(&peers);
+    for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+      auto peers = cluster_->mini_tablet_server(i)->server()->tablet_manager()->GetTabletPeers();
       for (const auto& peer : peers) {
-        if (peer->consensus() &&
-            peer->consensus()->GetLeaderStatus() !=
-                consensus::LeaderStatus::NOT_LEADER &&
+        auto consensus_result = peer->GetConsensus();
+        if (consensus_result &&
+            consensus_result.get()->GetLeaderStatus() != consensus::LeaderStatus::NOT_LEADER &&
             peer->tablet()->transaction_coordinator() &&
             peer->tablet()->transaction_coordinator()->test_count_transactions()) {
           consensus::LeaderStepDownRequestPB req;
           req.set_tablet_id(peer->tablet_id());
           consensus::LeaderStepDownResponsePB resp;
-          ASSERT_OK(peer->consensus()->StepDown(&req, &resp));
+          ASSERT_OK(consensus_result.get()->StepDown(&req, &resp));
         }
       }
     }
@@ -1333,7 +1488,8 @@ TEST_F(QLTransactionTest, ChangeLeader) {
 class RemoteBootstrapTest : public QLTransactionTest {
  protected:
   void SetUp() override {
-    FLAGS_remote_bootstrap_max_chunk_size = 1_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_remote_bootstrap_max_chunk_size) = 1_KB;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_log_min_seconds_to_retain) = 1;
     QLTransactionTest::SetUp();
   }
 };
@@ -1354,7 +1510,6 @@ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
 
   DisableTransactionTimeout();
   DisableApplyingIntents();
-  FLAGS_log_min_seconds_to_retain = 1;
 
   cluster_->mini_tablet_server(0)->Shutdown();
 
@@ -1387,13 +1542,13 @@ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
   std::this_thread::sleep_for(5s * kTimeMultiplier);
 
   // Shutdown to reset cached logs.
-  for (int i = 1; i != cluster_->num_tablet_servers(); ++i) {
+  for (size_t i = 1; i != cluster_->num_tablet_servers(); ++i) {
     cluster_->mini_tablet_server(i)->Shutdown();
   }
 
   // Start all servers. Cluster verifier should check that all tablets are synchronized.
-  for (int i = 0; i != cluster_->num_tablet_servers(); ++i) {
-    ASSERT_OK(cluster_->mini_tablet_server(i)->Start());
+  for (size_t i = 0; i != cluster_->num_tablet_servers(); ++i) {
+    ASSERT_OK(cluster_->mini_tablet_server(i)->Start(tserver::WaitTabletsBootstrapped::kFalse));
   }
 
   ASSERT_OK(WaitFor([this] { return CheckAllTabletsRunning(); }, 20s * kTimeMultiplier,
@@ -1401,10 +1556,10 @@ TEST_F_EX(QLTransactionTest, RemoteBootstrap, RemoteBootstrapTest) {
 }
 
 TEST_F(QLTransactionTest, FlushIntents) {
-  FLAGS_flush_rocksdb_on_shutdown = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_flush_rocksdb_on_shutdown) = false;
 
   WriteData();
-  WriteRows(CreateSession(), 1);
+  ASSERT_OK(WriteRows(CreateSession(), 1));
 
   VerifyData(2);
 
@@ -1416,7 +1571,7 @@ TEST_F(QLTransactionTest, FlushIntents) {
 }
 
 // This test checks that read restart never happen during first read request to single table.
-TEST_F(QLTransactionTest, PickReadTimeAtServer) {
+TEST_F_EX(QLTransactionTest, PickReadTimeAtServer, QLTransactionBigLogSegmentSizeTest) {
   constexpr int kKeys = 10;
   constexpr int kThreads = 5;
 
@@ -1424,6 +1579,7 @@ TEST_F(QLTransactionTest, PickReadTimeAtServer) {
   std::vector<std::thread> threads;
   while (threads.size() != kThreads) {
     threads.emplace_back([this, &stop] {
+      CDSAttacher attacher;
       StopOnFailure stop_on_failure(&stop);
       while (!stop.load(std::memory_order_acquire)) {
         auto txn = CreateTransaction();
@@ -1499,6 +1655,211 @@ TEST_F(QLTransactionTest, DelayedInit) {
     ASSERT_EQ(1, row1);
     auto row2 = SelectRow(read_session, 2);
     ASSERT_TRUE(!row2.ok() && row2.status().IsNotFound()) << row2;
+  }
+}
+
+class QLTransactionTestSingleTablet :
+    public TransactionCustomLogSegmentSizeTest<4_KB, QLTransactionTest> {
+ public:
+  int NumTablets() override {
+    return 1;
+  }
+};
+
+TEST_F_EX(QLTransactionTest, DeleteFlushedIntents, QLTransactionTestSingleTablet) {
+  constexpr int kNumWrites = 10;
+
+  auto session = CreateSession();
+  for (size_t idx = 0; idx != kNumWrites; ++idx) {
+    auto txn = CreateTransaction();
+    session->SetTransaction(txn);
+    ASSERT_OK(WriteRows(session, idx, WriteOpType::INSERT));
+    ASSERT_OK(cluster_->FlushTablets(tablet::FlushMode::kSync, tablet::FlushFlags::kIntents));
+    ASSERT_OK(txn->CommitFuture().get());
+  }
+
+  ASSERT_OK(WaitFor([this] {
+    if (CountIntents(cluster_.get()) != 0) {
+      return false;
+    }
+
+    auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kAll);
+    size_t total_sst_files = 0;
+    for (auto& peer : peers) {
+      auto intents_db = peer->tablet()->intents_db();
+      if (!intents_db) {
+        continue;
+      }
+      std::vector<rocksdb::LiveFileMetaData> files;
+      intents_db->GetLiveFilesMetaData(&files);
+      LOG(INFO) << "T " << peer->tablet_id() << " P " << peer->permanent_uuid() << ": files: "
+                << AsString(files);
+      total_sst_files += files.size();
+    }
+
+    return total_sst_files == 0;
+  }, 15s, "Intents and files are removed"));
+}
+
+// Test performs transactional writes to get flushed intents.
+// Then performs non transactional writes and checks that log size stabilizes, meaning
+// log gc is working.
+TEST_F_EX(QLTransactionTest, GCLogsAfterTransactionalWritesStop, QLTransactionTestSingleTablet) {
+  // An amount of time during which we require log size to be stable.
+  const MonoDelta kStableTimePeriod = 10s;
+  const MonoDelta kTimeout = 30s + kStableTimePeriod;
+
+  LOG(INFO) << "Perform transactional writes, to get non empty intents db";
+  TestThreadHolder thread_holder;
+  std::atomic<bool> use_transaction(true);
+  // This thread first does transactional writes and then switches to doing non-transactional
+  // writes.
+  thread_holder.AddThreadFunctor([this, &use_transaction, &stop = thread_holder.stop_flag()] {
+    SetFlagOnExit set_flag_on_exit(&stop);
+    auto session = CreateSession();
+    int txn_idx = 0;
+    while (!stop.load(std::memory_order_acquire)) {
+      YBTransactionPtr write_txn = use_transaction.load(std::memory_order_acquire)
+          ? CreateTransaction() : nullptr;
+      session->SetTransaction(write_txn);
+      ASSERT_OK(WriteRows(session, txn_idx++));
+      if (write_txn) {
+        ASSERT_OK(write_txn->CommitFuture().get());
+      }
+    }
+  });
+  // Waiting for some intent SSTables to be flushed.
+  bool has_flushed_intents_db = false;
+  while (!has_flushed_intents_db && !thread_holder.stop_flag().load(std::memory_order_acquire)) {
+    ASSERT_OK(cluster_->FlushTablets());
+    auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+    for (const auto& peer : peers) {
+      auto* tablet = peer->tablet();
+      if (!tablet) {
+        continue;
+      }
+      auto persistent_op_id = ASSERT_RESULT(tablet->MaxPersistentOpId());
+      if (persistent_op_id.intents.index > 10) {
+        has_flushed_intents_db = true;
+        break;
+      }
+    }
+    std::this_thread::sleep_for(10ms);
+  }
+
+  // We are expecting the log size to stay bounded, which means the maximum log size we've ever
+  // seen for any tablet should stabilize. That would indicate that the bug with unbounded log
+  // growth (https://github.com/YugaByte/yugabyte-db/issues/2221) is not happening.
+  LOG(INFO) << "Perform non transactional writes";
+
+  use_transaction.store(false, std::memory_order_release);
+  uint64_t max_log_size = 0;
+  auto last_log_size_increment = CoarseMonoClock::now();
+  auto deadline = last_log_size_increment + kTimeout;
+  while (!thread_holder.stop_flag().load(std::memory_order_acquire)) {
+    auto now = CoarseMonoClock::now();
+    ASSERT_OK(cluster_->FlushTablets(tablet::FlushMode::kSync, tablet::FlushFlags::kRegular));
+    ASSERT_OK(cluster_->CleanTabletLogs());
+    auto peers = ListTabletPeers(cluster_.get(), ListPeersFilter::kLeaders);
+    for (const auto& peer : peers) {
+      auto* log = peer->log();
+      if (!log) {
+        continue;
+      }
+      uint64_t current_log_size = log->OnDiskSize();
+      if (current_log_size > max_log_size) {
+        LOG(INFO) << Format("T $1 P $0: Log size increased: $2", peer->permanent_uuid(),
+                            peer->tablet_id(), current_log_size);
+        last_log_size_increment = now;
+        max_log_size = current_log_size;
+      }
+    }
+    if (now - last_log_size_increment > kStableTimePeriod) {
+      break;
+    } else {
+      ASSERT_LE(last_log_size_increment + kStableTimePeriod, deadline)
+          << "Log size would not stabilize in " << kTimeout;
+    }
+    std::this_thread::sleep_for(100ms);
+  }
+
+  thread_holder.Stop();
+}
+
+class QLTransactionTestSingleTS : public QLTransactionTest {
+ protected:
+  void SetUp() override {
+    mini_cluster_opt_.num_tablet_servers = 1;
+    QLTransactionTest::SetUp();
+  }
+};
+
+TEST_F_EX(QLTransactionTest, TransactionsEarlyLoadedTest, QLTransactionTestSingleTS) {
+  auto txn_1 = CreateTransaction();
+  ASSERT_OK(WriteRow(
+      CreateSession(txn_1),
+      /* key = */ 0,
+      /* value = */ 0,
+      WriteOpType::INSERT,
+      Flush::kTrue));
+  auto txn_2 = CreateTransaction();
+  ASSERT_OK(WriteRow(
+      CreateSession(txn_2),
+      /* key = */ 100,
+      /* value = */ 100,
+      WriteOpType::INSERT,
+      Flush::kTrue));
+
+  // Skip applying and removing intent before stoping the cluster.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_remove_intent) = true;
+  txn_1->Abort();
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_process_apply) = true;
+  ASSERT_OK(txn_2->CommitFuture().get());
+
+  cluster_->StopSync();
+
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_process_apply) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_skip_remove_intent) = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_inject_sleep_before_applying_intents_ms) = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_TEST_load_transactions_sync) = true;
+  // Replay WAL [txn_1(ABORTED), txn_2(COMMITTED)]
+  ASSERT_OK(cluster_->Start());
+  CheckAllTabletsRunning();
+  AssertNoRunningTransactions();
+}
+
+TEST_F(QLTransactionTest, DeleteTableDuringWrite) {
+  DisableApplyingIntents();
+  ASSERT_NO_FATALS(WriteData());
+  ASSERT_OK(client_->DeleteTable(table_.table()->id()));
+  SetIgnoreApplyingProbability(0.0);
+  ASSERT_OK(WaitFor([this] {
+    return !HasTransactions();
+  }, 10s * kTimeMultiplier, "Cleanup transactions from coordinator"));
+}
+
+class QLTransactionTestSmallWriteBuffer :
+    public TransactionCustomLogSegmentSizeTest<64_KB, QLTransactionTest> {
+ public:
+  void SetUp() override {
+    FLAGS_db_write_buffer_size = 4_KB;
+    QLTransactionTest::SetUp();
+  }
+
+  int NumTablets() override {
+    return 1;
+  }
+};
+
+TEST_F_EX(QLTransactionTest, FlushBecauseOfWriteStop, QLTransactionTestSmallWriteBuffer) {
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_intents_flush_max_delay_ms) = 5000;
+  auto session = CreateSession();
+  session->SetTimeout(2s);
+  for (int txn_idx = 0; txn_idx != 300; ++txn_idx) {
+    YBTransactionPtr write_txn = CreateTransaction();
+    session->SetTransaction(write_txn);
+    ASSERT_OK(WriteRows(session, txn_idx++));
+    ASSERT_OK(write_txn->CommitFuture().get());
   }
 }
 

@@ -13,13 +13,25 @@
 
 #include "yb/client/table_alterer.h"
 
-#include "yb/client/client.h"
 #include "yb/client/client-internal.h"
-#include "yb/client/schema.h"
 #include "yb/client/schema-internal.h"
+
+#include "yb/common/common_util.h"
+#include "yb/common/schema_pbutil.h"
+#include "yb/common/schema.h"
+#include "yb/common/transaction.h"
+
+#include "yb/master/master_ddl.pb.h"
+
+using std::string;
 
 namespace yb {
 namespace client {
+
+struct YBTableAlterer::Step {
+  master::AlterTableRequestPB::StepType step_type;
+  std::unique_ptr<YBColumnSpec> spec;
+};
 
 YBTableAlterer::YBTableAlterer(YBClient* client, const YBTableName& name)
   : client_(client), table_name_(name) {
@@ -33,7 +45,7 @@ YBTableAlterer::~YBTableAlterer() {
 }
 
 YBTableAlterer* YBTableAlterer::RenameTo(const YBTableName& new_name) {
-  rename_to_ = new_name;
+  rename_to_ = std::make_unique<YBTableName>(new_name);
   return this;
 }
 
@@ -55,7 +67,17 @@ YBTableAlterer* YBTableAlterer::DropColumn(const string& name) {
 }
 
 YBTableAlterer* YBTableAlterer::SetTableProperties(const TableProperties& table_properties) {
-  table_properties_ = table_properties;
+  table_properties_ = std::make_unique<TableProperties>(table_properties);
+  return this;
+}
+
+YBTableAlterer* YBTableAlterer::replication_info(const master::ReplicationInfoPB& ri) {
+  replication_info_ = std::make_unique<master::ReplicationInfoPB>(ri);
+  return this;
+}
+
+YBTableAlterer* YBTableAlterer::SetWalRetentionSecs(const uint32_t wal_retention_secs) {
+  wal_retention_secs_ = wal_retention_secs;
   return this;
 }
 
@@ -69,6 +91,16 @@ YBTableAlterer* YBTableAlterer::wait(bool wait) {
   return this;
 }
 
+YBTableAlterer* YBTableAlterer::part_of_transaction(const TransactionMetadata* txn) {
+  txn_ = txn;
+  return this;
+}
+
+YBTableAlterer* YBTableAlterer::set_increment_schema_version() {
+  increment_schema_version_ = true;
+  return this;
+}
+
 Status YBTableAlterer::Alter() {
   master::AlterTableRequestPB req;
   RETURN_NOT_OK(ToRequest(&req));
@@ -76,11 +108,10 @@ Status YBTableAlterer::Alter() {
   MonoDelta timeout = timeout_.Initialized() ?
     timeout_ :
     client_->default_admin_operation_timeout();
-  MonoTime deadline = MonoTime::Now();
-  deadline.AddDelta(timeout);
+  auto deadline = CoarseMonoClock::Now() + timeout;
   RETURN_NOT_OK(client_->data_->AlterTable(client_, req, deadline));
   if (wait_) {
-    YBTableName alter_name = rename_to_.get_value_or(table_name_);
+    YBTableName alter_name = rename_to_ ? *rename_to_ : table_name_;
     RETURN_NOT_OK(client_->data_->WaitForAlterTableToFinish(
         client_, alter_name, table_id_, deadline));
   }
@@ -93,7 +124,8 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
     return status_;
   }
 
-  if (!rename_to_.is_initialized() && steps_.empty() && !table_properties_.is_initialized()) {
+  if (!rename_to_ && steps_.empty() && !increment_schema_version_ &&
+      !table_properties_ && !wal_retention_secs_ && !replication_info_) {
     return STATUS(InvalidArgument, "No alter steps provided");
   }
 
@@ -107,11 +139,11 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
     (req->mutable_table())->set_table_id(table_id_);
   }
 
-  if (rename_to_.is_initialized()) {
-    req->set_new_table_name(rename_to_.get().table_name());
+  if (rename_to_) {
+    req->set_new_table_name(rename_to_->table_name());
 
-    if (rename_to_.get().has_namespace()) {
-      req->mutable_new_namespace()->set_name(rename_to_.get().namespace_name());
+    if (rename_to_->has_namespace()) {
+      req->mutable_new_namespace()->set_name(rename_to_->namespace_name());
     }
   }
 
@@ -137,19 +169,19 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
         // TODO(KUDU-861): support altering a column in the wire protocol.
         // For now, we just give an error if the caller tries to do
         // any operation other than rename.
-        if (s.spec->data_->has_type ||
-            s.spec->data_->has_nullable ||
-            s.spec->data_->primary_key) {
-          return STATUS(NotSupported, "cannot support AlterColumn of this type",
-                                      s.spec->data_->name);
+        if (s.spec->data_->type) {
+          return STATUS(NotSupported, "Cannot change type of the column", s.spec->data_->name);
+        }
+        if (s.spec->data_->kind != ColumnKind::VALUE) {
+          return STATUS(NotSupported, "Cannot alter key column", s.spec->data_->name);
         }
         // We only support rename column
-        if (!s.spec->data_->has_rename_to) {
+        if (!s.spec->data_->rename_to) {
           return STATUS(InvalidArgument, "no alter operation specified",
                                          s.spec->data_->name);
         }
         pb_step->mutable_rename_column()->set_old_name(s.spec->data_->name);
-        pb_step->mutable_rename_column()->set_new_name(s.spec->data_->rename_to);
+        pb_step->mutable_rename_column()->set_new_name(*s.spec->data_->rename_to);
         pb_step->set_type(master::AlterTableRequestPB::RENAME_COLUMN);
         break;
       default:
@@ -157,8 +189,26 @@ Status YBTableAlterer::ToRequest(master::AlterTableRequestPB* req) {
     }
   }
 
-  if (table_properties_.is_initialized()) {
+  if (table_properties_) {
     table_properties_->ToTablePropertiesPB(req->mutable_alter_properties());
+  }
+
+  if (wal_retention_secs_) {
+    req->set_wal_retention_secs(*wal_retention_secs_);
+  }
+
+  if (replication_info_) {
+    // TODO: Maybe add checks for the sanity of the replication_info.
+    req->mutable_replication_info()->CopyFrom(*replication_info_);
+  }
+
+  if (txn_) {
+    txn_->ToPB(req->mutable_transaction());
+    req->set_ysql_yb_ddl_rollback_enabled(YsqlDdlRollbackEnabled());
+  }
+
+  if (increment_schema_version_) {
+    req->set_increment_schema_version(true);
   }
 
   return Status::OK();

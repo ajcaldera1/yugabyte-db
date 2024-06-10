@@ -2,22 +2,11 @@
 // Copyright (c) YugaByte, Inc.
 //
 
-#ifndef YB_UTIL_CONCURRENT_VALUE_H
-#define YB_UTIL_CONCURRENT_VALUE_H
+#pragma once
 
 #include <atomic>
 #include <mutex>
 #include <thread>
-
-#if defined(__APPLE__) && __clang_major__ < 8 || YB_ZAPCC
-#define YB_CONCURRENT_VALUE_USE_BOOST_THREAD_SPECIFIC_PTR 1
-#else
-#define YB_CONCURRENT_VALUE_USE_BOOST_THREAD_SPECIFIC_PTR 0
-#endif
-
-#if YB_CONCURRENT_VALUE_USE_BOOST_THREAD_SPECIFIC_PTR
-#include <boost/thread/tss.hpp>
-#endif
 
 #include "yb/util/logging.h"
 
@@ -26,6 +15,8 @@ namespace yb {
 namespace internal {
 typedef decltype(std::this_thread::get_id()) ThreadId;
 
+const auto kNullThreadId = ThreadId();
+
 // Tracks list of threads that is using URCU.
 template<class T>
 class ThreadList {
@@ -33,14 +24,38 @@ class ThreadList {
   typedef T Data;
 
   ~ThreadList() {
-    while (allocated_.load(std::memory_order_acquire) != 0) {
+    const auto current_thread_id = std::this_thread::get_id();
+    destructor_thread_id_.store(current_thread_id, std::memory_order_relaxed);
+
+    // Check if the current thread has an associated URCUThreadData object that has not been
+    // retired yet. We are doing it by traversing the linked list because the thread local
+    // variable might have been destructed already.
+    size_t desired_allocated_threads = 0;
+    for (auto* p = head_.load(std::memory_order_acquire); p;) {
+      if (p->owner.load(std::memory_order_acquire) == current_thread_id) {
+        desired_allocated_threads = 1;
+        break;
+      }
+      p = p->next.load(std::memory_order_acquire);
+    }
+
+    // Wait for all threads holding URCUThreadData objects, except maybe for this thread, to call
+    // Retire(). This thread might have to do that later, depending on the destruction orders of
+    // statics.
+    while (allocated_.load(std::memory_order_acquire) != desired_allocated_threads) {
       std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
+    // At this point no other threads should be touching the linked list. We are not enforcing that,
+    // but we assume that if the ThreadList destructor is being called, the system has already
+    // almost shut down.
     for (auto* p = head_.exchange(nullptr, std::memory_order_acquire); p;) {
       auto* n = p->next.load(std::memory_order_relaxed);
-
-      delete p;
+      if (p->owner.load(std::memory_order_relaxed) != current_thread_id) {
+        // If the current thread has not called Retire() on its URCUThreadData object, then we will
+        // defer deleting that object until Retire() is called.
+        delete p;
+      }
       p = n;
     }
   }
@@ -49,12 +64,11 @@ class ThreadList {
     allocated_.fetch_add(1, std::memory_order_relaxed);
     Data* data;
     const auto current_thread_id = std::this_thread::get_id();
-    const auto null_thread_id = ThreadId();
 
     // First, try to reuse a retired (non-active) HP record.
     for (data = head_.load(std::memory_order_acquire); data;
          data = data->next.load(std::memory_order_relaxed)) {
-      auto old_value = null_thread_id;
+      auto old_value = kNullThreadId;
       if (data->owner.compare_exchange_strong(old_value,
                                               current_thread_id,
                                               std::memory_order_seq_cst,
@@ -78,9 +92,15 @@ class ThreadList {
 
   void Retire(Data* data) {
     DCHECK_ONLY_NOTNULL(data);
-    const auto null_thread_id = decltype(std::this_thread::get_id())();
-    data->owner.store(null_thread_id, std::memory_order_release);
+    auto old_thread_id = data->owner.exchange(kNullThreadId, std::memory_order_acq_rel);
     allocated_.fetch_sub(1, std::memory_order_release);
+
+    // Using relaxed memory order because we only need to delete the URCUThreadData object here
+    // in case we set destructor_thread_id_ earlier on the same thread. If we are in a different
+    // thread, then the thread id will not match anyway.
+    if (old_thread_id == destructor_thread_id_.load(std::memory_order_relaxed)) {
+      delete data;
+    }
   }
 
   Data* Head(std::memory_order mo) const {
@@ -91,11 +111,13 @@ class ThreadList {
     static ThreadList<T> result;
     return result;
   }
+
  private:
   ThreadList() {}
 
   std::atomic<Data*> head_{nullptr};
   std::atomic<size_t> allocated_{0};
+  std::atomic<ThreadId> destructor_thread_id_{kNullThreadId};
 };
 
 // URCU data associated with thread.
@@ -153,7 +175,7 @@ class URCU {
   }
 
   void Synchronize() {
-    std::lock_guard<std::mutex> lock(mutex_);
+    std::lock_guard lock(mutex_);
     FlipAndWait();
     FlipAndWait();
   }
@@ -168,13 +190,12 @@ class URCU {
   }
 
   void FlipAndWait() {
-    const auto null_thread_id = ThreadId();
     global_control_word_.fetch_xor(kControlBit, std::memory_order_seq_cst);
 
     for (auto* data = ThreadList<URCUThreadData>::Instance().Head(std::memory_order_acquire);
          data;
          data = data->next.load(std::memory_order_acquire)) {
-      while (data->owner.load(std::memory_order_acquire) != null_thread_id &&
+      while (data->owner.load(std::memory_order_acquire) != kNullThreadId &&
              CheckGracePeriod(data)) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         std::atomic_thread_fence(std::memory_order_seq_cst);
@@ -190,13 +211,6 @@ class URCU {
 
   std::atomic <uint32_t> global_control_word_{1};
   std::mutex mutex_;
-#if YB_CONCURRENT_VALUE_USE_BOOST_THREAD_SPECIFIC_PTR
-  static void CleanupThreadData(URCUThreadData* data) {
-    ThreadList<URCUThreadData>::Instance().Retire(data);
-  }
-
-  static boost::thread_specific_ptr<URCUThreadData> data_;
-#else
   struct CleanupThreadData {
     void operator()(URCUThreadData* data) {
       ThreadList<URCUThreadData>::Instance().Retire(data);
@@ -204,7 +218,6 @@ class URCU {
   };
 
   static thread_local std::unique_ptr<URCUThreadData, CleanupThreadData> data_;
-#endif
 };
 
 // Reference to concurrent value. Provides read access to concurrent value.
@@ -294,5 +307,3 @@ class ConcurrentValue {
 using internal::ConcurrentValue;
 
 } // namespace yb
-
-#endif // YB_UTIL_CONCURRENT_VALUE_H

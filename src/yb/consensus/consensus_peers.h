@@ -30,28 +30,40 @@
 // under the License.
 //
 
-#ifndef YB_CONSENSUS_CONSENSUS_PEERS_H_
-#define YB_CONSENSUS_CONSENSUS_PEERS_H_
+#pragma once
 
+#include <stdint.h>
+
+#include <atomic>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <type_traits>
 #include <vector>
-#include <atomic>
+
+#include <boost/version.hpp>
+#include "yb/util/flags.h"
 
 #include "yb/consensus/consensus_fwd.h"
 #include "yb/consensus/consensus.pb.h"
-#include "yb/consensus/metadata.pb.h"
 #include "yb/consensus/consensus_util.h"
+#include "yb/consensus/metadata.pb.h"
 
-#include "yb/rpc/response_callback.h"
+#include "yb/gutil/integral_types.h"
+
 #include "yb/rpc/rpc_controller.h"
 
+#include "yb/util/status_fwd.h"
 #include "yb/util/atomic.h"
 #include "yb/util/countdown_latch.h"
 #include "yb/util/locks.h"
+#include "yb/util/memory/arena.h"
 #include "yb/util/net/net_util.h"
+#include "yb/util/result.h"
 #include "yb/util/semaphore.h"
-#include "yb/util/status.h"
+#include "yb/util/shared_lock.h"
+#include "yb/util/trace.h"
 
 namespace yb {
 class HostPort;
@@ -60,10 +72,6 @@ class ThreadPoolToken;
 namespace rpc {
 class Messenger;
 class PeriodicTimer;
-}
-
-namespace log {
-class Log;
 }
 
 namespace consensus {
@@ -124,15 +132,14 @@ typedef std::shared_ptr<Peer> PeerPtr;
 class Peer : public std::enable_shared_from_this<Peer> {
  public:
   Peer(const RaftPeerPB& peer, std::string tablet_id, std::string leader_uuid,
-       PeerProxyPtr proxy, PeerMessageQueue* queue,
-       ThreadPoolToken* raft_pool_token, Consensus* consensus,
-       std::shared_ptr<rpc::Messenger> messenger);
+       PeerProxyPtr proxy, PeerMessageQueue* queue, MultiRaftHeartbeatBatcherPtr multi_raft_batcher,
+       ThreadPoolToken* raft_pool_token, Consensus* consensus, rpc::Messenger* messenger);
 
   // Initializes a peer and get its status.
-  CHECKED_STATUS Init();
+  Status Init();
 
   // Signals that this peer has a new request to replicate/store.
-  CHECKED_STATUS SignalRequest(RequestTriggerMode trigger_mode);
+  Status SignalRequest(RequestTriggerMode trigger_mode);
 
   const RaftPeerPB& peer_pb() const { return peer_pb_; }
 
@@ -152,7 +159,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // the ThreadPoolToken.
   void Close();
 
-  void SetTermForTest(int term);
+  void TEST_SetTerm(int term, ThreadSafeArena* arena);
 
   ~Peer();
 
@@ -161,38 +168,40 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // Requests to this peer (which may end up doing IO to read non-cached log entries) are assembled
   // on 'raft_pool_token'.  Response handling may also involve IO related to log-entry lookups
   // and is also done on 'thread_pool'.
-  static Result<PeerPtr> NewRemotePeer(
-      const RaftPeerPB& peer_pb,
-      const std::string& tablet_id,
-      const std::string& leader_uuid,
-      PeerMessageQueue* queue,
-      ThreadPoolToken* raft_pool_token,
-      PeerProxyPtr proxy,
-      Consensus* consensus,
-      std::shared_ptr<rpc::Messenger> messenger);
+  template <class... Args>
+  static Result<PeerPtr> NewRemotePeer(Args&&... args) {
+    auto new_peer = std::make_shared<Peer>(std::forward<Args>(args)...);
+    RETURN_NOT_OK(new_peer->Init());
+    return Result<PeerPtr>(std::move(new_peer));
+  }
 
   uint64_t failed_attempts() {
-    std::lock_guard<simple_spinlock> l(peer_lock_);
+    std::lock_guard l(peer_lock_);
     return failed_attempts_;
   }
+
+  void DumpToHtml(std::ostream& out) const;
 
  private:
   void SendNextRequest(RequestTriggerMode trigger_mode);
 
-  // Signals that a response was received from the peer.  This method is called from the reactor
-  // thread and calls DoProcessResponse() on raft_pool_token_ to do any work that requires IO or
-  // lock-taking.
-  void ProcessResponse();
+  // Signals that a response was received from the peer. This method does response handling that
+  // requires IO or may block.
+  void ProcessResponse(TracePtr trace);
 
-  // Run on 'raft_pool_token'. Does response handling that requires IO or may block.
-  void DoProcessResponse();
+  // Signals that a heartbeat response was received from the peer.
+  void ProcessHeartbeatResponse(const Status& status);
+
+  // Returns true if there are more pending ops to process, false otherwise.
+  bool ProcessResponseWithStatus(const Status& status,
+                                 LWConsensusResponsePB* response);
 
   // Fetch the desired remote bootstrap request from the queue and send it to the peer. The callback
   // goes to ProcessRemoteBootstrapResponse().
   //
   // Returns a bad Status if remote bootstrap is disabled, or if the request cannot be generated for
   // some reason.
-  CHECKED_STATUS SendRemoteBootstrapRequest();
+  Status SendRemoteBootstrapRequest();
 
   // Handle RPC callback from initiating remote bootstrap.
   void ProcessRemoteBootstrapResponse();
@@ -204,8 +213,13 @@ class Peer : public std::enable_shared_from_this<Peer> {
   std::unique_lock<simple_spinlock> StartProcessingUnlocked();
 
   template <class LockType>
-  std::unique_lock<AtomicTryMutex> LockPerforming(LockType type) {
-    return std::unique_lock<AtomicTryMutex>(performing_mutex_, type);
+  std::unique_lock<AtomicTryMutex> LockPerformingUpdate(LockType type) {
+    return std::unique_lock<AtomicTryMutex>(performing_update_mutex_, type);
+  }
+
+  template <class LockType>
+  std::unique_lock<AtomicTryMutex> LockPerformingHeartbeat(LockType type) {
+    return std::unique_lock<AtomicTryMutex>(performing_heartbeat_mutex_, type);
   }
 
   std::string LogPrefix() const;
@@ -222,23 +236,47 @@ class Peer : public std::enable_shared_from_this<Peer> {
   PeerMessageQueue* queue_;
   uint64_t failed_attempts_ = 0;
 
-  // The latest consensus update request and response.
-  ConsensusRequestPB request_;
-  ConsensusResponsePB response_;
+  // The latest consensus update request and response stored in arena_.
+  ThreadSafeArena arena_;
+  LWConsensusRequestPB* update_request_ = nullptr;
+  LWConsensusResponsePB* update_response_ = nullptr;
+
+  // Latest heartbeat request and response
+  ConsensusRequestPB heartbeat_request_;
+  ConsensusResponsePB heartbeat_response_;
+
+  // Each time a heartbeat request is sent this value is incremented.
+  int64_t cur_heartbeat_id_ = 0;
+  // Indiciates the last valid heartbeat id that was sent.
+  // Each time an operation (non-heartbeat) is sent this value is updated.
+  // Upon receving the response for an outstanding heartbeat if
+  // cur_heartbeat_id_ < minimum_viable_heartbeat_ then the heartbeat is invalid
+  // since a more recent op was sent so we won't process it's response.
+  int64_t minimum_viable_heartbeat_ = 0;
 
   // The latest remote bootstrap request and response.
   StartRemoteBootstrapRequestPB rb_request_;
   StartRemoteBootstrapResponsePB rb_response_;
 
   rpc::RpcController controller_;
+  std::atomic<CoarseTimePoint> last_rpc_start_time_{CoarseTimePoint::min()};
 
   // Held if there is an outstanding request.  This is used in order to ensure that we only have a
   // single request outstanding at a time, and to wait for the outstanding requests at Close().
-  AtomicTryMutex performing_mutex_;
+  AtomicTryMutex performing_update_mutex_;
+
+  // Held if there is an outstanding heartbeat request.
+  // This is used in order to ensure that we only have a
+  // single heartbeat request outstanding at a time.
+  AtomicTryMutex performing_heartbeat_mutex_;
 
   // Heartbeater for remote peer implementations.  This will send status only requests to the remote
   // peers whenever we go more than 'FLAGS_raft_heartbeat_interval_ms' without sending actual data.
   std::shared_ptr<rpc::PeriodicTimer> heartbeater_;
+
+  // Batcher that currently batches heartbeat requests that are sent by each consensus peer
+  // on a per tserver level
+  MultiRaftHeartbeatBatcherPtr multi_raft_batcher_;
 
   // Thread pool used to construct requests to this peer.
   ThreadPoolToken* raft_pool_token_;
@@ -255,7 +293,7 @@ class Peer : public std::enable_shared_from_this<Peer> {
   mutable simple_spinlock peer_lock_;
   State state_ = kPeerCreated;
   Consensus* consensus_ = nullptr;
-  std::shared_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
   std::atomic<int> using_thread_pool_{0};
 };
 
@@ -265,9 +303,9 @@ class PeerProxy {
  public:
 
   // Sends a request, asynchronously, to a remote peer.
-  virtual void UpdateAsync(const ConsensusRequestPB* request,
+  virtual void UpdateAsync(const LWConsensusRequestPB* request,
                            RequestTriggerMode trigger_mode,
-                           ConsensusResponsePB* response,
+                           LWConsensusResponsePB* response,
                            rpc::RpcController* controller,
                            const rpc::ResponseCallback& callback) = 0;
 
@@ -313,7 +351,7 @@ class PeerProxyFactory {
 
   virtual ~PeerProxyFactory() {}
 
-  virtual std::shared_ptr<rpc::Messenger> messenger() const {
+  virtual rpc::Messenger* messenger() const {
     return nullptr;
   }
 };
@@ -323,9 +361,9 @@ class RpcPeerProxy : public PeerProxy {
  public:
   RpcPeerProxy(HostPort hostport, ConsensusServiceProxyPtr consensus_proxy);
 
-  virtual void UpdateAsync(const ConsensusRequestPB* request,
+  virtual void UpdateAsync(const LWConsensusRequestPB* request,
                            RequestTriggerMode trigger_mode,
-                           ConsensusResponsePB* response,
+                           LWConsensusResponsePB* response,
                            rpc::RpcController* controller,
                            const rpc::ResponseCallback& callback) override;
 
@@ -359,17 +397,16 @@ class RpcPeerProxy : public PeerProxy {
 // PeerProxyFactory implementation that generates RPCPeerProxies
 class RpcPeerProxyFactory : public PeerProxyFactory {
  public:
-  RpcPeerProxyFactory(std::shared_ptr<rpc::Messenger> messenger, rpc::ProxyCache* proxy_cache,
-                      CloudInfoPB from);
+  RpcPeerProxyFactory(rpc::Messenger* messenger, rpc::ProxyCache* proxy_cache, CloudInfoPB from);
 
   PeerProxyPtr NewProxy(const RaftPeerPB& peer_pb) override;
 
   virtual ~RpcPeerProxyFactory();
 
-  std::shared_ptr<rpc::Messenger> messenger() const override;
+  rpc::Messenger* messenger() const override;
 
  private:
-  std::shared_ptr<rpc::Messenger> messenger_;
+  rpc::Messenger* messenger_ = nullptr;
   rpc::ProxyCache* const proxy_cache_;
   const CloudInfoPB from_;
 };
@@ -384,5 +421,3 @@ Status SetPermanentUuidForRemotePeer(
 
 }  // namespace consensus
 }  // namespace yb
-
-#endif /* YB_CONSENSUS_CONSENSUS_PEERS_H_ */

@@ -15,35 +15,52 @@
 
 #include "yb/client/yb_table_name.h"
 
+#include "yb/qlexpr/ql_expr.h"
 #include "yb/common/wire_protocol-test-util.h"
 
 #include "yb/consensus/consensus.h"
 #include "yb/consensus/consensus.proxy.h"
 
-#include "yb/docdb/doc_rowwise_iterator.h"
+#include "yb/docdb/ql_rowwise_iterator_interface.h"
+
+#include "yb/dockv/reader_projection.h"
 
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/proxy.h"
+#include "yb/rpc/rpc_controller.h"
 
 #include "yb/server/server_base.proxy.h"
 
 #include "yb/tablet/local_tablet_writer.h"
 #include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_peer.h"
 
 #include "yb/tserver/mini_tablet_server.h"
 #include "yb/tserver/tablet_server.h"
 #include "yb/tserver/tablet_server_test_util.h"
+#include "yb/tserver/ts_tablet_manager.h"
 #include "yb/tserver/tserver_admin.proxy.h"
+#include "yb/tserver/tserver_service.proxy.h"
 
+#include "yb/util/flags.h"
+#include "yb/util/backoff_waiter.h"
+#include "yb/util/metrics.h"
+#include "yb/util/status_log.h"
 #include "yb/util/test_graph.h"
+
+using std::string;
+using std::vector;
 
 using namespace std::literals;
 
-DEFINE_int32(rpc_timeout, 1000, "Timeout for RPC calls, in seconds");
-DEFINE_int32(num_updater_threads, 1, "Number of updating threads to launch");
+DEFINE_NON_RUNTIME_int32(rpc_timeout, 1000, "Timeout for RPC calls, in seconds");
+DEFINE_NON_RUNTIME_int32(num_updater_threads, 1, "Number of updating threads to launch");
 DECLARE_bool(durable_wal_write);
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(enable_data_block_fsync);
 DECLARE_int32(heartbeat_rpc_timeout_ms);
+DECLARE_bool(disable_auto_flags_management);
+DECLARE_bool(allow_encryption_at_rest);
 
 METRIC_DEFINE_entity(test);
 
@@ -60,19 +77,21 @@ TabletServerTestBase::TabletServerTestBase(TableType table_type)
       table_type_(table_type),
       ts_test_metric_entity_(METRIC_ENTITY_test.Instantiate(
                                  &ts_test_metric_registry_, "ts_server-test")) {
+  const_cast<Schema&>(schema_).InitColumnIdsByDefault();
+
   // Disable the maintenance ops manager since we want to trigger our own
   // maintenance operations at predetermined times.
-  FLAGS_enable_maintenance_manager = false;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_maintenance_manager) = false;
 
   // Decrease heartbeat timeout: we keep re-trying heartbeats when a
   // single master server fails due to a network error. Decreasing
-  // the hearbeat timeout to 1 second speeds up unit tests which
+  // the heartbeat timeout to 1 second speeds up unit tests which
   // purposefully specify non-running Master servers.
-  FLAGS_heartbeat_rpc_timeout_ms = 1000;
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_heartbeat_rpc_timeout_ms) = 1000;
 
   // Keep unit tests fast, but only if no one has set the flag explicitly.
   if (google::GetCommandLineFlagInfoOrDie("enable_data_block_fsync").is_default) {
-    FLAGS_enable_data_block_fsync = false;
+    ANNOTATE_UNPROTECTED_WRITE(FLAGS_enable_data_block_fsync) = false;
   }
 }
 
@@ -85,31 +104,51 @@ void TabletServerTestBase::SetUp() {
   key_schema_ = schema_.CreateKeyProjection();
 
   client_messenger_ = ASSERT_RESULT(rpc::MessengerBuilder("Client").Build());
-  proxy_cache_ = std::make_unique<rpc::ProxyCache>(client_messenger_);
+  proxy_cache_ = std::make_unique<rpc::ProxyCache>(client_messenger_.get());
 }
 
 void TabletServerTestBase::TearDown() {
+  if (client_messenger_) {
+    client_messenger_->Shutdown();
+  }
+
   tablet_peer_.reset();
   if (mini_server_) {
     mini_server_->Shutdown();
   }
 }
 
+Result<std::unique_ptr<MiniTabletServer>> TabletServerTestBase::CreateMiniTabletServer() {
+  vector<string> drive_dirs;
+  for (int i = 0; i < NumDrives(); ++i) {
+    drive_dirs.push_back(GetTestPath("TabletServerTest-fsroot") + std::to_string(i));
+  }
+  return MiniTabletServer::CreateMiniTabletServer(drive_dirs, 0);
+}
+
 void TabletServerTestBase::StartTabletServer() {
   // Start server with an invalid master address, so it never successfully
   // heartbeats, even if there happens to be a master running on this machine.
-  auto mini_ts =
-      MiniTabletServer::CreateMiniTabletServer(GetTestPath("TabletServerTest-fsroot"), 0);
+
+  // Disable AutoFlags management as we dont have a master. AutoFlags will be enabled based on
+  // FLAGS_TEST_promote_all_auto_flags in test_main.cc.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_disable_auto_flags_management) = true;
+
+  // Disallow encryption at rest as there is no master.
+  ANNOTATE_UNPROTECTED_WRITE(FLAGS_allow_encryption_at_rest) = false;
+
+  auto mini_ts = CreateMiniTabletServer();
   CHECK_OK(mini_ts);
   mini_server_ = std::move(*mini_ts);
   auto addr = std::make_shared<server::MasterAddresses>();
   addr->push_back({HostPort("255.255.255.255", 1)});
   mini_server_->options()->SetMasterAddresses(addr);
-  CHECK_OK(mini_server_->Start());
+  CHECK_OK(mini_server_->Start(tserver::WaitTabletsBootstrapped::kFalse));
 
   // Set up a tablet inside the server.
-  CHECK_OK(mini_server_->AddTestTablet(kTableName.table_name(), kTabletId, schema_, table_type_));
-  CHECK(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_));
+  CHECK_OK(mini_server_->AddTestTablet(
+      kTableName.namespace_name(), kTableName.table_name(), kTabletId, schema_, table_type_));
+  tablet_peer_ = CHECK_RESULT(mini_server_->server()->tablet_manager()->GetTablet(kTabletId));
 
   // Creating a tablet is async, we wait here instead of having to handle errors later.
   CHECK_OK(WaitForTabletRunning(kTabletId));
@@ -120,13 +159,12 @@ void TabletServerTestBase::StartTabletServer() {
 
 Status TabletServerTestBase::WaitForTabletRunning(const char *tablet_id) {
   auto* tablet_manager = mini_server_->server()->tablet_manager();
-  std::shared_ptr<tablet::TabletPeer> tablet_peer;
-  RETURN_NOT_OK(tablet_manager->GetTabletPeer(tablet_id, &tablet_peer));
+  auto tablet_peer = VERIFY_RESULT(tablet_manager->GetServingTablet(Slice(tablet_id)));
 
   // Sometimes the disk can be really slow and hence we need a high timeout to wait for consensus.
   RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromSeconds(60)));
 
-  RETURN_NOT_OK(tablet_peer->consensus()->EmulateElection());
+  RETURN_NOT_OK(VERIFY_RESULT(tablet_peer->GetConsensus())->EmulateElection());
 
   return WaitFor([tablet_manager, tablet_peer, tablet_id]() {
         if (tablet_manager->IsTabletInTransition(tablet_id)) {
@@ -138,7 +176,7 @@ Status TabletServerTestBase::WaitForTabletRunning(const char *tablet_id) {
 }
 
 void TabletServerTestBase::UpdateTestRowRemote(int tid,
-                                               int64_t row_idx,
+                                               int32_t row_idx,
                                                int32_t new_val,
                                                TimeSeries *ts) {
   WriteRequestPB req;
@@ -163,14 +201,14 @@ void TabletServerTestBase::UpdateTestRowRemote(int tid,
 void TabletServerTestBase::ResetClientProxies() {
   CreateTsClientProxies(HostPort::FromBoundEndpoint(mini_server_->bound_rpc_addr()),
                         proxy_cache_.get(),
-                        &proxy_, &admin_proxy_, &consensus_proxy_, &generic_proxy_);
+                        &proxy_, &admin_proxy_, &consensus_proxy_, &generic_proxy_, &backup_proxy_);
 }
 
 // Inserts 'num_rows' test rows directly into the tablet (i.e not via RPC)
-void TabletServerTestBase::InsertTestRowsDirect(int64_t start_row, uint64_t num_rows) {
-  tablet::LocalTabletWriter writer(tablet_peer_->tablet());
+void TabletServerTestBase::InsertTestRowsDirect(int32_t start_row, int32_t num_rows) {
+  tablet::LocalTabletWriter writer(CHECK_RESULT(tablet_peer_->shared_tablet_safe()));
   QLWriteRequestPB req;
-  for (int64_t i = 0; i < num_rows; i++) {
+  for (int i = 0; i < num_rows; i++) {
     BuildTestRow(start_row + i, &req);
     CHECK_OK(writer.Write(&req));
   }
@@ -180,9 +218,9 @@ void TabletServerTestBase::InsertTestRowsDirect(int64_t start_row, uint64_t num_
 // Rows are grouped in batches of 'count'/'num_batches' size.
 // Batch size defaults to 1.
 void TabletServerTestBase::InsertTestRowsRemote(int tid,
-                                                int64_t first_row,
-                                                uint64_t count,
-                                                uint64_t num_batches,
+                                                int32_t first_row,
+                                                int32_t count,
+                                                int32_t num_batches,
                                                 TabletServerServiceProxy* proxy,
                                                 string tablet_id,
                                                 vector<uint64_t>* write_hybrid_times_collector,
@@ -212,8 +250,8 @@ void TabletServerTestBase::InsertTestRowsRemote(int tid,
       controller.set_timeout(MonoDelta::FromSeconds(FLAGS_rpc_timeout));
       req.clear_ql_write_batch();
 
-      uint64_t first_row_in_batch = first_row + (i * count / num_batches);
-      uint64_t last_row_in_batch = first_row_in_batch + count / num_batches;
+      auto first_row_in_batch = first_row + (i * count / num_batches);
+      auto last_row_in_batch = first_row_in_batch + count / num_batches;
 
       for (int j = first_row_in_batch; j < last_row_in_batch; j++) {
         if (!string_field_defined) {
@@ -253,8 +291,8 @@ void TabletServerTestBase::InsertTestRowsRemote(int tid,
 }
 
 // Delete specified test row range.
-void TabletServerTestBase::DeleteTestRowsRemote(int64_t first_row,
-                                                uint64_t count,
+void TabletServerTestBase::DeleteTestRowsRemote(int32_t first_row,
+                                                int32_t count,
                                                 TabletServerServiceProxy* proxy,
                                                 string tablet_id) {
   if (!proxy) {
@@ -267,7 +305,7 @@ void TabletServerTestBase::DeleteTestRowsRemote(int64_t first_row,
 
   req.set_tablet_id(tablet_id);
 
-  for (int64_t rowid = first_row; rowid < first_row + count; rowid++) {
+  for (int32_t rowid = first_row; rowid < first_row + count; rowid++) {
     AddTestRowDelete(rowid, &req);
   }
 
@@ -302,8 +340,7 @@ Status TabletServerTestBase::ShutdownAndRebuildTablet() {
   ShutdownTablet();
 
   // Start server.
-  auto mini_ts =
-      MiniTabletServer::CreateMiniTabletServer(GetTestPath("TabletServerTest-fsroot"), 0);
+  auto mini_ts = CreateMiniTabletServer();
   CHECK_OK(mini_ts);
   mini_server_ = std::move(*mini_ts);
   auto addr = std::make_shared<server::MasterAddresses>();
@@ -311,11 +348,8 @@ Status TabletServerTestBase::ShutdownAndRebuildTablet() {
   mini_server_->options()->SetMasterAddresses(addr);
   // this should open the tablet created on StartTabletServer()
   RETURN_NOT_OK(mini_server_->Start());
-  RETURN_NOT_OK(mini_server_->WaitStarted());
 
-  if (!mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet_peer_)) {
-    return STATUS(NotFound, "Tablet was not found");
-  }
+  tablet_peer_ = VERIFY_RESULT(mini_server_->server()->tablet_manager()->GetTablet(kTabletId));
   // Connect to it.
   ResetClientProxies();
 
@@ -324,21 +358,26 @@ Status TabletServerTestBase::ShutdownAndRebuildTablet() {
   return Status::OK();
 }
 
-// Verifies that a set of expected rows (key, value) is present in the tablet.
-void TabletServerTestBase::VerifyRows(const Schema& schema, const vector<KeyValue>& expected) {
-  auto iter = tablet_peer_->tablet()->NewRowIterator(schema, boost::none);
+void TabletServerTestBase::VerifyRows(
+    const Schema& schema, const vector<KeyValue>& expected,
+    std::optional<tablet::TabletPeerPtr> tablet_peer) {
+  dockv::ReaderProjection projection(schema);
+  if (!tablet_peer) {
+    tablet_peer = tablet_peer_;
+  }
+  auto iter = (*tablet_peer)->tablet()->NewRowIterator(projection);
   ASSERT_OK(iter);
 
   int count = 0;
-  QLTableRow row;
-  while (ASSERT_RESULT((**iter).HasNext())) {
-    ASSERT_OK_FAST((**iter).NextRow(&row));
+  qlexpr::QLTableRow row;
+  while (ASSERT_RESULT((**iter).FetchNext(&row))) {
     ++count;
   }
   ASSERT_EQ(count, expected.size());
 }
 
-const client::YBTableName TabletServerTestBase::kTableName("my_keyspace", "test-table");
+const client::YBTableName TabletServerTestBase::kTableName(
+    YQL_DATABASE_CQL, "my_keyspace", "test-table");
 const char* TabletServerTestBase::kTabletId = "test-tablet";
 
 } // namespace tserver

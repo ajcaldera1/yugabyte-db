@@ -38,8 +38,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef STRINGS_UTIL_H_
-#define STRINGS_UTIL_H_
+#pragma once
 
 #include <stddef.h>
 #include <stdio.h>
@@ -50,12 +49,8 @@
 #endif
 
 #include <functional>
-using std::binary_function;
-using std::less;
 #include <string>
-using std::string;
 #include <vector>
-using std::vector;
 
 #include "yb/gutil/integral_types.h"
 #include "yb/gutil/port.h"
@@ -97,7 +92,7 @@ inline char* strdup_nonempty(const char* src) {
 // Never searches past the first null character in the string; therefore, only
 // suitable for null-terminated strings.
 // WARNING: Removes const-ness of string argument!
-inline char* strnchr(const char* buf, char c, int sz) {
+inline char* strnchr(const char* buf, char c, size_t sz) {
   const char* end = buf + sz;
   while (buf != end && *buf) {
     if (*buf == c)
@@ -165,7 +160,7 @@ const char* strncaseprefix(const char* haystack, int haystack_size,
 // and searching a non-const char* returns a non-const char*.
 template<class CharStar>
 inline CharStar var_strprefix(CharStar str, const char* prefix) {
-  const int len = strlen(prefix);
+  const auto len = strlen(prefix);
   return strncmp(str, prefix, len) == 0 ?  str + len : NULL;
 }
 
@@ -173,7 +168,7 @@ inline CharStar var_strprefix(CharStar str, const char* prefix) {
 // prefix.
 template<class CharStar>
 inline CharStar var_strcaseprefix(CharStar str, const char* prefix) {
-  const int len = strlen(prefix);
+  const auto len = strlen(prefix);
   return strncasecmp(str, prefix, len) == 0 ?  str + len : NULL;
 }
 
@@ -204,8 +199,8 @@ bool MatchPattern(const GStringPiece& string,
 
 // Returns where suffix begins in str, or NULL if str doesn't end with suffix.
 inline char* strsuffix(char* str, const char* suffix) {
-  const int lenstr = strlen(str);
-  const int lensuffix = strlen(suffix);
+  const auto lenstr = strlen(str);
+  const auto lensuffix = strlen(suffix);
   char* strbeginningoftheend = str + lenstr - lensuffix;
 
   if (lenstr >= lensuffix && 0 == strcmp(strbeginningoftheend, suffix)) {
@@ -263,7 +258,7 @@ inline ptrdiff_t strcount(const char* buf, size_t len, char c) {
   return strcount(buf, buf + len, c);
 }
 // Returns the number of times a character occurs in a string for a C++ string:
-inline ptrdiff_t strcount(const string& buf, char c) {
+inline ptrdiff_t strcount(const std::string& buf, char c) {
   return strcount(buf.c_str(), buf.size(), c);
 }
 
@@ -277,43 +272,19 @@ char* strchrnth(const char* str, const char& c, int n);
 // WARNING: Removes const-ness of string argument!
 char* AdjustedLastPos(const char* str, char separator, int n);
 
-// STL-compatible function objects for char* string keys:
-
-// Compares two char* strings for equality. (Works with NULL, which compares
-// equal only to another NULL). Useful in hash tables:
-//    hash_map<const char*, Value, hash<const char*>, streq> ht;
-struct streq : public binary_function<const char*, const char*, bool> {
-  bool operator()(const char* s1, const char* s2) const {
-    return ((s1 == 0 && s2 == 0) ||
-            (s1 && s2 && *s1 == *s2 && strcmp(s1, s2) == 0));
-  }
-};
-
-// Compares two char* strings. (Works with NULL, which compares greater than any
-// non-NULL). Useful in maps:
-//    map<const char*, Value, strlt> m;
-struct strlt : public binary_function<const char*, const char*, bool> {
-  bool operator()(const char* s1, const char* s2) const {
-    return (s1 != s2) && (s2 == 0 || (s1 != 0 && strcmp(s1, s2) < 0));
-  }
-};
-
 // Returns whether str has only Ascii characters (as defined by ascii_isascii()
 // in strings/ascii_ctype.h).
-bool IsAscii(const char* str, int len);
+bool IsAscii(const char* str, size_t len);
 inline bool IsAscii(const GStringPiece& str) {
   return IsAscii(str.data(), str.size());
 }
 
-// Returns the smallest lexicographically larger string of equal or smaller
-// length. Returns an empty string if there is no such successor (if the input
-// is empty or consists entirely of 0xff bytes).
-// Useful for calculating the smallest lexicographically larger string
-// that will not be prefixed by the input string.
-//
-// Examples:
-// "a" -> "b", "aaa" -> "aab", "aa\xff" -> "ab", "\xff" -> "", "" -> ""
-string PrefixSuccessor(const GStringPiece& prefix);
+// Returns whether str has only Ascii printable characters (as defined by ascii_isprint()
+// in strings/ascii_ctype.h).
+bool IsPrint(const char* str, size_t len);
+inline bool IsPrint(const GStringPiece& str) {
+  return IsPrint(str.data(), str.size());
+}
 
 // Returns the immediate lexicographically-following string. This is useful to
 // turn an inclusive range into something that can be used with Bigtable's
@@ -332,17 +303,7 @@ string PrefixSuccessor(const GStringPiece& prefix);
 //
 // WARNING: Transforms "" -> "\0"; this doesn't account for Bigtable's special
 // treatment of "" as infinity.
-string ImmediateSuccessor(const GStringPiece& s);
-
-// Fills in *separator with a short string less than limit but greater than or
-// equal to start. If limit is greater than start, *separator is the common
-// prefix of start and limit, followed by the successor to the next character in
-// start. Examples:
-// FindShortestSeparator("foobar", "foxhunt", &sep) => sep == "fop"
-// FindShortestSeparator("abracadabra", "bacradabra", &sep) => sep == "b"
-// If limit is less than or equal to start, fills in *separator with start.
-void FindShortestSeparator(const GStringPiece& start, const GStringPiece& limit,
-                           string* separator);
+std::string ImmediateSuccessor(const GStringPiece& s);
 
 // Copies at most n-1 bytes from src to dest, and returns dest. If n >=1, null
 // terminates dest; otherwise, returns dest unchanged. Unlike strncpy(), only
@@ -375,11 +336,11 @@ size_t strlcpy(char* dst, const char* src, size_t dst_size);
 // Replaces the first occurrence (if replace_all is false) or all occurrences
 // (if replace_all is true) of oldsub in s with newsub. In the second version,
 // *res must be distinct from all the other arguments.
-string StringReplace(const GStringPiece& s, const GStringPiece& oldsub,
+std::string StringReplace(const GStringPiece& s, const GStringPiece& oldsub,
                      const GStringPiece& newsub, bool replace_all);
 void StringReplace(const GStringPiece& s, const GStringPiece& oldsub,
                    const GStringPiece& newsub, bool replace_all,
-                   string* res);
+                   std::string* res);
 
 // Replaces all occurrences of substring in s with replacement. Returns the
 // number of instances replaced. s must be distinct from the other arguments.
@@ -387,12 +348,12 @@ void StringReplace(const GStringPiece& s, const GStringPiece& oldsub,
 // Less flexible, but faster, than RE::GlobalReplace().
 int GlobalReplaceSubstring(const GStringPiece& substring,
                            const GStringPiece& replacement,
-                           string* s);
+                           std::string* s);
 
 // Removes v[i] for every element i in indices. Does *not* preserve the order of
 // v. indices must be sorted in strict increasing order (no duplicates). Runs in
 // O(indices.size()).
-void RemoveStrings(vector<string>* v, const vector<int>& indices);
+void RemoveStrings(std::vector<std::string>* v, const std::vector<size_t>& indices);
 
 // Case-insensitive strstr(); use system strcasestr() instead.
 // WARNING: Removes const-ness of string argument!
@@ -439,14 +400,14 @@ const char* strstr_delimited(const char* haystack,
 char* gstrsep(char** stringp, const char* delim);
 
 // Appends GStringPiece(data, len) to *s.
-void FastStringAppend(string* s, const char* data, int len);
+void FastStringAppend(std::string* s, const char* data, size_t len);
 
 // Returns a duplicate of the_string, with memory allocated by new[].
 char* strdup_with_new(const char* the_string);
 
 // Returns a duplicate of up to the first max_length bytes of the_string, with
 // memory allocated by new[].
-char* strndup_with_new(const char* the_string, int max_length);
+char* strndup_with_new(const char* the_string, size_t max_length);
 
 // Finds, in the_string, the first "word" (consecutive !ascii_isspace()
 // characters). Returns pointer to the beginning of the word, and sets *end_ptr
@@ -488,25 +449,25 @@ bool IsIdentifier(const char* str);
 // tag/value pair is founds; returns false otherwise.
 bool FindTagValuePair(const char* in_str, char tag_value_separator,
                       char attribute_separator, char string_terminal,
-                      char** tag, int* tag_len,
-                      char** value, int* value_len);
+                      char** tag, size_t* tag_len,
+                      char** value, size_t* value_len);
 
 // Inserts separator after every interval characters in *s (but never appends to
 // the end of the original *s).
-void UniformInsertString(string* s, int interval, const char* separator);
+void UniformInsertString(std::string* s, int interval, const char* separator);
 
 // Inserts separator into s at each specified index. indices must be sorted in
 // ascending order.
 void InsertString(
-    string* s, const vector<uint32>& indices, char const* separator);
+    std::string* s, const std::vector<uint32>& indices, char const* separator);
 
 // Finds the nth occurrence of c in n; returns the index in s of that
 // occurrence, or string::npos if fewer than n occurrences.
-int FindNth(GStringPiece s, char c, int n);
+size_t FindNth(GStringPiece s, char c, size_t n);
 
 // Finds the nth-to-last occurrence of c in s; returns the index in s of that
 // occurrence, or string::npos if fewer than n occurrences.
-int ReverseFindNth(GStringPiece s, char c, int n);
+size_t ReverseFindNth(GStringPiece s, char c, size_t n);
 
 // Returns whether s contains only whitespace characters (including the case
 // where s is empty).
@@ -524,6 +485,4 @@ int SafeSnprintf(char* str, size_t size, const char* format, ...)
 // Reads a line (terminated by delim) from file into *str. Reads delim from
 // file, but doesn't copy it into *str. Returns true if read a delim-terminated
 // line, or false on end-of-file or error.
-bool GetlineFromStdioFile(FILE* file, string* str, char delim);
-
-#endif  // STRINGS_UTIL_H_
+bool GetlineFromStdioFile(FILE* file, std::string* str, char delim);

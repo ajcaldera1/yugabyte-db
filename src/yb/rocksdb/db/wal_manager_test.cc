@@ -18,32 +18,36 @@
 // under the License.
 //
 
-#ifndef ROCKSDB_LITE
-
 #include <map>
 #include <string>
 
 #include "yb/rocksdb/cache.h"
 #include "yb/rocksdb/write_batch.h"
 
-#include "yb/rocksdb/db/wal_manager.h"
-#include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/column_family.h"
+#include "yb/rocksdb/db/filename.h"
+#include "yb/rocksdb/db/log_writer.h"
 #include "yb/rocksdb/db/version_set.h"
+#include "yb/rocksdb/db/wal_manager.h"
 #include "yb/rocksdb/db/writebuffer.h"
 #include "yb/rocksdb/util/file_reader_writer.h"
 #include "yb/rocksdb/util/mock_env.h"
-#include "yb/util/string_util.h"
 #include "yb/rocksdb/util/testharness.h"
 #include "yb/rocksdb/util/testutil.h"
 #include "yb/rocksdb/table/mock_table.h"
 #include "yb/rocksdb/db/db_impl.h"
 
+#include "yb/util/status_log.h"
+#include "yb/util/string_util.h"
+#include "yb/util/test_util.h"
+
+using std::unique_ptr;
+
 namespace rocksdb {
 
 // TODO(icanadi) mock out VersionSet
 // TODO(icanadi) move other WalManager-specific tests from db_test here
-class WalManagerTest : public testing::Test {
+class WalManagerTest : public RocksDBTest {
  public:
   WalManagerTest()
       : env_(new MockEnv(Env::Default())),
@@ -51,7 +55,7 @@ class WalManagerTest : public testing::Test {
         table_cache_(NewLRUCache(50000, 16)),
         write_buffer_(db_options_.db_write_buffer_size),
         current_log_number_(0) {
-    DestroyDB(dbname_, Options());
+    CHECK_OK(DestroyDB(dbname_, Options()));
   }
 
   void Init() {
@@ -80,7 +84,7 @@ class WalManagerTest : public testing::Test {
     WriteBatch batch;
     batch.Put(key, value);
     WriteBatchInternal::SetSequence(&batch, seq);
-    current_log_writer_->AddRecord(WriteBatchInternal::Contents(&batch));
+    ASSERT_OK(current_log_writer_->AddRecord(WriteBatchInternal::Contents(&batch)));
     versions_->SetLastSequence(seq);
   }
 
@@ -146,7 +150,7 @@ TEST_F(WalManagerTest, ReadFirstRecordCache) {
   WriteBatch batch;
   batch.Put("foo", "bar");
   WriteBatchInternal::SetSequence(&batch, 10);
-  writer.AddRecord(WriteBatchInternal::Contents(&batch));
+  ASSERT_OK(writer.AddRecord(WriteBatchInternal::Contents(&batch)));
 
   // TODO(icanadi) move SpecialEnv outside of db_test, so we can reuse it here.
   // Waiting for lei to finish with db_test
@@ -171,14 +175,14 @@ namespace {
 uint64_t GetLogDirSize(std::string dir_path, Env* env) {
   uint64_t dir_size = 0;
   std::vector<std::string> files;
-  env->GetChildren(dir_path, &files);
+  EXPECT_OK(env->GetChildren(dir_path, &files));
   for (auto& f : files) {
     uint64_t number;
     FileType type;
     if (ParseFileName(f, &number, &type) && type == kLogFile) {
       std::string const file_path = dir_path + "/" + f;
       uint64_t file_size;
-      env->GetFileSize(file_path, &file_size);
+      EXPECT_OK(env->GetFileSize(file_path, &file_size));
       dir_size += file_size;
     }
   }
@@ -188,7 +192,7 @@ std::vector<std::uint64_t> ListSpecificFiles(
     Env* env, const std::string& path, const FileType expected_file_type) {
   std::vector<std::string> files;
   std::vector<uint64_t> file_numbers;
-  env->GetChildren(path, &files);
+  EXPECT_OK(env->GetChildren(path, &files));
   uint64_t number;
   FileType type;
   for (size_t i = 0; i < files.size(); ++i) {
@@ -309,13 +313,3 @@ int main(int argc, char** argv) {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
 }
-
-#else
-#include <stdio.h>
-
-int main(int argc, char** argv) {
-  fprintf(stderr, "SKIPPED as WalManager is not supported in ROCKSDB_LITE\n");
-  return 0;
-}
-
-#endif  // !ROCKSDB_LITE

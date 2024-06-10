@@ -30,38 +30,52 @@
 // under the License.
 //
 
-#include <glog/logging.h>
+#include <cstddef>
 
+#include "yb/util/logging.h"
+
+#include "yb/common/opid.h"
+#include "yb/common/ql_protocol_util.h"
 #include "yb/common/schema.h"
 #include "yb/common/wire_protocol-test-util.h"
-#include "yb/common/ql_protocol_util.h"
+
 #include "yb/fs/fs_manager.h"
+
 #include "yb/gutil/ref_counted.h"
+
 #include "yb/tablet/local_tablet_writer.h"
+#include "yb/tablet/operations/snapshot_operation.h"
 #include "yb/tablet/tablet-test-util.h"
+#include "yb/tablet/tablet.h"
+#include "yb/tablet/tablet_metadata.h"
+#include "yb/tablet/tablet_snapshots.h"
+
+#include "yb/util/status_log.h"
+
+using std::string;
 
 namespace yb {
 namespace tablet {
 
-class TestTabletMetadata : public YBTabletTest {
+class TestRaftGroupMetadata : public YBTabletTest {
  public:
-  TestTabletMetadata()
+  TestRaftGroupMetadata()
       : YBTabletTest(GetSimpleTestSchema()) {
   }
 
   void SetUp() override {
     YBTabletTest::SetUp();
-    writer_.reset(new LocalTabletWriter(harness_->tablet().get()));
+    writer_.reset(new LocalTabletWriter(harness_->tablet()));
   }
 
   void BuildPartialRow(int key, int intval, const char* strval,
                        QLWriteRequestPB* req);
 
  protected:
-  gscoped_ptr<LocalTabletWriter> writer_;
+  std::unique_ptr<LocalTabletWriter> writer_;
 };
 
-void TestTabletMetadata::BuildPartialRow(int key, int intval, const char* strval,
+void TestRaftGroupMetadata::BuildPartialRow(int key, int intval, const char* strval,
                                          QLWriteRequestPB* req) {
   req->Clear();
   QLAddInt32HashValue(req, key);
@@ -70,7 +84,7 @@ void TestTabletMetadata::BuildPartialRow(int key, int intval, const char* strval
 }
 
 // Test that loading & storing the superblock results in an equivalent file.
-TEST_F(TestTabletMetadata, TestLoadFromSuperBlock) {
+TEST_F(TestRaftGroupMetadata, TestLoadFromSuperBlock) {
   // Write some data to the tablet and flush.
   QLWriteRequestPB req;
   BuildPartialRow(0, 0, "foo", &req);
@@ -83,19 +97,20 @@ TEST_F(TestTabletMetadata, TestLoadFromSuperBlock) {
   ASSERT_OK(harness_->tablet()->Flush(tablet::FlushMode::kSync));
 
   // Shut down the tablet.
-  harness_->tablet()->Shutdown();
+  harness_->tablet()->StartShutdown();
+  harness_->tablet()->CompleteShutdown(DisableFlushOnShutdown::kFalse, AbortOps::kFalse);
 
-  TabletMetadata* meta = harness_->tablet()->metadata();
+  RaftGroupMetadata* meta = harness_->tablet()->metadata();
 
   // Dump the superblock to a PB. Save the PB to the side.
-  TabletSuperBlockPB superblock_pb_1;
+  RaftGroupReplicaSuperBlockPB superblock_pb_1;
   meta->ToSuperBlock(&superblock_pb_1);
 
-  // Load the superblock PB back into the TabletMetadata.
+  // Load the superblock PB back into the RaftGroupMetadata.
   ASSERT_OK(meta->ReplaceSuperBlock(superblock_pb_1));
 
   // Dump the tablet metadata to a superblock PB again, and save it.
-  TabletSuperBlockPB superblock_pb_2;
+  RaftGroupReplicaSuperBlockPB superblock_pb_2;
   meta->ToSuperBlock(&superblock_pb_2);
 
   // Compare the 2 dumped superblock PBs.
@@ -108,6 +123,40 @@ TEST_F(TestTabletMetadata, TestLoadFromSuperBlock) {
             << superblock_pb_1.DebugString();
 }
 
+TEST_F(TestRaftGroupMetadata, TestDeleteTabletDataClearsDisk) {
+  auto tablet = harness_->tablet();
+
+  // Write some data to the tablet and flush.
+  QLWriteRequestPB req;
+  BuildPartialRow(0, 0, "foo", &req);
+  ASSERT_OK(writer_->Write(&req));
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync));
+
+  // Create one more row. Write and flush.
+  BuildPartialRow(1, 1, "bar", &req);
+  ASSERT_OK(writer_->Write(&req));
+  ASSERT_OK(tablet->Flush(tablet::FlushMode::kSync));
+
+  const string snapshotId = "0123456789ABCDEF0123456789ABCDEF";
+  tserver::TabletSnapshotOpRequestPB request;
+  request.set_snapshot_id(snapshotId);
+  tablet::SnapshotOperation operation(tablet);
+  operation.AllocateRequest()->CopyFrom(request);
+  operation.set_hybrid_time(tablet->clock()->Now());
+  operation.set_op_id(OpId(-1, 2));
+  ASSERT_OK(tablet->snapshots().Create(&operation));
+
+  ASSERT_TRUE(env_->DirExists(tablet->metadata()->rocksdb_dir()));
+  ASSERT_TRUE(env_->DirExists(tablet->metadata()->intents_rocksdb_dir()));
+  ASSERT_TRUE(env_->DirExists(tablet->metadata()->snapshots_dir()));
+
+  CHECK_OK(tablet->metadata()->DeleteTabletData(
+    TabletDataState::TABLET_DATA_DELETED, operation.op_id()));
+
+  ASSERT_FALSE(env_->DirExists(tablet->metadata()->rocksdb_dir()));
+  ASSERT_FALSE(env_->DirExists(tablet->metadata()->intents_rocksdb_dir()));
+  ASSERT_FALSE(env_->DirExists(tablet->metadata()->snapshots_dir()));
+}
 
 } // namespace tablet
 } // namespace yb

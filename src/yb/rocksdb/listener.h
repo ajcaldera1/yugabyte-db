@@ -16,8 +16,6 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H
-#define ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H
 
 #pragma once
 
@@ -28,6 +26,8 @@
 #include "yb/rocksdb/compaction_job_stats.h"
 #include "yb/rocksdb/status.h"
 #include "yb/rocksdb/table_properties.h"
+
+#include "yb/util/enums.h"
 
 namespace rocksdb {
 
@@ -48,35 +48,41 @@ struct TableFileCreationInfo {
   // the path to the created file.
   std::string file_path;
   // the size of the file.
-  uint64_t file_size;
+  uint64_t file_size = 0;
   // the id of the job (which could be flush or compaction) that
   // created the file.
-  int job_id;
+  int job_id = 0;
   // Detailed properties of the created file.
   TableProperties table_properties;
 };
 
-enum class CompactionReason {
-  kUnknown,
+YB_DEFINE_ENUM(CompactionReason,
+  (kUnknown)
   // [Level] number of L0 files > level0_file_num_compaction_trigger
-  kLevelL0FilesNum,
+  (kLevelL0FilesNum)
   // [Level] total size of level > MaxBytesForLevel()
-  kLevelMaxLevelSize,
+  (kLevelMaxLevelSize)
   // [Universal] Compacting for size amplification
-  kUniversalSizeAmplification,
+  (kUniversalSizeAmplification)
   // [Universal] Compacting for size ratio
-  kUniversalSizeRatio,
+  (kUniversalSizeRatio)
   // [Universal] number of sorted runs > level0_file_num_compaction_trigger
-  kUniversalSortedRunNum,
+  (kUniversalSortedRunNum)
+  // [Universal] files have been marked for direct deletion
+  (kUniversalDirectDeletion)
   // [FIFO] total size > max_table_files_size
-  kFIFOMaxSize,
-  // Manual compaction
-  kManualCompaction,
+  (kFIFOMaxSize)
+  // Unknown manual compaction
+  (kManualCompaction)
   // DB::SuggestCompactRange() marked files for compaction
-  kFilesMarkedForCompaction,
-};
+  (kFilesMarkedForCompaction)
+  // Admin-triggered full compaction
+  (kAdminCompaction)
+  // Scheduled full compaction
+  (kScheduledFullCompaction)
+  // Post-split compaction
+  (kPostSplitCompaction));
 
-#ifndef ROCKSDB_LITE
 
 struct TableFileDeletionInfo {
   // The name of the database where the file was deleted.
@@ -126,13 +132,13 @@ struct CompactionJobInfo {
   // the status indicating whether the compaction was successful or not.
   Status status;
   // the id of the thread that completed this compaction job.
-  uint64_t thread_id;
+  uint64_t thread_id = 0;
   // the job id, which is unique in the same thread.
-  int job_id;
+  int job_id = 0;
   // the smallest input level of the compaction.
-  int base_input_level;
+  int base_input_level = 0;
   // the output level of the compaction.
-  int output_level;
+  int output_level = 0;
   // the names of the compaction input files.
   std::vector<std::string> input_files;
 
@@ -143,7 +149,14 @@ struct CompactionJobInfo {
   TablePropertiesCollection table_properties;
 
   // Reason to run the compaction
-  CompactionReason compaction_reason;
+  CompactionReason compaction_reason = CompactionReason::kUnknown;
+
+  // True if all files in the current storage version have been compacted.
+  // Compactions with no files are also considered as full compactions.
+  bool is_full_compaction = false;
+
+  // True if a compaction has no operation (action) done.
+  bool is_no_op_compaction = false;
 
   // If non-null, this variable stores detailed information
   // about this compaction.
@@ -213,6 +226,9 @@ class EventListener {
   // returned value.
   virtual void OnTableFileDeleted(const TableFileDeletionInfo& /*info*/) {}
 
+  // A call-back function for RocksDB which will be called whenever a compaction has been started.
+  virtual void OnCompactionStarted() {}
+
   // A call-back function for RocksDB which will be called whenever
   // a registered RocksDB compacts a file. The default implementation
   // is a no-op.
@@ -245,13 +261,5 @@ class EventListener {
   virtual ~EventListener() {}
 };
 
-#else
-
-class EventListener {
-};
-
-#endif  // ROCKSDB_LITE
 
 }  // namespace rocksdb
-
-#endif // ROCKSDB_INCLUDE_ROCKSDB_LISTENER_H

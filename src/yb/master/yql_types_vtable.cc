@@ -11,34 +11,40 @@
 // under the License.
 //
 
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_types_vtable.h"
-#include "yb/master/catalog_manager.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
+
+#include "yb/util/status_log.h"
+
+using std::string;
 
 namespace yb {
 namespace master {
 
-QLTypesVTable::QLTypesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSchemaTypesTableName, master, CreateSchema()) {
+QLTypesVTable::QLTypesVTable(const TableName& table_name,
+                             const NamespaceName& namespace_name,
+                             Master* const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status QLTypesVTable::RetrieveData(const QLReadRequestPB& request,
-                                    std::unique_ptr<QLRowBlock>* vtable) const {
-
-  vtable->reset(new QLRowBlock(schema_));
+Result<VTableDataPtr> QLTypesVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<UDTypeInfo> > types;
-  master_->catalog_manager()->GetAllUDTypes(&types);
+  catalog_manager().GetAllUDTypes(&types);
 
-  for (scoped_refptr<UDTypeInfo> type : types) {
+  for (const scoped_refptr<UDTypeInfo>& type : types) {
     // Get namespace for table.
-    NamespaceIdentifierPB nsId;
-    nsId.set_id(type->namespace_id());
-    scoped_refptr<NamespaceInfo> nsInfo;
-    RETURN_NOT_OK(master_->catalog_manager()->FindNamespace(nsId, &nsInfo));
+    auto ns_info = VERIFY_RESULT(catalog_manager().FindNamespaceById(type->namespace_id()));
 
     // Create appropriate row for the table;
-    QLRow& row = (*vtable)->Extend();
-    RETURN_NOT_OK(SetColumnValue(kKeyspaceName, nsInfo->name(), &row));
+    auto& row = vtable->Extend();
+    RETURN_NOT_OK(SetColumnValue(kKeyspaceName, ns_info->name(), &row));
     RETURN_NOT_OK(SetColumnValue(kTypeName, type->name(), &row));
 
     // Create appropriate field_names entry.
@@ -63,7 +69,7 @@ Status QLTypesVTable::RetrieveData(const QLReadRequestPB& request,
     RETURN_NOT_OK(SetColumnValue(kFieldTypes, field_types, &row));
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema QLTypesVTable::CreateSchema() const {

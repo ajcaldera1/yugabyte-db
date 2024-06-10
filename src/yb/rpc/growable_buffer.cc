@@ -15,18 +15,21 @@
 
 #include "yb/rpc/growable_buffer.h"
 
-#include <iostream>
-#include <unordered_set>
+#include <stdint.h>
 
-#include "yb/gutil/strings/substitute.h"
+#include <functional>
+#include <thread>
+
+#include <boost/lockfree/stack.hpp>
+#include "yb/util/logging.h"
 
 #include "yb/util/mem_tracker.h"
-#include "yb/util/object_pool.h"
+#include "yb/util/result.h"
+#include "yb/util/status_format.h"
 
 using namespace std::placeholders;
 
-namespace yb {
-namespace rpc {
+namespace yb::rpc {
 
 class GrowableBufferAllocator::Impl : public GarbageCollector,
                                       public std::enable_shared_from_this<Impl> {
@@ -45,7 +48,7 @@ class GrowableBufferAllocator::Impl : public GarbageCollector,
     allocated_tracker_->parent()->AddGarbageCollector(shared_from_this());
   }
 
-  virtual ~Impl() {
+  ~Impl() override {
     CollectGarbage(std::numeric_limits<size_t>::max());
   }
 
@@ -152,7 +155,7 @@ GrowableBuffer::GrowableBuffer(GrowableBufferAllocator* allocator, size_t limit)
 }
 
 std::string GrowableBuffer::ToString() const {
-  return Format("{ size: $0 limit: $1 }", size_, limit_);
+  return YB_CLASS_TO_STRING(size, limit);
 }
 
 void GrowableBuffer::Consume(size_t count, const Slice& prepend) {
@@ -269,5 +272,4 @@ std::ostream& operator<<(std::ostream& out, const GrowableBuffer& receiver) {
   return out << receiver.ToString();
 }
 
-} // namespace rpc
-} // namespace yb
+} // namespace yb::rpc

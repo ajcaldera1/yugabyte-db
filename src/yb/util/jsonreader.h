@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_UTIL_JSONREADER_H_
-#define YB_UTIL_JSONREADER_H_
+#pragma once
 
 #include <stdint.h>
 #include <string>
@@ -38,9 +37,16 @@
 
 #include <rapidjson/document.h>
 
-#include "yb/gutil/gscoped_ptr.h"
 #include "yb/gutil/macros.h"
-#include "yb/util/status.h"
+
+#include "yb/util/status_fwd.h"
+
+namespace google {
+namespace protobuf {
+class FieldDescriptor;
+class Message;
+} // namespace protobuf
+} // namespace google
 
 namespace yb {
 
@@ -53,9 +59,9 @@ namespace yb {
 class JsonReader {
  public:
   explicit JsonReader(std::string text);
-  ~JsonReader();
+  virtual ~JsonReader();
 
-  CHECKED_STATUS Init();
+  Status Init();
 
   // Extractor methods.
   //
@@ -64,35 +70,63 @@ class JsonReader {
   // 'field' is NULL, will try to convert 'object' directly into the
   // desire type.
 
-  CHECKED_STATUS ExtractInt32(const rapidjson::Value* object,
+  Status ExtractBool(const rapidjson::Value* object,
+                      const char* field,
+                      bool* result) const;
+
+  Status ExtractInt32(const rapidjson::Value* object,
                       const char* field,
                       int32_t* result) const;
 
-  CHECKED_STATUS ExtractInt64(const rapidjson::Value* object,
+  Status ExtractInt64(const rapidjson::Value* object,
                       const char* field,
                       int64_t* result) const;
 
-  CHECKED_STATUS ExtractString(const rapidjson::Value* object,
+  Status ExtractUInt32(const rapidjson::Value* object,
+                       const char* field,
+                       uint32_t* result) const;
+
+  Status ExtractUInt64(const rapidjson::Value* object,
+                       const char* field,
+                       uint64_t* result) const;
+
+  Status ExtractString(const rapidjson::Value* object,
                        const char* field,
                        std::string* result) const;
 
   // 'result' is only valid for as long as JsonReader is alive.
-  CHECKED_STATUS ExtractObject(const rapidjson::Value* object,
+  Status ExtractObject(const rapidjson::Value* object,
                        const char* field,
                        const rapidjson::Value** result) const;
 
   // 'result' is only valid for as long as JsonReader is alive.
-  CHECKED_STATUS ExtractObjectArray(const rapidjson::Value* object,
+  Status ExtractObjectArray(const rapidjson::Value* object,
                             const char* field,
                             std::vector<const rapidjson::Value*>* result) const;
 
+  Status ExtractProtobuf(const rapidjson::Value* object,
+                         const char* field,
+                         google::protobuf::Message* pb) const;
+
   const rapidjson::Value* root() const { return &document_; }
 
- private:
-  CHECKED_STATUS ExtractField(const rapidjson::Value* object,
+ protected:
+  Status ExtractField(const rapidjson::Value* object,
                       const char* field,
                       const rapidjson::Value** result) const;
 
+  Status ExtractProtobufMessage(const rapidjson::Value& value,
+                                google::protobuf::Message* pb) const;
+
+  Status ExtractProtobufField(const rapidjson::Value& value,
+                              google::protobuf::Message* pb,
+                              const google::protobuf::FieldDescriptor* field) const;
+
+  virtual Status ExtractProtobufRepeatedField(const rapidjson::Value& value,
+                                              google::protobuf::Message* pb,
+                                              const google::protobuf::FieldDescriptor* field) const;
+
+ private:
   std::string text_;
   rapidjson::Document document_;
 
@@ -100,5 +134,3 @@ class JsonReader {
 };
 
 } // namespace yb
-
-#endif // YB_UTIL_JSONREADER_H_

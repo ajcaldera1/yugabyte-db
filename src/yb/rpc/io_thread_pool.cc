@@ -17,12 +17,11 @@
 
 #include <thread>
 
-#include <boost/optional.hpp>
 #include <boost/asio/io_service.hpp>
+#include <boost/optional.hpp>
+#include "yb/util/logging.h"
 
-#include <glog/logging.h>
-
-#include "yb/util/format.h"
+#include "yb/util/status_log.h"
 #include "yb/util/thread.h"
 
 using namespace std::literals;
@@ -36,10 +35,9 @@ class IoThreadPool::Impl {
     threads_.reserve(num_threads);
     size_t index = 0;
     while (threads_.size() != num_threads) {
-      threads_.emplace_back([this, index] {
-        yb::SetThreadName(Format("iotp_$0_$1", name_, index));
-        Execute();
-      });
+      threads_.push_back(CHECK_RESULT(Thread::Make(
+          Format("iotp_$0", name_), Format("iotp_$0_$1", name_, index),
+          std::bind(&Impl::Execute, this))));
       ++index;
     }
   }
@@ -68,9 +66,7 @@ class IoThreadPool::Impl {
       std::this_thread::sleep_for(10ms);
     }
     for (auto& thread : threads_) {
-      if (thread.joinable()) {
-        thread.join();
-      }
+      thread->Join();
     }
   }
 
@@ -82,7 +78,7 @@ class IoThreadPool::Impl {
   }
 
   std::string name_;
-  std::vector<std::thread> threads_;
+  std::vector<ThreadPtr> threads_;
   IoService io_service_;
   boost::optional<IoService::work> work_{io_service_};
 };

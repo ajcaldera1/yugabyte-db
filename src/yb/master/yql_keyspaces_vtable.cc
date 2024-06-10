@@ -11,40 +11,50 @@
 // under the License.
 //
 
-#include "yb/common/redis_constants_common.h"
-#include "yb/common/ql_value.h"
-#include "yb/master/catalog_manager.h"
-#include "yb/master/master_defaults.h"
 #include "yb/master/yql_keyspaces_vtable.h"
+
+#include <stdint.h>
+
+#include "yb/util/logging.h"
+
+#include "yb/common/ql_type.h"
+#include "yb/common/schema.h"
+
+#include "yb/master/catalog_entity_info.h"
+#include "yb/master/catalog_manager_if.h"
+
+#include "yb/util/status_log.h"
+#include "yb/util/uuid.h"
 
 namespace yb {
 namespace master {
 
-YQLKeyspacesVTable::YQLKeyspacesVTable(const Master* const master)
-    : YQLVirtualTable(master::kSystemSchemaKeyspacesTableName, master, CreateSchema()) {
+YQLKeyspacesVTable::YQLKeyspacesVTable(const TableName& table_name,
+                                       const NamespaceName& namespace_name,
+                                       Master * const master)
+    : YQLVirtualTable(table_name, namespace_name, master, CreateSchema()) {
 }
 
-Status YQLKeyspacesVTable::RetrieveData(const QLReadRequestPB& request,
-                                        std::unique_ptr<QLRowBlock>* vtable) const {
-  vtable->reset(new QLRowBlock(schema_));
+Result<VTableDataPtr> YQLKeyspacesVTable::RetrieveData(
+    const QLReadRequestPB& request) const {
+  auto vtable = std::make_shared<qlexpr::QLRowBlock>(schema());
   std::vector<scoped_refptr<NamespaceInfo> > namespaces;
-  master_->catalog_manager()->GetAllNamespaces(&namespaces);
+  catalog_manager().GetAllNamespaces(&namespaces, true);
   for (scoped_refptr<NamespaceInfo> ns : namespaces) {
     // Skip non-YQL namespace.
-    if (!CatalogManager::IsYcqlNamespace(*ns)) {
+    if (!IsYcqlNamespace(*ns)) {
       continue;
     }
 
-    QLRow& row = (*vtable)->Extend();
+    auto& row = vtable->Extend();
     RETURN_NOT_OK(SetColumnValue(kKeyspaceName, ns->name(), &row));
     RETURN_NOT_OK(SetColumnValue(kDurableWrites, true, &row));
 
-    int repl_factor;
-    RETURN_NOT_OK(master_->catalog_manager()->GetReplicationFactor(ns->name(), &repl_factor));
+    auto repl_factor = VERIFY_RESULT(catalog_manager().GetReplicationFactor(ns->name()));
     RETURN_NOT_OK(SetColumnValue(kReplication, util::GetReplicationValue(repl_factor), &row));
   }
 
-  return Status::OK();
+  return vtable;
 }
 
 Schema YQLKeyspacesVTable::CreateSchema() const {

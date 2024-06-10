@@ -76,6 +76,9 @@
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
+/* YB includes. */
+#include "access/sysattr.h"
+
 
 /*
  * Use computed-goto-based opcode dispatch when computed gotos are available.
@@ -144,8 +147,8 @@ static void ExecInitInterpreter(void);
 /* support functions */
 static void CheckVarSlotCompatibility(TupleTableSlot *slot, int attnum, Oid vartype);
 static TupleDesc get_cached_rowtype(Oid type_id, int32 typmod,
-				   TupleDesc *cache_field, ExprContext *econtext);
-static void ShutdownTupleDescRef(Datum arg);
+									ExprEvalRowtypeCache *rowcache,
+									bool *changed);
 static void ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 				   ExprContext *econtext, bool checkisnull);
 
@@ -393,6 +396,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		&&CASE_EEOP_AGG_PLAIN_TRANS,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_DATUM,
 		&&CASE_EEOP_AGG_ORDERED_TRANS_TUPLE,
+		&&CASE_EEOP_ROWARRAY_COMPARE,
 		&&CASE_EEOP_LAST
 	};
 
@@ -529,14 +533,28 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			int			attnum = op->d.var.attnum;
 			Datum		d;
 
-			/* these asserts must match defenses in slot_getattr */
-			Assert(scanslot->tts_tuple != NULL);
-			Assert(scanslot->tts_tuple != &(scanslot->tts_minhdr));
+			/*
+			 * The ybctid may be copied to the slot.
+			 * The heap tuple does not need to be formed in this case.
+			 */
+			if (attnum == YBTupleIdAttributeNumber && scanslot->tts_ybctid)
+			{
+				*op->resnull = false;
+				d = scanslot->tts_ybctid;
+			}
+			else
+			{
+				/* these asserts must match defenses in slot_getattr */
+				Assert(scanslot->tts_tuple != NULL);
+				Assert(scanslot->tts_tuple != &(scanslot->tts_minhdr));
 
-			/* heap_getsysattr has sufficient defenses against bad attnums */
-			d = heap_getsysattr(scanslot->tts_tuple, attnum,
-								scanslot->tts_tupleDescriptor,
-								op->resnull);
+				/*
+				 * heap_getsysattr has sufficient defenses against bad attnums
+				 */
+				d = heap_getsysattr(scanslot->tts_tuple, attnum,
+									scanslot->tts_tupleDescriptor,
+									op->resnull);
+			}
 			*op->resvalue = d;
 
 			EEO_NEXT();
@@ -560,6 +578,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
 			Assert(attnum >= 0 && attnum < innerslot->tts_nvalid);
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = innerslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = innerslot->tts_isnull[attnum];
 
@@ -576,6 +595,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
 			Assert(attnum >= 0 && attnum < outerslot->tts_nvalid);
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_values[resultnum] = outerslot->tts_values[attnum];
 			resultslot->tts_isnull[resultnum] = outerslot->tts_isnull[attnum];
 
@@ -591,9 +611,19 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			 * We do not need CheckVarSlotCompatibility here; that was taken
 			 * care of at compilation time.  But see EEOP_INNER_VAR comments.
 			 */
-			Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
-			resultslot->tts_values[resultnum] = scanslot->tts_values[attnum];
-			resultslot->tts_isnull[resultnum] = scanslot->tts_isnull[attnum];
+
+			/* Hacky way to allow YSQL upgrade INSERTs to set oid column. */
+			if (IsYsqlUpgrade && resultnum == ObjectIdAttributeNumber - 1)
+			{
+				resultslot->tts_yb_insert_oid = DatumGetObjectId(scanslot->tts_values[attnum]);
+			}
+			else
+			{
+				Assert(attnum >= 0 && attnum < scanslot->tts_nvalid);
+				Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
+				resultslot->tts_values[resultnum] = scanslot->tts_values[attnum];
+				resultslot->tts_isnull[resultnum] = scanslot->tts_isnull[attnum];
+			}
 
 			EEO_NEXT();
 		}
@@ -602,8 +632,17 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			int			resultnum = op->d.assign_tmp.resultnum;
 
-			resultslot->tts_values[resultnum] = state->resvalue;
-			resultslot->tts_isnull[resultnum] = state->resnull;
+			/* Hacky way to allow YSQL upgrade INSERTs to set oid column. */
+			if (IsYsqlUpgrade && resultnum == ObjectIdAttributeNumber - 1)
+			{
+				resultslot->tts_yb_insert_oid = DatumGetObjectId(state->resvalue);
+			}
+			else
+			{
+				Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
+				resultslot->tts_values[resultnum] = state->resvalue;
+				resultslot->tts_isnull[resultnum] = state->resnull;
+			}
 
 			EEO_NEXT();
 		}
@@ -612,6 +651,7 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 		{
 			int			resultnum = op->d.assign_tmp.resultnum;
 
+			Assert(resultnum >= 0 && resultnum < resultslot->tts_tupleDescriptor->natts);
 			resultslot->tts_isnull[resultnum] = state->resnull;
 			if (!resultslot->tts_isnull[resultnum])
 				resultslot->tts_values[resultnum] =
@@ -1752,6 +1792,14 @@ ExecInterpExpr(ExprState *state, ExprContext *econtext, bool *isnull)
 			EEO_NEXT();
 		}
 
+		EEO_CASE(EEOP_ROWARRAY_COMPARE)
+		{
+			/* too complex for an inline implementation */
+			YBExecEvalRowArrayComparison(state, op);
+
+			EEO_NEXT();
+		}
+
 		EEO_CASE(EEOP_LAST)
 		{
 			/* unreachable */
@@ -1894,56 +1942,78 @@ CheckVarSlotCompatibility(TupleTableSlot *slot, int attnum, Oid vartype)
  * get_cached_rowtype: utility function to lookup a rowtype tupdesc
  *
  * type_id, typmod: identity of the rowtype
- * cache_field: where to cache the TupleDesc pointer in expression state node
- *		(field must be initialized to NULL)
- * econtext: expression context we are executing in
+ * rowcache: space for caching identity info
+ *		(rowcache->cacheptr must be initialized to NULL)
+ * changed: if not NULL, *changed is set to true on any update
  *
- * NOTE: because the shutdown callback will be called during plan rescan,
- * must be prepared to re-do this during any node execution; cannot call
- * just once during expression initialization.
+ * The returned TupleDesc is not guaranteed pinned; caller must pin it
+ * to use it across any operation that might incur cache invalidation.
+ * (The TupleDesc is always refcounted, so just use IncrTupleDescRefCount.)
+ *
+ * NOTE: because composite types can change contents, we must be prepared
+ * to re-do this during any node execution; cannot call just once during
+ * expression initialization.
  */
 static TupleDesc
 get_cached_rowtype(Oid type_id, int32 typmod,
-				   TupleDesc *cache_field, ExprContext *econtext)
+				   ExprEvalRowtypeCache *rowcache,
+				   bool *changed)
 {
-	TupleDesc	tupDesc = *cache_field;
-
-	/* Do lookup if no cached value or if requested type changed */
-	if (tupDesc == NULL ||
-		type_id != tupDesc->tdtypeid ||
-		typmod != tupDesc->tdtypmod)
+	if (type_id != RECORDOID)
 	{
-		tupDesc = lookup_rowtype_tupdesc(type_id, typmod);
+		/*
+		 * It's a named composite type, so use the regular typcache.  Do a
+		 * lookup first time through, or if the composite type changed.  Note:
+		 * "tupdesc_id == 0" may look redundant, but it protects against the
+		 * admittedly-theoretical possibility that type_id was RECORDOID the
+		 * last time through, so that the cacheptr isn't TypeCacheEntry *.
+		 */
+		TypeCacheEntry *typentry = (TypeCacheEntry *) rowcache->cacheptr;
 
-		if (*cache_field)
+		if (unlikely(typentry == NULL ||
+					 rowcache->tupdesc_id == 0 ||
+					 typentry->tupDesc_identifier != rowcache->tupdesc_id))
 		{
-			/* Release old tupdesc; but callback is already registered */
-			ReleaseTupleDesc(*cache_field);
+			typentry = lookup_type_cache(type_id, TYPECACHE_TUPDESC);
+			if (typentry->tupDesc == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						 errmsg("type %s is not composite",
+								format_type_be(type_id))));
+			rowcache->cacheptr = (void *) typentry;
+			rowcache->tupdesc_id = typentry->tupDesc_identifier;
+			if (changed)
+				*changed = true;
 		}
-		else
-		{
-			/* Need to register shutdown callback to release tupdesc */
-			RegisterExprContextCallback(econtext,
-										ShutdownTupleDescRef,
-										PointerGetDatum(cache_field));
-		}
-		*cache_field = tupDesc;
+		return typentry->tupDesc;
 	}
-	return tupDesc;
+	else
+	{
+		/*
+		 * A RECORD type, once registered, doesn't change for the life of the
+		 * backend.  So we don't need a typcache entry as such, which is good
+		 * because there isn't one.  It's possible that the caller is asking
+		 * about a different type than before, though.
+		 */
+		TupleDesc	tupDesc = (TupleDesc) rowcache->cacheptr;
+
+		if (unlikely(tupDesc == NULL ||
+					 rowcache->tupdesc_id != 0 ||
+					 type_id != tupDesc->tdtypeid ||
+					 typmod != tupDesc->tdtypmod))
+		{
+			tupDesc = lookup_rowtype_tupdesc(type_id, typmod);
+			/* Drop pin acquired by lookup_rowtype_tupdesc */
+			ReleaseTupleDesc(tupDesc);
+			rowcache->cacheptr = (void *) tupDesc;
+			rowcache->tupdesc_id = 0;	/* not a valid value for non-RECORD */
+			if (changed)
+				*changed = true;
+		}
+		return tupDesc;
+	}
 }
 
-/*
- * Callback function to release a tupdesc refcount at econtext shutdown
- */
-static void
-ShutdownTupleDescRef(Datum arg)
-{
-	TupleDesc  *cache_field = (TupleDesc *) DatumGetPointer(arg);
-
-	if (*cache_field)
-		ReleaseTupleDesc(*cache_field);
-	*cache_field = NULL;
-}
 
 /*
  * Fast-path functions, for very simple expressions
@@ -2015,8 +2085,10 @@ ExecJustAssignInnerVar(ExprState *state, ExprContext *econtext, bool *isnull)
 	 *
 	 * Since we use slot_getattr(), we don't need to implement the FETCHSOME
 	 * step explicitly, and we also needn't Assert that the attnum is in range
-	 * --- slot_getattr() will take care of any problems.
+	 * --- slot_getattr() will take care of any problems.  Nonetheless, check
+	 * that resultnum is in range.
 	 */
+	Assert(resultnum >= 0 && resultnum < outslot->tts_tupleDescriptor->natts);
 	outslot->tts_values[resultnum] =
 		slot_getattr(inslot, attnum, &outslot->tts_isnull[resultnum]);
 	return 0;
@@ -2033,6 +2105,7 @@ ExecJustAssignOuterVar(ExprState *state, ExprContext *econtext, bool *isnull)
 	TupleTableSlot *outslot = state->resultslot;
 
 	/* See comments in ExecJustAssignInnerVar */
+	Assert(resultnum >= 0 && resultnum < outslot->tts_tupleDescriptor->natts);
 	outslot->tts_values[resultnum] =
 		slot_getattr(inslot, attnum, &outslot->tts_isnull[resultnum]);
 	return 0;
@@ -2049,6 +2122,7 @@ ExecJustAssignScanVar(ExprState *state, ExprContext *econtext, bool *isnull)
 	TupleTableSlot *outslot = state->resultslot;
 
 	/* See comments in ExecJustAssignInnerVar */
+	Assert(resultnum >= 0 && resultnum < outslot->tts_tupleDescriptor->natts);
 	outslot->tts_values[resultnum] =
 		slot_getattr(inslot, attnum, &outslot->tts_isnull[resultnum]);
 	return 0;
@@ -2464,8 +2538,7 @@ ExecEvalRowNullInt(ExprState *state, ExprEvalStep *op,
 
 	/* Lookup tupdesc if first time through or if type changes */
 	tupDesc = get_cached_rowtype(tupType, tupTypmod,
-								 &op->d.nulltest_row.argdesc,
-								 econtext);
+								 &op->d.nulltest_row.rowcache, NULL);
 
 	/*
 	 * heap_attisnull needs a HeapTuple not a bare HeapTupleHeader.
@@ -2672,6 +2745,10 @@ ExecEvalArrayExpr(ExprState *state, ExprEvalStep *op)
 			dims[i] = elem_dims[i - 1];
 			lbs[i] = elem_lbs[i - 1];
 		}
+
+		/* check for subscript overflow */
+		(void) ArrayGetNItems(ndims, dims);
+		ArrayCheckBounds(ndims, dims, lbs);
 
 		if (havenulls)
 		{
@@ -2901,8 +2978,7 @@ ExecEvalFieldSelect(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 
 		/* Lookup tupdesc if first time through or if type changes */
 		tupDesc = get_cached_rowtype(tupType, tupTypmod,
-									 &op->d.fieldselect.argdesc,
-									 econtext);
+									 &op->d.fieldselect.rowcache, NULL);
 
 		/*
 		 * Find field's attr record.  Note we don't support system columns
@@ -2960,9 +3036,9 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 {
 	TupleDesc	tupDesc;
 
-	/* Lookup tupdesc if first time through or after rescan */
+	/* Lookup tupdesc if first time through or if type changes */
 	tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
-								 op->d.fieldstore.argdesc, econtext);
+								 op->d.fieldstore.rowcache, NULL);
 
 	/* Check that current tupdesc doesn't have more fields than we allocated */
 	if (unlikely(tupDesc->natts > op->d.fieldstore.ncolumns))
@@ -3004,10 +3080,14 @@ ExecEvalFieldStoreDeForm(ExprState *state, ExprEvalStep *op, ExprContext *econte
 void
 ExecEvalFieldStoreForm(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
+	TupleDesc	tupDesc;
 	HeapTuple	tuple;
 
-	/* argdesc should already be valid from the DeForm step */
-	tuple = heap_form_tuple(*op->d.fieldstore.argdesc,
+	/* Lookup tupdesc (should be valid already) */
+	tupDesc = get_cached_rowtype(op->d.fieldstore.fstore->resulttype, -1,
+								 op->d.fieldstore.rowcache, NULL);
+
+	tuple = heap_form_tuple(tupDesc,
 							op->d.fieldstore.values,
 							op->d.fieldstore.nulls);
 
@@ -3218,13 +3298,13 @@ ExecEvalArrayRefAssign(ExprState *state, ExprEvalStep *op)
 void
 ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext)
 {
-	ConvertRowtypeExpr *convert = op->d.convert_rowtype.convert;
 	HeapTuple	result;
 	Datum		tupDatum;
 	HeapTupleHeader tuple;
 	HeapTupleData tmptup;
 	TupleDesc	indesc,
 				outdesc;
+	bool		changed = false;
 
 	/* NULL in -> NULL out */
 	if (*op->resnull)
@@ -3233,24 +3313,19 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 	tupDatum = *op->resvalue;
 	tuple = DatumGetHeapTupleHeader(tupDatum);
 
-	/* Lookup tupdescs if first time through or after rescan */
-	if (op->d.convert_rowtype.indesc == NULL)
-	{
-		get_cached_rowtype(exprType((Node *) convert->arg), -1,
-						   &op->d.convert_rowtype.indesc,
-						   econtext);
-		op->d.convert_rowtype.initialized = false;
-	}
-	if (op->d.convert_rowtype.outdesc == NULL)
-	{
-		get_cached_rowtype(convert->resulttype, -1,
-						   &op->d.convert_rowtype.outdesc,
-						   econtext);
-		op->d.convert_rowtype.initialized = false;
-	}
-
-	indesc = op->d.convert_rowtype.indesc;
-	outdesc = op->d.convert_rowtype.outdesc;
+	/*
+	 * Lookup tupdescs if first time through or if type changes.  We'd better
+	 * pin them since type conversion functions could do catalog lookups and
+	 * hence cause cache invalidation.
+	 */
+	indesc = get_cached_rowtype(op->d.convert_rowtype.inputtype, -1,
+								op->d.convert_rowtype.incache,
+								&changed);
+	IncrTupleDescRefCount(indesc);
+	outdesc = get_cached_rowtype(op->d.convert_rowtype.outputtype, -1,
+								 op->d.convert_rowtype.outcache,
+								 &changed);
+	IncrTupleDescRefCount(outdesc);
 
 	/*
 	 * We used to be able to assert that incoming tuples are marked with
@@ -3261,8 +3336,8 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 	Assert(HeapTupleHeaderGetTypeId(tuple) == indesc->tdtypeid ||
 		   HeapTupleHeaderGetTypeId(tuple) == RECORDOID);
 
-	/* if first time through, initialize conversion map */
-	if (!op->d.convert_rowtype.initialized)
+	/* if first time through, or after change, initialize conversion map */
+	if (changed)
 	{
 		MemoryContext old_cxt;
 
@@ -3273,7 +3348,6 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 		op->d.convert_rowtype.map =
 			convert_tuples_by_name(indesc, outdesc,
 								   gettext_noop("could not convert row type"));
-		op->d.convert_rowtype.initialized = true;
 
 		MemoryContextSwitchTo(old_cxt);
 	}
@@ -3285,7 +3359,7 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 	if (op->d.convert_rowtype.map != NULL)
 	{
 		/* Full conversion with attribute rearrangement needed */
-		result = do_convert_tuple(&tmptup, op->d.convert_rowtype.map);
+		result = execute_attr_map_tuple(&tmptup, op->d.convert_rowtype.map);
 		/* Result already has appropriate composite-datum header fields */
 		*op->resvalue = HeapTupleGetDatum(result);
 	}
@@ -3303,6 +3377,9 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
 		 */
 		*op->resvalue = heap_copy_tuple_as_datum(&tmptup, outdesc);
 	}
+
+	DecrTupleDescRefCount(indesc);
+	DecrTupleDescRefCount(outdesc);
 }
 
 /*
@@ -3314,6 +3391,8 @@ ExecEvalConvertRowtype(ExprState *state, ExprEvalStep *op, ExprContext *econtext
  * The operator always yields boolean, and we combine the results across all
  * array elements using OR and AND (for ANY and ALL respectively).  Of course
  * we short-circuit as soon as the result is known.
+ *
+ * YB: If you change this make sure to look at YBExecEvalRowArrayComparison.
  */
 void
 ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
@@ -3458,6 +3537,162 @@ ExecEvalScalarArrayOp(ExprState *state, ExprEvalStep *op)
 			}
 		}
 	}
+
+	*op->resvalue = result;
+	*op->resnull = resultnull;
+}
+
+/*
+ * YB: Lifted from ExecEvalScalarArrayOp.
+ */
+void
+YBExecEvalRowArrayComparison(ExprState *state, ExprEvalStep *op)
+{
+	FunctionCallInfo *fcinfos = op->d.row_array_compare.fcinfos;
+	PGFunction *fn_addrs = op->d.row_array_compare.fn_addrs;
+	int ncols = op->d.row_array_compare.ncols;
+	ArrayType  *arr;
+	int			nitems;
+	Datum		result;
+	bool		resultnull;
+	int			i;
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	char	   *s;
+	bits8	   *bitmap;
+	int			bitmask;
+
+	/*
+	 * If the array is NULL then we return NULL --- it's not very meaningful
+	 * to do anything else, even if the operator isn't strict.
+	 */
+	if (*op->resnull)
+		return;
+
+	/* Else okay to fetch and detoast the array */
+	arr = DatumGetArrayTypeP(*op->resvalue);
+
+	/*
+	 * If the array is empty, we return either FALSE or TRUE per the useOr
+	 * flag.  This is correct even if the scalar is NULL; since we would
+	 * evaluate the operator zero times, it matters not whether it would want
+	 * to return NULL.
+	 */
+	nitems = ArrayGetNItems(ARR_NDIM(arr), ARR_DIMS(arr));
+	if (nitems <= 0)
+	{
+		*op->resvalue = BoolGetDatum(false);
+		*op->resnull = false;
+		return;
+	}
+
+	/*
+	 * If the scalar is NULL, and the function is strict, return NULL; no
+	 * point in iterating the loop.
+	 */
+	for (int i = 0; i < ncols; i++)
+	{
+		if (fcinfos[i]->argnull[0])
+		{
+			*op->resnull = true;
+			return;
+		}
+	}
+
+	typlen = -1;
+	typbyval = false;
+	typalign = 'd';
+
+	/* Initialize result appropriately depending on useOr */
+	result = BoolGetDatum(false);
+	resultnull = false;
+
+	/* Loop over the array elements */
+	s = (char *) ARR_DATA_PTR(arr);
+	bitmap = ARR_NULLBITMAP(arr);
+	bitmask = 1;
+
+	TupleDesc tupleDesc = NULL;
+
+	for (i = 0; i < nitems; i++)
+	{
+		Datum		elt;
+		Datum		thisresult;
+		HeapTupleHeader	row_header;
+		HeapTupleData row;
+		ItemPointerSetInvalid(&(row.t_self));
+		row.t_tableOid = InvalidOid;
+
+
+		/* Get array element, checking for NULL */
+		if (bitmap && (*bitmap & bitmask) == 0)
+			continue;
+		else
+		{
+			elt = fetch_att(s, typbyval, typlen);
+			s = att_addlength_pointer(s, typlen, s);
+			s = (char *) att_align_nominal(s, typalign);
+			row_header = DatumGetHeapTupleHeader(elt);
+			row.t_len = HeapTupleHeaderGetDatumLength(row_header);
+			row.t_data = row_header;
+		}
+
+		if (tupleDesc == NULL)
+		{
+			Oid tupType = HeapTupleHeaderGetTypeId(row_header);
+			Oid typTypMod = HeapTupleHeaderGetTypMod(row_header);
+
+			/* Build tuple descriptor for row */
+			tupleDesc = lookup_rowtype_tupdesc(tupType, typTypMod);
+		}
+
+		for (int j = 0; j < ncols; j++)
+		{
+			FunctionCallInfo fcinfo = fcinfos[j];
+			PGFunction fn_addr = fn_addrs[j];
+			fcinfo->arg[1] =
+				heap_getattr(&row, j + 1, tupleDesc, &fcinfo->argnull[1]);
+			/* Call comparison function */
+			if (fcinfo->argnull[1])
+			{
+				result = false;
+				break;
+			}
+			else
+			{
+				fcinfo->isnull = false;
+				/*
+				 * As this is a comparison function we check equality
+				 * by checking if the compare result is equal to 0.
+				 */
+				thisresult = fn_addr(fcinfo) == 0;
+			}
+			if (!thisresult)
+				break;
+		}
+
+		if (DatumGetBool(thisresult))
+		{
+			result = BoolGetDatum(true);
+			resultnull = false;
+			break;			/* needn't look at any more elements */
+		}
+
+		/* advance bitmap pointer if any */
+		if (bitmap)
+		{
+			bitmask <<= 1;
+			if (bitmask == 0x100)
+			{
+				bitmap++;
+				bitmask = 1;
+			}
+		}
+	}
+
+	if (tupleDesc != NULL)
+		ReleaseTupleDesc(tupleDesc);
 
 	*op->resvalue = result;
 	*op->resnull = resultnull;
@@ -4049,7 +4284,7 @@ ExecAggTransReparent(AggState *aggstate, AggStatePerTrans pertrans,
 		if (DatumIsReadWriteExpandedObject(newValue,
 										   false,
 										   pertrans->transtypeLen) &&
-			MemoryContextGetParent(DatumGetEOHP(newValue)->eoh_context) == CurrentMemoryContext)
+			MemoryContextGetParent(DatumGetEOHP(newValue)->eoh_context) == GetCurrentMemoryContext())
 			 /* do nothing */ ;
 		else
 			newValue = datumCopy(newValue,

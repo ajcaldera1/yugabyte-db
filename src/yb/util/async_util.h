@@ -30,18 +30,17 @@
 // under the License.
 //
 // Utility functions which are handy when doing async/callback-based programming.
-#ifndef YB_UTIL_ASYNC_UTIL_H
-#define YB_UTIL_ASYNC_UTIL_H
+#pragma once
 
-#include <condition_variable>
+#include <pthread.h>
+
 #include <future>
-#include <mutex>
 
 #include <boost/function.hpp>
 
-#include "yb/gutil/bind.h"
 #include "yb/gutil/macros.h"
-#include "yb/util/countdown_latch.h"
+
+#include "yb/util/monotime.h"
 #include "yb/util/status.h"
 #include "yb/util/status_callback.h"
 
@@ -79,15 +78,15 @@ class Synchronizer {
     return std::bind(&Synchronizer::StatusCB, this, std::placeholders::_1);
   }
 
-  CHECKED_STATUS Wait() {
+  Status Wait() {
     return WaitUntil(std::chrono::steady_clock::time_point::max());
   }
 
-  CHECKED_STATUS WaitFor(const MonoDelta& delta) {
+  Status WaitFor(const MonoDelta& delta) {
     return WaitUntil(std::chrono::steady_clock::now() + delta.ToSteadyDuration());
   }
 
-  CHECKED_STATUS WaitUntil(const std::chrono::steady_clock::time_point& time);
+  Status WaitUntil(const std::chrono::steady_clock::time_point& time);
 
   void Reset();
 
@@ -114,11 +113,21 @@ class Synchronizer {
 template <class Result, class Functor>
 std::future<Result> MakeFuture(const Functor& functor) {
   auto promise = std::make_shared<std::promise<Result>>();
+  auto future = promise->get_future();
   functor([promise](Result result) {
     promise->set_value(std::move(result));
   });
-  return promise->get_future();
+  return future;
+}
+
+template <class T>
+bool IsReady(const std::shared_future<T>& f) {
+  return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+}
+
+template <class T>
+bool IsReady(const std::future<T>& f) {
+  return f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
 }
 
 } // namespace yb
-#endif /* YB_UTIL_ASYNC_UTIL_H */

@@ -15,8 +15,7 @@
 // Tree node definitions for database object names such as table, column, or index names.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_PT_NAME_H_
-#define YB_YQL_CQL_QL_PTREE_PT_NAME_H_
+#pragma once
 
 #include "yb/client/yb_table_name.h"
 #include "yb/yql/cql/ql/ptree/tree_node.h"
@@ -36,7 +35,7 @@ class PTName : public TreeNode {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   explicit PTName(MemoryContext *memctx = nullptr,
-                  YBLocation::SharedPtr loc = nullptr,
+                  YBLocationPtr loc = nullptr,
                   const MCSharedPtr<MCString>& name = nullptr);
   virtual ~PTName();
 
@@ -50,13 +49,9 @@ class PTName : public TreeNode {
     return MCMakeShared<PTName>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override {
+  virtual Status Analyze(SemContext *sem_context) override {
     return Status::OK();
   }
-
-  CHECKED_STATUS SetupPrimaryKey(SemContext *sem_context) const;
-  CHECKED_STATUS SetupHashAndPrimaryKey(SemContext *sem_context) const;
-  CHECKED_STATUS SetupCoveringIndexColumn(SemContext *sem_context) const;
 
   const MCString& name() const {
     return *name_;
@@ -66,11 +61,11 @@ class PTName : public TreeNode {
     return name_;
   }
 
-  virtual string QLName() const {
+  virtual std::string QLName() const {
     return name_->c_str();
   }
 
- private:
+ protected:
   MCSharedPtr<MCString> name_;
 };
 
@@ -84,7 +79,7 @@ class PTNameAll : public PTName {
 
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
-  PTNameAll(MemoryContext *memctx, YBLocation::SharedPtr loc);
+  PTNameAll(MemoryContext *memctx, YBLocationPtr loc);
   virtual ~PTNameAll();
 
   template<typename... TypeArgs>
@@ -92,7 +87,7 @@ class PTNameAll : public PTName {
     return MCMakeShared<PTNameAll>(memctx, std::forward<TypeArgs>(args)...);
   }
 
-  virtual string QLName() const override {
+  virtual std::string QLName() const override {
     // We should not get here as '*' should have been converted into a list of column name before
     // the selected tuple is constructed and described.
     LOG(INFO) << "Calling QLName before '*' is converted into a list of column name";
@@ -111,10 +106,10 @@ class PTQualifiedName : public PTName {
   //------------------------------------------------------------------------------------------------
   // Constructor and destructor.
   PTQualifiedName(MemoryContext *mctx,
-                  YBLocation::SharedPtr loc,
+                  YBLocationPtr loc,
                   const PTName::SharedPtr& ptname);
   PTQualifiedName(MemoryContext *mctx,
-                  YBLocation::SharedPtr loc,
+                  YBLocationPtr loc,
                   const MCSharedPtr<MCString>& name);
   virtual ~PTQualifiedName();
 
@@ -130,7 +125,7 @@ class PTQualifiedName : public PTName {
   void Prepend(const PTName::SharedPtr& ptname);
 
   // Node semantics analysis.
-  virtual CHECKED_STATUS Analyze(SemContext *sem_context) override;
+  virtual Status Analyze(SemContext *sem_context) override;
 
   const MCString& first_name() const {
     return ptnames_.front()->name();
@@ -144,20 +139,25 @@ class PTQualifiedName : public PTName {
     return ptnames_.size() == 1;
   }
 
+  // Column name should be the last name.
+  const MCSharedPtr<MCString>& column_name() {
+    return ptnames_.back()->name_ptr();
+  }
+
   // Construct bind variable name from this name.
   const MCSharedPtr<MCString>& bindvar_name() {
     return ptnames_.back()->name_ptr();
   }
 
   // Analyze this qualified name as an object name.
-  CHECKED_STATUS AnalyzeName(SemContext *sem_context, ObjectType object_type);
+  Status AnalyzeName(SemContext *sem_context, ObjectType object_type);
 
   client::YBTableName ToTableName() const {
-    return client::YBTableName(first_name().c_str(), last_name().c_str());
+    return client::YBTableName(YQL_DATABASE_CQL, first_name().c_str(), last_name().c_str());
   }
 
-  virtual string QLName() const override {
-    string full_name;
+  virtual std::string QLName() const override {
+    std::string full_name;
     for (auto name : ptnames_) {
       if (!full_name.empty()) {
         full_name += '.';
@@ -175,5 +175,3 @@ using PTQualifiedNameListNode = TreeListNode<PTQualifiedName>;
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_PT_NAME_H_

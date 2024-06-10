@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_RPC_RPC_SERVICE_H
-#define YB_RPC_RPC_SERVICE_H
+#pragma once
 
 #include "yb/rpc/rpc_fwd.h"
 
@@ -41,6 +40,8 @@ class RpcService : public RefCountedThreadSafe<RpcService> {
  public:
   virtual ~RpcService() {}
 
+  virtual void FillEndpoints(RpcEndpointMap* map) = 0;
+
   // Enqueue a call for processing.
   // On failure, the RpcService::QueueInboundCall() implementation is
   // responsible for responding to the client with a failure message.
@@ -48,9 +49,19 @@ class RpcService : public RefCountedThreadSafe<RpcService> {
 
   // Handle a call directly.
   virtual void Handle(InboundCallPtr call) = 0;
+
+  // Initiate RPC service shutdown.
+  // Two phase shutdown is required to prevent shutdown deadlock of 2 dependent resources.
+  virtual void StartShutdown() = 0;
+
+  // Wait until RPC sevrice shutdown completes.
+  virtual void CompleteShutdown() = 0;
+
+  void Shutdown() {
+    StartShutdown();
+    CompleteShutdown();
+  }
 };
 
 } // namespace rpc
 } // namespace yb
-
-#endif // YB_RPC_RPC_SERVICE_H

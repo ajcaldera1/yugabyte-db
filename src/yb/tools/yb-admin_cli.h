@@ -29,21 +29,27 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_TOOLS_YB_ADMIN_CLI_H
-#define YB_TOOLS_YB_ADMIN_CLI_H
+#pragma once
 
 #include <functional>
 #include <map>
-#include <vector>
+#include <memory>
 #include <string>
+#include <vector>
 
-#include "yb/util/status.h"
+#include <rapidjson/document.h>
+
+#include "yb/util/status_fwd.h"
+#include "yb/tools/tools_fwd.h"
 
 namespace yb {
-namespace tools {
+namespace client {
 
-class ClusterAdminClient;
-typedef YB_EDITION_NS_PREFIX ClusterAdminClient ClusterAdminClientClass;
+class YBTableName;
+
+} // namespace client
+
+namespace tools {
 
 // Tool to administer a cluster from the CLI.
 class ClusterAdminCli {
@@ -52,29 +58,51 @@ class ClusterAdminCli {
 
   virtual ~ClusterAdminCli() = default;
 
-  int Run(int argc, char** argv);
+  Status Run(int argc, char** argv);
 
-  static void UsageAndExit(const std::string& prog_name);
+  static const Status kInvalidArguments;
 
  protected:
-  typedef std::function<Status(const CLIArguments&)> CommandFn;
+  typedef std::function<Status(const CLIArguments&, ClusterAdminClient* client)> Action;
+
   struct Command {
     std::string name_;
     std::string usage_arguments_;
-    CommandFn fn_;
+    Action action_;
   };
 
-  void Register(std::string&& cmd_name, std::string&& cmd_args, CommandFn&& cmd_fn);
+  void Register(std::string&& cmd_name, const std::string& cmd_args, Action&& action);
   void SetUsage(const std::string& prog_name);
 
-  virtual void RegisterCommandHandlers(ClusterAdminClientClass* client);
+  virtual void RegisterCommandHandlers();
 
  private:
+  Status RunCommand(
+      const Command& command, const CLIArguments& command_args, const std::string& program_name);
+  std::string GetArgumentExpressions(const std::string& usage_arguments);
   std::vector<Command> commands_;
   std::map<std::string, size_t> command_indexes_;
+  std::unique_ptr<ClusterAdminClient> client_;
 };
+
+using CLIArgumentsIterator = ClusterAdminCli::CLIArguments::const_iterator;
+using TailArgumentsProcessor =
+    std::function<Status(CLIArgumentsIterator, const CLIArgumentsIterator&)>;
+
+Result<std::vector<client::YBTableName>> ResolveTableNames(
+    ClusterAdminClient* client,
+    CLIArgumentsIterator i,
+    const CLIArgumentsIterator& end,
+    const TailArgumentsProcessor& tail_processor = TailArgumentsProcessor(),
+    bool allow_namespace_only = false);
+
+Result<client::YBTableName> ResolveSingleTableName(
+    ClusterAdminClient* client,
+    CLIArgumentsIterator i,
+    const CLIArgumentsIterator& end,
+    TailArgumentsProcessor tail_processor = TailArgumentsProcessor());
+
+Status CheckArgumentsCount(size_t count, size_t min, size_t max);
 
 }  // namespace tools
 }  // namespace yb
-
-#endif // YB_TOOLS_YB_ADMIN_CLI_H

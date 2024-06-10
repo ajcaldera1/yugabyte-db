@@ -29,8 +29,7 @@
 // or implied.  See the License for the specific language governing permissions and limitations
 // under the License.
 //
-#ifndef YB_SERVER_RPCZ_PATH_HANDLER_H
-#define YB_SERVER_RPCZ_PATH_HANDLER_H
+#pragma once
 
 #include <memory>
 
@@ -40,8 +39,6 @@ namespace yb {
 
 class Webserver;
 
-void AddRpczPathHandlers(const std::shared_ptr<rpc::Messenger>& messenger,
-                         Webserver* webserver);
+void AddRpczPathHandlers(rpc::Messenger* messenger, bool show_local_calls, Webserver* webserver);
 
 } // namespace yb
-#endif /* YB_SERVER_RPCZ_PATH_HANDLER_H */

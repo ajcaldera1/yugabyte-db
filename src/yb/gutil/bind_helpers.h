@@ -155,13 +155,13 @@
 //                        In most cases MessageLoop::DeleteSoon() is a better
 //                        fit.
 
-#ifndef YB_GUTIL_BIND_HELPERS_H_
-#define YB_GUTIL_BIND_HELPERS_H_
+#pragma once
 
 #include <assert.h>
 
-#include "yb/gutil/basictypes.h"
 #include "yb/gutil/callback.h"
+#include "yb/gutil/integral_types.h"
+#include "yb/gutil/macros.h"
 #include "yb/gutil/template_util.h"
 
 // Unneeded define from Chromium
@@ -433,11 +433,11 @@ struct UnwrapTraits<scoped_refptr<T> > {
 
 // We didn't import WeakPtr from Chromium.
 //
-//template <typename T>
-//struct UnwrapTraits<WeakPtr<T> > {
-//  typedef const WeakPtr<T>& ForwardType;
-//  static ForwardType Unwrap(const WeakPtr<T>& o) { return o; }
-//};
+// template <typename T>
+// struct UnwrapTraits<WeakPtr<T> > {
+//   typedef const WeakPtr<T>& ForwardType;
+//   static ForwardType Unwrap(const WeakPtr<T>& o) { return o; }
+// };
 
 template <typename T>
 struct UnwrapTraits<OwnedWrapper<T> > {
@@ -450,7 +450,7 @@ struct UnwrapTraits<OwnedWrapper<T> > {
 template <typename T>
 struct UnwrapTraits<PassedWrapper<T> > {
   typedef T ForwardType;
-  static T Unwrap(PassedWrapper<T>& o) {
+  static T Unwrap(PassedWrapper<T>& o) { // NOLINT
     return o.Pass();
   }
 };
@@ -506,14 +506,14 @@ struct MaybeRefcount<true, const T*> {
 //// the target object is invalidated.
 ////
 //// P1 should be the type of the object that will be received of the method.
-//template <bool IsMethod, typename P1>
-//struct IsWeakMethod : public false_type {};
+// template <bool IsMethod, typename P1>
+// struct IsWeakMethod : public false_type {};
 //
-//template <typename T>
-//struct IsWeakMethod<true, WeakPtr<T> > : public true_type {};
+// template <typename T>
+// struct IsWeakMethod<true, WeakPtr<T> > : public true_type {};
 //
-//template <typename T>
-//struct IsWeakMethod<true, ConstRefWrapper<WeakPtr<T> > > : public true_type {};
+// template <typename T>
+// struct IsWeakMethod<true, ConstRefWrapper<WeakPtr<T> > > : public true_type {};
 
 }  // namespace internal
 
@@ -562,5 +562,3 @@ void DeletePointer(T* obj) {
 }
 
 }  // namespace yb
-
-#endif  // BASE_BIND_HELPERS_H_

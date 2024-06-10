@@ -11,32 +11,62 @@
 // under the License.
 //
 
-#include <yb/rpc/rpc_introspection.pb.h>
 #include "yb/yql/cql/cqlserver/cql_server.h"
 
-#include "yb/util/flag_tags.h"
-#include "yb/util/size_literals.h"
+#include <boost/bind.hpp>
+
+#include "yb/client/client.h"
+
 #include "yb/gutil/strings/substitute.h"
-#include "yb/yql/cql/cqlserver/cql_service.h"
+
+#include "yb/master/master_heartbeat.pb.h"
+
+#include "yb/rpc/connection.h"
+#include "yb/rpc/connection_context.h"
 #include "yb/rpc/messenger.h"
+#include "yb/rpc/rpc_introspection.pb.h"
 
-using yb::rpc::ServiceIf;
-using namespace yb::size_literals;  // NOLINT.
+#include "yb/tserver/tablet_server_interface.h"
+#include "yb/tserver/pg_client.pb.h"
 
-DEFINE_int32(cql_service_queue_length, 10000,
+#include "yb/rpc/secure.h"
+#include "yb/rpc/secure_stream.h"
+
+#include "yb/util/flags.h"
+#include "yb/util/net/dns_resolver.h"
+#include "yb/util/result.h"
+#include "yb/util/size_literals.h"
+#include "yb/util/source_location.h"
+
+#include "yb/yql/cql/cqlserver/cql_rpc.h"
+#include "yb/yql/cql/cqlserver/cql_service.h"
+#include "yb/yql/cql/cqlserver/statements-path-handler.h"
+
+DEFINE_UNKNOWN_int32(cql_service_queue_length, 10000,
              "RPC queue length for CQL service");
 TAG_FLAG(cql_service_queue_length, advanced);
 
-DEFINE_int32(cql_nodelist_refresh_interval_secs, 60,
-             "Interval after which a node list refresh event should be sent to all CQL clients.");
+DEFINE_RUNTIME_int32(cql_nodelist_refresh_interval_secs, 300,
+    "Interval after which a node list refresh event should be sent to all CQL clients.");
 TAG_FLAG(cql_nodelist_refresh_interval_secs, advanced);
 
-DEFINE_int64(cql_rpc_memory_limit, 0, "CQL RPC memory limit");
+DEFINE_RUNTIME_bool(
+    cql_limit_nodelist_refresh_to_subscribed_conns, true,
+    "When enabled, the node list refresh events will only be sent to the connections which have "
+    "subscribed to receiving the topology change events.");
+TAG_FLAG(cql_limit_nodelist_refresh_to_subscribed_conns, advanced);
 
-using namespace std::placeholders;
+DEFINE_UNKNOWN_int64(cql_rpc_memory_limit, 0, "CQL RPC memory limit");
+
+DECLARE_bool(ysql_yb_enable_ash);
+DECLARE_string(cert_node_filename);
 
 namespace yb {
 namespace cqlserver {
+
+using namespace std::placeholders;
+using namespace yb::size_literals;
+using namespace yb::ql; // NOLINT
 
 namespace {
 
@@ -48,28 +78,37 @@ boost::posix_time::time_duration refresh_interval() {
 
 CQLServer::CQLServer(const CQLServerOptions& opts,
                      boost::asio::io_service* io,
-                     const tserver::TabletServer* const tserver,
-                     client::LocalTabletFilter local_tablet_filter)
+                     tserver::TabletServerIf* tserver)
     : RpcAndWebServerBase(
           "CQLServer", opts, "yb.cqlserver",
           MemTracker::CreateTracker(
               "CQL", tserver ? tserver->mem_tracker() : MemTracker::GetRootTracker(),
-              AddToParent::kTrue, CreateMetrics::kFalse)),
+              AddToParent::kTrue, CreateMetrics::kFalse),
+          tserver->Clock()),
       opts_(opts),
       timer_(*io, refresh_interval()),
-      tserver_(tserver),
-      local_tablet_filter_(std::move(local_tablet_filter)) {
+      tserver_(tserver) {
   SetConnectionContextFactory(rpc::CreateConnectionContextFactory<CQLConnectionContext>(
       FLAGS_cql_rpc_memory_limit, mem_tracker()->parent()));
+
+  if (tserver_) {
+    tserver_->RegisterCertificateReloader(std::bind(&CQLServer::ReloadKeysAndCertificates, this));
+    if (tserver) {
+      tserver->SetCQLServer(this, this);
+    }
+  }
 }
 
 Status CQLServer::Start() {
   RETURN_NOT_OK(server::RpcAndWebServerBase::Init());
 
-  auto cql_service = std::make_shared<CQLServiceImpl>(this, opts_, local_tablet_filter_);
+  auto cql_service = std::make_shared<CQLServiceImpl>(this, opts_);
   cql_service->CompleteInit();
 
-  RETURN_NOT_OK(RegisterService(FLAGS_cql_service_queue_length, std::move(cql_service)));
+  cql_service_ = std::move(cql_service);
+  RETURN_NOT_OK(RegisterService(FLAGS_cql_service_queue_length, cql_service_));
+
+  AddStatementsPathHandlers(web_server_.get(), cql_service_);
 
   RETURN_NOT_OK(server::RpcAndWebServerBase::Start());
 
@@ -94,7 +133,9 @@ void CQLServer::RescheduleTimer() {
   auto new_expires = timer_.expires_at() + refresh_interval();
   timer_.expires_at(new_expires, ec);
   if (ec) {
+    // Happens during shutdown.
     LOG(WARNING) << "Failed to reschedule timer: " << ec;
+    return;
   }
   timer_.async_wait(boost::bind(&CQLServer::CQLNodeListRefresh, this,
                                 boost::asio::placeholders::error));
@@ -107,56 +148,105 @@ std::unique_ptr<CQLServerEvent> CQLServer::BuildTopologyChangeEvent(
   return cql_server_event;
 }
 
-void CQLServer::CQLNodeListRefresh(const boost::system::error_code &e) {
-  if (!e) {
-    auto cqlserver_event_list = std::make_shared<CQLServerEventList>();
-    if (tserver_ != nullptr) {
-      // Get all live tservers.
-      std::vector<master::TSInformationPB> live_tservers;
-      Status s = tserver_->GetLiveTServers(&live_tservers);
-      if (!s.ok()) {
-        LOG (WARNING) << s.ToString();
-        RescheduleTimer();
-        return;
-      }
-
-      // Queue NEW_NODE event for all the live tservers.
-      for (const master::TSInformationPB& ts_info : live_tservers) {
-        const auto& hostport_pb = DesiredHostPort(ts_info.registration().common(), CloudInfoPB());
-        if (hostport_pb.host().empty()) {
-          LOG (WARNING) << "Skipping TS since it doesn't have any rpc address: "
-                        << ts_info.DebugString();
-          continue;
-        }
-
-        // Use only the first rpc address.
-        InetAddress addr;
-        if (PREDICT_FALSE(!addr.FromString(hostport_pb.host()).ok())) {
-          LOG(WARNING) << strings::Substitute("Couldn't parse host $0", hostport_pb.host());
-          continue;
-        }
-
-        // Queue event for all clients to add a node.
-        cqlserver_event_list->AddEvent(
-            BuildTopologyChangeEvent(TopologyChangeEventResponse::kNewNode,
-                                     Endpoint(addr.address(), hostport_pb.port())));
-      }
-    }
-
-    // Queue node refresh event, to remove any nodes that are down. Note that the 'MOVED_NODE'
-    // event forces the client to refresh its entire cluster topology. The RPC address associated
-    // with the event doesn't have much significance.
-    cqlserver_event_list->AddEvent(
-        BuildTopologyChangeEvent(TopologyChangeEventResponse::kMovedNode, first_rpc_address()));
-
-    Status s = messenger_->QueueEventOnAllReactors(cqlserver_event_list, SOURCE_LOCATION());
-    if (!s.ok()) {
-      LOG (WARNING) << strings::Substitute("Failed to push events: [$0], due to: $1",
-                                           cqlserver_event_list->ToString(), s.ToString());
-    }
-
-    RescheduleTimer();
+void CQLServer::CQLNodeListRefresh(const boost::system::error_code &ec) {
+  if (ec) {
+    return;
   }
+
+  auto cqlserver_event_list = std::make_shared<CQLServerEventList>();
+  auto& resolver = tserver_->client()->messenger()->resolver();
+  if (tserver_ != nullptr) {
+    // Get all live tservers.
+    std::vector<master::TSInformationPB> live_tservers;
+    Status s = tserver_->GetLiveTServers(&live_tservers);
+    if (!s.ok()) {
+      LOG(WARNING) << s.ToString();
+      RescheduleTimer();
+      return;
+    }
+
+    // Queue NEW_NODE event for all the live tservers.
+    for (const master::TSInformationPB& ts_info : live_tservers) {
+      const auto& hostport_pb = DesiredHostPort(ts_info.registration().common(), CloudInfoPB());
+      if (hostport_pb.host().empty()) {
+        LOG (WARNING) << "Skipping TS since it doesn't have any rpc address: "
+                      << ts_info.DebugString();
+        continue;
+      }
+
+      // Use only the first rpc address.
+      auto addr = resolver.Resolve(hostport_pb.host());
+      if (PREDICT_FALSE(!addr.ok())) {
+        LOG(WARNING) << Format("Couldn't result host $0: $1", hostport_pb.host(), addr.status());
+        continue;
+      }
+
+      // We need the CQL port not the tserver port so use the rpc port from the local CQL server.
+      // Note: this relies on the fact that all tservers must use the same CQL port which is not
+      // currently enforced on YB side, but is practically required by the drivers.
+      const auto cql_port = first_rpc_address().port();
+
+      // Queue event for all clients to add a node.
+      cqlserver_event_list->AddEvent(
+          BuildTopologyChangeEvent(TopologyChangeEventResponse::kNewNode,
+                                   Endpoint(*addr, cql_port)));
+    }
+  }
+
+  // Queue node refresh event, to remove any nodes that are down. Note that the 'MOVED_NODE'
+  // event forces the client to refresh its entire cluster topology. The RPC address associated
+  // with the event doesn't have much significance.
+  cqlserver_event_list->AddEvent(
+      BuildTopologyChangeEvent(TopologyChangeEventResponse::kMovedNode, first_rpc_address()));
+
+  Status s;
+  if (PREDICT_TRUE(FLAGS_cql_limit_nodelist_refresh_to_subscribed_conns)) {
+    s = messenger_->QueueEventOnFilteredConnections(
+        cqlserver_event_list, SOURCE_LOCATION(), [](const rpc::ConnectionPtr conn) {
+          const auto& context = static_cast<CQLConnectionContext&>(conn->context());
+          return context.registered_events() & ql::BatchRequest::kTopologyChange;
+        });
+  } else {
+    s = messenger_->QueueEventOnAllReactors(cqlserver_event_list, SOURCE_LOCATION());
+  }
+  if (!s.ok()) {
+    LOG (WARNING) << strings::Substitute("Failed to push events: [$0], due to: $1",
+                                         cqlserver_event_list->ToString(), s.ToString());
+  }
+
+  RescheduleTimer();
+}
+
+Status CQLServer::ReloadKeysAndCertificates() {
+  if (!secure_context_) {
+    return Status::OK();
+  }
+
+  return rpc::ReloadSecureContextKeysAndCertificates(
+      secure_context_.get(), fs_manager_->GetDefaultRootDir(), rpc::SecureContextType::kExternal,
+      options_.HostsString());
+}
+
+Status CQLServer::SetupMessengerBuilder(rpc::MessengerBuilder* builder) {
+  RETURN_NOT_OK(RpcAndWebServerBase::SetupMessengerBuilder(builder));
+  if (!FLAGS_cert_node_filename.empty()) {
+    secure_context_ = VERIFY_RESULT(rpc::SetupSecureContext(
+        fs_manager_->GetDefaultRootDir(), FLAGS_cert_node_filename,
+        rpc::SecureContextType::kExternal, builder));
+  } else {
+    std::vector<HostPort> host_ports;
+    RETURN_NOT_OK(HostPort::ParseStrings(options_.HostsString(), 0, &host_ports));
+
+    secure_context_ = VERIFY_RESULT(rpc::SetupSecureContext(
+        fs_manager_->GetDefaultRootDir(), host_ports[0].host(), rpc::SecureContextType::kExternal,
+        builder));
+  }
+  return Status::OK();
+}
+
+Status CQLServer::YCQLStatementStats(const tserver::PgYCQLStatementStatsRequestPB& req,
+      tserver::PgYCQLStatementStatsResponsePB* resp) const {
+  return cql_service_->YCQLStatementStats(req, resp);
 }
 
 }  // namespace cqlserver

@@ -15,8 +15,14 @@ package org.yb.util;
 import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableSet;
 
+import java.io.IOException;
 import java.lang.reflect.Field;
+import java.util.List;
 import java.util.Set;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+
+import org.yb.minicluster.LogPrinter;
 
 public final class ProcessUtil {
 
@@ -24,7 +30,8 @@ public final class ProcessUtil {
   private static String UNIX_PROCESS_CLASS_NAME =  "java.lang.UNIXProcess";
   private static String JDK9_PROCESS_IMPL_CLASS_NAME = "java.lang.ProcessImpl";
 
-  private static Set<String> VALID_SIGNALS =  ImmutableSet.of("STOP", "CONT", "TERM", "KILL");
+  private static Set<String> VALID_SIGNALS =  ImmutableSet.of("STOP", "CONT", "TERM", "KILL",
+                                                              "SIGSEGV");
 
   private ProcessUtil() {
   }
@@ -60,7 +67,6 @@ public final class ProcessUtil {
     }
   }
 
-
   /**
    * Send a code specified by its string representation to the specified process.
    *
@@ -80,7 +86,7 @@ public final class ProcessUtil {
     if (rv != 0) {
       throw new IllegalStateException(
           String.format("unable to send SIG%s to process with pid=%d: " +
-                        "expected return code from kill, but got %d instead", sig, pid, pid, rv));
+                        "expected return code from kill, but got %d instead", sig, pid, rv));
     }
   }
 
@@ -106,4 +112,44 @@ public final class ProcessUtil {
     signalProcess(proc, "CONT");
   }
 
+  /**
+   * Execute a simple command as a process, awaiting for it to complete and redirecting its output
+   * to a Java test log.
+   * <p>
+   * Waits for a process forever.
+   * <p>
+   * Throws an exception on non-zero exit code.
+   */
+  public static void executeSimple(List<String> args, String logPrefix) throws Exception {
+    executeSimple(args, logPrefix, Integer.MAX_VALUE);
+  }
+
+  /**
+   * Execute a simple command as a process, awaiting for it to complete and redirecting its output
+   * to a Java test log.
+   * <p>
+   * Throws an exception on non-zero exit code.
+   */
+  public static void executeSimple(List<String> args, String logPrefix, int timeoutSec)
+      throws Exception {
+    String[] pathPieces  = args.get(0).split("/");
+    String   programName = pathPieces[pathPieces.length - 1];
+
+    ProcessBuilder pb = new ProcessBuilder(args);
+
+    // Handle the logs output.
+    Process process = pb.start();
+    try (LogPrinter outLp = new LogPrinter(process.getInputStream(), logPrefix + "|stdout ");
+         LogPrinter errLp = new LogPrinter(process.getErrorStream(), logPrefix + "|stderr ")) {
+
+      // Wait for the process to complete.
+      if (!process.waitFor(timeoutSec, TimeUnit.SECONDS)) {
+        throw new TimeoutException("Timed out waiting for " + process);
+      }
+    }
+
+    if (process.exitValue() != 0) {
+      throw new IOException(programName + " exited with code " + process.exitValue());
+    }
+  }
 }

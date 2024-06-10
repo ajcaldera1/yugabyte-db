@@ -30,7 +30,9 @@
 // under the License.
 //
 
+#include "yb/util/logging.h"
 #include <gtest/gtest.h>
+
 #include "yb/util/object_pool.h"
 
 namespace yb {

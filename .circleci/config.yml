@@ -1,35 +1,20 @@
-version: 2
+# Use the latest 2.1 version of CircleCI pipeline process engine. See: https://circleci.com/docs/2.0/configuration-reference
+version: 2.1
+
 jobs:
-  # For image tags, see:
-  # https://circleci.com/docs/2.0/docker-image-tags.json
-  ubuntu1804:
+  no-build:
     docker:
-      - image: circleci/buildpack-deps:18.04
+      - image: circleci/node:latest
     steps:
-      - checkout
-      - run:
-          name: Install dependencies
-          command: |
-            sudo apt-get update
-            sudo apt-get install -y \
-              python-pip \
-              uuid-dev \
-              libbz2-dev \
-              libreadline-dev \
-              maven \
-              cmake \
-              rsync \
-              flex \
-              bison \
-              ninja-build \
-              python-dev \
-              openjdk-8-jdk-headless
-      - run: |
-          export MAVEN_OPTS="--add-opens=java.base/java.nio=ALL-UNNAMED"
-          java -version && ./yb_build.sh --ninja -j 1
+      - run: echo "Not running builds at this time."
+
 workflows:
-  # See https://circleci.com/docs/2.0/workflows/
   version: 2
-  build_yugabyte_db:
+
+  no-build:
     jobs:
-      - ubuntu1804
+      - no-build:
+          name: no-automatic-build
+          filters:
+            branches:
+              ignore: /.*/

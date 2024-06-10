@@ -21,19 +21,33 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_UTIL_FILE_READER_WRITER_H
-#define ROCKSDB_UTIL_FILE_READER_WRITER_H
+#pragma once
+
+#include <string.h>
 
 #include <string>
+
+#include "yb/util/flags.h"
+
 #include "yb/rocksdb/env.h"
-#include "yb/rocksdb/util/aligned_buffer.h"
-#include "yb/rocksdb/util/statistics.h"
 #include "yb/rocksdb/port/port.h"
+#include "yb/rocksdb/statistics.h"
+#include "yb/rocksdb/util/aligned_buffer.h"
+
+DECLARE_int32(rocksdb_file_starting_buffer_size);
+
+namespace yb {
+
+class PriorityThreadPoolSuspender;
+
+}
 
 namespace rocksdb {
 
 class Statistics;
 class HistogramImpl;
+
+YB_STRONGLY_TYPED_BOOL(AllocateBuffer);
 
 std::unique_ptr<RandomAccessFile> NewReadaheadRandomAccessFile(
   std::unique_ptr<RandomAccessFile>&& file, size_t readahead_size);
@@ -58,7 +72,7 @@ class SequentialFileReader {
   SequentialFileReader(const SequentialFileReader&) = delete;
   SequentialFileReader& operator=(const SequentialFileReader&) = delete;
 
-  Status Read(size_t n, Slice* result, char* scratch);
+  Status Read(size_t n, Slice* result, uint8_t* scratch);
 
   Status Skip(uint64_t n);
 
@@ -101,7 +115,11 @@ class RandomAccessFileReader {
   RandomAccessFileReader(const RandomAccessFileReader&) = delete;
   RandomAccessFileReader& operator=(const RandomAccessFileReader&) = delete;
 
-  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch) const;
+  Status Read(uint64_t offset, size_t n, Slice* result, char* scratch,
+              Statistics* statistics = nullptr) const;
+  Status ReadAndValidate(
+      uint64_t offset, size_t n, Slice* result, char* scratch, const yb::ReadValidator& validator,
+      Statistics* statistics = nullptr);
 
   RandomAccessFile* file() { return file_.get(); }
 };
@@ -126,10 +144,17 @@ class WritableFileWriter {
   uint64_t                last_sync_size_;
   uint64_t                bytes_per_sync_;
   RateLimiter*            rate_limiter_;
+  // When the writer is used by the priority thread pool's task, this task could pass provided
+  // suspender to the writer, so it will be used by writer to check whether task should be
+  // paused after block is flushed.
+  yb::PriorityThreadPoolSuspender* suspender_;
 
  public:
-  WritableFileWriter(std::unique_ptr<WritableFile>&& file,
-                     const EnvOptions& options)
+  WritableFileWriter(
+      std::unique_ptr<WritableFile>&& file,
+      const EnvOptions& options,
+      yb::PriorityThreadPoolSuspender* suspender = nullptr,
+      AllocateBuffer allocate_buffer = AllocateBuffer::kTrue)
       : writable_file_(std::move(file)),
         buf_(),
         max_buffer_size_(options.writable_file_max_buffer_size),
@@ -141,17 +166,20 @@ class WritableFileWriter {
         use_os_buffer_(writable_file_->UseOSBuffer()),
         last_sync_size_(0),
         bytes_per_sync_(options.bytes_per_sync),
-        rate_limiter_(options.rate_limiter) {
+        rate_limiter_(options.rate_limiter),
+        suspender_(suspender) {
 
     buf_.Alignment(writable_file_->GetRequiredBufferAlignment());
-    buf_.AllocateNewBuffer(65536);
+    if (allocate_buffer) {
+      buf_.AllocateNewBuffer(FLAGS_rocksdb_file_starting_buffer_size);
+    }
   }
 
   WritableFileWriter(const WritableFileWriter&) = delete;
 
   WritableFileWriter& operator=(const WritableFileWriter&) = delete;
 
-  ~WritableFileWriter() { Close(); }
+  ~WritableFileWriter();
 
   Status Append(const Slice& data);
 
@@ -168,9 +196,7 @@ class WritableFileWriter {
 
   uint64_t GetFileSize() { return filesize_; }
 
-  Status InvalidateCache(size_t offset, size_t length) {
-    return writable_file_->InvalidateCache(offset, length);
-  }
+  Status InvalidateCache(size_t offset, size_t length);
 
   WritableFile* writable_file() const { return writable_file_.get(); }
 
@@ -186,8 +212,14 @@ class WritableFileWriter {
 };
 
 extern Status NewWritableFile(Env* env, const std::string& fname,
-                              unique_ptr<WritableFile>* result,
+                              std::unique_ptr<WritableFile>* result,
                               const EnvOptions& options);
-}  // namespace rocksdb
 
-#endif // ROCKSDB_UTIL_FILE_READER_WRITER_H
+// Returns an error if file ends with check_size zeros. If check_size is larger than file size it is
+// automatically reset to file size.
+// Returns an error if check_size == 0.
+// Returned error contains size of contiguous zeroed array placed at the end of the file.
+Status CheckFileTailForZeros(
+    Env* env, const EnvOptions& env_options, const std::string& file_path, size_t check_size);
+
+}  // namespace rocksdb

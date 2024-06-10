@@ -21,12 +21,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_DB_FILE_INDEXER_H
-#define ROCKSDB_DB_FILE_INDEXER_H
 
 #pragma once
 
-#include <cstdint>
 #include <functional>
 #include <limits>
 #include <vector>
@@ -158,5 +155,3 @@ class FileIndexer {
 };
 
 }  // namespace rocksdb
-
-#endif // ROCKSDB_DB_FILE_INDEXER_H

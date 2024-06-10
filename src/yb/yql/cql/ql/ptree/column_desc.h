@@ -15,12 +15,9 @@
 // Structure definitions for column descriptor of a table.
 //--------------------------------------------------------------------------------------------------
 
-#ifndef YB_YQL_CQL_QL_PTREE_COLUMN_DESC_H_
-#define YB_YQL_CQL_QL_PTREE_COLUMN_DESC_H_
+#pragma once
 
-#include "yb/common/types.h"
-#include "yb/yql/cql/ql/ptree/pt_type.h"
-#include "yb/util/memory/mc_types.h"
+#include "yb/client/schema.h"
 
 namespace yb {
 namespace ql {
@@ -30,7 +27,7 @@ namespace ql {
 // This class can be used to describe any reference of a column.
 class ColumnDesc {
  public:
-  ColumnDesc(const int index,
+  ColumnDesc(const size_t index,
              const int id,
              const std::string& name,
              const bool is_hash,
@@ -38,7 +35,8 @@ class ColumnDesc {
              const bool is_static,
              const bool is_counter,
              const std::shared_ptr<QLType>& ql_type,
-             const InternalType internal_type)
+             const InternalType internal_type,
+             bool has_mangled_name = false)
       : index_(index),
         id_(id),
         name_(name),
@@ -47,10 +45,11 @@ class ColumnDesc {
         is_static_(is_static),
         is_counter_(is_counter),
         ql_type_(ql_type),
-        internal_type_(internal_type) {
+        internal_type_(internal_type),
+        has_mangled_name_(has_mangled_name) {
   }
 
-  int index() const {
+  size_t index() const {
     return index_;
   }
 
@@ -58,7 +57,16 @@ class ColumnDesc {
     return id_;
   }
 
-  const std::string& name() const {
+  // User name (not mangled).
+  std::string name() const;
+
+  // Index column name (mangled).
+  std::string MangledName() const;
+
+  // Return the name that is kept in catalog.
+  // - For Catalog::Table, user-defined-column name is not mangled.
+  // - For Catalong::IndexTable, expression-column name (ColumnRef, JsonRef, ...) is mangled.
+  std::string MetadataName() const {
     return name_;
   }
 
@@ -86,8 +94,12 @@ class ColumnDesc {
     return internal_type_;
   }
 
+  void set_id(int id) {
+    id_ = id;
+  }
+
  private:
-  int index_ = -1;
+  size_t index_;
   int id_ = -1;
   std::string name_;
   bool is_hash_ = false;
@@ -96,9 +108,11 @@ class ColumnDesc {
   bool is_counter_ = false;
   std::shared_ptr<QLType> ql_type_;
   InternalType internal_type_ = InternalType::VALUE_NOT_SET;
+  // Depending on whether the table object is user-table, old index-table, or new index-table, the
+  // column name might or might not be mangled. The member "has_mangled_name_" is added so that we
+  // don't have to concern about which object this column belongs to.
+  bool has_mangled_name_;
 };
 
 }  // namespace ql
 }  // namespace yb
-
-#endif  // YB_YQL_CQL_QL_PTREE_COLUMN_DESC_H_
