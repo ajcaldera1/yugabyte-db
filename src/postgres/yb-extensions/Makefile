@@ -1,4 +1,5 @@
 DIRS = \
+	ddl_instead_of \
 	pg_dist_rag \
 	yb_pg_metrics \
 	yb_test_extension \
