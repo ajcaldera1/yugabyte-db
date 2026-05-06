@@ -8,6 +8,9 @@ OBJS = ddl_instead_of.o $(WIN32RES)
 EXTENSION = ddl_instead_of
 DATA = ddl_instead_of--1.0.sql
 
+TESTS = $(wildcard sql/*.sql)
+REGRESS = $(patsubst sql/%.sql,%,$(TESTS))
+
 ifdef USE_PGXS
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
