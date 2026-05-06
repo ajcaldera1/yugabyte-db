@@ -25,10 +25,13 @@ import api.v2.models.UniverseEditGFlags;
 import api.v2.models.UniverseEditKubernetesOverrides;
 import api.v2.models.UniverseEditSpec;
 import api.v2.models.UniverseOperatorImportReq;
+import api.v2.models.UniversePagedQuerySpec;
+import api.v2.models.UniversePagedResp;
 import api.v2.models.UniverseQueryLogsExport;
 import api.v2.models.UniverseResizeNodes;
 import api.v2.models.UniverseResourceDetails;
 import api.v2.models.UniverseRestart;
+import api.v2.models.UniverseResumeCanaryUpgrade;
 import api.v2.models.UniverseRollbackUpgradeReq;
 import api.v2.models.UniverseSoftwareUpgradeFinalize;
 import api.v2.models.UniverseSoftwareUpgradeFinalizeInfo;
@@ -38,8 +41,8 @@ import api.v2.models.UniverseSoftwareUpgradeStart;
 import api.v2.models.UniverseSystemdEnableStart;
 import api.v2.models.UniverseThirdPartySoftwareUpgradeStart;
 import api.v2.models.YBATask;
-import com.google.inject.Inject;
 import com.yugabyte.yw.models.Audit;
+import jakarta.inject.Inject;
 import java.io.InputStream;
 import java.util.UUID;
 import play.mvc.Http;
@@ -47,12 +50,26 @@ import play.mvc.Http.Request;
 import play.mvc.Result;
 
 public class UniverseApiControllerImp extends UniverseApiControllerImpInterface {
-  @Inject private UniverseManagementHandler universeHandler;
-  @Inject private UniverseUpgradesManagementHandler universeUpgradeHandler;
+  private final UniverseManagementHandler universeHandler;
+  private final UniverseUpgradesManagementHandler universeUpgradeHandler;
+
+  @Inject
+  public UniverseApiControllerImp(
+      UniverseManagementHandler universeHandler,
+      UniverseUpgradesManagementHandler universeUpgradeHandler) {
+    this.universeHandler = universeHandler;
+    this.universeUpgradeHandler = universeUpgradeHandler;
+  }
 
   @Override
   public Universe getUniverse(Request request, UUID cUUID, UUID uniUUID) throws Exception {
     return universeHandler.getUniverse(cUUID, uniUUID);
+  }
+
+  @Override
+  public UniversePagedResp pageListUniverses(
+      Request request, UUID cUUID, UniversePagedQuerySpec universePagedQuerySpec) throws Exception {
+    return universeHandler.pageListUniverses(cUUID, universePagedQuerySpec);
   }
 
   @Override
@@ -127,6 +144,12 @@ public class UniverseApiControllerImp extends UniverseApiControllerImpInterface 
   public YBATask rollbackSoftwareUpgrade(
       Request request, UUID cUUID, UUID uniUUID, UniverseRollbackUpgradeReq req) throws Exception {
     return universeUpgradeHandler.rollbackSoftwareUpgrade(request, cUUID, uniUUID, req);
+  }
+
+  @Override
+  public YBATask resumeCanarySoftwareUpgrade(
+      Request request, UUID cUUID, UUID uniUUID, UniverseResumeCanaryUpgrade req) throws Exception {
+    return universeUpgradeHandler.resumeCanarySoftwareUpgrade(cUUID, uniUUID, req);
   }
 
   @Override

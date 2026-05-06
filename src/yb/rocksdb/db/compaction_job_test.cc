@@ -281,7 +281,8 @@ class CompactionJobTest : public RocksDBTest {
 
     auto compaction = Compaction::Create(
         cfd->current()->storage_info(), *cfd->GetLatestMutableCFOptions(), compaction_input_files,
-        1, 1024 * 1024, 10, 0, kNoCompression, {}, db_options_.info_log.get(), true);
+        1, 1024 * 1024, 10, 0, kNoCompression, {}, /* mem_tracker = */ nullptr,
+        db_options_.info_log.get(), /* manual_compaction = */ true);
     compaction->SetInputVersion(cfd->current());
 
     LogBuffer log_buffer(InfoLogLevel::INFO_LEVEL, db_options_.info_log.get());
@@ -332,7 +333,7 @@ class CompactionJobTest : public RocksDBTest {
   ColumnFamilyData* cfd_;
   std::unique_ptr<CompactionFilter> compaction_filter_;
   std::shared_ptr<MergeOperator> merge_op_;
-  Status bg_error_;
+  BackgroundError bg_error_;
 };
 
 TEST_F(CompactionJobTest, Simple) {

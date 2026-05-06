@@ -102,14 +102,16 @@ class WriteOperation : public OperationBase<OperationType::kWrite, LWWritePB>  {
   // Commits the mvcc transaction and updates the metrics.
   Status DoReplicated(int64_t leader_term, Status* complete_status) override;
 
+  Status ApplyOperation(int64_t leader_term, bool skip_opid_update);
+
   // Aborts the mvcc transaction.
   Status DoAborted(const Status& status) override;
 
   HybridTime WriteHybridTime() const override;
 
-  AsyncWriteCallback added_to_leader_callback_;
+  AsyncWriteCallback async_write_callback_;
 
-  bool do_replicated_completed_ = false;
+  bool apply_completed_ = false;
 };
 
 bool IsTxnAborted(const Status& status);

@@ -90,6 +90,7 @@ class Env;
 
 namespace yb {
 
+class Cgroup;
 class Env;
 class MaintenanceManager;
 class ObjectLockTracker;
@@ -137,6 +138,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   // Default tserver and consensus RPC queue length per service.
   static constexpr uint32_t kDefaultSvcQueueLength = 5000;
 
+  static constexpr int32_t kUnknownClusterConfigVersion = -1;
+
   explicit TabletServer(const TabletServerOptions& opts);
   ~TabletServer();
 
@@ -165,6 +168,9 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   std::string ToString() const override;
 
   uint32_t GetAutoFlagConfigVersion() const override;
+  std::map<std::string, std::string> ExtendedFlagValidation(
+      const std::map<std::string, std::string>& flags_to_validate,
+      CoarseTimePoint deadline) override;
   void HandleMasterHeartbeatResponse(
       HybridTime heartbeat_sent_time, std::optional<AutoFlagsConfigPB> new_config);
 
@@ -183,6 +189,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   TServerCgroupManager* cgroup_manager() const override {
     return cgroup_manager_.get();
   }
+
+  Cgroup* PerDbCgroupProvider(rpc::ThreadPoolTag tag);
 #endif
 
   Heartbeater* heartbeater() { return heartbeater_.get(); }
@@ -372,8 +380,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   SchemaVersion GetMinXClusterSchemaVersion(const TableId& table_id,
       const ColocationId& colocation_id) const;
 
-  // Currently only used by cdc.
-  virtual int32_t cluster_config_version() const;
+  virtual int32_t cluster_config_version() const override;
 
   Result<uint32_t> XClusterConfigVersion() const;
 
@@ -396,6 +403,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   void RegisterCertificateReloader(CertificateReloader reloader) override;
   void RegisterPgProcessRestarter(std::function<Status(void)> restarter) override;
   void RegisterPgProcessKiller(std::function<Status(void)> killer) override;
+  void RegisterPgConfigGenerator(pgwrapper::PgConfigGenerator generator) override;
   void RegisterConnectionManagerRestarter(std::function<Status(void)> restarter);
 
   Status StartYSQLLeaseRefresher();
@@ -411,6 +419,9 @@ class TabletServer : public DbServerBase, public TabletServerIf {
 
   Status XClusterPopulateMasterHeartbeatRequest(
       master::TSHeartbeatRequestPB& req, bool needs_full_tablet_report);
+
+  Status ClusterConfigHandleMasterHeartbeatResponse(const master::TSHeartbeatResponsePB& resp);
+
   Status XClusterHandleMasterHeartbeatResponse(const master::TSHeartbeatResponsePB& resp);
 
   Status ValidateAndMaybeSetUniverseUuid(const UniverseUuid& universe_uuid);
@@ -472,6 +483,8 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   }
 
   ConnectivityStateResponsePB ConnectivityState() override;
+
+  ReplicationInfoPB GetClusterReplicationInfo() const override;
 
  protected:
   virtual Status RegisterServices();
@@ -616,6 +629,14 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   key_t ysql_conn_mgr_stats_shmem_key_ = 0;
 
  private:
+  struct ClusterConfig {
+    std::atomic<int32_t> version{kUnknownClusterConfigVersion};
+    mutable std::mutex mutex;
+    ReplicationInfoPB replication_info GUARDED_BY(mutex);
+  };
+
+  ClusterConfig cluster_config_;
+
   // Auto initialize some of the service flags that are defaulted to -1.
   void AutoInitServiceFlags();
 
@@ -654,6 +675,9 @@ class TabletServer : public DbServerBase, public TabletServerIf {
                                   const Status& status);
   void DoUpdateMasterAddresses();
 
+  std::map<std::string, std::string> ValidateConfCsvViaPg(
+      const std::map<std::string, std::string>& conf_flags, CoarseTimePoint deadline);
+
   std::string log_prefix_;
 
   // Bind address of postgres proxy under this tserver.
@@ -671,6 +695,7 @@ class TabletServer : public DbServerBase, public TabletServerIf {
   std::vector<CertificateReloader> certificate_reloaders_;
   std::function<Status(void)> pg_restarter_;
   std::function<Status(void)> pg_killer_;
+  pgwrapper::PgConfigGenerator pg_config_generator_;
 
   std::function<Status(void)> conn_manager_restarter_;
 

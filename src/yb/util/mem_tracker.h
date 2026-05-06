@@ -60,6 +60,7 @@ class MetricEntity;
 using MemTrackerPtr = std::shared_ptr<MemTracker>;
 
 static const std::string kTCMallocTrackerNamePrefix = "TCMalloc ";
+static const std::string kUntrackedTrackerName = "Untracked memory";
 
 // Garbage collector is used by MemTracker to free memory allocated by caches when reached
 // soft memory limit.
@@ -473,6 +474,9 @@ class MemTracker : public std::enable_shared_from_this<MemTracker> {
       CreateMetrics create_metrics,
       const std::string& metric_name);
 
+  std::shared_ptr<MemTracker> InsertChildUnlocked(
+    const std::string& id, std::shared_ptr<MemTracker> child);
+
   bool ShouldForceUpdateConsumption() const;
   void IncrementBy(int64_t amount);
   bool TryIncrementBy(int64_t amount);
@@ -710,5 +714,13 @@ void DumpMemoryUsage();
 // If A < X < B, then we reject if used score > (B - X) / (B - A).
 bool CheckMemoryPressureWithLogging(
     const MemTrackerPtr& mem_tracker, double score, const char* error_prefix);
+
+namespace internal {
+// Validate that the given memory-limit ratio flag is valid.
+// The value must be larger than 0 and not exceed 1, except the special sentinel value,
+// `USE_RECOMMENDED_MEMORY_VALUE`. The conditions are somewhat too specific to become
+// a general function in flags.h, hence declared here.
+bool ValidateMemoryLimitToRamRatio(const char* flag_name, double value);
+}  // namespace internal
 
 } // namespace yb

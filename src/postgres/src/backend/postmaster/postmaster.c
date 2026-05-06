@@ -600,7 +600,7 @@ HANDLE		PostmasterHandle;
  * suppressing them in all occurrences of strdup.
  */
 char *
-postmaster_strdup(const char *in)
+yb_postmaster_strdup(const char *in)
 {
 	char	   *result = strdup(in);
 
@@ -760,11 +760,11 @@ PostmasterMain(int argc, char *argv[])
 				break;
 
 			case 'C':
-				output_config_variable = postmaster_strdup(optarg);
+				output_config_variable = yb_postmaster_strdup(optarg);
 				break;
 
 			case 'D':
-				userDoption = postmaster_strdup(optarg);
+				userDoption = yb_postmaster_strdup(optarg);
 				break;
 
 			case 'd':
@@ -1499,7 +1499,7 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Load configuration files for client authentication.
 	 */
-	if (!load_hba())
+	if (!load_hba(NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * It makes no sense to continue if we fail to load the HBA file,
@@ -1508,7 +1508,7 @@ PostmasterMain(int argc, char *argv[])
 		ereport(FATAL,
 				(errmsg("could not load pg_hba.conf")));
 	}
-	if (!load_ident(NULL /* yb_ident_context */ ))
+	if (!load_ident(NULL, NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * We can start up without the IDENT file, although it means that you
@@ -3058,12 +3058,12 @@ SIGHUP_handler(SIGNAL_ARGS)
 			signal_child(SysLoggerPID, SIGHUP);
 
 		/* Reload authentication config files too */
-		if (!load_hba())
+		if (!load_hba(NULL /* yb_validate_conf_file */ ))
 			ereport(LOG,
 			/* translator: %s is a configuration file */
 					(errmsg("%s was not reloaded", "pg_hba.conf")));
 
-		if (!load_ident(NULL /* yb_ident_context */ ))
+		if (!load_ident(NULL, NULL /* yb_validate_conf_file */ ))
 			ereport(LOG,
 					(errmsg("%s was not reloaded", "pg_ident.conf")));
 
@@ -4926,8 +4926,8 @@ BackendInitialize(Port *port)
 	 * Save remote_host and remote_port in port structure (after this, they
 	 * will appear in log_line_prefix data for log messages).
 	 */
-	port->remote_host = strdup(remote_host);
-	port->remote_port = strdup(remote_port);
+	port->remote_host = yb_postmaster_strdup(remote_host);
+	port->remote_port = yb_postmaster_strdup(remote_port);
 
 	/* And now we can issue the Log_connections message, if wanted */
 	if (Log_connections)

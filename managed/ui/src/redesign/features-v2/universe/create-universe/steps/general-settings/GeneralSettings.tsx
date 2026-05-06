@@ -22,6 +22,7 @@ import { generateUniqueName } from '../../../../../helpers/utils';
 import {
   CreateUniverseContext,
   CreateUniverseContextMethods,
+  initialCreateUniverseFormState,
   StepsRef
 } from '../../CreateUniverseContext';
 import { GeneralSettingsValidationSchema } from './ValidationSchema';
@@ -35,7 +36,7 @@ import {
   REGIONS_FIELD,
   RESILIENCE_TYPE,
   RESILIENCE_FORM_MODE,
-  REPLICATION_FACTOR,
+  RESILIENCE_FACTOR,
   FAULT_TOLERANCE_TYPE,
   NODE_COUNT,
   SINGLE_AVAILABILITY_ZONE
@@ -48,7 +49,12 @@ const CONTROL_WIDTH = '480px';
 export const GeneralSettings = forwardRef<StepsRef>((_, forwardRef) => {
   const [
     { generalSettings, resilienceAndRegionsSettings },
-    { moveToNextPage, saveGeneralSettings, saveResilienceAndRegionsSettings }
+    {
+      moveToNextPage,
+      saveGeneralSettings,
+      saveResilienceAndRegionsSettings,
+      saveInstanceSettings
+    }
   ] = (useContext(CreateUniverseContext) as unknown) as CreateUniverseContextMethods;
 
   const { t } = useTranslation('translation', { keyPrefix: 'createUniverseV2.generalSettings' });
@@ -76,18 +82,18 @@ export const GeneralSettings = forwardRef<StepsRef>((_, forwardRef) => {
   const cloud = methods.watch('cloud');
 
   useEffect(() => {
-    methods.resetField(PROVIDER_CONFIGURATION);
     saveResilienceAndRegionsSettings({
       [REGIONS_FIELD]: [],
       [SINGLE_AVAILABILITY_ZONE]: '',
       [RESILIENCE_TYPE]: resilienceAndRegionsSettings?.[RESILIENCE_TYPE] ?? ResilienceType.REGULAR,
       [RESILIENCE_FORM_MODE]:
         resilienceAndRegionsSettings?.[RESILIENCE_FORM_MODE] ?? ResilienceFormMode.GUIDED,
-      [REPLICATION_FACTOR]: resilienceAndRegionsSettings?.[REPLICATION_FACTOR] ?? 3,
+      [RESILIENCE_FACTOR]: resilienceAndRegionsSettings?.[RESILIENCE_FACTOR] ?? 3,
       [FAULT_TOLERANCE_TYPE]:
         resilienceAndRegionsSettings?.[FAULT_TOLERANCE_TYPE] ?? FaultToleranceType.AZ_LEVEL,
       [NODE_COUNT]: resilienceAndRegionsSettings?.[NODE_COUNT] ?? 1
     });
+    saveInstanceSettings(initialCreateUniverseFormState.instanceSettings!);
   }, [cloud]);
 
   return (
@@ -116,17 +122,19 @@ export const GeneralSettings = forwardRef<StepsRef>((_, forwardRef) => {
             />
           </div>
           <CloudField<GeneralSettingsProps> name={CLOUD} label={t('cloudProvider')} />
-          <ProviderConfigurationField<GeneralSettingsProps>
-            name={PROVIDER_CONFIGURATION}
-            label={t('providerconfiguration')}
-            placeholder={t('providerConfigurationPlaceholder')}
-            sx={{
-              width: CONTROL_WIDTH
-            }}
-            filterByProvider={cloud}
-            dataTestId="provider-configuration-field"
-            disabled={!cloud}
-          />
+          {cloud && (
+            <ProviderConfigurationField<GeneralSettingsProps>
+              name={PROVIDER_CONFIGURATION}
+              label={t('providerconfiguration')}
+              placeholder={t('providerConfigurationPlaceholder')}
+              sx={{
+                width: CONTROL_WIDTH
+              }}
+              filterByProvider={cloud}
+              dataTestId="provider-configuration-field"
+              disabled={!cloud}
+            />
+          )}
           <DatabaseVersionField<GeneralSettingsProps>
             name={DATABASE_VERSION}
             label={t('databaseVersion')}

@@ -41,6 +41,7 @@ import "yb/common/common_types.proto";
 import "yb/common/pgsql_protocol.proto";
 import "yb/common/transaction.proto";
 import "yb/common/wire_protocol.proto";
+import "yb/rpc/lightweight_message.proto";
 import "yb/rpc/service.proto";
 import "yb/tablet/tablet_types.proto";
 import "yb/tablet/operations.proto";
@@ -50,10 +51,12 @@ import "yb/tserver/tserver_types.proto";
 service TabletServerService {
   rpc Write(WriteRequestPB) returns (WriteResponsePB) {
     option (yb.rpc.send_metadata) = true;
+    option (yb.rpc.lightweight_method).sides = BOTH;
   }
   rpc WaitForAsyncWrite(WaitForAsyncWriteRequestPB) returns (WaitForAsyncWriteResponsePB);
   rpc Read(ReadRequestPB) returns (ReadResponsePB) {
     option (yb.rpc.send_metadata) = true;
+    option (yb.rpc.lightweight_method).sides = BOTH;
   }
   rpc VerifyTableRowRange(VerifyTableRowRangeRequestPB)
       returns (VerifyTableRowRangeResponsePB);
@@ -182,6 +185,9 @@ service TabletServerService {
   }
 
   rpc PgRemoteExec(PgRemoteExecRequestPB) returns (PgRemoteExecResponsePB);
+
+  rpc CollectYsqlCallHomeStats(CollectYsqlCallHomeStatsRequestPB)
+      returns (CollectYsqlCallHomeStatsResponsePB);
 }
 
 // Note: Either among transactions_by_tablet or transaction_ids should be set. Both the fields
@@ -708,10 +714,22 @@ message PgRemoteExecRequestPB {
   // One entry per query parameter ($1, $2, ...).
   // A param with no value set represents SQL NULL.
   repeated PgQueryParamPB params = 3;
+  required string database_name = 4;
 }
 
 message PgRemoteExecResponsePB {
   optional TabletServerErrorPB error = 1;
   optional PgResultPB pg_result = 2;
   optional bool reached_size_limit = 3;
+}
+
+message CollectYsqlCallHomeStatsRequestPB {
+}
+
+message CollectYsqlCallHomeStatsResponsePB {
+  optional TabletServerErrorPB error = 1;
+
+  // JSON string containing the collected YSQL cluster statistics.
+  // Format: {"aggregate": {...}, "databases": [...]}
+  optional string json_stats = 2;
 }

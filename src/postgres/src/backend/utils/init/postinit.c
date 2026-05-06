@@ -242,7 +242,7 @@ PerformAuthentication(Port *port)
 												  "Postmaster",
 												  ALLOCSET_DEFAULT_SIZES);
 
-	if (!load_hba())
+	if (!load_hba(NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * It makes no sense to continue if we fail to load the HBA file,
@@ -252,7 +252,7 @@ PerformAuthentication(Port *port)
 				(errmsg("could not load pg_hba.conf")));
 	}
 
-	if (!load_ident(NULL /* yb_ident_context */ ))
+	if (!load_ident(NULL, NULL /* yb_validate_conf_file */ ))
 	{
 		/*
 		 * It is ok to continue if we fail to load the IDENT file, although it
@@ -335,6 +335,68 @@ PerformAuthentication(Port *port)
 	set_ps_display("startup");
 
 	ClientAuthInProgress = false;	/* client_min_messages is active now */
+}
+
+void
+YbLogAuthPassthroughConnReceived(struct Port *port)
+{
+	/*
+	 * YB: Now we issue the Log_connections message, if wanted.
+	 * Conn Mgr does not provide the port number, so we only log the host.
+	 */
+
+	if (Log_connections)
+		ereport(LOG,
+				(errmsg("connection received (Auth Passthrough): host=%s",
+						port->remote_host)));
+}
+
+/*
+ * YbLogAuthPassthroughConnAuthenticated -- post-authentication bookkeeping
+ * for connections authenticated via the auth passthrough path.
+ *
+ * Mirrors the logging and counter updates done in PerformAuthentication(),
+ * adapted for logical connections through the connection manager.
+ */
+void
+YbLogAuthPassthroughConnAuthenticated(Port *port)
+{
+	Assert(YbIsAuthPassthroughInProgress(port));
+	/*
+	 * YB: SSL details are not available for logical connections, so we only
+	 * log that SSL is enabled on the CM-client side. Similarly, GSS is not
+	 * supported with Connection Manager, so we don't log that either.
+	 */
+	if (Log_connections)
+	{
+		StringInfoData logmsg;
+
+		initStringInfo(&logmsg);
+		if (am_walsender)
+			appendStringInfo(&logmsg,
+							 _("replication connection authorized: user=%s"),
+							 port->user_name);
+		else
+			appendStringInfo(&logmsg, _("connection authorized: user=%s"),
+							 port->user_name);
+		if (!am_walsender)
+			appendStringInfo(&logmsg, _(" database=%s"),
+							 port->database_name);
+
+		if (port->application_name != NULL)
+			appendStringInfo(&logmsg, _(" application_name=%s"),
+							 port->application_name);
+
+		if (port->yb_is_ssl_enabled_in_logical_conn)
+			appendStringInfo(&logmsg, _(" SSL enabled"));
+
+		appendStringInfo(&logmsg, _(" (via Auth Passthrough)"));
+
+		ereport(LOG, errmsg_internal("%s", logmsg.data));
+		pfree(logmsg.data);
+	}
+
+	YbNumAuthorizedConnections++;
 }
 
 static int
@@ -462,17 +524,31 @@ YbCheckMyDatabase(const char *name, bool am_superuser,
 	/*
 	 * OK, we're golden.  Next to-do item is to save the encoding info out of
 	 * the pg_database tuple.
-	 * YB: GUC SOURCE has been changed to PGC_S_CLIENT from
-	 * PGC_S_DEFAULT_DYNAMIC in order to avoid setting defaults and sending
-	 * PARAMETER STATUS packets back on auth failure.
+	 *
+	 * YB: Ideally, during an Auth Passthrough authentication, GUC modifications
+	 * need to:
+	 *   - Set the current value of the GUC (change visible on calling SHOW)
+	 *   - Be reported to the client *only if* they were
+	 *       - set by the client (startup packet); or
+	 *       - marked to be reported by default (GUC_REPORT).
+	 *   - Not set the GUC default (GUC sources >= PGC_S_INTERACTIVE)
+	 *
+	 * However, here we make an exception to the last rule as this setting is
+	 * done for every authentication before any text encoding conversion is
+	 * done. Conversely, these encoding set calls need to be here because both
+	 * these vars are GUC_REPORT, and will always be reported back to the
+	 * client.
+	 *
+	 * Thus, every incoming client sees the encoding set for their supplied db
+	 * only (or encoding set via startup packet, if suppliec).
 	 */
 	SetDatabaseEncoding(dbform->encoding);
 	/* Record it as a GUC internal option, too */
 	SetConfigOption("server_encoding", GetDatabaseEncodingName(), PGC_INTERNAL,
-					PGC_S_CLIENT);
+					PGC_S_DYNAMIC_DEFAULT);
 	/* If we have no other source of client_encoding, use server encoding */
 	SetConfigOption("client_encoding", GetDatabaseEncodingName(), PGC_BACKEND,
-					PGC_S_CLIENT);
+					PGC_S_DYNAMIC_DEFAULT);
 }
 
 /*
@@ -1816,6 +1892,29 @@ ShutdownPostgres(int code, Datum arg)
 }
 
 
+#if defined(ADDRESS_SANITIZER)
+static volatile int yb_skip_lsan_check = 0;
+
+int
+__lsan_is_turned_off(void)
+{
+	return yb_skip_lsan_check;
+}
+#endif
+
+static void
+YbKillMe(int sig)
+{
+#if defined(ADDRESS_SANITIZER)
+	yb_skip_lsan_check = 1;
+#endif
+#ifdef HAVE_SETSID
+	/* try to signal whole process group */
+	kill(-MyProcPid, sig);
+#endif
+	kill(MyProcPid, sig);
+}
+
 /*
  * STATEMENT_TIMEOUT handler: trigger a query-cancel interrupt.
  */
@@ -1831,11 +1930,7 @@ StatementTimeoutHandler(void)
 	if (ClientAuthInProgress)
 		sig = SIGTERM;
 
-#ifdef HAVE_SETSID
-	/* try to signal whole process group */
-	kill(-MyProcPid, sig);
-#endif
-	kill(MyProcPid, sig);
+	YbKillMe(sig);
 }
 
 /*
@@ -1844,11 +1939,7 @@ StatementTimeoutHandler(void)
 static void
 LockTimeoutHandler(void)
 {
-#ifdef HAVE_SETSID
-	/* try to signal whole process group */
-	kill(-MyProcPid, SIGINT);
-#endif
-	kill(MyProcPid, SIGINT);
+	YbKillMe(SIGINT);
 }
 
 static void

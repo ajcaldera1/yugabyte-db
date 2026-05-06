@@ -111,6 +111,7 @@
 #include "yb/tserver/tserver_xcluster_context_if.h"
 #include "yb/tserver/xcluster_safe_time_map.h"
 #include "yb/tserver/ysql_advisory_lock_table.h"
+#include "yb/tserver/ysql_call_home_stats.h"
 #include "yb/tserver/ysql_lease.h"
 
 #include "yb/util/async_util.h"
@@ -548,13 +549,13 @@ class WriteQueryCompletionCallback {
       }
 
       if (status.IsTryAgain()) {
-          LOG_DETAIL << "Write failed: " << status;
+          LOG(DETAIL) << "Write failed: " << status;
       } else {
           LOG(INFO) << "Write failed: " << status;
       }
 
       if (include_trace_ && trace_) {
-        response_->set_trace_buffer(trace_->DumpToString(true));
+        response_->dup_trace_buffer(trace_->DumpToString(true));
       }
       SetupErrorAndRespond(get_error(), status, context_.get());
       return;
@@ -574,7 +575,7 @@ class WriteQueryCompletionCallback {
     }
 
     if (include_trace_ && trace_) {
-      response_->set_trace_buffer(trace_->DumpToString(true));
+      response_->dup_trace_buffer(trace_->DumpToString(true));
     }
     response_->set_propagated_hybrid_time(clock_->Now().ToUint64());
     FillTabletConsensusInfoIfRequestOpIdStale(tablet_peer_, query_->client_request(), response_);
@@ -2599,9 +2600,8 @@ Status TabletServiceImpl::PerformWrite(
   }
   ADOPT_TRACE(context->trace());
   TRACE("Start Write");
-  TRACE_EVENT1("tserver", "TabletServiceImpl::Write",
-               "tablet_id", req->tablet_id());
-  VLOG(2) << "Received Write RPC: " << req->DebugString();
+  TRACE_EVENT1("tserver", "TabletServiceImpl::Write", "tablet_id", std::string(req->tablet_id()));
+  VLOG(2) << "Received Write RPC: " << AsString(*req);
 
   UpdateClock(*req, server_->Clock());
   TEST_SYNC_POINT_CALLBACK("TabletServiceImpl::PerformWrite", const_cast<WriteRequestMsg*>(req));
@@ -3079,11 +3079,9 @@ void ConsensusServiceImpl::LeaderStepDown(const LeaderStepDownRequestPB* req,
     return;
   }
   Status s = scope->StepDown(req, resp);
-  if (!resp->has_error()) {
+  if (resp->has_error()) {
     LOG(INFO) << "Leader stepdown request " << req->ShortDebugString() << " failed. Resp code="
               << TabletServerErrorPB::Code_Name(resp->error().code());
-  } else {
-    LOG(INFO) << "Leader stepdown request " << req->ShortDebugString() << " succeeded";
   }
   scope.CheckStatus(s, resp);
 }
@@ -3545,7 +3543,7 @@ void TabletServiceImpl::PgRemoteExec(
 
   // TODO(#30396): Maintain a pool of connections instead of creating a new connection
   auto conn = server_->CreateInternalPGConn(
-      "template1", /* simple_query_protocol */ false, context.GetClientDeadline());
+      req->database_name(), /* simple_query_protocol */ false, context.GetClientDeadline());
   if (!conn.ok()) {
     SetupErrorAndRespond(resp->mutable_error(), conn.status(), &context);
     return;
@@ -3971,6 +3969,18 @@ void TabletServiceImpl::AdminExecutePgsql(
   } else {
     context.RespondSuccess();
   }
+}
+
+void TabletServiceImpl::CollectYsqlCallHomeStats(
+    const CollectYsqlCallHomeStatsRequestPB* req, CollectYsqlCallHomeStatsResponsePB* resp,
+    rpc::RpcContext context) {
+  auto result = CollectYsqlClusterStatsJson(server_);
+  if (!result.ok()) {
+    SetupErrorAndRespond(resp->mutable_error(), result.status(), &context);
+    return;
+  }
+  resp->set_json_stats(*result);
+  context.RespondSuccess();
 }
 
 void TabletServiceImpl::GetLocalPgTxnSnapshot(

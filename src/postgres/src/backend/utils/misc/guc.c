@@ -122,9 +122,10 @@
 #include "commands/copy.h"
 #include "common/pg_yb_param_status_flags.h"
 #include "executor/ybModifyTable.h"
-#include "optimizer/yb_saop_merge.h"
+#include "optimizer/yb_merge_scan.h"
 #include "pg_yb_utils.h"
 #include "tcop/pquery.h"
+#include "utils/spccache.h"
 #include "utils/syscache.h"
 #include "yb/util/debug/leak_annotations.h"
 #include "yb_ash.h"
@@ -853,6 +854,7 @@ static char *yb_read_time_string;
 static char *yb_neg_catcache_ids_string;
 static bool yb_conn_mgr_modifying_defaults = false;
 bool		yb_test_skip_binding_scan_keys;
+bool		yb_enable_advanced_index_cond_fold;
 static bool yb_bypass_cond_recheck;
 static bool yb_pushdown_is_not_null;
 static bool yb_pushdown_strict_inequality;
@@ -2589,6 +2591,18 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"yb_use_cluster_config_for_geolocation_costing", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("When no tablespace is assigned to table, use cluster "
+						 "replication info to estimate network costs"),
+			NULL,
+			GUC_EXPLAIN
+		},
+		&yb_use_cluster_config_for_geolocation_costing,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"yb_pushdown_strict_inequality", PGC_USERSET, CUSTOM_OPTIONS,
 			gettext_noop("DEPRECATED: no-op."),
 			NULL,
@@ -2742,6 +2756,18 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_cdcsdk_stream_tables_without_primary_key,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_cdcsdk_allow_dml_without_pk", PGC_SUSET, DEVELOPER_OPTIONS,
+			gettext_noop("When set to true, allows UPDATE/DELETE on tables under a publication "
+						 "with REPLICA IDENTITY DEFAULT or CHANGE that do not have a primary key."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_cdcsdk_allow_dml_without_pk,
 		false,
 		NULL, NULL, NULL
 	},
@@ -3071,6 +3097,21 @@ static struct config_bool ConfigureNamesBool[] =
 	},
 
 	{
+		{"yb_enable_advanced_index_cond_fold", PGC_USERSET, QUERY_TUNING_METHOD,
+			gettext_noop("Enable advanced folding of same-column index "
+						 "conditions, including tightening inequality "
+						 "bounds across scan keys, intersecting IN "
+						 "arrays, and detecting additional contradictions "
+						 "at bind time."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_enable_advanced_index_cond_fold,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
 		{"yb_test_skip_binding_scan_keys", PGC_USERSET, DEVELOPER_OPTIONS,
 			gettext_noop("For YB scans, skip binding scan keys to pggate. "
 						 "ybgin and internal scans are not affected."),
@@ -3087,18 +3128,22 @@ static struct config_bool ConfigureNamesBool[] =
 			gettext_noop("If true, derives additional scalar array operation "
 						 "conditions from table constraints and adds them to "
 						 "queries to improve performance."),
-			gettext_noop("Has no impact in case yb_max_saop_merge_streams is 0."),
+			gettext_noop("Has no impact in case yb_max_merge_scan_streams is 0."),
 			GUC_EXPLAIN
 		},
 		&yb_enable_derived_saops,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 
 	{
 		{"yb_enable_upsert_mode", PGC_USERSET, CLIENT_CONN_STATEMENT,
 			gettext_noop("Sets the boolean flag to enable or disable upsert mode for writes."),
-			NULL
+			gettext_noop("When the target table has secondary indexes, triggers, "
+						 "or foreign key constraints, upsert mode is automatically "
+						 "disabled to prevent correctness issues. "
+						 "Consider using INSERT ... ON CONFLICT for true upsert "
+						 "semantics instead.")
 		},
 		&yb_enable_upsert_mode,
 		false,
@@ -3206,7 +3251,7 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_EXPLAIN
 		},
 		&yb_enable_derived_equalities,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 
@@ -3651,7 +3696,7 @@ static struct config_bool ConfigureNamesBool[] =
 						 "which creates database connection for query diagnostics. "
 						 "If this is set to true, ASH and schema details are not dumped"),
 			NULL,
-			GUC_NOT_IN_SAMPLE
+			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL
 		},
 		&yb_query_diagnostics_disable_database_connection_bgworker,
 		false,
@@ -3787,7 +3832,7 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_EXPLAIN
 		},
 		&yb_enable_parallel_scan_hash_sharded,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 
@@ -3798,7 +3843,7 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_EXPLAIN
 		},
 		&yb_enable_parallel_scan_range_sharded,
-		false,
+		true,
 		NULL, NULL, NULL
 	},
 
@@ -3969,6 +4014,53 @@ static struct config_bool ConfigureNamesBool[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_enable_listen_notify,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_test_fatal_after_notifs_queue_write", PGC_SIGHUP, DEVELOPER_OPTIONS,
+			gettext_noop("When true, the notifications poller exits with FATAL "
+						 "after writing to the async queue but before the CDC ack."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_test_fatal_after_notifs_queue_write,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_skip_ensure_read_time_in_parallel_execution", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Skip forcing ENSURE_READ_TIME_IS_SET during parallel execution."),
+			gettext_noop("When true, parallel execution will not force read time to be "
+						 "picked on the proxy. This should be used with caution."),
+			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL
+		},
+		&yb_skip_ensure_read_time_in_parallel_execution,
+		false,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_conn_mgr_selective_deallocate", PGC_SIGHUP, CUSTOM_OPTIONS,
+			gettext_noop("Enables connection-manager-aware DEALLOCATE behavior."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_conn_mgr_selective_deallocate,
+		true,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_enable_mage", PGC_POSTMASTER, DEVELOPER_OPTIONS,
+			gettext_noop("Enable the use of mage extension. "
+						 "NOTE: This is for internal use only."),
+			NULL,
+			GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL
+		},
+		&yb_enable_mage,
 		false,
 		NULL, NULL, NULL
 	},
@@ -4172,6 +4264,18 @@ static struct config_int ConfigureNamesInt[] =
 		},
 		&yb_walsender_poll_sleep_duration_empty_ms,
 		10, 0, INT_MAX,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_test_notify_queue_max_pages", PGC_SIGHUP, DEVELOPER_OPTIONS,
+			gettext_noop("When set to a positive value, artificially limits the "
+						 "NOTIFY queue to this many pages for testing."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_test_notify_queue_max_pages,
+		0, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
@@ -5930,7 +6034,7 @@ static struct config_int ConfigureNamesInt[] =
 			GUC_NOT_IN_SAMPLE
 		},
 		&yb_max_num_invalidation_messages,
-		4096, 0, INT_MAX,
+		8192, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
@@ -5993,19 +6097,30 @@ static struct config_int ConfigureNamesInt[] =
 	},
 
 	{
-		{"yb_max_saop_merge_streams", PGC_USERSET, QUERY_TUNING_METHOD,
+		{"yb_max_merge_scan_streams", PGC_USERSET, QUERY_TUNING_METHOD,
 			gettext_noop("Sets the maximum number of streams tolerated for "
-						 "scalar array operation merge."),
+						 "merge scan."),
 			gettext_noop("For YB LSM index scans, when multiple "
-						 "SAOP-mergeable scalar array operations are "
-						 "involved, they are added to SAOP merge until their "
-						 "cartesian product's cardinality reaches this limit. "
-						 "Scalar array operation merge is per index scan, and "
+						 "merge-scan-eligible scalar array operations are "
+						 "involved, they are combined until their cartesian "
+						 "product's cardinality reaches this limit. "
+						 "Merge scan is per index scan, and "
 						 "the limit applies per index scan, not globally. Set "
 						 "to 0 to disable."),
 		},
-		&yb_max_saop_merge_streams,
-		0, 0, 1024,
+		&yb_max_merge_scan_streams,
+		64, 0, 1024,
+		NULL, NULL, NULL
+	},
+
+	{
+		{"yb_catcache_list_from_preloaded_limit", PGC_USERSET, DEVELOPER_OPTIONS,
+			gettext_noop("Max tuples in a preloaded catalog cache for local list building. 0 disables."),
+			NULL,
+			GUC_NOT_IN_SAMPLE
+		},
+		&yb_catcache_list_from_preloaded_limit,
+		100000, 0, INT_MAX,
 		NULL, NULL, NULL
 	},
 
@@ -7861,6 +7976,7 @@ static const char *const map_old_guc_names[] = {
 	"sort_mem", "work_mem",
 	"vacuum_mem", "maintenance_work_mem",
 	"yb_enable_parallel_append", "enable_parallel_append",
+	"yb_max_saop_merge_streams", "yb_max_merge_scan_streams",
 	NULL
 };
 
@@ -7870,6 +7986,7 @@ static const char *const map_old_guc_names[] = {
  * yb_db_admin to modify PG_SUSET variables without being a superuser itself.
  */
 static const char *const YbDbAdminVariables[] = {
+	"backtrace_functions",
 	"session_replication_role",
 	"yb_make_next_ddl_statement_nonbreaking",
 	"yb_make_next_ddl_statement_nonincrementing",
@@ -16914,6 +17031,7 @@ assign_yb_enable_cbo(int new_value, void *extra)
 	yb_enable_optimizer_statistics = false;
 	yb_ignore_stats = false;
 	yb_legacy_bnl_cost = false;
+	yb_use_cluster_config_for_geolocation_costing = false;
 
 	switch (new_value)
 	{
@@ -16952,6 +17070,7 @@ assign_yb_enable_cbo(int new_value, void *extra)
 	 *  - yb_enable_bitmapscan to on
 	 *  - yb_parallel_range_rows to 10000
 	 *  - yb_enable_update_reltuples_after_create_index to on
+	 *  - yb_use_cluster_config_for_geolocation_costing to on
 	 */
 	if (new_value == YB_COST_MODEL_ON)
 	{
@@ -16961,12 +17080,15 @@ assign_yb_enable_cbo(int new_value, void *extra)
 						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 		SetConfigOption("yb_enable_update_reltuples_after_create_index", "on",
 						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_use_cluster_config_for_geolocation_costing", "on",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 	}
 	/*
 	 * When disabling CBO, also reset:
 	 *  - yb_enable_bitmapscan
 	 *  - yb_parallel_range_rows
 	 *  - yb_enable_update_reltuples_after_create_index
+	 *  - yb_use_cluster_config_for_geolocation_costing
 	 */
 	else
 	{
@@ -16975,6 +17097,8 @@ assign_yb_enable_cbo(int new_value, void *extra)
 		SetConfigOption("yb_parallel_range_rows", "0",
 						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 		SetConfigOption("yb_enable_update_reltuples_after_create_index", "off",
+						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+		SetConfigOption("yb_use_cluster_config_for_geolocation_costing", "off",
 						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 	}
 }

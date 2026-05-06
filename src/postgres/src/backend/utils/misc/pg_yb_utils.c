@@ -545,7 +545,7 @@ GetTablePrimaryKeyBms(Relation rel,
 												   &column_info),
 								ybc_tabledesc);
 
-		if (column_info.is_hash || column_info.is_primary)
+		if (column_info.is_hash || column_info.is_key)
 		{
 			pkey = bms_add_member(pkey, attnum - minattr);
 		}
@@ -646,6 +646,25 @@ YBRelHasSecondaryIndices(Relation relation)
 	list_free(indexlist);
 
 	return has_indices;
+}
+
+bool
+YBIsUpsertUnsafeOnRel(Relation relation)
+{
+	/*
+	 * Check if upsert (blind write) is unsafe on the given relation.
+	 * Blind writes skip reading the old row, which means secondary index
+	 * entries are updated incorrectly, triggers fire incorrectly, and
+	 * foreign key cascades are skipped.
+	 *
+	 * Upsert mode only applies to YB relations (DocDB-backed tables). For
+	 * non-YB relations it is a no-op, so treat them as trivially safe.
+	 */
+	if (!IsYBRelation(relation))
+		return false;
+	return YBRelHasSecondaryIndices(relation) ||
+		   relation->rd_rel->relhastriggers ||
+		   relation->rd_rel->relhasrules;
 }
 
 bool
@@ -1215,6 +1234,7 @@ YBInitPostgresBackend(const char *program_name, const YbcPgInitPostgresInfo *ini
 			.GetCatalogSnapshotReadPoint = &YbGetCatalogSnapshotReadPoint,
 			.GetSessionReplicationOriginId = &YbGetSessionReplicationOriginId,
 			.CheckForInterrupts = &YBCheckForInterrupts,
+			.IsInParallelMode = &IsInParallelMode,
 		};
 
 		ash_config.metadata = &MyProc->yb_ash_metadata;
@@ -2271,6 +2291,7 @@ bool		yb_prefer_bnl = false;
 bool		yb_explain_hide_non_deterministic_fields = false;
 bool		yb_enable_saop_pushdown = true;
 int			yb_toast_catcache_threshold = 2048; /* 2 KB */
+int			yb_catcache_list_from_preloaded_limit = 100000;
 int			yb_parallel_range_size = 1024 * 1024;
 int			yb_insert_on_conflict_read_batch_size = 1024;
 bool		yb_enable_fkey_catcache = true;
@@ -2281,7 +2302,7 @@ bool		yb_enable_docdb_vector_type = false;
 bool		yb_enable_invalidation_messages = true;
 bool		yb_enable_invalidate_table_cache_entry = true;
 int			yb_invalidation_message_expiration_secs = 10;
-int			yb_max_num_invalidation_messages = 4096;
+int			yb_max_num_invalidation_messages = 8192;
 bool		yb_enable_parallel_scan_colocated = true;
 bool		yb_enable_parallel_scan_hash_sharded = false;
 bool		yb_enable_parallel_scan_range_sharded = false;
@@ -5924,7 +5945,7 @@ yb_is_local_table(PG_FUNCTION_ARGS)
 	{
 		PG_RETURN_BOOL(true);
 	}
-	YbGeolocationDistance distance = get_tablespace_distance(tablespaceId);
+	YbGeolocationDistance distance = get_geolocation_distance(tablespaceId);
 
 	PG_RETURN_BOOL(distance == REGION_LOCAL || distance == ZONE_LOCAL);
 }
@@ -6490,7 +6511,7 @@ static bool
 YBNeedCollationEncoding(const YbcPgColumnInfo *column_info)
 {
 	/* We only need collation encoding for range keys. */
-	return (column_info->is_primary && !column_info->is_hash);
+	return (column_info->is_key && !column_info->is_hash);
 }
 
 void
@@ -7506,6 +7527,16 @@ bool		yb_ysql_conn_mgr_superuser_existed = false;
  * are/were held by the current session.
  */
 bool		yb_ysql_conn_mgr_sticky_locks = false;
+
+/*
+ * When enabled, DEALLOCATE commands sent via YSQL Connection Manager selectively
+ * deallocates prepared statements (cached plans are invalid or if connection is sticky).
+ * Valid plans are retained so they can be reused across logical connections
+ * sharing the same backend. Updated at runtime via GUC (PGC_SIGHUP).
+ */
+bool		yb_conn_mgr_selective_deallocate = true;
+
+bool		yb_enable_mage = false;
 
 bool
 YbIsSuperuserConnSticky()

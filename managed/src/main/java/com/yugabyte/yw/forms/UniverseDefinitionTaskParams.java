@@ -483,8 +483,17 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     @Getter
     @Setter
     @ApiModelProperty(
-        value = "WARNING: This is a preview API that could change. Geo partitions for cluster")
+        value = "List of current partitions. " + "WARNING: This is a preview API that could change")
     private List<PartitionInfo> partitions;
+
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2.27.0.0")
+    @Getter
+    @Setter
+    @ApiModelProperty(
+        value =
+            "Property indicating that tablespaces are created for partitions."
+                + "WARNING: This is a preview API that could change")
+    private boolean geoPartitioned;
 
     /** Default to PRIMARY. */
     private Cluster() {
@@ -685,15 +694,35 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     }
 
     @JsonIgnore
-    public boolean isGeoPartitioned() {
-      return partitions != null && partitions.size() > 1;
-    }
-
-    @JsonIgnore
     public PartitionInfo getDefaultPartition() {
       return partitions == null
           ? null
           : partitions.stream().filter(g -> g.defaultPartition).findFirst().get();
+    }
+
+    public Optional<UUID> searchProviderUUIDByAz(UUID azUUID) {
+      if (!CollectionUtils.isEmpty(partitions)) {
+        for (PartitionInfo partition : partitions) {
+          Optional<UUID> ret = searchProviderUUIDByAz(azUUID, partition.getPlacement());
+          if (ret.isPresent()) {
+            return ret;
+          }
+        }
+        return Optional.empty();
+      }
+      return searchProviderUUIDByAz(azUUID, getOverallPlacement());
+    }
+
+    public static Optional<UUID> searchProviderUUIDByAz(UUID azUUID, PlacementInfo placementInfo) {
+      return placementInfo
+          .azInfoStream()
+          .filter(az -> az.placementAZ.uuid.equals(azUUID))
+          .findFirst()
+          .map(az -> az.cloud.uuid);
+    }
+
+    public CloudType getProviderCloudType(NodeDetails nodeDetails) {
+      return userIntent.providerType;
     }
 
     @JsonIgnore
@@ -781,7 +810,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       if (other == null) {
         return;
       }
-      if (other.getDeviceInfo() != null) {
+      if (other.getDeviceInfo() != null && !other.getDeviceInfo().allNull()) {
         this.setDeviceInfo(other.getDeviceInfo());
       }
       if (other.getInstanceType() != null) {
@@ -944,6 +973,14 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
       if (MapUtils.isEmpty(azOverrides)) {
         azOverrides = null;
       }
+    }
+
+    @JsonIgnore
+    public void removeNonRequiredAZs(Set<UUID> usedAZs) {
+      if (MapUtils.isEmpty(azOverrides)) {
+        return;
+      }
+      azOverrides.keySet().retainAll(usedAZs);
     }
 
     @JsonIgnore
@@ -1228,6 +1265,59 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     @ApiModelProperty(value = "YbaApi Internal. Use clockbound as time source")
     private boolean useClockbound = false;
 
+    @Data
+    @ApiModel(description = "Multi-tenancy configuration for QoS")
+    public static class MultiTenancyConfig {
+      @ApiModelProperty(value = "Enable QoS-based multi-tenancy (sets enable_qos gflag)")
+      private boolean enableQos = false;
+
+      @ApiModelProperty(value = "Maximum per-database CPU percentage")
+      @Nullable
+      private Double qosMaxDbCpuPercent;
+
+      @ApiModelProperty(value = "Maximum number of databases allowed")
+      @Nullable
+      private Integer qosMaxDbCount;
+
+      @Override
+      public MultiTenancyConfig clone() {
+        MultiTenancyConfig newConfig = new MultiTenancyConfig();
+        newConfig.enableQos = enableQos;
+        newConfig.qosMaxDbCount = qosMaxDbCount;
+        newConfig.qosMaxDbCpuPercent = qosMaxDbCpuPercent;
+        return newConfig;
+      }
+
+      @Override
+      public boolean equals(Object other) {
+        if (other == null) {
+          return false;
+        }
+        if (other.getClass() != this.getClass()) {
+          return false;
+        }
+        MultiTenancyConfig otherMt = (MultiTenancyConfig) other;
+        return enableQos == otherMt.enableQos
+            && Objects.equals(qosMaxDbCount, otherMt.getQosMaxDbCount())
+            && Objects.equals(qosMaxDbCpuPercent, otherMt.getQosMaxDbCpuPercent());
+      }
+    }
+
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1.0.0")
+    @Getter
+    @Setter
+    @Nullable
+    @ApiModelProperty(
+        value = "WARNING: This is a preview API that could change. Multi-tenancy configuration")
+    private MultiTenancyConfig multiTenancy;
+
+    @ApiModelProperty(
+        hidden = true,
+        value = "YbaApi Internal. Universe provisioned with cpu cgroup")
+    @Getter
+    @Setter
+    private boolean cpuCgroupConfigured;
+
     @Getter
     @Setter
     @Nullable
@@ -1242,6 +1332,11 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
             "WARNING: This is a preview API that could change. Use YBDB inbuilt YBC for K8s"
                 + " universe")
     private boolean useYbdbInbuiltYbc = false;
+
+    @JsonIgnore
+    public boolean isQosEnabled() {
+      return multiTenancy != null && multiTenancy.isEnableQos();
+    }
 
     @Override
     public String toString() {
@@ -1329,6 +1424,9 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
         newUserIntent.tserverK8SNodeResourceSpec = tserverK8SNodeResourceSpec.clone();
       }
       newUserIntent.useClockbound = useClockbound;
+      if (multiTenancy != null) {
+        newUserIntent.multiTenancy = multiTenancy.clone();
+      }
       newUserIntent.useYbdbInbuiltYbc = useYbdbInbuiltYbc;
       return newUserIntent;
     }
@@ -1365,6 +1463,20 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
         return overridenDetails.getCgroupSize();
       }
       return cgroupSize;
+    }
+
+    @JsonIgnore
+    public Set<UUID> getAllProviderUUIDs() {
+      // For tests to work.
+      if (provider == null) {
+        return Collections.emptySet();
+      }
+      return Collections.singleton(UUID.fromString(provider));
+    }
+
+    @JsonIgnore
+    public Set<CloudType> getAllCloudTypes() {
+      return Collections.singleton(providerType);
     }
 
     @JsonIgnore
@@ -1817,6 +1929,15 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
     return Iterables.getOnlyElement(foundClusters, null);
   }
 
+  public UUID searchProviderUUIDByAz(UUID azUUID) {
+    return clusters.stream()
+        .map(c -> c.searchProviderUUIDByAz(azUUID))
+        .filter(p -> p.isPresent())
+        .findFirst()
+        .map(o -> o.get())
+        .orElseGet(() -> AvailabilityZone.getOrBadRequest(azUUID).getProvider().getUuid());
+  }
+
   // the getter has some logic built around, as there are no other layer to
   // have such logic at a common place
   public UUID getClientRootCA() {
@@ -1914,6 +2035,7 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
   public PrevYBSoftwareConfig prevYBSoftwareConfig;
 
   @Data
+  @JsonIgnoreProperties(ignoreUnknown = true)
   public static class PrevYBSoftwareConfig {
 
     @ApiModelProperty private String softwareVersion;
@@ -1927,12 +2049,54 @@ public class UniverseDefinitionTaskParams extends UniverseTaskParams {
 
     @ApiModelProperty private boolean canRollbackCatalogUpgrade;
 
-    // Canary upgrade progress: set when upgrade is paused for canary
-    @ApiModelProperty private boolean mastersUpgradeCompleted;
+    @ApiModelProperty(
+        value =
+            "WARNING: This is a preview API that could change. True when canary upgrade is enabled"
+                + " for this upgrade (task progress API)")
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1.0.0-b0")
+    private boolean isCanaryUpgrade;
 
-    @ApiModelProperty private List<UUID> primaryClusterAZsCompleted;
+    @ApiModelProperty(
+        value =
+            "WARNING: This is a preview API that could change. Canary pause state when upgrade is"
+                + " paused at a canary point")
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1.0.0-b0")
+    private CanaryPauseState canaryPauseState = null;
 
-    @ApiModelProperty private Map<UUID, List<UUID>> readReplicaClusterAZsCompleted;
+    @ApiModelProperty(
+        value =
+            "WARNING: This is a preview API that could change. Per-AZ master upgrade progress"
+                + " (standard and canary)")
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1.0.0-b0")
+    private List<AZUpgradeState> masterAZUpgradeStatesList = new ArrayList<>();
+
+    @ApiModelProperty(
+        value =
+            "WARNING: This is a preview API that could change. Per-AZ tserver upgrade progress"
+                + " (standard and canary)")
+    @YbaApi(visibility = YbaApiVisibility.PREVIEW, sinceYBAVersion = "2026.1.0.0-b0")
+    private List<AZUpgradeState> tserverAZUpgradeStatesList = new ArrayList<>();
+
+    /**
+     * After YBA restart or task failure, any AZ left {@link AZUpgradeStatus#IN_PROGRESS} should be
+     * marked {@link AZUpgradeStatus#FAILED} so progress is not stuck mid-AZ.
+     */
+    public void markInProgressAzUpgradeStatusesAsFailed() {
+      if (masterAZUpgradeStatesList != null) {
+        for (AZUpgradeState s : masterAZUpgradeStatesList) {
+          if (s.getStatus() == AZUpgradeStatus.IN_PROGRESS) {
+            s.setStatus(AZUpgradeStatus.FAILED);
+          }
+        }
+      }
+      if (tserverAZUpgradeStatesList != null) {
+        for (AZUpgradeState s : tserverAZUpgradeStatesList) {
+          if (s.getStatus() == AZUpgradeStatus.IN_PROGRESS) {
+            s.setStatus(AZUpgradeStatus.FAILED);
+          }
+        }
+      }
+    }
   }
 
   // XCluster: All the xCluster related code resides in this section.

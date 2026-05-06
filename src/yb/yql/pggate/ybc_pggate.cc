@@ -519,6 +519,7 @@ void YBCDestroyPgGate() {
   LOG_IF(FATAL, !is_main_thread())
       << __PRETTY_FUNCTION__ << " should only be invoked from the main thread";
 
+  pgapi->Shutdown();
   if (pgapi_shutdown_done.exchange(true)) {
     LOG(DFATAL) << __PRETTY_FUNCTION__ << " should only be called once";
     return;
@@ -2064,7 +2065,7 @@ bool YBCIsLegacyModeForCatalogOps() {
   //     the TransactionSnapshot's read time serial number.
   //
   return !YBCIsObjectLockingEnabled() || !yb_enable_concurrent_ddl || YBCIsInitDbModeEnvVarSet()
-    || YBCIsSysTablePrefetchingStarted();
+      || YBCIsSysTablePrefetchingStarted() || pgapi->IsParallelWorker();
 }
 
 //------------------------------------------------------------------------------------------------
@@ -2203,6 +2204,14 @@ YbcStatus YBCPgIsInitDbDone(bool* initdb_done) {
 
 bool YBCGetDisableTransparentCacheRefreshRetry() {
   return pgapi->GetDisableTransparentCacheRefreshRetry();
+}
+
+const YbcReplicationInfo *YBCGetClusterReplicationInfo() {
+  return &pgapi->replication_info_snapshot().Value();
+}
+
+void YBCRefreshClusterReplicationInfo() {
+  pgapi->replication_info_snapshot().Refresh();
 }
 
 YbcStatus YBCGetSharedCatalogVersion(uint64_t* catalog_version) {
@@ -3386,8 +3395,8 @@ YbcFlushDebugContext YBCMakeFlushDebugContextEndOfTopLevelStmt() {
 // PgGlobalViewRead C API wrappers
 // ---------------------------------------------------------------------------
 
-YbcStatus YBCPgNewGlobalViewRead(YbcPgGlobalViewRead* handle) {
-  return ToYBCStatus(pgapi->NewGlobalViewRead(handle));
+YbcStatus YBCPgNewGlobalViewRead(const char* database_name, YbcPgGlobalViewRead* handle) {
+  return ToYBCStatus(pgapi->NewGlobalViewRead(database_name, handle));
 }
 
 void YBCPgGlobalViewReadResetScan(YbcPgGlobalViewRead handle) {

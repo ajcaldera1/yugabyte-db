@@ -28,6 +28,7 @@ import api.v2.models.UniverseEditKubernetesOverrides;
 import api.v2.models.UniverseQueryLogsExport;
 import api.v2.models.UniverseResizeNodes;
 import api.v2.models.UniverseRestart;
+import api.v2.models.UniverseResumeCanaryUpgrade;
 import api.v2.models.UniverseRollbackUpgradeReq;
 import api.v2.models.UniverseSoftwareUpgradeFinalize;
 import api.v2.models.UniverseSoftwareUpgradeFinalizeInfo;
@@ -42,8 +43,6 @@ import com.fasterxml.jackson.core.JsonProcessingException;
 import com.google.inject.Inject;
 import com.google.inject.Singleton;
 import com.yugabyte.yw.commissioner.Commissioner;
-import com.yugabyte.yw.commissioner.Common;
-import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.SoftwareUpgradeHelper;
 import com.yugabyte.yw.common.Util;
@@ -225,6 +224,15 @@ public class UniverseUpgradesManagementHandler extends ApiControllerUtils {
     return ybaTask;
   }
 
+  public YBATask resumeCanarySoftwareUpgrade(
+      UUID cUUID, UUID uniUUID, UniverseResumeCanaryUpgrade req) {
+    Customer customer = Customer.getOrBadRequest(cUUID);
+    Universe universe = Universe.getOrBadRequest(uniUUID, customer);
+    UUID taskUuid = v1Handler.resumeCanarySoftwareUpgrade(cUUID, uniUUID, req.getTaskUuid());
+    YBATask ybaTask = new YBATask().taskUuid(taskUuid).resourceUuid(universe.getUniverseUUID());
+    return ybaTask;
+  }
+
   public UniverseSoftwareUpgradePrecheckResp precheckSoftwareUpgrade(
       UUID cUUID, UUID uniUUID, UniverseSoftwareUpgradePrecheckReq precheckReq) throws Exception {
     if (confGetter.getGlobalConf(GlobalConfKeys.enableReleasesRedesign)) {
@@ -247,12 +255,7 @@ public class UniverseUpgradesManagementHandler extends ApiControllerUtils {
       uniRestart = new UniverseRestart();
     }
     // Kubernetes services only can do a service level restart.
-    if (universe
-            .getUniverseDetails()
-            .getPrimaryCluster()
-            .userIntent
-            .providerType
-            .equals(Common.CloudType.kubernetes)
+    if (Util.isKubernetesBasedUniverse(universe)
         || uniRestart.getRestartType().equals(UniverseRestart.RestartTypeEnum.SERVICE)) {
       log.debug("performing universe restart (service only)");
       RestartTaskParams v1Params =
@@ -398,7 +401,7 @@ public class UniverseUpgradesManagementHandler extends ApiControllerUtils {
     }
 
     // Block k8s universes from configuring metrics export for now.
-    if (userIntent.providerType.equals(CloudType.kubernetes)) {
+    if (Util.isKubernetesBasedUniverse(universe)) {
       String errorMessage = "Metrics export is not supported for kubernetes based universes.";
       log.error(errorMessage);
       throw new PlatformServiceException(BAD_REQUEST, errorMessage);

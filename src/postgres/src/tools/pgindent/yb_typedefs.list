@@ -61,6 +61,8 @@ YbCatalogModificationAspects
 YbCatalogVersionType
 YbChildScan
 YbChildScanData
+YbColFoldState
+YbColFoldType
 YbCommandInfo
 YbConcurrencyContext
 YbCostModel
@@ -116,10 +118,13 @@ YbIntCounters
 YbIssueDetectionCheck
 YbIssueDetectionPlan
 YbJumbleState
+YbListenerQueueScanCurrentXactState
 YbLocationLen
 YbLockMechanism
 YbLogicalClientVersionType
 YbLsmBuildState
+YbMergeScanInfo
+YbMergeScanSaopColInfo
 YbNLBatchStatus
 YbNLBucketInfo
 YbNameToOidMapEntry
@@ -150,6 +155,7 @@ YbPgMemTracker
 YbPgRpcStats
 YbPgssCounters
 YbPgssFillInConstantLengths
+YbPgssQueryNeedingNormalization
 YbPlanInfo
 YbPlanStatePtr
 YbPrefetcherStarterFunctor
@@ -181,8 +187,6 @@ YbRowBounds
 YbRunWithPrefetcherContext
 YbSample
 YbSampleData
-YbSaopMergeInfo
-YbSaopMergeSaopColInfo
 YbScanDesc
 YbScanDescData
 YbScanPlan
@@ -240,6 +244,7 @@ YbcBindColumn
 YbcCatalogMessageList
 YbcCatalogMessageLists
 YbcCloneInfo
+YbcCloudInfo
 YbcConnectionMetrics
 YbcConstSliceSet
 YbcConstSliceVector
@@ -254,7 +259,6 @@ YbcMetricsInfo
 YbcObjectLockId
 YbcObjectLockMode
 YbcOrderingMode
-YbcOtelScope
 YbcOtelSpanContext
 YbcPallocFn
 YbcPgAshConfig
@@ -335,6 +339,7 @@ YbcReadHybridTime
 YbcReadPointHandle
 YbcRecordTempRelationDDL_hook_type
 YbcRemotePgExecResult
+YbcReplicationInfo
 YbcReplicationSlotDescriptor
 YbcReplicationSlotHashRange
 YbcRpczEntry

@@ -575,15 +575,15 @@ public class GCPUtil implements CloudUtil {
         HttpURLConnection con = (HttpURLConnection) url.openConnection();
         con.setRequestMethod("GET");
         con.connect();
-        BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()));
-        String inputLine;
-        StringBuffer content = new StringBuffer();
-        while ((inputLine = in.readLine()) != null) {
-          content.append(inputLine);
+        try (BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()))) {
+          String inputLine;
+          StringBuffer content = new StringBuffer();
+          while ((inputLine = in.readLine()) != null) {
+            content.append(inputLine);
+          }
+          JsonNode response = Json.mapper().readTree(content.toString());
+          PRICE_JSON = response.get("gcp_price_list");
         }
-        in.close();
-        JsonNode response = Json.mapper().readTree(content.toString());
-        PRICE_JSON = response.get("gcp_price_list");
       }
       JsonNode prices = PRICE_JSON.findValue(instanceType);
       Double spotPrice = prices.findValue(region).asDouble();
@@ -613,7 +613,12 @@ public class GCPUtil implements CloudUtil {
             EXPECTATION_FAILED, "Error while creating Storage service from GCS Data!");
       }
 
-      validateOnLocation(storage, YbcBackupUtil.DEFAULT_REGION_STRING, configData, permissions);
+      validateOnLocation(
+          storage,
+          YbcBackupUtil.DEFAULT_REGION_STRING,
+          configData,
+          permissions,
+          gcsData.immutableStorage);
 
       if (CollectionUtils.isNotEmpty(gcsData.regionLocations)) {
         for (RegionLocations location : gcsData.regionLocations) {
@@ -622,7 +627,8 @@ public class GCPUtil implements CloudUtil {
                 EXPECTATION_FAILED, "Region of a location cannot be empty.");
           }
 
-          validateOnLocation(storage, location.region, configData, permissions);
+          validateOnLocation(
+              storage, location.region, configData, permissions, gcsData.immutableStorage);
         }
       }
     } else {
@@ -638,7 +644,8 @@ public class GCPUtil implements CloudUtil {
       Storage storage,
       String bucketName,
       String prefix,
-      List<ExtraPermissionToValidate> permissions) {
+      List<ExtraPermissionToValidate> permissions,
+      boolean skipDelete) {
     Optional<ExtraPermissionToValidate> unsupportedPermission =
         permissions.stream()
             .filter(
@@ -668,7 +675,9 @@ public class GCPUtil implements CloudUtil {
       validateListBlobs(storage, bucketName, completeFileName);
     }
 
-    validateDelete(storage, bucketName, completeFileName);
+    if (!skipDelete) {
+      validateDelete(storage, bucketName, completeFileName);
+    }
   }
 
   /**
@@ -679,9 +688,10 @@ public class GCPUtil implements CloudUtil {
       Storage storage,
       String region,
       CustomerConfigData configData,
-      List<ExtraPermissionToValidate> permissions) {
+      List<ExtraPermissionToValidate> permissions,
+      boolean skipDelete) {
     CloudLocationInfo cLInfo = getCloudLocationInfo(region, configData, null);
-    validateOnBucket(storage, cLInfo.bucket, cLInfo.cloudPath, permissions);
+    validateOnBucket(storage, cLInfo.bucket, cLInfo.cloudPath, permissions, skipDelete);
   }
 
   /**

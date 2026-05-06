@@ -3,6 +3,8 @@
 package com.yugabyte.yw.commissioner.tasks.upgrade;
 
 import static com.yugabyte.yw.models.TaskInfo.State.Success;
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.hamcrest.MatcherAssert.assertThat;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
@@ -16,15 +18,21 @@ import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
-import static org.mockito.Mockito.*;
+import static org.mockito.Mockito.lenient;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.when;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.ImmutableMap;
 import com.google.common.net.HostAndPort;
+import com.yugabyte.yw.commissioner.Common.CloudType;
 import com.yugabyte.yw.commissioner.MockUpgrade;
 import com.yugabyte.yw.commissioner.UpgradeTaskBase;
 import com.yugabyte.yw.commissioner.tasks.params.NodeTaskParams;
 import com.yugabyte.yw.common.ApiUtils;
 import com.yugabyte.yw.common.PlacementInfoUtil;
+import com.yugabyte.yw.common.PlatformServiceException;
 import com.yugabyte.yw.common.ReleaseContainer;
 import com.yugabyte.yw.common.ReleaseManager;
 import com.yugabyte.yw.common.ShellResponse;
@@ -32,8 +40,12 @@ import com.yugabyte.yw.common.TestHelper;
 import com.yugabyte.yw.common.TestUtils;
 import com.yugabyte.yw.common.Util;
 import com.yugabyte.yw.common.config.UniverseConfKeys;
+import com.yugabyte.yw.forms.AZUpgradeState;
+import com.yugabyte.yw.forms.AZUpgradeStatus;
 import com.yugabyte.yw.forms.AZUpgradeStep;
 import com.yugabyte.yw.forms.CanaryUpgradeConfig;
+import com.yugabyte.yw.forms.GFlagsUpgradeParams;
+import com.yugabyte.yw.forms.RollbackUpgradeParams;
 import com.yugabyte.yw.forms.SoftwareUpgradeParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams;
 import com.yugabyte.yw.forms.UniverseDefinitionTaskParams.PrevYBSoftwareConfig;
@@ -42,7 +54,6 @@ import com.yugabyte.yw.forms.UpgradeTaskParams;
 import com.yugabyte.yw.forms.UpgradeTaskParams.UpgradeOption;
 import com.yugabyte.yw.models.AvailabilityZone;
 import com.yugabyte.yw.models.CustomerTask;
-import com.yugabyte.yw.models.RuntimeConfigEntry;
 import com.yugabyte.yw.models.TaskInfo;
 import com.yugabyte.yw.models.Universe;
 import com.yugabyte.yw.models.helpers.NodeDetails;
@@ -165,7 +176,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         taskParams.ybSoftwareVersion,
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
     TaskInfo taskInfo = submitTask(taskParams, defaultUniverse.getVersion());
-    verify(mockNodeManager, times(75)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(45)).nodeCommand(any(), any());
     verify(mockNodeUniverseManager, times(15)).runCommand(any(), any(), anyList(), any());
 
     MockUpgrade mockUpgrade = initMockUpgrade();
@@ -178,20 +189,22 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
-        .upgradeRound(UpgradeOption.ROLLING_UPGRADE)
-        .withContext(
+        .rollingSoftwareUpgradeWithProgressSaves(
+            UpgradeOption.ROLLING_UPGRADE,
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyRound()
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -233,7 +246,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         taskParams.ybSoftwareVersion,
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
     TaskInfo taskInfo = submitTask(taskParams, defaultUniverse.getVersion());
-    verify(mockNodeManager, times(75)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(45)).nodeCommand(any(), any());
     verify(mockNodeUniverseManager, times(15)).runCommand(any(), any(), anyList(), any());
 
     MockUpgrade mockUpgrade = initMockUpgrade();
@@ -245,20 +258,22 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
-        .upgradeRound(UpgradeOption.ROLLING_UPGRADE)
-        .withContext(
+        .rollingSoftwareUpgradeWithProgressSaves(
+            UpgradeOption.ROLLING_UPGRADE,
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyRound()
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .addTasks(TaskType.PromoteAutoFlags)
@@ -292,7 +307,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         taskParams.ybSoftwareVersion,
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
     TaskInfo taskInfo = submitTask(taskParams, defaultUniverse.getVersion());
-    verify(mockNodeManager, times(75)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(45)).nodeCommand(any(), any());
     verify(mockNodeUniverseManager, times(15)).runCommand(any(), any(), anyList(), any());
 
     MockUpgrade mockUpgrade = initMockUpgrade();
@@ -304,20 +319,22 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
-        .upgradeRound(UpgradeOption.ROLLING_UPGRADE)
-        .withContext(
+        .rollingSoftwareUpgradeWithProgressSaves(
+            UpgradeOption.ROLLING_UPGRADE,
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyRound()
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -345,6 +362,8 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
     userIntent.regionList = ImmutableList.of(region.getUuid());
     userIntent.enableYSQL = enableYSQL;
     userIntent.provider = defaultProvider.getUuid().toString();
+    userIntent.deviceInfo = ApiUtils.getDummyDeviceInfo(1, 100);
+    userIntent.providerType = CloudType.valueOf(defaultProvider.getCode());
 
     PlacementInfo pi = new PlacementInfo();
     AvailabilityZone az4 = AvailabilityZone.createOrThrow(region, "az-4", "AZ 4", "subnet-1");
@@ -369,7 +388,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         taskParams.ybSoftwareVersion,
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
     TaskInfo taskInfo = submitTask(taskParams, defaultUniverse.getVersion());
-    verify(mockNodeManager, times(102)).nodeCommand(any(), any());
+    verify(mockNodeManager, times(63)).nodeCommand(any(), any());
     verify(mockNodeUniverseManager, times(24)).runCommand(any(), any(), anyList(), any());
 
     MockUpgrade mockUpgrade = initMockUpgrade();
@@ -381,20 +400,22 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServersInPrimaryCluster().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
-        .upgradeRound(UpgradeOption.ROLLING_UPGRADE)
-        .withContext(
+        .rollingSoftwareUpgradeWithProgressSaves(
+            UpgradeOption.ROLLING_UPGRADE,
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyRound()
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -424,7 +445,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
     TaskInfo taskInfo = submitTask(taskParams, defaultUniverse.getVersion());
     ArgumentCaptor<NodeTaskParams> commandParams = ArgumentCaptor.forClass(NodeTaskParams.class);
-    verify(mockNodeManager, times(51)).nodeCommand(any(), commandParams.capture());
+    verify(mockNodeManager, times(25)).nodeCommand(any(), commandParams.capture());
     verify(mockNodeUniverseManager, times(10)).runCommand(any(), any(), anyList(), any());
 
     MockUpgrade mockUpgrade = initMockUpgrade();
@@ -436,20 +457,21 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
-        .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
-        .withContext(
+        .nonRollingSoftwareUpgradeWithProgressSaves(
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyRound()
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -514,6 +536,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getMasters().size())
@@ -521,6 +544,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         .addSimultaneousTasks(TaskType.AnsibleConfigureServers, defaultUniverse.getMasters().size())
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -531,8 +555,10 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToMasters()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addTasks(TaskType.RunYsqlMajorVersionCatalogUpgrade)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -543,6 +569,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToTservers()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getMasters().size())
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getTServers().size())
@@ -551,6 +578,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -624,6 +652,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getMasters().size())
@@ -632,6 +661,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.ManageCatalogUpgradeSuperUser)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -642,9 +672,11 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToMasters()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addTasks(TaskType.RunYsqlMajorVersionCatalogUpgrade)
         .addTasks(TaskType.ManageCatalogUpgradeSuperUser)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -655,6 +687,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToTservers()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getMasters().size())
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getTServers().size())
@@ -663,6 +696,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -749,6 +783,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.RollbackYsqlMajorVersionCatalogUpgrade)
         .addSimultaneousTasks(TaskType.AnsibleConfigureServers, defaultUniverse.getMasters().size())
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
@@ -769,6 +804,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         .addSimultaneousTasks(
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.ManageCatalogUpgradeSuperUser)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -779,9 +815,11 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToMasters()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addTasks(TaskType.RunYsqlMajorVersionCatalogUpgrade)
         .addTasks(TaskType.ManageCatalogUpgradeSuperUser)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .upgradeRound(UpgradeOption.NON_ROLLING_UPGRADE)
         .withContext(
             UpgradeTaskBase.UpgradeContext.builder()
@@ -792,6 +830,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
                 .build())
         .task(TaskType.AnsibleConfigureServers)
         .applyToTservers()
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareUpdatePrevConfig)
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getMasters().size())
         .addSimultaneousTasks(TaskType.SetFlagInMemory, defaultUniverse.getTServers().size())
@@ -800,6 +839,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -815,7 +855,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
   @Test
   public void testSoftwareUpgradeRetries() {
-    RuntimeConfigEntry.upsertGlobal("yb.checks.leaderless_tablets.enabled", "false");
+    factory.globalRuntimeConf().setValue("yb.checks.leaderless_tablets.enabled", "false");
     SoftwareUpgradeParams taskParams = new SoftwareUpgradeParams();
     taskParams.ybSoftwareVersion = "2.21.0.0-b2";
     taskParams.expectedUniverseVersion = -1;
@@ -978,19 +1018,23 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
             TaskType.AnsibleConfigureServers, defaultUniverse.getTServers().size())
         .addTasks(TaskType.XClusterInfoPersist)
         .addTasks(TaskType.StoreAutoFlagConfigVersion)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addSimultaneousTasks(TaskType.AnsibleConfigureServers, tserverNames.size())
-        .upgradeRound(UpgradeTaskParams.UpgradeOption.ROLLING_UPGRADE)
-        .withContext(
+        .rollingSoftwareUpgradeWithProgressSaves(
+            UpgradeTaskParams.UpgradeOption.ROLLING_UPGRADE,
             UpgradeTaskBase.UpgradeContext.builder()
                 .reconfigureMaster(false)
                 .runBeforeStopping(false)
                 .processInactiveMaster(true)
                 .targetSoftwareVersion("2.21.0.0-b2")
-                .build())
-        .task(TaskType.AnsibleConfigureServers)
-        .applyToNodes(masterNames, tserverNames)
+                .build(),
+            TaskType.AnsibleConfigureServers,
+            false,
+            masterNames,
+            tserverNames)
         .addSimultaneousTasks(TaskType.CheckSoftwareVersion, defaultUniverse.getTServers().size())
         .addTasks(TaskType.PromoteAutoFlags)
+        .addTasks(TaskType.SaveSoftwareUpgradeProgress)
         .addTasks(TaskType.UpdateSoftwareVersion)
         .addTasks(TaskType.UpdateUniverseState)
         .verifyTasks(taskInfo.getSubTasks());
@@ -1044,6 +1088,86 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
   }
 
   @Test
+  public void testCanaryUpgradeRejectedWhenStagePauseDurationNonZero() throws InterruptedException {
+    updateDefaultUniverseTo5Nodes(true);
+    when(mockSoftwareUpgradeHelper.checkUpgradeRequireFinalize(anyString(), anyString()))
+        .thenReturn(true);
+
+    List<AZUpgradeStep> steps = new ArrayList<>();
+    for (UUID azUUID : Arrays.asList(az1.getUuid(), az2.getUuid(), az3.getUuid())) {
+      AZUpgradeStep step = new AZUpgradeStep();
+      step.azUUID = azUUID;
+      step.pauseAfterTserverUpgrade = false;
+      steps.add(step);
+    }
+
+    SoftwareUpgradeParams taskParams = new SoftwareUpgradeParams();
+    taskParams.ybSoftwareVersion = "2.21.0.0-b2";
+    taskParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    taskParams.sleepAfterMasterRestartMillis = 5;
+    taskParams.sleepAfterTServerRestartMillis = 5;
+    taskParams.creatingUser = defaultUser;
+    taskParams.clusters.add(defaultUniverse.getUniverseDetails().getPrimaryCluster());
+    taskParams.canaryUpgradeConfig = new CanaryUpgradeConfig();
+    taskParams.canaryUpgradeConfig.pauseAfterMasters = false;
+    taskParams.canaryUpgradeConfig.primaryClusterAZSteps = steps;
+
+    defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+    try {
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeMasterStagePauseDurationMs.getKey(), "5000");
+      defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+      taskParams.expectedUniverseVersion = defaultUniverse.getVersion();
+
+      PlatformServiceException ex =
+          assertThrows(
+              PlatformServiceException.class,
+              () -> commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams));
+      assertThat(ex.getMessage(), containsString("per-AZ stage pause durations are non-zero"));
+
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeMasterStagePauseDurationMs.getKey(), "0");
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeTServerStagePauseDurationMs.getKey(), "5000");
+      defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+      taskParams.expectedUniverseVersion = defaultUniverse.getVersion();
+
+      ex =
+          assertThrows(
+              PlatformServiceException.class,
+              () -> commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams));
+      assertThat(ex.getMessage(), containsString("per-AZ stage pause durations are non-zero"));
+
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeTServerStagePauseDurationMs.getKey(), "0");
+      defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+      taskParams.expectedUniverseVersion = defaultUniverse.getVersion();
+
+      mockDBServerVersion(
+          defaultUniverse.getUniverseDetails().getPrimaryCluster().userIntent.ybSoftwareVersion,
+          taskParams.ybSoftwareVersion,
+          defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
+
+      UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
+      assertNotNull(taskUUID);
+      TaskInfo taskInfo = waitForTask(taskUUID);
+      assertEquals(Success, taskInfo.getTaskState());
+    } finally {
+      defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeMasterStagePauseDurationMs.getKey(), "0");
+      factory
+          .forUniverse(defaultUniverse)
+          .setValue(UniverseConfKeys.upgradeTServerStagePauseDurationMs.getKey(), "0");
+    }
+  }
+
+  @Test
   public void testCanaryResumeAfterMasters() throws InterruptedException {
     updateDefaultUniverseTo5Nodes(true);
     when(mockSoftwareUpgradeHelper.checkUpgradeRequireFinalize(anyString(), anyString()))
@@ -1066,7 +1190,8 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
 
     UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
-    waitForTask(taskUUID, TaskInfo.State.Paused);
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     assertEquals(
@@ -1074,7 +1199,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
     assertEquals(taskUUID, defaultUniverse.getUniverseDetails().updatingTaskUUID);
     PrevYBSoftwareConfig prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue("Masters phase should be completed before pause", prev.isMastersUpgradeCompleted());
+    assertTrue("Masters phase should be completed before pause", allMasterAzsCompleted(prev));
 
     // Re-mock server versions: first run consumed mock responses.
     mockDBServerVersion(
@@ -1083,7 +1208,7 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
 
     UUID resumedUUID = resumeCanaryTask(taskUUID);
-    TaskInfo taskInfo = waitForTask(resumedUUID);
+    taskInfo = waitForTask(resumedUUID);
 
     assertEquals(Success, taskInfo.getTaskState());
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
@@ -1147,17 +1272,18 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
 
     UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
-    waitForTask(taskUUID, TaskInfo.State.Paused);
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     assertEquals(
         SoftwareUpgradeState.Paused, defaultUniverse.getUniverseDetails().softwareUpgradeState);
     PrevYBSoftwareConfig prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue(prev.isMastersUpgradeCompleted());
+    assertTrue(allMasterAzsCompleted(prev));
     assertTrue(
         "az1 should be in completed AZs when sleepTime=0",
-        prev.getPrimaryClusterAZsCompleted().contains(az1.getUuid()));
+        primaryTserverAzCompleted(prev, defaultUniverse, az1.getUuid()));
   }
 
   @Test
@@ -1191,20 +1317,21 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
         defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
 
     UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
-    waitForTask(taskUUID, TaskInfo.State.Paused);
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     assertEquals(
         SoftwareUpgradeState.Paused, defaultUniverse.getUniverseDetails().softwareUpgradeState);
     PrevYBSoftwareConfig prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue(prev.isMastersUpgradeCompleted());
+    assertTrue(allMasterAzsCompleted(prev));
     assertTrue(
         "az1 should be in completed AZs",
-        prev.getPrimaryClusterAZsCompleted().contains(az1.getUuid()));
+        primaryTserverAzCompleted(prev, defaultUniverse, az1.getUuid()));
     assertFalse(
         "az2 should not yet be completed",
-        prev.getPrimaryClusterAZsCompleted().contains(az2.getUuid()));
+        primaryTserverAzCompleted(prev, defaultUniverse, az2.getUuid()));
   }
 
   @Test
@@ -1241,13 +1368,14 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
     // First run: should pause after az1 tservers.
     UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
-    waitForTask(taskUUID, TaskInfo.State.Paused);
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     PrevYBSoftwareConfig prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue(prev.getPrimaryClusterAZsCompleted().contains(az1.getUuid()));
-    assertEquals(1, prev.getPrimaryClusterAZsCompleted().size());
+    assertTrue(primaryTserverAzCompleted(prev, defaultUniverse, az1.getUuid()));
+    assertEquals(1, countPrimaryCompletedTserverAzs(prev, defaultUniverse));
 
     // Re-mock server versions: first run consumed mock responses.
     mockDBServerVersion(
@@ -1257,18 +1385,19 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
     // Resume: should pause after az2 tservers.
     UUID resumedUUID = resumeCanaryTask(taskUUID);
-    waitForTask(resumedUUID, TaskInfo.State.Paused);
+    taskInfo = waitForTask(resumedUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
     assertTrue(
         "az1 should still be completed",
-        prev.getPrimaryClusterAZsCompleted().contains(az1.getUuid()));
+        primaryTserverAzCompleted(prev, defaultUniverse, az1.getUuid()));
     assertTrue(
         "az2 should now be completed",
-        prev.getPrimaryClusterAZsCompleted().contains(az2.getUuid()));
-    assertEquals(2, prev.getPrimaryClusterAZsCompleted().size());
+        primaryTserverAzCompleted(prev, defaultUniverse, az2.getUuid()));
+    assertEquals(2, countPrimaryCompletedTserverAzs(prev, defaultUniverse));
 
     // Re-mock server versions for the second resume.
     mockDBServerVersion(
@@ -1326,13 +1455,16 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
     // First run: should pause after masters.
     UUID taskUUID = commissioner.submit(TaskType.SoftwareUpgradeYB, taskParams);
-    waitForTask(taskUUID, TaskInfo.State.Paused);
+    TaskInfo taskInfo = waitForTask(taskUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     PrevYBSoftwareConfig prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue("Masters should be completed", prev.isMastersUpgradeCompleted());
-    assertTrue("No tserver AZs completed yet", prev.getPrimaryClusterAZsCompleted().isEmpty());
+    assertTrue("Masters should be completed", allMasterAzsCompleted(prev));
+    assertTrue(
+        "No tserver AZs completed yet",
+        countPrimaryCompletedTserverAzs(prev, defaultUniverse) == 0);
 
     // Re-mock server versions: first run consumed mock responses.
     mockDBServerVersion(
@@ -1342,12 +1474,13 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
 
     // Resume after masters: should pause after az1 tservers.
     UUID resumedUUID = resumeCanaryTask(taskUUID);
-    waitForTask(resumedUUID, TaskInfo.State.Paused);
+    taskInfo = waitForTask(resumedUUID);
+    assertEquals(TaskInfo.State.Paused, taskInfo.getTaskState());
 
     defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
     prev = defaultUniverse.getUniverseDetails().prevYBSoftwareConfig;
     assertNotNull(prev);
-    assertTrue(prev.getPrimaryClusterAZsCompleted().contains(az1.getUuid()));
+    assertTrue(primaryTserverAzCompleted(prev, defaultUniverse, az1.getUuid()));
 
     // Re-mock server versions for the final resume.
     mockDBServerVersion(
@@ -1364,6 +1497,99 @@ public class SoftwareUpgradeYBTest extends UpgradeTaskTest {
     assertEquals(
         SoftwareUpgradeState.PreFinalize,
         defaultUniverse.getUniverseDetails().softwareUpgradeState);
+  }
+
+  @Test
+  public void testCanaryPauseBlocksDisallowedTasksAndAllowsRollback() throws InterruptedException {
+    updateDefaultUniverseTo5Nodes(true);
+    PrevYBSoftwareConfig prev = new PrevYBSoftwareConfig();
+    prev.setSoftwareVersion("2.21.0.0-b1");
+    prev.setTargetUpgradeSoftwareVersion("2.21.0.0-b2");
+    prev.setCanRollbackCatalogUpgrade(true);
+    prev.setAllTserversUpgradedToYsqlMajorVersion(true);
+    defaultUniverse =
+        Universe.saveDetails(
+            defaultUniverse.getUniverseUUID(),
+            universe -> {
+              UniverseDefinitionTaskParams d = universe.getUniverseDetails();
+              d.softwareUpgradeState = SoftwareUpgradeState.Paused;
+              d.isSoftwareRollbackAllowed = true;
+              d.prevYBSoftwareConfig = prev;
+              d.updateInProgress = false;
+              universe.setUniverseDetails(d);
+            });
+
+    GFlagsUpgradeParams gflagsParams = new GFlagsUpgradeParams();
+    gflagsParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    gflagsParams.expectedUniverseVersion = defaultUniverse.getVersion();
+    gflagsParams.creatingUser = defaultUser;
+    gflagsParams.masterGFlags = ImmutableMap.of("master-flag", "m1");
+    gflagsParams.tserverGFlags = ImmutableMap.of("tserver-flag", "t1");
+    gflagsParams.upgradeOption = UpgradeOption.ROLLING_UPGRADE;
+
+    PlatformServiceException gflagsEx =
+        assertThrows(
+            PlatformServiceException.class,
+            () -> commissioner.submit(TaskType.GFlagsUpgrade, gflagsParams));
+    assertThat(gflagsEx.getMessage(), containsString("paused canary software upgrade"));
+
+    RollbackUpgradeParams rollbackParams = new RollbackUpgradeParams();
+    rollbackParams.setUniverseUUID(defaultUniverse.getUniverseUUID());
+    rollbackParams.upgradeOption = UpgradeOption.ROLLING_UPGRADE;
+    rollbackParams.creatingUser = defaultUser;
+    rollbackParams.sleepAfterMasterRestartMillis = 5;
+    rollbackParams.sleepAfterTServerRestartMillis = 5;
+
+    mockDBServerVersion(
+        "2.21.0.0-b2",
+        "2.21.0.0-b1",
+        defaultUniverse.getMasters().size() + defaultUniverse.getTServers().size());
+    defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+    TaskInfo rollbackTaskInfo =
+        submitTask(
+            rollbackParams, TaskType.RollbackUpgrade, commissioner, defaultUniverse.getVersion());
+    assertEquals(Success, rollbackTaskInfo.getTaskState());
+    defaultUniverse = Universe.getOrBadRequest(defaultUniverse.getUniverseUUID());
+    assertEquals(
+        SoftwareUpgradeState.Ready, defaultUniverse.getUniverseDetails().softwareUpgradeState);
+  }
+
+  private static boolean allMasterAzsCompleted(PrevYBSoftwareConfig prev) {
+    if (prev.getMasterAZUpgradeStatesList() == null
+        || prev.getMasterAZUpgradeStatesList().isEmpty()) {
+      return false;
+    }
+    return prev.getMasterAZUpgradeStatesList().stream()
+        .allMatch(s -> s.getStatus() == AZUpgradeStatus.COMPLETED);
+  }
+
+  private static boolean primaryTserverAzCompleted(
+      PrevYBSoftwareConfig prev, Universe universe, UUID azUuid) {
+    UUID primaryUuid = universe.getUniverseDetails().getPrimaryCluster().uuid;
+    if (prev.getTserverAZUpgradeStatesList() == null) {
+      return false;
+    }
+    return prev.getTserverAZUpgradeStatesList().stream()
+        .anyMatch(
+            s ->
+                primaryUuid.equals(s.getClusterUUID())
+                    && azUuid.equals(s.getAzUUID())
+                    && s.getStatus() == AZUpgradeStatus.COMPLETED);
+  }
+
+  private static long countPrimaryCompletedTserverAzs(PrevYBSoftwareConfig prev, Universe u) {
+    UUID primaryUuid = u.getUniverseDetails().getPrimaryCluster().uuid;
+    if (prev.getTserverAZUpgradeStatesList() == null) {
+      return 0;
+    }
+    return prev.getTserverAZUpgradeStatesList().stream()
+        .filter(
+            s ->
+                primaryUuid.equals(s.getClusterUUID())
+                    && s.getStatus() == AZUpgradeStatus.COMPLETED)
+        .map(AZUpgradeState::getAzUUID)
+        .distinct()
+        .count();
   }
 
   private MockUpgrade initMockUpgrade() {
