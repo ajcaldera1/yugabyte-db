@@ -1,5 +1,9 @@
 set client_min_messages = warning;
 create extension ddl_instead_of;
+create function public.ddl_io_bad_handler(x int) returns text language sql as $$ select null::text $$;
+select ddl_instead_of.validate_handler('ddl_io_bad_handler(int)'::regprocedure);
+ERROR:  ddl_instead_of handler must have signature (text, text) RETURNS text
+drop function public.ddl_io_bad_handler(int);
 create or replace function public.ddl_io_test_rewrite(cmd text, stmt text)
 returns text
 language plpgsql
@@ -11,6 +15,12 @@ begin
 	return null;
 end;
 $body$;
+select ddl_instead_of.validate_handler('ddl_io_test_rewrite(text,text)'::regprocedure);
+ validate_handler 
+------------------
+ 
+(1 row)
+
 select ddl_instead_of.add_rule(
 	't_rewrite',
 	'CREATE TABLE',
@@ -27,8 +37,8 @@ from pg_attribute a
 where a.attrelid = 'ddl_io_rewrite_table'::regclass
 	and a.attnum > 0
 	and not a.attisdropped;
-  cols  
---------
+ cols 
+------
  i,j
 (1 row)
 
@@ -45,10 +55,18 @@ where a.attrelid = 'ddl_io_plain'::regclass
 (1 row)
 
 drop table ddl_io_plain;
+select ddl_instead_of.drop_rule('no_such_rule');
+ERROR:  ddl_instead_of.drop_rule: rule no_such_rule not found
 select ddl_instead_of.drop_rule('t_rewrite');
  drop_rule 
 -----------
  
+(1 row)
+
+select count(*) from ddl_instead_of.intercept_rule where rule_name = 't_rewrite';
+ count 
+-------
+     0
 (1 row)
 
 drop function public.ddl_io_test_rewrite(text, text);

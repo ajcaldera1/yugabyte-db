@@ -36,69 +36,79 @@
 #include "parser/parser.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/elog.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
 
-#define MAX_HANDLERS 64
-#define MAX_RECURSION_GUARD 32
+#define MAX_HANDLERS		64
+#define MAX_RECURSION_GUARD	32
 
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static int	ddl_instead_of_depth = 0;
 
 static void chain_ProcessUtility(PlannedStmt *pstmt,
-								   const char *queryString,
-								   bool readOnlyTree,
-								   ProcessUtilityContext context,
-								   ParamListInfo params,
-								   QueryEnvironment *queryEnv,
-								   DestReceiver *dest,
-								   QueryCompletion *qc);
+								 const char *queryString,
+								 bool readOnlyTree,
+								 ProcessUtilityContext context,
+								 ParamListInfo params,
+								 QueryEnvironment *queryEnv,
+								 DestReceiver *dest,
+								 QueryCompletion *qc);
 
-static void
-validate_handler_signature(Oid fnoid)
+/*
+ * Validate that fnoid is a function with signature (text, text) RETURNS text.
+ * Called at rule-registration time only (add_rule), not on the hot path.
+ */
+void
+ddl_instead_of_validate_handler(Oid fnoid)
 {
 	HeapTuple	tup;
 	Form_pg_proc procform;
+	bool		ok;
 
 	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fnoid));
 	if (!HeapTupleIsValid(tup))
-		elog(ERROR, "cache lookup failed for function %u", fnoid);
+		elog(ERROR, "ddl_instead_of: cache lookup failed for function %u", fnoid);
 
 	procform = (Form_pg_proc) GETSTRUCT(tup);
 
-	if (procform->pronargs != 2)
-	{
-		ReleaseSysCache(tup);
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ddl_instead_of handler must have exactly two arguments")));
-	}
-
-	if (procform->proargtypes.values[0] != TEXTOID ||
-		procform->proargtypes.values[1] != TEXTOID)
-	{
-		ReleaseSysCache(tup);
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ddl_instead_of handler arguments must be (text, text)")));
-	}
-
-	if (procform->prorettype != TEXTOID)
-	{
-		ReleaseSysCache(tup);
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("ddl_instead_of handler must return text")));
-	}
+	ok = (procform->pronargs == 2 &&
+		  procform->proargtypes.values[0] == TEXTOID &&
+		  procform->proargtypes.values[1] == TEXTOID &&
+		  procform->prorettype == TEXTOID);
 
 	ReleaseSysCache(tup);
+
+	if (!ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("ddl_instead_of handler must have signature"
+						" (text, text) RETURNS text")));
+}
+
+PG_FUNCTION_INFO_V1(ddl_instead_of_validate_handler_sql);
+Datum
+ddl_instead_of_validate_handler_sql(PG_FUNCTION_ARGS)
+{
+	Oid		fnoid = PG_GETARG_OID(0);
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("ddl_instead_of: superuser privileges required")));
+
+	ddl_instead_of_validate_handler(fnoid);
+	PG_RETURN_VOID();
 }
 
 /*
- * Copy handler Oids from ddl_instead_of.intercept_rule.  On any SPI or catalog
- * failure, returns 0 (caller treats as no rules).
+ * Query ddl_instead_of.intercept_rule for handlers matching command_tag.
+ * Returns the number of OIDs written into handlers[].
+ *
+ * On any SPI or catalog failure we emit a WARNING and return 0 so that the
+ * original DDL is executed unchanged rather than failing unexpectedly.
  */
 static int
 load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
@@ -106,36 +116,46 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 	Oid			argtypes[1];
 	Datum		values[1];
 	char		nulls[1];
+	Datum		tag_datum;
 	int			i;
-	int			n;
+	int			n = 0;
 	bool		isnull;
 
 	if (SPI_connect() != SPI_OK_CONNECT)
+	{
+		ereport(WARNING,
+				(errmsg("ddl_instead_of: SPI_connect failed, skipping intercept")));
 		return 0;
+	}
 
-	n = 0;
+	/*
+	 * Allocate the tag datum in the caller's context so it survives
+	 * SPI_finish and can be freed cleanly below.
+	 */
+	tag_datum = CStringGetTextDatum(command_tag);
+
+	argtypes[0] = TEXTOID;
+	values[0] = tag_datum;
+	nulls[0] = ' ';
+
 	PG_TRY();
 	{
-		argtypes[0] = TEXTOID;
-		values[0] = CStringGetTextDatum(command_tag);
-		nulls[0] = ' ';
-
 		if (SPI_execute_with_args("SELECT r.handler::oid AS fn "
 								  "FROM ddl_instead_of.intercept_rule r "
 								  "WHERE r.enabled "
 								  "AND (r.command_tag = $1 OR r.command_tag = '*') "
 								  "ORDER BY r.priority, r.rule_name",
-								  1, argtypes, values, nulls, true, 0) == SPI_OK_SELECT &&
-			SPI_processed > 0)
+								  1, argtypes, values, nulls, true, 0) == SPI_OK_SELECT
+			&& SPI_processed > 0)
 		{
 			SPITupleTable *tuptab = SPI_tuptable;
 			TupleDesc	tupdesc = tuptab->tupdesc;
 
 			for (i = 0; i < (int) SPI_processed && n < maxhandlers; i++)
 			{
-				Datum		d;
+				Datum		d = SPI_getbinval(tuptab->vals[i], tupdesc, 1,
+											  &isnull);
 
-				d = SPI_getbinval(tuptab->vals[i], tupdesc, 1, &isnull);
 				if (!isnull)
 					handlers[n++] = DatumGetObjectId(d);
 			}
@@ -143,53 +163,100 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 	}
 	PG_CATCH();
 	{
+		ErrorData  *edata = CopyErrorData();
+
 		FlushErrorState();
+		ereport(WARNING,
+				(errmsg("ddl_instead_of: error querying intercept_rule, "
+						"skipping intercept: %s", edata->message)));
+		FreeErrorData(edata);
 		n = 0;
 	}
 	PG_END_TRY();
 
 	SPI_finish();
+	pfree(DatumGetPointer(tag_datum));
 	return n;
 }
 
+/*
+ * Invoke handler fnoid(command_tag, statement_text) and return the result as a
+ * palloc'd C string, or NULL if the handler returned NULL or an empty string.
+ *
+ * Caller is responsible for pfree'ing the returned string.
+ * All temporary allocations are made in a short-lived memory context that is
+ * destroyed before returning, so only the result string survives.
+ */
 static char *
 call_handler(Oid fnoid, const char *command_tag, const char *fragment)
 {
+	MemoryContext call_ctx;
+	MemoryContext old_ctx;
 	FmgrInfo	flinfo;
 	LOCAL_FCINFO(fcinfo, 2);
 	Datum		result;
-	char	   *out;
+	char	   *out = NULL;
 
-	validate_handler_signature(fnoid);
+	/*
+	 * Use a short-lived context for the FmgrInfo, arg Datums, and any
+	 * intermediate detoasted copies produced by the handler call.  The result
+	 * C string is copied into the caller's context before the child is freed.
+	 */
+	call_ctx = AllocSetContextCreate(CurrentMemoryContext,
+									 "ddl_instead_of call_handler",
+									 ALLOCSET_SMALL_SIZES);
+	old_ctx = MemoryContextSwitchTo(call_ctx);
 
-	fmgr_info(fnoid, &flinfo);
-
-	InitFunctionCallInfoData(*fcinfo, &flinfo, 2,
-							 InvalidOid, NULL, NULL);
-
-	fcinfo->args[0].value = CStringGetTextDatum(command_tag);
-	fcinfo->args[0].isnull = false;
-	fcinfo->args[1].value = CStringGetTextDatum(fragment);
-	fcinfo->args[1].isnull = false;
-
-	result = FunctionCallInvoke(fcinfo);
-
-	if (fcinfo->isnull)
-		return NULL;
-
-	out = text_to_cstring(DatumGetTextPP(result));
-	if (out[0] == '\0')
+	PG_TRY();
 	{
-		pfree(out);
-		return NULL;
-	}
+		text	   *txt;
 
+		fmgr_info(fnoid, &flinfo);
+
+		InitFunctionCallInfoData(*fcinfo, &flinfo, 2,
+								 InvalidOid, NULL, NULL);
+
+		fcinfo->args[0].value = CStringGetTextDatum(command_tag);
+		fcinfo->args[0].isnull = false;
+		fcinfo->args[1].value = CStringGetTextDatum(fragment);
+		fcinfo->args[1].isnull = false;
+
+		result = FunctionCallInvoke(fcinfo);
+
+		if (!fcinfo->isnull)
+		{
+			/*
+			 * DatumGetTextPP may return a palloc'd detoasted copy; both it
+			 * and the original result datum live in call_ctx and are freed
+			 * when we delete the context below.  We copy the C string into
+			 * the caller's context so it outlives call_ctx.
+			 */
+			txt = DatumGetTextPP(result);
+			if (VARSIZE_ANY_EXHDR(txt) > 0)
+			{
+				MemoryContextSwitchTo(old_ctx);
+				out = text_to_cstring(txt);
+				MemoryContextSwitchTo(call_ctx);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(old_ctx);
+		MemoryContextDelete(call_ctx);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(old_ctx);
+	MemoryContextDelete(call_ctx);	/* frees flinfo, arg Datums, result datum */
 	return out;
 }
 
 /*
- * Extract the current utility statement text from queryString using
- * stmt_location and stmt_len from PlannedStmt.
+ * Extract the utility statement text from queryString using stmt_location and
+ * stmt_len stored in pstmt.  Returns a palloc'd C string in the current memory
+ * context, or NULL when queryString is unavailable.
  */
 static char *
 extract_statement_text(const PlannedStmt *pstmt, const char *queryString)
@@ -202,7 +269,7 @@ extract_statement_text(const PlannedStmt *pstmt, const char *queryString)
 	if (queryString == NULL)
 		return NULL;
 
-	qlen = strlen(queryString);
+	qlen = (int) strlen(queryString);
 
 	if (loc < 0)
 		loc = 0;
@@ -220,15 +287,22 @@ extract_statement_text(const PlannedStmt *pstmt, const char *queryString)
 	if (len > 0)
 		memcpy(buf, queryString + loc, len);
 	buf[len] = '\0';
-
 	return buf;
 }
 
+/*
+ * Parse newsql and install the single resulting utility Node into pstmt.
+ *
+ * pstmt must already be a private copy (not the shared read-only tree).
+ * The RawStmt wrapper and List cell from raw_parser are freed; only the inner
+ * Node survives in pstmt->utilityStmt.
+ */
 static void
-apply_rewrite(PlannedStmt *pstmt, char *newsql)
+apply_rewrite(PlannedStmt *pstmt, const char *newsql)
 {
 	List	   *parsetree_list;
 	RawStmt    *rawstmt;
+	Node	   *stmt;
 
 	parsetree_list = raw_parser(newsql, RAW_PARSE_DEFAULT);
 
@@ -245,7 +319,17 @@ apply_rewrite(PlannedStmt *pstmt, char *newsql)
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("ddl_instead_of rewrite produced an empty parse tree")));
 
-	pstmt->utilityStmt = rawstmt->stmt;
+	/*
+	 * Detach the inner Node, then free the RawStmt wrapper and the List cell.
+	 * list_free only frees the List cells, not the pointed-to nodes, so we
+	 * must pfree rawstmt explicitly.
+	 */
+	stmt = rawstmt->stmt;
+	rawstmt->stmt = NULL;
+	pfree(rawstmt);
+	list_free(parsetree_list);
+
+	pstmt->utilityStmt = stmt;
 }
 
 static void
@@ -261,38 +345,30 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 	Node	   *utility;
 	CommandTag	tag;
 	const char *tagname;
-	char	   *fragment;
+	char	   *fragment = NULL;
+	char	   *rewritten = NULL;
 	Oid			handlers[MAX_HANDLERS];
 	int			nhandlers;
 	int			i;
 
+	/*
+	 * Recursion guard: when ddl_instead_of_depth > 0 we are already inside an
+	 * intercept dispatch (e.g. chain_ProcessUtility fired another utility).
+	 * Skip interception entirely to avoid infinite loops.
+	 */
 	if (ddl_instead_of_depth > MAX_RECURSION_GUARD)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("ddl_instead_of: exceeded recursion guard")));
+				 errmsg("ddl_instead_of: maximum recursion depth exceeded")));
 
-	if (ddl_instead_of_depth > 0)
-	{
-		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-							 params, queryEnv, dest, qc);
-		return;
-	}
-
-	if (!IsUnderPostmaster || IsBinaryUpgrade || IsYsqlUpgrade || creating_extension)
-	{
-		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-							 params, queryEnv, dest, qc);
-		return;
-	}
-
-	if (pstmt->commandType != CMD_UTILITY)
-	{
-		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-							 params, queryEnv, dest, qc);
-		return;
-	}
-
-	if (context != PROCESS_UTILITY_TOPLEVEL)
+	if (ddl_instead_of_depth > 0 ||
+		!IsUnderPostmaster ||
+		IsBinaryUpgrade ||
+		IsYsqlUpgrade ||
+		creating_extension ||
+		pstmt->commandType != CMD_UTILITY ||
+		context != PROCESS_UTILITY_TOPLEVEL ||
+		pstmt->utilityStmt == NULL)
 	{
 		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 							 params, queryEnv, dest, qc);
@@ -300,13 +376,6 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 	}
 
 	utility = pstmt->utilityStmt;
-	if (utility == NULL)
-	{
-		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
-							 params, queryEnv, dest, qc);
-		return;
-	}
-
 	tag = CreateCommandTag(utility);
 	tagname = GetCommandTagName(tag);
 
@@ -323,35 +392,52 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 	ddl_instead_of_depth++;
 	PG_TRY();
 	{
-		if (nhandlers > 0)
+		for (i = 0; i < nhandlers; i++)
 		{
-			for (i = 0; i < nhandlers; i++)
+			rewritten = call_handler(handlers[i], tagname, fragment);
+			if (rewritten != NULL)
 			{
-				char	   *rewritten;
+				/*
+				 * Fix #1: if the incoming pstmt is shared/read-only, make a
+				 * private copy before mutating utilityStmt.  Pass
+				 * readOnlyTree=false to the chain since we own the copy.
+				 */
+				if (readOnlyTree)
+					pstmt = copyObject(pstmt);
 
-				rewritten = call_handler(handlers[i], tagname, fragment);
-				if (rewritten != NULL)
-				{
-					apply_rewrite(pstmt, rewritten);
-					pfree(rewritten);
-					break;
-				}
+				apply_rewrite(pstmt, rewritten);
+
+				/* rewritten is no longer needed once the parse tree is built */
+				pfree(rewritten);
+				rewritten = NULL;
+
+				chain_ProcessUtility(pstmt, queryString, false, context,
+									 params, queryEnv, dest, qc);
+				goto done;
 			}
 		}
 
+		/* No handler rewrote the statement; execute as-is. */
 		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 							 params, queryEnv, dest, qc);
 	}
-	PG_FINALLY();
+	PG_CATCH();
 	{
-		if (fragment != NULL)
+		/* Fix #2: free rewritten if apply_rewrite or the chain threw. */
+		if (rewritten != NULL)
 		{
-			pfree(fragment);
-			fragment = NULL;
+			pfree(rewritten);
+			rewritten = NULL;
 		}
+		pfree(fragment);
 		ddl_instead_of_depth--;
+		PG_RE_THROW();
 	}
 	PG_END_TRY();
+
+done:
+	pfree(fragment);
+	ddl_instead_of_depth--;
 }
 
 static void
@@ -383,4 +469,11 @@ _PG_init(void)
 
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = ddl_instead_of_ProcessUtility;
+}
+
+/* Fix #8: restore the previous hook when the library is unloaded. */
+void
+_PG_fini(void)
+{
+	ProcessUtility_hook = prev_ProcessUtility;
 }
