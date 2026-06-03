@@ -11,11 +11,12 @@ CREATE TABLE intercept_rule (
 	enabled		boolean		NOT NULL DEFAULT true
 );
 
--- command_tag is the HASH column so rows are distributed by the equality
--- predicate used in load_handler_oids.  enabled, priority, rule_name are
--- range columns so the scan returns enabled=true rows in priority order.
+-- Range index leading on command_tag (the equality predicate in
+-- load_handler_oids), then enabled, priority, rule_name so the scan
+-- returns enabled=true rows in priority order without a sort step.
+-- Using ASC throughout keeps the syntax compatible with vanilla PostgreSQL.
 CREATE INDEX intercept_rule_lookup
-	ON intercept_rule (command_tag HASH, enabled ASC, priority ASC, rule_name ASC);
+	ON intercept_rule (command_tag ASC, enabled ASC, priority ASC, rule_name ASC);
 
 REVOKE ALL ON TABLE intercept_rule FROM PUBLIC;
 
