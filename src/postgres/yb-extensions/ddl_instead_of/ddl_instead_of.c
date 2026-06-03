@@ -38,7 +38,6 @@
 #include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/guc.h"
-#include "utils/memutils.h"
 #include "utils/syscache.h"
 
 PG_MODULE_MAGIC;
@@ -216,75 +215,82 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 
 /*
  * Invoke handler fnoid(command_tag, statement_text) and return the result as a
- * palloc'd C string, or NULL if the handler returned NULL or an empty string.
+ * palloc'd C string in the caller's memory context, or NULL if the handler
+ * returned NULL or an empty string.
  *
  * Caller is responsible for pfree'ing the returned string.
- * All temporary allocations are made in a short-lived memory context that is
- * destroyed before returning, so only the result string survives.
+ *
+ * We do NOT switch CurrentMemoryContext before calling fmgr_info or
+ * FunctionCallInvoke.  fmgr_info captures CurrentMemoryContext as fn_mcxt,
+ * and the SQL/PL function executors (fmgr_sql, plpgsql_call_handler) create
+ * their per-call cache sub-contexts from fn_mcxt.  If fn_mcxt points to a
+ * short-lived throw-away context, those sub-contexts receive invalid addresses
+ * and the next palloc inside the executor crashes with SIGSEGV.
+ *
+ * Instead, the two argument text Datums are allocated in the caller's context
+ * and freed explicitly after the call.  The result Datum (and any detoasted
+ * copy of it) is also in the caller's context; we copy the C string out of it
+ * and then free the original.
  */
 static char *
 call_handler(Oid fnoid, const char *command_tag, const char *fragment)
 {
-	MemoryContext call_ctx;
-	MemoryContext old_ctx;
 	FmgrInfo	flinfo;
 	LOCAL_FCINFO(fcinfo, 2);
+	Datum		arg0;
+	Datum		arg1;
 	Datum		result;
 	char	   *out = NULL;
 
 	/*
-	 * Use a short-lived context for the FmgrInfo, arg Datums, and any
-	 * intermediate detoasted copies produced by the handler call.  The result
-	 * C string is copied into the caller's context before the child is freed.
+	 * fmgr_info runs in the caller's CurrentMemoryContext, so fn_mcxt is a
+	 * long-lived context that the SQL/PL executors can safely use for their
+	 * internal function-cache sub-contexts.
 	 */
-	call_ctx = AllocSetContextCreate(CurrentMemoryContext,
-									 "ddl_instead_of call_handler",
-									 ALLOCSET_SMALL_SIZES);
-	old_ctx = MemoryContextSwitchTo(call_ctx);
+	fmgr_info(fnoid, &flinfo);
+
+	InitFunctionCallInfoData(*fcinfo, &flinfo, 2,
+							 InvalidOid, NULL, NULL);
+
+	arg0 = CStringGetTextDatum(command_tag);
+	arg1 = CStringGetTextDatum(fragment);
+
+	fcinfo->args[0].value = arg0;
+	fcinfo->args[0].isnull = false;
+	fcinfo->args[1].value = arg1;
+	fcinfo->args[1].isnull = false;
 
 	PG_TRY();
 	{
-		text	   *txt;
-
-		fmgr_info(fnoid, &flinfo);
-
-		InitFunctionCallInfoData(*fcinfo, &flinfo, 2,
-								 InvalidOid, NULL, NULL);
-
-		fcinfo->args[0].value = CStringGetTextDatum(command_tag);
-		fcinfo->args[0].isnull = false;
-		fcinfo->args[1].value = CStringGetTextDatum(fragment);
-		fcinfo->args[1].isnull = false;
-
 		result = FunctionCallInvoke(fcinfo);
 
 		if (!fcinfo->isnull)
 		{
 			/*
-			 * DatumGetTextPP may return a palloc'd detoasted copy; both it
-			 * and the original result datum live in call_ctx and are freed
-			 * when we delete the context below.  We copy the C string into
-			 * the caller's context so it outlives call_ctx.
+			 * DatumGetTextPP may return a detoasted palloc'd copy.  Copy the
+			 * C string out, then free the (possibly detoasted) text Datum so
+			 * we don't leave a large buffer behind.
 			 */
-			txt = DatumGetTextPP(result);
+			text	   *txt = DatumGetTextPP(result);
+
 			if (VARSIZE_ANY_EXHDR(txt) > 0)
-			{
-				MemoryContextSwitchTo(old_ctx);
 				out = text_to_cstring(txt);
-				MemoryContextSwitchTo(call_ctx);
-			}
+
+			/* Free the detoasted copy if it differs from the raw datum. */
+			if ((Pointer) txt != DatumGetPointer(result))
+				pfree(txt);
 		}
 	}
 	PG_CATCH();
 	{
-		MemoryContextSwitchTo(old_ctx);
-		MemoryContextDelete(call_ctx);
+		pfree(DatumGetPointer(arg0));
+		pfree(DatumGetPointer(arg1));
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	MemoryContextSwitchTo(old_ctx);
-	MemoryContextDelete(call_ctx);	/* frees flinfo, arg Datums, result datum */
+	pfree(DatumGetPointer(arg0));
+	pfree(DatumGetPointer(arg1));
 	return out;
 }
 
