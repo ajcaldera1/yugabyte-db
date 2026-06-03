@@ -58,10 +58,10 @@ BEGIN
 		(add_rule.rule_name, add_rule.command_tag,
 		 add_rule.handler, add_rule.priority, true)
 	ON CONFLICT ON CONSTRAINT intercept_rule_pkey DO UPDATE
-		SET r.command_tag = EXCLUDED.command_tag,
-			r.handler     = EXCLUDED.handler,
-			r.priority    = EXCLUDED.priority,
-			r.enabled     = true;
+		SET command_tag = EXCLUDED.command_tag,
+			handler     = EXCLUDED.handler,
+			priority    = EXCLUDED.priority,
+			enabled     = true;
 END;
 $fn$;
 
