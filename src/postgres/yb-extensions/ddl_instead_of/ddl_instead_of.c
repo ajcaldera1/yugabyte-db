@@ -37,6 +37,7 @@
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
+#include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/syscache.h"
 
@@ -45,8 +46,37 @@ PG_MODULE_MAGIC;
 #define MAX_HANDLERS		64
 #define MAX_RECURSION_GUARD	32
 
+/*
+ * Maximum number of characters from a SQL fragment or rewrite string that
+ * are printed in debug messages.  Keeps log lines readable.
+ */
+#define DDL_DBG_SQL_MAXLEN	200
+
 static ProcessUtility_hook_type prev_ProcessUtility = NULL;
 static int	ddl_instead_of_depth = 0;
+
+/*
+ * ddl_instead_of.debug  (GUC, USERSET boolean, default off)
+ *
+ * When on, emits LOG-level messages at each interception point:
+ *   - which command tag and SQL fragment were intercepted
+ *   - how many handlers matched
+ *   - what each handler returned (NULL = pass-through, or the rewrite text)
+ *   - whether a rewrite was applied or the original executed unchanged
+ *
+ * Enable per-session:  SET ddl_instead_of.debug = on;
+ */
+static bool ddl_instead_of_debug = false;
+
+/*
+ * Emit a LOG message when ddl_instead_of.debug is on.
+ * Uses %.Ns format truncation so no extra palloc is needed on the hot path.
+ */
+#define DDL_DBG(fmt, ...) \
+	do { \
+		if (ddl_instead_of_debug) \
+			ereport(LOG, (errmsg("ddl_instead_of: " fmt, ##__VA_ARGS__))); \
+	} while (0)
 
 static void chain_ProcessUtility(PlannedStmt *pstmt,
 								 const char *queryString,
@@ -121,6 +151,8 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 	int			n = 0;
 	bool		isnull;
 
+	DDL_DBG("load_handler_oids: querying rules for tag=\"%s\"", command_tag);
+
 	if (SPI_connect() != SPI_OK_CONNECT)
 	{
 		ereport(WARNING,
@@ -176,6 +208,9 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 
 	SPI_finish();
 	pfree(DatumGetPointer(tag_datum));
+
+	DDL_DBG("load_handler_oids: found %d handler(s) for tag=\"%s\"",
+			n, command_tag);
 	return n;
 }
 
@@ -370,6 +405,10 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 		context != PROCESS_UTILITY_TOPLEVEL ||
 		pstmt->utilityStmt == NULL)
 	{
+		DDL_DBG("skipping interception (depth=%d creating_extension=%d"
+				" context=%d commandType=%d)",
+				ddl_instead_of_depth, (int) creating_extension,
+				(int) context, (int) pstmt->commandType);
 		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 							 params, queryEnv, dest, qc);
 		return;
@@ -382,21 +421,38 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 	fragment = extract_statement_text(pstmt, queryString);
 	if (fragment == NULL)
 	{
+		DDL_DBG("tag=\"%s\" no queryString available, passing through", tagname);
 		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 							 params, queryEnv, dest, qc);
 		return;
 	}
 
+	DDL_DBG("intercepted tag=\"%s\" fragment=\"%.*s%s\"",
+			tagname,
+			(int) Min(strlen(fragment), DDL_DBG_SQL_MAXLEN), fragment,
+			strlen(fragment) > DDL_DBG_SQL_MAXLEN ? "..." : "");
+
 	nhandlers = load_handler_oids(tagname, handlers, MAX_HANDLERS);
+
+	DDL_DBG("tag=\"%s\" matched %d handler(s)", tagname, nhandlers);
 
 	ddl_instead_of_depth++;
 	PG_TRY();
 	{
 		for (i = 0; i < nhandlers; i++)
 		{
+			DDL_DBG("calling handler[%d] oid=%u for tag=\"%s\"",
+					i, handlers[i], tagname);
+
 			rewritten = call_handler(handlers[i], tagname, fragment);
+
 			if (rewritten != NULL)
 			{
+				DDL_DBG("handler[%d] oid=%u returned rewrite: \"%.*s%s\"",
+						i, handlers[i],
+						(int) Min(strlen(rewritten), DDL_DBG_SQL_MAXLEN), rewritten,
+						strlen(rewritten) > DDL_DBG_SQL_MAXLEN ? "..." : "");
+
 				/*
 				 * Fix #1: if the incoming pstmt is shared/read-only, make a
 				 * private copy before mutating utilityStmt.  Pass
@@ -407,6 +463,8 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 
 				apply_rewrite(pstmt, rewritten);
 
+				DDL_DBG("rewrite applied successfully for tag=\"%s\"", tagname);
+
 				/* rewritten is no longer needed once the parse tree is built */
 				pfree(rewritten);
 				rewritten = NULL;
@@ -415,9 +473,14 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 									 params, queryEnv, dest, qc);
 				goto done;
 			}
+
+			DDL_DBG("handler[%d] oid=%u returned NULL, continuing to next handler",
+					i, handlers[i]);
 		}
 
 		/* No handler rewrote the statement; execute as-is. */
+		DDL_DBG("no handler rewrote tag=\"%s\", executing original statement",
+				tagname);
 		chain_ProcessUtility(pstmt, queryString, readOnlyTree, context,
 							 params, queryEnv, dest, qc);
 	}
@@ -466,6 +529,30 @@ _PG_init(void)
 
 	if (ProcessUtility_hook == ddl_instead_of_ProcessUtility)
 		return;
+
+	/*
+	 * Register the debug GUC before installing the hook so it is available
+	 * as soon as the library is loaded.
+	 *
+	 * SET ddl_instead_of.debug = on;   -- enable per-session
+	 * SET ddl_instead_of.debug = off;  -- disable
+	 *
+	 * Messages are emitted at LOG level so they appear in the server log and
+	 * at the client when client_min_messages >= log (the default).
+	 */
+	DefineCustomBoolVariable("ddl_instead_of.debug",
+							 "Log rule matching and rewrite decisions.",
+							 "When on, emits LOG messages showing which command tag was "
+							 "intercepted, how many handlers matched, what each handler "
+							 "returned, and whether a rewrite was applied or the original "
+							 "statement executed unchanged.",
+							 &ddl_instead_of_debug,
+							 false,
+							 PGC_USERSET,
+							 0,
+							 NULL, NULL, NULL);
+
+	MarkGUCPrefixReserved("ddl_instead_of");
 
 	prev_ProcessUtility = ProcessUtility_hook;
 	ProcessUtility_hook = ddl_instead_of_ProcessUtility;
