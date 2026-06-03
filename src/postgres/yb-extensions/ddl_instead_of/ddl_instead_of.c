@@ -34,6 +34,7 @@
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "parser/parser.h"
+#include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/elog.h"
@@ -338,28 +339,37 @@ extract_statement_text(const PlannedStmt *pstmt, const char *queryString)
 }
 
 /*
- * Parse newsql and install the single resulting utility Node into pstmt.
+ * Parse and analyze newsql, then install the single resulting utility Node
+ * into pstmt.
  *
  * pstmt must already be a private copy (not the shared read-only tree).
- * The RawStmt wrapper and List cell from raw_parser are freed; only the inner
- * Node survives in pstmt->utilityStmt.
+ *
+ * We deliberately go through the full parse + analyze pipeline
+ * (pg_analyze_and_rewrite_fixedparams) rather than using raw_parser alone.
+ * For statements such as CALL, the executor (ExecuteCallStmt) expects semantic
+ * fields (e.g. CallStmt.funcexpr) to have been populated by the analysis
+ * phase.  If we skip analysis and pass a raw-parsed node, ExecuteCallStmt
+ * crashes with a NULL-dereference (rbx=0, fault at 0x4) because funcexpr is
+ * NULL.  In YugabyteDB the analysis is done by exec_simple_query before
+ * ProcessUtility is called; since we bypass that path we must do it ourselves.
  */
 static void
 apply_rewrite(PlannedStmt *pstmt, const char *newsql)
 {
-	List	   *parsetree_list;
+	List	   *raw_list;
+	List	   *query_list;
 	RawStmt    *rawstmt;
-	Node	   *stmt;
+	Query	   *query;
 
-	parsetree_list = raw_parser(newsql, RAW_PARSE_DEFAULT);
+	raw_list = raw_parser(newsql, RAW_PARSE_DEFAULT);
 
-	if (list_length(parsetree_list) != 1)
+	if (list_length(raw_list) != 1)
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("ddl_instead_of rewrite must yield exactly one statement"),
 				 errdetail("Rewritten SQL was: %s", newsql)));
 
-	rawstmt = linitial_node(RawStmt, parsetree_list);
+	rawstmt = linitial_node(RawStmt, raw_list);
 
 	if (rawstmt->stmt == NULL)
 		ereport(ERROR,
@@ -367,16 +377,21 @@ apply_rewrite(PlannedStmt *pstmt, const char *newsql)
 				 errmsg("ddl_instead_of rewrite produced an empty parse tree")));
 
 	/*
-	 * Detach the inner Node, then free the RawStmt wrapper and the List cell.
-	 * list_free only frees the List cells, not the pointed-to nodes, so we
-	 * must pfree rawstmt explicitly.
+	 * Run semantic analysis.  For CALL this populates CallStmt.funcexpr;
+	 * for most DDL it is a no-op.  The call also applies any relevant query
+	 * rewrite rules (also a no-op for utility statements in practice).
 	 */
-	stmt = rawstmt->stmt;
-	rawstmt->stmt = NULL;
-	pfree(rawstmt);
-	list_free(parsetree_list);
+	query_list = pg_analyze_and_rewrite_fixedparams(rawstmt, newsql,
+													 NULL, 0, NULL);
 
-	pstmt->utilityStmt = stmt;
+	if (list_length(query_list) != 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("ddl_instead_of rewrite did not produce exactly one analyzed statement")));
+
+	query = linitial_node(Query, query_list);
+
+	pstmt->utilityStmt = query->utilityStmt;
 }
 
 static void
@@ -477,12 +492,15 @@ ddl_instead_of_ProcessUtility(PlannedStmt *pstmt,
 
 				DDL_DBG("rewrite applied successfully for tag=\"%s\"", tagname);
 
-				/* rewritten is no longer needed once the parse tree is built */
+				/*
+				 * Pass the rewritten SQL as queryString so downstream hooks
+				 * (e.g. pg_stat_statements) record the correct text.  Keep
+				 * rewritten alive across the chain call; free it after.
+				 */
+				chain_ProcessUtility(pstmt, rewritten, false, context,
+									 params, queryEnv, dest, qc);
 				pfree(rewritten);
 				rewritten = NULL;
-
-				chain_ProcessUtility(pstmt, queryString, false, context,
-									 params, queryEnv, dest, qc);
 				goto done;
 			}
 
