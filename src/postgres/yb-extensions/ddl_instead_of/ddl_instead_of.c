@@ -152,18 +152,24 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 
 	DDL_DBG("load_handler_oids: querying rules for tag=\"%s\"", command_tag);
 
+	/*
+	 * Allocate tag_datum BEFORE SPI_connect().  SPI_connect() switches
+	 * CurrentMemoryContext to its internal procCxt, so any palloc after that
+	 * point lands in procCxt.  SPI_finish() deletes procCxt, which would make
+	 * tag_datum a dangling pointer and the pfree below a use-after-free,
+	 * corrupting the allocator and leaving CurrentMemoryContext at a garbage
+	 * value.  Allocating here keeps tag_datum in the caller's context where
+	 * the pfree after SPI_finish() is safe.
+	 */
+	tag_datum = CStringGetTextDatum(command_tag);
+
 	if (SPI_connect() != SPI_OK_CONNECT)
 	{
+		pfree(DatumGetPointer(tag_datum));
 		ereport(WARNING,
 				(errmsg("ddl_instead_of: SPI_connect failed, skipping intercept")));
 		return 0;
 	}
-
-	/*
-	 * Allocate the tag datum in the caller's context so it survives
-	 * SPI_finish and can be freed cleanly below.
-	 */
-	tag_datum = CStringGetTextDatum(command_tag);
 
 	argtypes[0] = TEXTOID;
 	values[0] = tag_datum;
