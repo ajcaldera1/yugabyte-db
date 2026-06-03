@@ -11,8 +11,11 @@ CREATE TABLE intercept_rule (
 	enabled		boolean		NOT NULL DEFAULT true
 );
 
+-- command_tag is the HASH column so rows are distributed by the equality
+-- predicate used in load_handler_oids.  enabled, priority, rule_name are
+-- range columns so the scan returns enabled=true rows in priority order.
 CREATE INDEX intercept_rule_lookup
-	ON intercept_rule (enabled, command_tag, priority, rule_name);
+	ON intercept_rule (command_tag HASH, enabled ASC, priority ASC, rule_name ASC);
 
 REVOKE ALL ON TABLE intercept_rule FROM PUBLIC;
 
