@@ -61,10 +61,17 @@ CREATE EXTENSION ddl_instead_of;
 This creates the `ddl_instead_of` schema and its catalog table and management
 functions.
 
-### Upgrading from 1.0
+### Upgrading
 
 ```sql
+-- From 1.0 to 1.1
 ALTER EXTENSION ddl_instead_of UPDATE TO '1.1';
+
+-- From 1.1 to 1.2  (adds parse_command_info)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.2';
+
+-- From 1.0 directly to 1.2  (PostgreSQL chains the upgrade scripts automatically)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.2';
 ```
 
 ## Usage
@@ -85,16 +92,22 @@ function_name(command_tag text, statement_text text) RETURNS text
 Return `NULL` (or an empty string) to execute the original statement unchanged.
 Return any non-empty string to replace it.
 
-**Example — add a `SPLIT INTO` clause to every `CREATE TABLE`:**
+**Example — add a `SPLIT INTO` clause to every `CREATE TABLE` in a specific schema:**
 
 ```sql
 CREATE OR REPLACE FUNCTION public.add_split_tablets(
     command_tag text,
     stmt        text
 ) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    info record;
 BEGIN
-    -- Only augment plain CREATE TABLE (not CREATE TABLE AS, etc.)
-    IF stmt ~* 'CREATE\s+TABLE' AND stmt !~* 'SPLIT\s+INTO' THEN
+    SELECT * INTO info
+    FROM ddl_instead_of.parse_command_info(command_tag, stmt)
+    LIMIT 1;
+
+    -- Only augment tables in 'myschema' that don't already have SPLIT INTO
+    IF info.schema_name = 'myschema' AND stmt !~* 'SPLIT\s+INTO' THEN
         RETURN stmt || ' SPLIT INTO 8 TABLETS';
     END IF;
     RETURN NULL;  -- pass through unchanged
@@ -110,12 +123,16 @@ CREATE OR REPLACE FUNCTION public.truncate_to_soft_delete(
     stmt        text
 ) RETURNS text LANGUAGE plpgsql AS $$
 DECLARE
-    tbl text;
+    info record;
 BEGIN
-    -- Parse the table name out of the statement (simplified)
-    tbl := regexp_replace(stmt, '(?i)TRUNCATE\s+(TABLE\s+)?', '', 'i');
+    -- Use parse_command_info to reliably extract schema and table name
+    SELECT * INTO info
+    FROM ddl_instead_of.parse_command_info(command_tag, stmt)
+    LIMIT 1;
+
     -- Return a CALL statement; the original TRUNCATE is suppressed
-    RETURN format('CALL soft_delete.archive(%L)', tbl);
+    RETURN format('CALL soft_delete.archive(%L, %L)',
+                  info.schema_name, info.object_name);
 END;
 $$;
 ```
@@ -208,6 +225,85 @@ ddl_instead_of.validate_handler(handler regprocedure) RETURNS void
 
 Checks that the referenced function has the required signature.  Called
 internally by `add_rule`; also available for manual testing.  Superuser only.
+
+### `ddl_instead_of.parse_command_info`
+
+```sql
+ddl_instead_of.parse_command_info(
+    command_tag text,
+    statement   text
+) RETURNS TABLE(
+    object_type      text,
+    schema_name      text,
+    object_name      text,
+    object_identity  text
+)
+```
+
+Parses a raw DDL statement and returns structured information about the primary
+object(s) it addresses.  Intended to be called from within a handler function
+to extract `schema_name` and `object_name` without brittle regex-based parsing.
+
+Works pre-execution on raw SQL text; no catalog lookups are performed and no
+OIDs are resolved.  The names returned are exactly as they appeared in the SQL
+text.
+
+Granted to `PUBLIC` because it only parses SQL text and performs no data or
+catalog access.
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `object_type` | Human-readable object type, e.g. `'table'`, `'index'`, `'function'`, `'schema'` |
+| `schema_name` | Schema qualifier, or `NULL` when inapplicable (schemas, extensions, roles) or when no explicit schema was written |
+| `object_name` | Unqualified object name |
+| `object_identity` | `schema_name.object_name` when schema is known, otherwise `object_name` |
+
+**Supported statements:**
+
+| Statement | Notes |
+|---|---|
+| `CREATE TABLE`, `CREATE TABLE AS`, `CREATE MATERIALIZED VIEW` | `object_type` is `'table'` or `'materialized view'` |
+| `ALTER TABLE` / `ALTER INDEX` / `ALTER VIEW` / `ALTER MATERIALIZED VIEW` | `object_type` reflects what is being altered |
+| `CREATE INDEX` | `schema_name` from the indexed table; `object_name` is the index name |
+| `CREATE VIEW`, `REFRESH MATERIALIZED VIEW` | |
+| `CREATE SEQUENCE`, `ALTER SEQUENCE` | |
+| `CREATE SCHEMA` | `schema_name` is `NULL`; `object_name` is the schema name |
+| `CREATE FUNCTION`, `CREATE PROCEDURE` | |
+| `CREATE TYPE` (composite, enum, range), `CREATE DOMAIN` | |
+| `CREATE TRIGGER`, `CREATE POLICY` | `schema_name` from the parent table |
+| `CREATE EXTENSION`, `ALTER EXTENSION ... UPDATE` | `schema_name` is `NULL` |
+| `DROP TABLE`, `DROP INDEX`, `DROP VIEW`, etc. | One row per dropped object |
+| `TRUNCATE` | One row per listed relation |
+| `CALL procedure(...)` | `object_type` is `'procedure'` |
+| `ALTER ... RENAME TO` | Reports the pre-rename name |
+| `ALTER ... SET SCHEMA` | |
+| `COMMENT ON` | |
+| All others | One row with `object_type` from `command_tag`; `schema_name` and `object_name` are `NULL` |
+
+**Example:**
+
+```sql
+SELECT * FROM ddl_instead_of.parse_command_info(
+    'CREATE TABLE',
+    'CREATE TABLE myschema.orders (id bigint PRIMARY KEY)'
+);
+
+--  object_type | schema_name | object_name | object_identity
+-- -------------+-------------+-------------+-----------------
+--  table       | myschema    | orders      | myschema.orders
+
+SELECT * FROM ddl_instead_of.parse_command_info(
+    'DROP TABLE',
+    'DROP TABLE public.foo, public.bar CASCADE'
+);
+
+--  object_type | schema_name | object_name | object_identity
+-- -------------+-------------+-------------+-----------------
+--  table       | public      | foo         | public.foo
+--  table       | public      | bar         | public.bar
+```
 
 ### Catalog table
 
@@ -321,5 +417,6 @@ Or via the YugabyteDB build wrapper (builds the full server plus the extension):
 
 | Version | Changes |
 |---|---|
+| 1.2 | Added `parse_command_info(command_tag, statement)` set-returning function that extracts `object_type`, `schema_name`, `object_name`, and `object_identity` from raw DDL text; covers 20+ statement types including multi-object DROP/TRUNCATE; granted to PUBLIC |
 | 1.1 | Fixed `intercept_rule_lookup` index column order for range-sharding compatibility; fixed `add_rule` ON CONFLICT ambiguity; added GUC debug logging (`ddl_instead_of.debug`); fixed `tag_datum` use-after-free in `load_handler_oids`; added `pg_analyze_and_rewrite` step in `apply_rewrite` to handle `CALL` and other statements requiring semantic analysis; pass rewritten SQL text as `queryString` to downstream hooks |
 | 1.0 | Initial release |
