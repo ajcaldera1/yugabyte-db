@@ -8,7 +8,9 @@ OBJS = ddl_instead_of.o $(WIN32RES)
 EXTENSION = ddl_instead_of
 DATA = ddl_instead_of--1.0.sql \
        ddl_instead_of--1.0--1.1.sql \
-       ddl_instead_of--1.1.sql
+       ddl_instead_of--1.1.sql \
+       ddl_instead_of--1.1--1.2.sql \
+       ddl_instead_of--1.2.sql
 
 TESTS = $(wildcard sql/*.sql)
 REGRESS = $(patsubst sql/%.sql,%,$(TESTS))

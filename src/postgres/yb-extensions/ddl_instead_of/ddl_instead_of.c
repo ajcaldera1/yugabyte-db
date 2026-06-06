@@ -33,6 +33,8 @@
 #include "miscadmin.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
+#include "funcapi.h"
+#include "lib/stringinfo.h"
 #include "parser/parser.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -40,6 +42,7 @@
 #include "utils/elog.h"
 #include "utils/guc.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 PG_MODULE_MAGIC;
 
@@ -86,6 +89,645 @@ static void chain_ProcessUtility(PlannedStmt *pstmt,
 								 QueryEnvironment *queryEnv,
 								 DestReceiver *dest,
 								 QueryCompletion *qc);
+
+/* -------------------------------------------------------------------------
+ * parse_command_info helpers
+ *
+ * These walk the raw parse tree of a DDL statement and extract the primary
+ * object's type, schema name, object name, and a dotted identity string.
+ * This is analogous to pg_event_trigger_ddl_commands() but works pre-
+ * execution on raw SQL text so handlers can use it without brittle regex.
+ * -------------------------------------------------------------------------
+ */
+
+/*
+ * Map a subset of ObjectType enum values to human-readable strings.
+ * Returns "unknown" for values not listed here (future-proof).
+ */
+static const char *
+ddlii_objecttype_str(ObjectType objtype)
+{
+	switch (objtype)
+	{
+		case OBJECT_TABLE:			return "table";
+		case OBJECT_INDEX:			return "index";
+		case OBJECT_VIEW:			return "view";
+		case OBJECT_MATVIEW:		return "materialized view";
+		case OBJECT_SEQUENCE:		return "sequence";
+		case OBJECT_SCHEMA:			return "schema";
+		case OBJECT_FUNCTION:		return "function";
+		case OBJECT_PROCEDURE:		return "procedure";
+		case OBJECT_ROUTINE:		return "routine";
+		case OBJECT_AGGREGATE:		return "aggregate";
+		case OBJECT_TYPE:			return "type";
+		case OBJECT_DOMAIN:			return "domain";
+		case OBJECT_TRIGGER:		return "trigger";
+		case OBJECT_RULE:			return "rule";
+		case OBJECT_POLICY:			return "policy";
+		case OBJECT_COLUMN:			return "column";
+		case OBJECT_FOREIGN_TABLE:	return "foreign table";
+		case OBJECT_COLLATION:		return "collation";
+		case OBJECT_CONVERSION:		return "conversion";
+		case OBJECT_EXTENSION:		return "extension";
+		case OBJECT_LANGUAGE:		return "language";
+		case OBJECT_PUBLICATION:	return "publication";
+		case OBJECT_ROLE:			return "role";
+		case OBJECT_TABLESPACE:		return "tablespace";
+		case OBJECT_FDW:			return "foreign-data wrapper";
+		case OBJECT_FOREIGN_SERVER:	return "server";
+		case OBJECT_OPERATOR:		return "operator";
+		case OBJECT_OPCLASS:		return "operator class";
+		case OBJECT_OPFAMILY:		return "operator family";
+		case OBJECT_STATISTIC_EXT:	return "statistics";
+		case OBJECT_EVENT_TRIGGER:	return "event trigger";
+		case OBJECT_ACCESS_METHOD:	return "access method";
+		case OBJECT_TSCONFIGURATION: return "text search configuration";
+		case OBJECT_TSDICTIONARY:	return "text search dictionary";
+		case OBJECT_TSPARSER:		return "text search parser";
+		case OBJECT_TSTEMPLATE:		return "text search template";
+		default:					return "unknown";
+	}
+}
+
+/*
+ * Extract schema_name and object_name from a qualified-name list
+ * (a List of String nodes produced by the parser).
+ *
+ * Handles 1-part (name), 2-part (schema.name), and 3-part
+ * (catalog.schema.name) forms; the last two components are used.
+ */
+static void
+ddlii_name_from_strlist(List *names,
+						const char **schema_out, const char **name_out)
+{
+	int			nnames = list_length(names);
+
+	*schema_out = NULL;
+	*name_out = NULL;
+
+	if (nnames == 0)
+		return;
+	else if (nnames == 1)
+		*name_out = strVal(linitial(names));
+	else if (nnames == 2)
+	{
+		*schema_out = strVal(linitial(names));
+		*name_out = strVal(lsecond(names));
+	}
+	else
+	{
+		/* catalog.schema.name — take the rightmost two elements */
+		*schema_out = strVal(list_nth(names, nnames - 2));
+		*name_out = strVal(llast(names));
+	}
+}
+
+/*
+ * Append one result row to the SRF tuplestore.
+ * Any of the string arguments may be NULL, in which case the column is NULL.
+ * object_identity is built automatically as [schema.]name.
+ */
+static void
+ddlii_emit_row(ReturnSetInfo *rsinfo,
+			   const char *object_type,
+			   const char *schema_name,
+			   const char *object_name)
+{
+	Datum		values[4];
+	bool		nulls[4];
+
+	MemSet(nulls, 0, sizeof(nulls));
+
+	if (object_type)
+		values[0] = CStringGetTextDatum(object_type);
+	else
+		nulls[0] = true;
+
+	if (schema_name && schema_name[0] != '\0')
+		values[1] = CStringGetTextDatum(schema_name);
+	else
+		nulls[1] = true;
+
+	if (object_name && object_name[0] != '\0')
+		values[2] = CStringGetTextDatum(object_name);
+	else
+		nulls[2] = true;
+
+	/* object_identity: [schema.]name */
+	if (object_name && object_name[0] != '\0')
+	{
+		if (schema_name && schema_name[0] != '\0')
+		{
+			StringInfoData buf;
+
+			initStringInfo(&buf);
+			appendStringInfo(&buf, "%s.%s", schema_name, object_name);
+			values[3] = CStringGetTextDatum(buf.data);
+			pfree(buf.data);
+		}
+		else
+			values[3] = CStringGetTextDatum(object_name);
+	}
+	else
+		nulls[3] = true;
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/* Convenience: emit a row whose names come from a RangeVar */
+static void
+ddlii_emit_rangevar(ReturnSetInfo *rsinfo,
+					const char *object_type,
+					const RangeVar *rv)
+{
+	ddlii_emit_row(rsinfo, object_type,
+				   rv ? rv->schemaname : NULL,
+				   rv ? rv->relname    : NULL);
+}
+
+/*
+ * ddl_instead_of_parse_command_info
+ *
+ * Parse a DDL statement and return structured information about the primary
+ * object(s) it addresses.  Returns a set of rows:
+ *
+ *   (object_type text, schema_name text, object_name text,
+ *    object_identity text)
+ *
+ * Mirrors the most useful columns from pg_event_trigger_ddl_commands() but
+ * works pre-execution on raw SQL text so that handler functions do not need
+ * to implement fragile regex-based name extraction.
+ *
+ * For statements that affect multiple objects (TRUNCATE, DROP TABLE a, b)
+ * each object produces its own row.
+ *
+ * schema_name is NULL when the object type does not have a parent schema
+ * (schemas, extensions, roles, tablespaces) or when the statement did not
+ * supply an explicit schema qualifier.
+ *
+ * Note: this function parses the statement with raw_parser, so OIDs are not
+ * resolved and system-catalog lookups are not performed.  The names returned
+ * are exactly what appeared in the SQL text.
+ */
+PG_FUNCTION_INFO_V1(ddl_instead_of_parse_command_info);
+Datum
+ddl_instead_of_parse_command_info(PG_FUNCTION_ARGS)
+{
+	text	   *cmd_tag_text = PG_GETARG_TEXT_PP(0);
+	text	   *stmt_text = PG_GETARG_TEXT_PP(1);
+	char	   *stmt_cstr;
+	List	   *raw_list;
+	RawStmt    *rawstmt;
+	Node	   *stmt;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stmt_cstr = text_to_cstring(stmt_text);
+	raw_list = raw_parser(stmt_cstr, RAW_PARSE_DEFAULT);
+	pfree(stmt_cstr);
+
+	if (list_length(raw_list) < 1)
+		return (Datum) 0;
+
+	rawstmt = linitial_node(RawStmt, raw_list);
+	stmt = rawstmt->stmt;
+	if (stmt == NULL)
+		return (Datum) 0;
+
+	switch (nodeTag(stmt))
+	{
+		/* ----------------------------------------------------------------
+		 * CREATE TABLE / CREATE TABLE AS / CREATE MATERIALIZED VIEW
+		 * ---------------------------------------------------------------- */
+		case T_CreateStmt:
+			ddlii_emit_rangevar(rsinfo, "table",
+								((CreateStmt *) stmt)->relation);
+			break;
+
+		case T_CreateTableAsStmt:
+		{
+			CreateTableAsStmt *ctas = (CreateTableAsStmt *) stmt;
+			const char *obj_type = (ctas->objtype == OBJECT_MATVIEW) ?
+				"materialized view" : "table";
+
+			ddlii_emit_rangevar(rsinfo, obj_type,
+								ctas->into ? ctas->into->rel : NULL);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE VIEW
+		 * ---------------------------------------------------------------- */
+		case T_ViewStmt:
+			ddlii_emit_rangevar(rsinfo, "view",
+								((ViewStmt *) stmt)->view);
+			break;
+
+		/* ----------------------------------------------------------------
+		 * REFRESH MATERIALIZED VIEW
+		 * ---------------------------------------------------------------- */
+		case T_RefreshMatViewStmt:
+			ddlii_emit_rangevar(rsinfo, "materialized view",
+								((RefreshMatViewStmt *) stmt)->relation);
+			break;
+
+		/* ----------------------------------------------------------------
+		 * CREATE SEQUENCE / ALTER SEQUENCE
+		 * ---------------------------------------------------------------- */
+		case T_CreateSeqStmt:
+			ddlii_emit_rangevar(rsinfo, "sequence",
+								((CreateSeqStmt *) stmt)->sequence);
+			break;
+
+		case T_AlterSeqStmt:
+			ddlii_emit_rangevar(rsinfo, "sequence",
+								((AlterSeqStmt *) stmt)->sequence);
+			break;
+
+		/* ----------------------------------------------------------------
+		 * CREATE INDEX
+		 *
+		 * The index's schema is inherited from the table; object_name is
+		 * the index name (may be NULL for unnamed system-generated indexes).
+		 * ---------------------------------------------------------------- */
+		case T_IndexStmt:
+		{
+			IndexStmt  *ix = (IndexStmt *) stmt;
+
+			ddlii_emit_row(rsinfo, "index",
+						   ix->relation ? ix->relation->schemaname : NULL,
+						   ix->idxname);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * ALTER TABLE / INDEX / VIEW / MATERIALIZED VIEW / FOREIGN TABLE
+		 *
+		 * objtype tells us what kind of object is being altered.
+		 * ---------------------------------------------------------------- */
+		case T_AlterTableStmt:
+		{
+			AlterTableStmt *at = (AlterTableStmt *) stmt;
+
+			ddlii_emit_rangevar(rsinfo,
+								ddlii_objecttype_str(at->objtype),
+								at->relation);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * TRUNCATE (can list multiple relations)
+		 * ---------------------------------------------------------------- */
+		case T_TruncateStmt:
+		{
+			TruncateStmt *trunc = (TruncateStmt *) stmt;
+			ListCell   *lc;
+
+			foreach(lc, trunc->relations)
+				ddlii_emit_rangevar(rsinfo, "table",
+									(RangeVar *) lfirst(lc));
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE SCHEMA
+		 * ---------------------------------------------------------------- */
+		case T_CreateSchemaStmt:
+		{
+			CreateSchemaStmt *cs = (CreateSchemaStmt *) stmt;
+
+			ddlii_emit_row(rsinfo, "schema", NULL, cs->schemaname);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE FUNCTION / CREATE PROCEDURE
+		 * ---------------------------------------------------------------- */
+		case T_CreateFunctionStmt:
+		{
+			CreateFunctionStmt *cf = (CreateFunctionStmt *) stmt;
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			ddlii_name_from_strlist(cf->funcname, &schema_name, &obj_name);
+			ddlii_emit_row(rsinfo,
+						   cf->is_procedure ? "procedure" : "function",
+						   schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CALL procedure(...)
+		 * ---------------------------------------------------------------- */
+		case T_CallStmt:
+		{
+			CallStmt   *cs = (CallStmt *) stmt;
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			if (cs->funccall)
+				ddlii_name_from_strlist(cs->funccall->funcname,
+										&schema_name, &obj_name);
+			ddlii_emit_row(rsinfo, "procedure", schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * RENAME (ALTER ... RENAME TO ...)
+		 *
+		 * Reports the object's current (pre-rename) name.
+		 * ---------------------------------------------------------------- */
+		case T_RenameStmt:
+		{
+			RenameStmt *rs = (RenameStmt *) stmt;
+			const char *obj_type = ddlii_objecttype_str(rs->renameType);
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			if (rs->relation)
+			{
+				schema_name = rs->relation->schemaname;
+				obj_name = rs->relation->relname;
+			}
+			else if (rs->object)
+			{
+				if (IsA(rs->object, List))
+					ddlii_name_from_strlist((List *) rs->object,
+											&schema_name, &obj_name);
+				else if (IsA(rs->object, String))
+					obj_name = strVal((String *) rs->object);
+				else if (IsA(rs->object, ObjectWithArgs))
+					ddlii_name_from_strlist(
+						((ObjectWithArgs *) rs->object)->objname,
+						&schema_name, &obj_name);
+			}
+			else if (rs->subname)
+				/* e.g. ALTER SCHEMA old RENAME TO new */
+				obj_name = rs->subname;
+
+			ddlii_emit_row(rsinfo, obj_type, schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * ALTER object SET SCHEMA
+		 * ---------------------------------------------------------------- */
+		case T_AlterObjectSchemaStmt:
+		{
+			AlterObjectSchemaStmt *aoss = (AlterObjectSchemaStmt *) stmt;
+			const char *obj_type = ddlii_objecttype_str(aoss->objectType);
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			if (aoss->relation)
+			{
+				schema_name = aoss->relation->schemaname;
+				obj_name = aoss->relation->relname;
+			}
+			else if (aoss->object)
+			{
+				if (IsA(aoss->object, List))
+					ddlii_name_from_strlist((List *) aoss->object,
+											&schema_name, &obj_name);
+				else if (IsA(aoss->object, String))
+					obj_name = strVal((String *) aoss->object);
+				else if (IsA(aoss->object, ObjectWithArgs))
+					ddlii_name_from_strlist(
+						((ObjectWithArgs *) aoss->object)->objname,
+						&schema_name, &obj_name);
+				else if (IsA(aoss->object, TypeName))
+					ddlii_name_from_strlist(
+						((TypeName *) aoss->object)->names,
+						&schema_name, &obj_name);
+			}
+			ddlii_emit_row(rsinfo, obj_type, schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * DROP (various types, potentially multiple objects per statement)
+		 * ---------------------------------------------------------------- */
+		case T_DropStmt:
+		{
+			DropStmt   *drop = (DropStmt *) stmt;
+			const char *obj_type = ddlii_objecttype_str(drop->removeType);
+			ListCell   *lc;
+
+			foreach(lc, drop->objects)
+			{
+				Node	   *obj = lfirst(lc);
+				const char *schema_name = NULL;
+				const char *obj_name = NULL;
+
+				switch (drop->removeType)
+				{
+					/*
+					 * Relation-like objects: each element is a List of String
+					 * (a qualified name such as [schema, name]).
+					 */
+					case OBJECT_TABLE:
+					case OBJECT_INDEX:
+					case OBJECT_VIEW:
+					case OBJECT_MATVIEW:
+					case OBJECT_SEQUENCE:
+					case OBJECT_FOREIGN_TABLE:
+						if (IsA(obj, List))
+							ddlii_name_from_strlist((List *) obj,
+													&schema_name, &obj_name);
+						break;
+
+					/*
+					 * Objects with no parent schema: each element is a bare
+					 * String (schema name, extension name, etc.).
+					 */
+					case OBJECT_SCHEMA:
+					case OBJECT_LANGUAGE:
+					case OBJECT_EXTENSION:
+					case OBJECT_TABLESPACE:
+					case OBJECT_ROLE:
+					case OBJECT_PUBLICATION:
+					case OBJECT_SUBSCRIPTION:
+						if (IsA(obj, String))
+							obj_name = strVal((String *) obj);
+						break;
+
+					/*
+					 * Function-like objects: each element is ObjectWithArgs
+					 * where objname is a qualified-name list.
+					 */
+					case OBJECT_FUNCTION:
+					case OBJECT_PROCEDURE:
+					case OBJECT_ROUTINE:
+					case OBJECT_AGGREGATE:
+					case OBJECT_OPERATOR:
+						if (IsA(obj, ObjectWithArgs))
+							ddlii_name_from_strlist(
+								((ObjectWithArgs *) obj)->objname,
+								&schema_name, &obj_name);
+						break;
+
+					/*
+					 * Type / domain: TypeName whose names is a qualified list.
+					 */
+					case OBJECT_TYPE:
+					case OBJECT_DOMAIN:
+						if (IsA(obj, TypeName))
+							ddlii_name_from_strlist(
+								((TypeName *) obj)->names,
+								&schema_name, &obj_name);
+						break;
+
+					default:
+						/* Best-effort for any unrecognised sub-type */
+						if (IsA(obj, List))
+							ddlii_name_from_strlist((List *) obj,
+													&schema_name, &obj_name);
+						else if (IsA(obj, String))
+							obj_name = strVal((String *) obj);
+						break;
+				}
+
+				ddlii_emit_row(rsinfo, obj_type, schema_name, obj_name);
+			}
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE TYPE (composite, enum, range)
+		 * ---------------------------------------------------------------- */
+		case T_CompositeTypeStmt:
+			ddlii_emit_rangevar(rsinfo, "type",
+								((CompositeTypeStmt *) stmt)->typevar);
+			break;
+
+		case T_CreateEnumStmt:
+		{
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			ddlii_name_from_strlist(((CreateEnumStmt *) stmt)->typeName,
+									&schema_name, &obj_name);
+			ddlii_emit_row(rsinfo, "type", schema_name, obj_name);
+			break;
+		}
+
+		case T_CreateRangeStmt:
+		{
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			ddlii_name_from_strlist(((CreateRangeStmt *) stmt)->typeName,
+									&schema_name, &obj_name);
+			ddlii_emit_row(rsinfo, "type", schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE DOMAIN
+		 * ---------------------------------------------------------------- */
+		case T_CreateDomainStmt:
+		{
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			ddlii_name_from_strlist(((CreateDomainStmt *) stmt)->domainname,
+									&schema_name, &obj_name);
+			ddlii_emit_row(rsinfo, "domain", schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE TRIGGER
+		 * ---------------------------------------------------------------- */
+		case T_CreateTrigStmt:
+		{
+			CreateTrigStmt *ct = (CreateTrigStmt *) stmt;
+
+			ddlii_emit_row(rsinfo, "trigger",
+						   ct->relation ? ct->relation->schemaname : NULL,
+						   ct->trigname);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE POLICY
+		 * ---------------------------------------------------------------- */
+		case T_CreatePolicyStmt:
+		{
+			CreatePolicyStmt *cp = (CreatePolicyStmt *) stmt;
+
+			ddlii_emit_row(rsinfo, "policy",
+						   cp->table ? cp->table->schemaname : NULL,
+						   cp->policy_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * CREATE EXTENSION / ALTER EXTENSION ... UPDATE
+		 * ---------------------------------------------------------------- */
+		case T_CreateExtensionStmt:
+			ddlii_emit_row(rsinfo, "extension", NULL,
+						   ((CreateExtensionStmt *) stmt)->extname);
+			break;
+
+		case T_AlterExtensionStmt:
+			ddlii_emit_row(rsinfo, "extension", NULL,
+						   ((AlterExtensionStmt *) stmt)->extname);
+			break;
+
+		/* ----------------------------------------------------------------
+		 * COMMENT ON
+		 * ---------------------------------------------------------------- */
+		case T_CommentStmt:
+		{
+			CommentStmt *cm = (CommentStmt *) stmt;
+			const char *obj_type = ddlii_objecttype_str(cm->objtype);
+			const char *schema_name = NULL;
+			const char *obj_name = NULL;
+
+			if (cm->object)
+			{
+				if (IsA(cm->object, RangeVar))
+				{
+					schema_name = ((RangeVar *) cm->object)->schemaname;
+					obj_name = ((RangeVar *) cm->object)->relname;
+				}
+				else if (IsA(cm->object, List))
+					ddlii_name_from_strlist((List *) cm->object,
+											&schema_name, &obj_name);
+				else if (IsA(cm->object, String))
+					obj_name = strVal((String *) cm->object);
+				else if (IsA(cm->object, TypeName))
+					ddlii_name_from_strlist(
+						((TypeName *) cm->object)->names,
+						&schema_name, &obj_name);
+				else if (IsA(cm->object, ObjectWithArgs))
+					ddlii_name_from_strlist(
+						((ObjectWithArgs *) cm->object)->objname,
+						&schema_name, &obj_name);
+			}
+			ddlii_emit_row(rsinfo, obj_type, schema_name, obj_name);
+			break;
+		}
+
+		/* ----------------------------------------------------------------
+		 * Fallback: return a single row with the command_tag as object_type
+		 * and NULL for the name columns.  This catches any DDL node type
+		 * not explicitly handled above.
+		 * ---------------------------------------------------------------- */
+		default:
+		{
+			char	   *tag = text_to_cstring(cmd_tag_text);
+
+			ddlii_emit_row(rsinfo, tag, NULL, NULL);
+			pfree(tag);
+			break;
+		}
+	}
+
+	return (Datum) 0;
+}
 
 /*
  * Validate that fnoid is a function with signature (text, text) RETURNS text.
