@@ -70,8 +70,15 @@ ALTER EXTENSION ddl_instead_of UPDATE TO '1.1';
 -- From 1.1 to 1.2  (adds parse_command_info)
 ALTER EXTENSION ddl_instead_of UPDATE TO '1.2';
 
--- From 1.0 directly to 1.2  (PostgreSQL chains the upgrade scripts automatically)
-ALTER EXTENSION ddl_instead_of UPDATE TO '1.2';
+-- From 1.2 to 1.3  (adds parse_table_columns, parse_table_constraints)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.3';
+
+-- From 1.3 to 1.4  (adds table_signature)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.4';
+
+-- From any earlier version directly to 1.4
+-- (PostgreSQL chains upgrade scripts automatically)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.4';
 ```
 
 ## Usage
@@ -111,6 +118,51 @@ BEGIN
         RETURN stmt || ' SPLIT INTO 8 TABLETS';
     END IF;
     RETURN NULL;  -- pass through unchanged
+END;
+$$;
+```
+
+**Example — enforce a structural schema contract using `table_signature`:**
+
+```sql
+-- Reject any CREATE TABLE whose column/constraint layout does not match
+-- a pre-approved "canonical" definition for that table name.
+CREATE OR REPLACE FUNCTION public.enforce_schema_contract(
+    command_tag text,
+    stmt        text
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    info      record;
+    approved  text;
+    actual    text;
+BEGIN
+    SELECT * INTO info
+    FROM ddl_instead_of.parse_command_info(command_tag, stmt)
+    LIMIT 1;
+
+    -- Only enforce contracts for tables in the 'app' schema
+    IF info.schema_name IS DISTINCT FROM 'app' THEN
+        RETURN NULL;
+    END IF;
+
+    -- Look up the pre-approved signature for this table
+    SELECT signature INTO approved
+    FROM schema_contracts
+    WHERE table_name = info.object_name;
+
+    IF NOT FOUND THEN
+        RETURN NULL;  -- no contract registered, allow
+    END IF;
+
+    actual := ddl_instead_of.table_signature(stmt);
+    IF actual <> approved THEN
+        RAISE EXCEPTION
+            'table % does not match the approved schema contract '
+            '(got signature %, expected %)',
+            info.object_identity, actual, approved;
+    END IF;
+
+    RETURN NULL;  -- passes structural check, execute as-is
 END;
 $$;
 ```
@@ -305,6 +357,228 @@ SELECT * FROM ddl_instead_of.parse_command_info(
 --  table       | public      | bar         | public.bar
 ```
 
+### `ddl_instead_of.parse_table_columns`
+
+```sql
+ddl_instead_of.parse_table_columns(statement text)
+RETURNS TABLE(
+    ordinal_position  integer,
+    column_name       text,
+    type_name         text,
+    not_null          boolean,
+    has_default       boolean,
+    default_expr      text
+)
+```
+
+Parses a raw `CREATE TABLE` statement and returns one row per column with
+full structural detail.  Operates entirely on raw SQL text; no catalog lookups
+or OID resolution are performed.
+
+Granted to `PUBLIC`.
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `ordinal_position` | 1-based position of the column in the column list |
+| `column_name` | Column name as written in the statement |
+| `type_name` | Full SQL type string, e.g. `character varying(100)`, `numeric(10, 2)`, `integer[]`, `myschema.status_enum` |
+| `not_null` | `true` when `NOT NULL`, `PRIMARY KEY`, `IDENTITY`, or `GENERATED` is present on the column |
+| `has_default` | `true` when a `DEFAULT` clause is present |
+| `default_expr` | The default expression rendered as text (e.g. `nextval('seq')`, `'active'::status_type`, `NOW()`), or `NULL` when `has_default` is `false` |
+
+**Notes:**
+
+- `LIKE` clauses and `INHERITS` references in `tableElts` are skipped (they
+  are not `ColumnDef` nodes in the raw parse tree).
+- `NOT NULL` imposed by a table-level `PRIMARY KEY` that names the column is
+  **not** reflected here; only column-level nullability constraints are
+  captured.
+- Returns zero rows for statements that are not `CREATE TABLE` (no error is
+  raised).
+
+**Example:**
+
+```sql
+SELECT ordinal_position, column_name, type_name, not_null, has_default, default_expr
+FROM ddl_instead_of.parse_table_columns($$
+    CREATE TABLE orders (
+        id          bigint          NOT NULL GENERATED ALWAYS AS IDENTITY,
+        customer_id integer         NOT NULL,
+        status      text            NOT NULL DEFAULT 'pending',
+        amount      numeric(12, 2)  NOT NULL,
+        tags        text[]
+    )
+$$);
+
+--  ordinal_position | column_name | type_name     | not_null | has_default | default_expr
+-- ------------------+-------------+---------------+----------+-------------+--------------
+--  1                | id          | bigint        | t        | f           |
+--  2                | customer_id | integer       | t        | f           |
+--  3                | status      | text          | t        | t           | 'pending'
+--  4                | amount      | numeric(12,2) | t        | f           |
+--  5                | tags        | text[]        | f        | f           |
+```
+
+### `ddl_instead_of.parse_table_constraints`
+
+```sql
+ddl_instead_of.parse_table_constraints(statement text)
+RETURNS TABLE(
+    constraint_name  text,
+    constraint_type  text,
+    column_names     text,
+    check_expr       text,
+    ref_table        text,
+    ref_columns      text,
+    fk_on_delete     text,
+    fk_on_update     text
+)
+```
+
+Parses a raw `CREATE TABLE` statement and returns one row per constraint.
+`NOT NULL` and `DEFAULT` are intentionally omitted; use `parse_table_columns`
+for those.
+
+Operates entirely on raw SQL text; no catalog lookups are performed.
+
+Granted to `PUBLIC`.
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `constraint_name` | User-given constraint name, or `NULL` for unnamed constraints |
+| `constraint_type` | `'PRIMARY KEY'`, `'UNIQUE'`, `'CHECK'`, `'FOREIGN KEY'`, or `'EXCLUDE'` |
+| `column_names` | Comma-separated key column list.  For YugabyteDB `PRIMARY KEY` and `UNIQUE` constraints, ordering suffixes are included: `id HASH, created_at ASC` |
+| `check_expr` | The `CHECK` predicate rendered as text (e.g. `(amount > 0)`), or `NULL` |
+| `ref_table` | `[schema.]table` for `FOREIGN KEY`, or `NULL` |
+| `ref_columns` | Referenced column list for `FOREIGN KEY`, or `NULL` (meaning: use the primary key of `ref_table`) |
+| `fk_on_delete` | `FOREIGN KEY` `ON DELETE` action: `'NO ACTION'`, `'RESTRICT'`, `'CASCADE'`, `'SET NULL'`, `'SET DEFAULT'`, or `NULL` for non-FK constraints |
+| `fk_on_update` | `FOREIGN KEY` `ON UPDATE` action (same values as `fk_on_delete`), or `NULL` |
+
+**Notes:**
+
+- Table-level constraints (written after the last column definition) are
+  returned before column-level key constraints.
+- Column-level `NOT NULL` and `DEFAULT` are not emitted as constraint rows;
+  they appear in `parse_table_columns` instead.
+- For a column-level `REFERENCES` clause, `column_names` is the declaring
+  column name and `fk_attrs` is `NULL` in the raw parse tree (filled in later
+  by the analyzer); the function reports the declaring column correctly.
+- Returns zero rows for statements that are not `CREATE TABLE`.
+
+**Example:**
+
+```sql
+SELECT constraint_name, constraint_type, column_names,
+       check_expr, ref_table, ref_columns, fk_on_delete, fk_on_update
+FROM ddl_instead_of.parse_table_constraints($$
+    CREATE TABLE orders (
+        id          bigint PRIMARY KEY,
+        customer_id integer NOT NULL
+            REFERENCES customers(id) ON DELETE CASCADE,
+        amount      numeric(12, 2) NOT NULL,
+        status      text NOT NULL,
+        CONSTRAINT chk_amount   CHECK (amount > 0),
+        CONSTRAINT uq_cust_stat UNIQUE (customer_id, status)
+    )
+$$);
+
+--  constraint_name | constraint_type | column_names          | check_expr   | ref_table | ref_columns | fk_on_delete | fk_on_update
+-- -----------------+-----------------+-----------------------+--------------+-----------+-------------+--------------+--------------
+--                  | PRIMARY KEY     | id                    |              |           |             |              |
+--  chk_amount      | CHECK           |                       | (amount > 0) |           |             |              |
+--  uq_cust_stat    | UNIQUE          | customer_id, status   |              |           |             |              |
+--                  | FOREIGN KEY     | customer_id           |              | customers | id          | CASCADE      | NO ACTION
+```
+
+### `ddl_instead_of.table_signature`
+
+```sql
+ddl_instead_of.table_signature(statement text) RETURNS text
+```
+
+Computes an MD5 fingerprint of the **structural definition** of a
+`CREATE TABLE` statement.  The signature captures every aspect of the
+table's shape that matters for compatibility: column positions, names,
+types, nullability, defaults, and constraint definitions.
+
+**Constraint names are deliberately excluded** so that two tables with
+identical structure but differently-named constraints produce the same
+signature.  This makes the function suitable for comparing tables across
+environments where constraint names were generated differently (e.g.
+`idx_12345_pkey` vs. `orders_pkey`).
+
+Returns `NULL` only when the statement is invalid or contains no columns.
+Granted to `PUBLIC`.
+
+**Canonical format**
+
+The MD5 is computed over a deterministic canonical text built as:
+
+```
+[column section]  GS  [constraint section]
+```
+
+where `GS` is ASCII 29 (group separator).  Within each section, rows are
+separated by ASCII 30 (record separator) and fields by ASCII 31 (unit
+separator).  These control characters cannot appear in SQL identifiers,
+type names, or expressions, so the canonical text is unambiguous.
+
+- **Columns** — ordered by `ordinal_position`.  Each row contains:
+  `ordinal_position`, `column_name`, `type_name`, `not_null`, `has_default`,
+  `default_expr`.
+- **Constraints** — sorted by `(constraint_type, column_names, check_expr,
+  ref_table, ref_columns)` so that declaration order does not affect the
+  result.  Each row contains: `constraint_type`, `column_names`,
+  `check_expr`, `ref_table`, `ref_columns`, `fk_on_delete`, `fk_on_update`.
+
+**Example:**
+
+```sql
+-- Two tables with identical structure but different constraint names
+-- produce the same signature.
+SELECT
+    ddl_instead_of.table_signature($$
+        CREATE TABLE orders (
+            id     bigint CONSTRAINT pk_orders  PRIMARY KEY,
+            email  text   CONSTRAINT uq_email   UNIQUE,
+            amount numeric(12,2) CONSTRAINT chk_amt CHECK (amount > 0)
+        )
+    $$)
+    =
+    ddl_instead_of.table_signature($$
+        CREATE TABLE orders_replica (
+            id     bigint PRIMARY KEY,
+            email  text   UNIQUE,
+            amount numeric(12,2) CHECK (amount > 0)
+        )
+    $$) AS signatures_match;
+-- → true
+
+-- Changing a column type breaks the signature.
+SELECT
+    ddl_instead_of.table_signature($$
+        CREATE TABLE t (id bigint PRIMARY KEY)
+    $$)
+    <>
+    ddl_instead_of.table_signature($$
+        CREATE TABLE t (id integer PRIMARY KEY)
+    $$) AS signatures_differ;
+-- → true
+```
+
+**Typical use cases:**
+
+- Schema drift detection: store the expected signature at deploy time and
+  compare against the incoming `CREATE TABLE` statement in a handler.
+- CI/CD schema validation: assert that migrated table DDL matches the
+  reference definition, ignoring environment-specific constraint names.
+- Audit logging: record the structural fingerprint alongside every
+  `CREATE TABLE` event for forensic comparison.
+
 ### Catalog table
 
 ```sql
@@ -417,6 +691,8 @@ Or via the YugabyteDB build wrapper (builds the full server plus the extension):
 
 | Version | Changes |
 |---|---|
+| 1.4 | Added `table_signature(statement)` — computes an MD5 fingerprint of a `CREATE TABLE` structural definition; constraint names are excluded so tables with identical structure but different constraint names produce the same hash; constraints are sorted before hashing for order-independence; granted to PUBLIC |
+| 1.3 | Added `parse_table_columns(statement)` returning per-column detail (ordinal position, name, type, nullability, default expression) and `parse_table_constraints(statement)` returning per-constraint detail (type, key columns with YugabyteDB ordering, check predicate, FK referenced table/columns, FK referential actions); type name formatter maps pg_catalog internal names to SQL standard names; expression formatter covers literals, type casts, function calls, operators, IN/BETWEEN, IS NULL, AND/OR/NOT; both granted to PUBLIC |
 | 1.2 | Added `parse_command_info(command_tag, statement)` set-returning function that extracts `object_type`, `schema_name`, `object_name`, and `object_identity` from raw DDL text; covers 20+ statement types including multi-object DROP/TRUNCATE; granted to PUBLIC |
 | 1.1 | Fixed `intercept_rule_lookup` index column order for range-sharding compatibility; fixed `add_rule` ON CONFLICT ambiguity; added GUC debug logging (`ddl_instead_of.debug`); fixed `tag_datum` use-after-free in `load_handler_oids`; added `pg_analyze_and_rewrite` step in `apply_rewrite` to handle `CALL` and other statements requiring semantic analysis; pass rewritten SQL text as `queryString` to downstream hooks |
 | 1.0 | Initial release |
