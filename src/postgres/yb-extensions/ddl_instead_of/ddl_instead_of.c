@@ -35,6 +35,7 @@
 #include "nodes/parsenodes.h"
 #include "funcapi.h"
 #include "lib/stringinfo.h"
+#include "nodes/primnodes.h"
 #include "parser/parser.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -89,6 +90,933 @@ static void chain_ProcessUtility(PlannedStmt *pstmt,
 								 QueryEnvironment *queryEnv,
 								 DestReceiver *dest,
 								 QueryCompletion *qc);
+
+/* =========================================================================
+ * parse_table_columns / parse_table_constraints implementation
+ *
+ * These two set-returning functions walk a raw CREATE TABLE parse tree and
+ * return structured column and constraint information, allowing handler
+ * functions to inspect the table signature without any regex-based parsing.
+ * ========================================================================= */
+
+/*
+ * Map pg_catalog internal type names to their SQL-standard equivalents.
+ * Returns NULL if the name has no special mapping (use it verbatim).
+ */
+static const char *
+ddlii_pg_catalog_type_name(const char *iname)
+{
+	/* Keep sorted by internal name for readability only; linear scan is fine */
+	static const struct { const char *internal; const char *sql; } map[] =
+	{
+		{ "bit",         "bit" },
+		{ "bool",        "boolean" },
+		{ "bpchar",      "character" },
+		{ "date",        "date" },
+		{ "float4",      "real" },
+		{ "float8",      "double precision" },
+		{ "int2",        "smallint" },
+		{ "int4",        "integer" },
+		{ "int8",        "bigint" },
+		{ "interval",    "interval" },
+		{ "numeric",     "numeric" },
+		{ "time",        "time" },
+		{ "timetz",      "time with time zone" },
+		{ "timestamp",   "timestamp" },
+		{ "timestamptz", "timestamp with time zone" },
+		{ "varbit",      "bit varying" },
+		{ "varchar",     "character varying" },
+	};
+	for (int i = 0; i < (int) lengthof(map); i++)
+		if (strcmp(iname, map[i].internal) == 0)
+			return map[i].sql;
+	return NULL;
+}
+
+/*
+ * Format a TypeName node as a human-readable SQL type string.
+ * Includes precision/scale modifiers and array brackets.
+ * Caller must pfree the returned palloc'd string.
+ */
+static char *
+ddlii_format_type(TypeName *typeName)
+{
+	StringInfoData	buf;
+	const char	   *schema_part = NULL;
+	const char	   *name_part = NULL;
+	int				nnames;
+	bool			is_pg_catalog;
+
+	initStringInfo(&buf);
+
+	if (typeName == NULL)
+	{
+		appendStringInfoString(&buf, "unknown");
+		return buf.data;
+	}
+
+	nnames = list_length(typeName->names);
+
+	if (nnames == 0)
+		name_part = "unknown";
+	else if (nnames == 1)
+		name_part = strVal(linitial(typeName->names));
+	else if (nnames == 2)
+	{
+		schema_part = strVal(linitial(typeName->names));
+		name_part   = strVal(lsecond(typeName->names));
+	}
+	else
+	{
+		schema_part = strVal(list_nth(typeName->names, nnames - 2));
+		name_part   = strVal(llast(typeName->names));
+	}
+
+	is_pg_catalog = (schema_part != NULL &&
+					 strcmp(schema_part, "pg_catalog") == 0);
+
+	if (is_pg_catalog || schema_part == NULL)
+	{
+		const char *sql_name = ddlii_pg_catalog_type_name(name_part);
+		appendStringInfoString(&buf, sql_name ? sql_name : name_part);
+	}
+	else
+		appendStringInfo(&buf, "%s.%s", schema_part, name_part);
+
+	/* Type modifiers: (precision), (precision, scale), (length), etc. */
+	if (typeName->typmods != NIL)
+	{
+		ListCell   *lc;
+		bool		first = true;
+
+		appendStringInfoChar(&buf, '(');
+		foreach(lc, typeName->typmods)
+		{
+			Node *mod = lfirst(lc);
+
+			if (!first)
+				appendStringInfoString(&buf, ", ");
+			first = false;
+
+			if (IsA(mod, A_Const))
+			{
+				A_Const *ac = (A_Const *) mod;
+				if (!ac->isnull)
+				{
+					if (IsA(&ac->val, Integer))
+						appendStringInfo(&buf, "%d", ac->val.ival.ival);
+					else if (IsA(&ac->val, Float))
+						appendStringInfoString(&buf, ac->val.fval.fval);
+					else if (IsA(&ac->val, String))
+						appendStringInfoString(&buf, ac->val.sval.sval);
+				}
+			}
+			else if (IsA(mod, Integer))
+				appendStringInfo(&buf, "%d", ((Integer *) mod)->ival);
+		}
+		appendStringInfoChar(&buf, ')');
+	}
+
+	/* Array dimensions: one "[]" per element in arrayBounds */
+	for (int i = 0; i < list_length(typeName->arrayBounds); i++)
+		appendStringInfoString(&buf, "[]");
+
+	return buf.data;
+}
+
+/*
+ * Forward declaration so ddlii_format_expr can be recursive.
+ */
+static char *ddlii_format_expr(Node *expr);
+
+/*
+ * Format a raw A_Const literal as a SQL text representation.
+ */
+static char *
+ddlii_format_aconst(A_Const *ac)
+{
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+
+	if (ac->isnull)
+	{
+		appendStringInfoString(&buf, "NULL");
+	}
+	else if (IsA(&ac->val, Integer))
+	{
+		appendStringInfo(&buf, "%d", ac->val.ival.ival);
+	}
+	else if (IsA(&ac->val, Float))
+	{
+		appendStringInfoString(&buf, ac->val.fval.fval);
+	}
+	else if (IsA(&ac->val, Boolean))
+	{
+		appendStringInfoString(&buf, ac->val.boolval.boolval ? "true" : "false");
+	}
+	else if (IsA(&ac->val, String))
+	{
+		const char *s = ac->val.sval.sval;
+		appendStringInfoChar(&buf, '\'');
+		while (*s)
+		{
+			if (*s == '\'')
+				appendStringInfoChar(&buf, '\''); /* double embedded quotes */
+			appendStringInfoChar(&buf, *s++);
+		}
+		appendStringInfoChar(&buf, '\'');
+	}
+	else if (IsA(&ac->val, BitString))
+	{
+		/* Starts with 'b' (binary literal) or 'x' (hex literal) */
+		const char *bs = ac->val.bsval.bsval;
+		if (*bs == 'b' || *bs == 'B')
+			appendStringInfo(&buf, "B'%s'", bs + 1);
+		else
+			appendStringInfo(&buf, "X'%s'", bs + 1);
+	}
+	else
+		appendStringInfoString(&buf, "<constant>");
+
+	return buf.data;
+}
+
+/*
+ * Format a raw expression node as a SQL text string.
+ *
+ * Handles the most common forms that appear in DEFAULT and CHECK expressions:
+ * literals, type casts, function calls, column references, and operators.
+ * Returns "<expression>" for anything else rather than crashing.
+ *
+ * Caller must pfree the returned palloc'd string.
+ */
+static char *
+ddlii_format_expr(Node *expr)
+{
+	StringInfoData buf;
+
+	if (expr == NULL)
+		return pstrdup("NULL");
+
+	initStringInfo(&buf);
+
+	if (IsA(expr, A_Const))
+	{
+		char *s = ddlii_format_aconst((A_Const *) expr);
+		appendStringInfoString(&buf, s);
+		pfree(s);
+	}
+	else if (IsA(expr, TypeCast))
+	{
+		TypeCast *tc = (TypeCast *) expr;
+		char	 *arg_str  = ddlii_format_expr(tc->arg);
+		char	 *type_str = ddlii_format_type(tc->typeName);
+
+		appendStringInfo(&buf, "%s::%s", arg_str, type_str);
+		pfree(arg_str);
+		pfree(type_str);
+	}
+	else if (IsA(expr, FuncCall))
+	{
+		FuncCall   *fc = (FuncCall *) expr;
+		ListCell   *lc;
+		bool		first = true;
+		const char *schema = NULL;
+		const char *fname  = NULL;
+		int			nnames = list_length(fc->funcname);
+
+		if (nnames == 1)
+			fname = strVal(linitial(fc->funcname));
+		else if (nnames >= 2)
+		{
+			schema = strVal(list_nth(fc->funcname, nnames - 2));
+			fname  = strVal(llast(fc->funcname));
+		}
+
+		/* Suppress pg_catalog schema prefix — it's redundant for users */
+		if (schema && strcmp(schema, "pg_catalog") != 0)
+			appendStringInfo(&buf, "%s.", schema);
+		appendStringInfoString(&buf, fname ? fname : "<func>");
+
+		appendStringInfoChar(&buf, '(');
+		if (fc->agg_star)
+			appendStringInfoChar(&buf, '*');
+		else
+		{
+			foreach(lc, fc->args)
+			{
+				char *arg_str = ddlii_format_expr((Node *) lfirst(lc));
+				if (!first) appendStringInfoString(&buf, ", ");
+				first = false;
+				appendStringInfoString(&buf, arg_str);
+				pfree(arg_str);
+			}
+		}
+		appendStringInfoChar(&buf, ')');
+	}
+	else if (IsA(expr, ColumnRef))
+	{
+		ColumnRef  *cr = (ColumnRef *) expr;
+		ListCell   *lc;
+		bool		first = true;
+
+		foreach(lc, cr->fields)
+		{
+			Node *field = (Node *) lfirst(lc);
+			if (!first) appendStringInfoChar(&buf, '.');
+			first = false;
+			if (IsA(field, String))
+				appendStringInfoString(&buf, strVal((String *) field));
+			else
+				appendStringInfoChar(&buf, '*');
+		}
+	}
+	else if (IsA(expr, A_Expr))
+	{
+		A_Expr	   *ae = (A_Expr *) expr;
+		const char *op_name = NULL;
+
+		if (list_length(ae->name) == 1 &&
+			IsA(linitial(ae->name), String))
+			op_name = strVal((String *) linitial(ae->name));
+
+		switch (ae->kind)
+		{
+			case AEXPR_OP:
+			case AEXPR_OP_ANY:
+			case AEXPR_OP_ALL:
+			case AEXPR_DISTINCT:
+			case AEXPR_NOT_DISTINCT:
+			case AEXPR_NULLIF:
+			{
+				if (ae->lexpr && ae->rexpr)
+				{
+					char	   *lstr = ddlii_format_expr(ae->lexpr);
+					char	   *rstr = ddlii_format_expr(ae->rexpr);
+					const char *mod  = (ae->kind == AEXPR_OP_ANY) ? " ANY" :
+									   (ae->kind == AEXPR_OP_ALL) ? " ALL" : "";
+					appendStringInfo(&buf, "(%s %s%s %s)",
+									lstr, op_name ? op_name : "?", mod, rstr);
+					pfree(lstr);
+					pfree(rstr);
+				}
+				else if (!ae->lexpr && ae->rexpr)
+				{
+					char *rstr = ddlii_format_expr(ae->rexpr);
+					appendStringInfo(&buf, "(%s %s)",
+									op_name ? op_name : "?", rstr);
+					pfree(rstr);
+				}
+				else if (ae->lexpr && !ae->rexpr)
+				{
+					char *lstr = ddlii_format_expr(ae->lexpr);
+					appendStringInfo(&buf, "(%s %s)",
+									lstr, op_name ? op_name : "?");
+					pfree(lstr);
+				}
+				else
+					appendStringInfoString(&buf, "<expression>");
+				break;
+			}
+
+			case AEXPR_IN:
+			{
+				char	   *lstr = ae->lexpr ? ddlii_format_expr(ae->lexpr)
+										    : pstrdup("?");
+				const char *in_kw = (op_name && strcmp(op_name, "=") == 0)
+									? "IN" : "NOT IN";
+				appendStringInfo(&buf, "(%s %s (", lstr, in_kw);
+				pfree(lstr);
+				if (ae->rexpr && IsA(ae->rexpr, List))
+				{
+					ListCell *lc;
+					bool	  first = true;
+					foreach(lc, (List *) ae->rexpr)
+					{
+						char *elem = ddlii_format_expr((Node *) lfirst(lc));
+						if (!first) appendStringInfoString(&buf, ", ");
+						first = false;
+						appendStringInfoString(&buf, elem);
+						pfree(elem);
+					}
+				}
+				appendStringInfoString(&buf, "))");
+				break;
+			}
+
+			case AEXPR_BETWEEN:
+			case AEXPR_NOT_BETWEEN:
+			case AEXPR_BETWEEN_SYM:
+			case AEXPR_NOT_BETWEEN_SYM:
+			{
+				const char *bw_kw =
+					(ae->kind == AEXPR_BETWEEN)         ? "BETWEEN" :
+					(ae->kind == AEXPR_NOT_BETWEEN)     ? "NOT BETWEEN" :
+					(ae->kind == AEXPR_BETWEEN_SYM)     ? "BETWEEN SYMMETRIC" :
+														  "NOT BETWEEN SYMMETRIC";
+				char *lstr = ae->lexpr ? ddlii_format_expr(ae->lexpr)
+									   : pstrdup("?");
+				appendStringInfo(&buf, "(%s %s", lstr, bw_kw);
+				pfree(lstr);
+				if (ae->rexpr && IsA(ae->rexpr, List))
+				{
+					List *bounds = (List *) ae->rexpr;
+					if (list_length(bounds) >= 2)
+					{
+						char *lo = ddlii_format_expr((Node *) linitial(bounds));
+						char *hi = ddlii_format_expr((Node *) lsecond(bounds));
+						appendStringInfo(&buf, " %s AND %s", lo, hi);
+						pfree(lo);
+						pfree(hi);
+					}
+				}
+				appendStringInfoChar(&buf, ')');
+				break;
+			}
+
+			case AEXPR_LIKE:
+			case AEXPR_ILIKE:
+			{
+				char	   *lstr = ae->lexpr ? ddlii_format_expr(ae->lexpr)
+										    : pstrdup("?");
+				char	   *rstr = ae->rexpr ? ddlii_format_expr(ae->rexpr)
+										    : pstrdup("?");
+				bool negated = (op_name &&
+								(strcmp(op_name, "!~~") == 0 ||
+								 strcmp(op_name, "!~~*") == 0));
+				appendStringInfo(&buf, "(%s %s%s %s)",
+								lstr,
+								negated ? "NOT " : "",
+								ae->kind == AEXPR_LIKE ? "LIKE" : "ILIKE",
+								rstr);
+				pfree(lstr);
+				pfree(rstr);
+				break;
+			}
+
+			default:
+			{
+				if (ae->lexpr && ae->rexpr)
+				{
+					char *lstr = ddlii_format_expr(ae->lexpr);
+					char *rstr = ddlii_format_expr(ae->rexpr);
+					appendStringInfo(&buf, "(%s %s %s)",
+									lstr, op_name ? op_name : "?", rstr);
+					pfree(lstr);
+					pfree(rstr);
+				}
+				else
+					appendStringInfoString(&buf, "<expression>");
+				break;
+			}
+		}
+	}
+	else if (IsA(expr, NullTest))
+	{
+		NullTest *nt  = (NullTest *) expr;
+		char	 *arg = ddlii_format_expr((Node *) nt->arg);
+		appendStringInfo(&buf, "(%s %s)", arg,
+						nt->nulltesttype == IS_NULL ? "IS NULL" : "IS NOT NULL");
+		pfree(arg);
+	}
+	else if (IsA(expr, BooleanTest))
+	{
+		BooleanTest *bt  = (BooleanTest *) expr;
+		char		*arg = ddlii_format_expr((Node *) bt->arg);
+		const char  *kw;
+		switch (bt->booltesttype)
+		{
+			case IS_TRUE:        kw = "IS TRUE";        break;
+			case IS_NOT_TRUE:    kw = "IS NOT TRUE";    break;
+			case IS_FALSE:       kw = "IS FALSE";       break;
+			case IS_NOT_FALSE:   kw = "IS NOT FALSE";   break;
+			case IS_UNKNOWN:     kw = "IS UNKNOWN";     break;
+			case IS_NOT_UNKNOWN: kw = "IS NOT UNKNOWN"; break;
+			default:             kw = "IS ?";           break;
+		}
+		appendStringInfo(&buf, "(%s %s)", arg, kw);
+		pfree(arg);
+	}
+	else if (IsA(expr, BoolExpr))
+	{
+		BoolExpr   *be    = (BoolExpr *) expr;
+		ListCell   *lc;
+		bool		first = true;
+
+		if (be->boolop == NOT_EXPR)
+		{
+			char *arg = ddlii_format_expr((Node *) linitial(be->args));
+			appendStringInfo(&buf, "(NOT %s)", arg);
+			pfree(arg);
+		}
+		else
+		{
+			const char *op = (be->boolop == AND_EXPR) ? " AND " : " OR ";
+			appendStringInfoChar(&buf, '(');
+			foreach(lc, be->args)
+			{
+				char *arg = ddlii_format_expr((Node *) lfirst(lc));
+				if (!first) appendStringInfoString(&buf, op);
+				first = false;
+				appendStringInfoString(&buf, arg);
+				pfree(arg);
+			}
+			appendStringInfoChar(&buf, ')');
+		}
+	}
+	else if (IsA(expr, ParamRef))
+	{
+		appendStringInfo(&buf, "$%d", ((ParamRef *) expr)->number);
+	}
+	else if (IsA(expr, CollateClause))
+	{
+		CollateClause *cc  = (CollateClause *) expr;
+		char		  *arg = ddlii_format_expr(cc->arg);
+		appendStringInfo(&buf, "%s COLLATE ...", arg);
+		pfree(arg);
+	}
+	else if (IsA(expr, SubLink))
+	{
+		appendStringInfoString(&buf, "<subquery>");
+	}
+	else
+	{
+		appendStringInfoString(&buf, "<expression>");
+	}
+
+	return buf.data;
+}
+
+/*
+ * Join a list of String nodes into a comma-separated palloc'd string.
+ */
+static char *
+ddlii_strlist_join(List *strlist, const char *sep)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first = true;
+
+	initStringInfo(&buf);
+	foreach(lc, strlist)
+	{
+		if (!first) appendStringInfoString(&buf, sep);
+		first = false;
+		appendStringInfoString(&buf, strVal(lfirst(lc)));
+	}
+	return buf.data;
+}
+
+/*
+ * Format a list of IndexElem nodes as "col [HASH|ASC|DESC], ..." .
+ * Used to render YugabyteDB PRIMARY KEY / UNIQUE ordering information.
+ */
+static char *
+ddlii_indexelem_list_to_str(List *ielems)
+{
+	StringInfoData	buf;
+	ListCell	   *lc;
+	bool			first = true;
+
+	initStringInfo(&buf);
+	foreach(lc, ielems)
+	{
+		IndexElem  *ie = lfirst_node(IndexElem, lc);
+		if (!first) appendStringInfoString(&buf, ", ");
+		first = false;
+
+		if (ie->name)
+			appendStringInfoString(&buf, ie->name);
+		else
+			appendStringInfoString(&buf, "<expr>");
+
+		/* YugabyteDB extended ordering suffix */
+		switch (ie->ordering)
+		{
+			case SORTBY_HASH:   appendStringInfoString(&buf, " HASH"); break;
+			case SORTBY_ASC:    appendStringInfoString(&buf, " ASC");  break;
+			case SORTBY_DESC:   appendStringInfoString(&buf, " DESC"); break;
+			default:            break;  /* SORTBY_DEFAULT: no suffix */
+		}
+	}
+	return buf.data;
+}
+
+/*
+ * Return the SQL keyword for a FK referential action character.
+ */
+static const char *
+ddlii_fk_action_str(char action)
+{
+	switch (action)
+	{
+		case FKCONSTR_ACTION_NOACTION:   return "NO ACTION";
+		case FKCONSTR_ACTION_RESTRICT:   return "RESTRICT";
+		case FKCONSTR_ACTION_CASCADE:    return "CASCADE";
+		case FKCONSTR_ACTION_SETNULL:    return "SET NULL";
+		case FKCONSTR_ACTION_SETDEFAULT: return "SET DEFAULT";
+		default:                         return "NO ACTION";
+	}
+}
+
+/* ---------- parse_table_columns ---------- */
+
+/*
+ * ddl_instead_of_parse_table_columns
+ *
+ * Parse a CREATE TABLE statement and return one row per column:
+ *
+ *   ordinal_position integer  -- 1-based
+ *   column_name      text
+ *   type_name        text     -- human-readable SQL type (e.g. "character varying(100)")
+ *   not_null         boolean  -- true when NOT NULL is present
+ *   has_default      boolean  -- true when a DEFAULT clause is present
+ *   default_expr     text     -- the default expression as text, or NULL
+ */
+PG_FUNCTION_INFO_V1(ddl_instead_of_parse_table_columns);
+Datum
+ddl_instead_of_parse_table_columns(PG_FUNCTION_ARGS)
+{
+	text		  *stmt_text = PG_GETARG_TEXT_PP(0);
+	char		  *stmt_cstr;
+	List		  *raw_list;
+	RawStmt		  *rawstmt;
+	Node		  *stmt;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	CreateStmt	  *cs;
+	ListCell	  *lc;
+	int			   ordinal = 0;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stmt_cstr = text_to_cstring(stmt_text);
+	raw_list  = raw_parser(stmt_cstr, RAW_PARSE_DEFAULT);
+	pfree(stmt_cstr);
+
+	if (list_length(raw_list) < 1)
+		return (Datum) 0;
+
+	rawstmt = linitial_node(RawStmt, raw_list);
+	stmt    = rawstmt->stmt;
+
+	if (stmt == NULL || !IsA(stmt, CreateStmt))
+		return (Datum) 0;
+
+	cs = (CreateStmt *) stmt;
+
+	foreach(lc, cs->tableElts)
+	{
+		Node	   *elt = (Node *) lfirst(lc);
+		ColumnDef  *col;
+		ListCell   *clc;
+		bool		col_not_null = false;
+		Node	   *col_default  = NULL;
+		Datum		values[6];
+		bool		nulls[6];
+		char	   *type_str;
+
+		if (!IsA(elt, ColumnDef))
+			continue;   /* skip table-level Constraint nodes */
+
+		col = (ColumnDef *) elt;
+		ordinal++;
+
+		/*
+		 * In the raw parse tree, NOT NULL and DEFAULT live in the constraints
+		 * list (CONSTR_NOTNULL / CONSTR_DEFAULT); the ColumnDef.is_not_null
+		 * and raw_default fields are populated only after semantic analysis.
+		 */
+		foreach(clc, col->constraints)
+		{
+			Constraint *con = lfirst_node(Constraint, clc);
+			switch (con->contype)
+			{
+				case CONSTR_NOTNULL:
+					col_not_null = true;
+					break;
+				case CONSTR_DEFAULT:
+					if (con->raw_expr != NULL)
+						col_default = con->raw_expr;
+					break;
+				case CONSTR_PRIMARY:
+				case CONSTR_IDENTITY:
+				case CONSTR_GENERATED:
+					/* These imply NOT NULL even without an explicit constraint */
+					col_not_null = true;
+					break;
+				default:
+					break;
+			}
+		}
+
+		MemSet(nulls, 0, sizeof(nulls));
+
+		/* ordinal_position */
+		values[0] = Int32GetDatum(ordinal);
+
+		/* column_name */
+		values[1] = CStringGetTextDatum(col->colname);
+
+		/* type_name */
+		if (col->typeName)
+		{
+			type_str = ddlii_format_type(col->typeName);
+			values[2] = CStringGetTextDatum(type_str);
+			pfree(type_str);
+		}
+		else
+			nulls[2] = true;
+
+		/* not_null */
+		values[3] = BoolGetDatum(col_not_null);
+
+		/* has_default */
+		values[4] = BoolGetDatum(col_default != NULL);
+
+		/* default_expr */
+		if (col_default != NULL)
+		{
+			char *expr_str = ddlii_format_expr(col_default);
+			values[5] = CStringGetTextDatum(expr_str);
+			pfree(expr_str);
+		}
+		else
+			nulls[5] = true;
+
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+
+	return (Datum) 0;
+}
+
+/* ---------- parse_table_constraints ---------- */
+
+/*
+ * Emit one constraint row into the SRF tuplestore.
+ *
+ * parent_colname: non-NULL for a column-level constraint (e.g. REFERENCES
+ * written inline with a column definition); NULL for a table-level constraint.
+ */
+static void
+ddlii_emit_constraint_row(ReturnSetInfo *rsinfo,
+						  Constraint	*con,
+						  const char	*parent_colname)
+{
+	Datum		values[8];
+	bool		nulls[8];
+	const char *con_type;
+
+	switch (con->contype)
+	{
+		case CONSTR_PRIMARY:   con_type = "PRIMARY KEY"; break;
+		case CONSTR_UNIQUE:    con_type = "UNIQUE";      break;
+		case CONSTR_CHECK:     con_type = "CHECK";       break;
+		case CONSTR_FOREIGN:   con_type = "FOREIGN KEY"; break;
+		case CONSTR_EXCLUSION: con_type = "EXCLUDE";     break;
+		default:               return;  /* ignore NULL/NOTNULL/DEFAULT etc. */
+	}
+
+	MemSet(nulls, 0, sizeof(nulls));
+
+	/* constraint_name */
+	if (con->conname && con->conname[0] != '\0')
+		values[0] = CStringGetTextDatum(con->conname);
+	else
+		nulls[0] = true;
+
+	/* constraint_type */
+	values[1] = CStringGetTextDatum(con_type);
+
+	/*
+	 * column_names: key column list.
+	 *
+	 * Preference order for PK/UNIQUE:
+	 *   1. yb_index_params (non-NIL) — carries YugabyteDB HASH/ASC/DESC ordering
+	 *   2. keys            (non-NIL) — plain column name list from standard grammar
+	 *   3. parent_colname  (non-NULL) — column-level constraint: the column itself
+	 *
+	 * For FOREIGN KEY the local column list comes from fk_attrs; for a
+	 * column-level REFERENCES the parser leaves fk_attrs NIL and the column
+	 * is identified by parent_colname.
+	 */
+	if (con->contype == CONSTR_FOREIGN)
+	{
+		if (parent_colname != NULL)
+			/* column-level REFERENCES: the FK column is the declaring column */
+			values[2] = CStringGetTextDatum(parent_colname);
+		else if (con->fk_attrs != NIL)
+		{
+			char *s = ddlii_strlist_join(con->fk_attrs, ", ");
+			values[2] = CStringGetTextDatum(s);
+			pfree(s);
+		}
+		else
+			nulls[2] = true;
+	}
+	else if (con->yb_index_params != NIL)
+	{
+		/* Use YB ordering-aware representation */
+		char *s = ddlii_indexelem_list_to_str(con->yb_index_params);
+		values[2] = CStringGetTextDatum(s);
+		pfree(s);
+	}
+	else if (con->keys != NIL)
+	{
+		char *s = ddlii_strlist_join(con->keys, ", ");
+		values[2] = CStringGetTextDatum(s);
+		pfree(s);
+	}
+	else if (parent_colname != NULL)
+		values[2] = CStringGetTextDatum(parent_colname);
+	else
+		nulls[2] = true;
+
+	/* check_expr — for CHECK constraints */
+	if (con->contype == CONSTR_CHECK && con->raw_expr != NULL)
+	{
+		char *s = ddlii_format_expr(con->raw_expr);
+		values[3] = CStringGetTextDatum(s);
+		pfree(s);
+	}
+	else
+		nulls[3] = true;
+
+	/* ref_table — for FOREIGN KEY */
+	if (con->contype == CONSTR_FOREIGN && con->pktable != NULL)
+	{
+		StringInfoData buf;
+		initStringInfo(&buf);
+		if (con->pktable->schemaname && con->pktable->schemaname[0] != '\0')
+			appendStringInfo(&buf, "%s.%s",
+							con->pktable->schemaname, con->pktable->relname);
+		else
+			appendStringInfoString(&buf, con->pktable->relname);
+		values[4] = CStringGetTextDatum(buf.data);
+		pfree(buf.data);
+	}
+	else
+		nulls[4] = true;
+
+	/*
+	 * ref_columns — referenced columns for FK.
+	 * NULL means "the primary key of ref_table" (PostgreSQL default).
+	 */
+	if (con->contype == CONSTR_FOREIGN && con->pk_attrs != NIL)
+	{
+		char *s = ddlii_strlist_join(con->pk_attrs, ", ");
+		values[5] = CStringGetTextDatum(s);
+		pfree(s);
+	}
+	else
+		nulls[5] = true;
+
+	/* fk_on_delete, fk_on_update — FK referential actions */
+	if (con->contype == CONSTR_FOREIGN)
+	{
+		values[6] = CStringGetTextDatum(ddlii_fk_action_str(con->fk_del_action));
+		values[7] = CStringGetTextDatum(ddlii_fk_action_str(con->fk_upd_action));
+	}
+	else
+	{
+		nulls[6] = true;
+		nulls[7] = true;
+	}
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * ddl_instead_of_parse_table_constraints
+ *
+ * Parse a CREATE TABLE statement and return one row per constraint:
+ *
+ *   constraint_name  text     -- name given by user, or NULL if unnamed
+ *   constraint_type  text     -- 'PRIMARY KEY', 'UNIQUE', 'CHECK', 'FOREIGN KEY', 'EXCLUDE'
+ *   column_names     text     -- comma-separated key columns (with HASH/ASC/DESC for YugabyteDB)
+ *   check_expr       text     -- CHECK predicate text, or NULL
+ *   ref_table        text     -- [schema.]table for FOREIGN KEY, or NULL
+ *   ref_columns      text     -- referenced columns for FK, or NULL (= use PK)
+ *   fk_on_delete     text     -- FK ON DELETE action, or NULL
+ *   fk_on_update     text     -- FK ON UPDATE action, or NULL
+ *
+ * Table-level constraints (listed after the last column) are emitted first,
+ * followed by column-level key constraints (PRIMARY KEY, UNIQUE, CHECK,
+ * FOREIGN KEY declared inline with a column).  NOT NULL and DEFAULT are not
+ * emitted here; use parse_table_columns for those.
+ */
+PG_FUNCTION_INFO_V1(ddl_instead_of_parse_table_constraints);
+Datum
+ddl_instead_of_parse_table_constraints(PG_FUNCTION_ARGS)
+{
+	text		  *stmt_text = PG_GETARG_TEXT_PP(0);
+	char		  *stmt_cstr;
+	List		  *raw_list;
+	RawStmt		  *rawstmt;
+	Node		  *stmt;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	CreateStmt	  *cs;
+	ListCell	  *lc;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stmt_cstr = text_to_cstring(stmt_text);
+	raw_list  = raw_parser(stmt_cstr, RAW_PARSE_DEFAULT);
+	pfree(stmt_cstr);
+
+	if (list_length(raw_list) < 1)
+		return (Datum) 0;
+
+	rawstmt = linitial_node(RawStmt, raw_list);
+	stmt    = rawstmt->stmt;
+
+	if (stmt == NULL || !IsA(stmt, CreateStmt))
+		return (Datum) 0;
+
+	cs = (CreateStmt *) stmt;
+
+	/* First: table-level Constraint nodes in tableElts */
+	foreach(lc, cs->tableElts)
+	{
+		Node *elt = (Node *) lfirst(lc);
+		if (IsA(elt, Constraint))
+			ddlii_emit_constraint_row(rsinfo, (Constraint *) elt, NULL);
+	}
+
+	/* Second: column-level key constraints from each ColumnDef */
+	foreach(lc, cs->tableElts)
+	{
+		Node	   *elt = (Node *) lfirst(lc);
+		ColumnDef  *col;
+		ListCell   *clc;
+
+		if (!IsA(elt, ColumnDef))
+			continue;
+
+		col = (ColumnDef *) elt;
+		foreach(clc, col->constraints)
+		{
+			Constraint *con = lfirst_node(Constraint, clc);
+			switch (con->contype)
+			{
+				case CONSTR_PRIMARY:
+				case CONSTR_UNIQUE:
+				case CONSTR_CHECK:
+				case CONSTR_FOREIGN:
+					ddlii_emit_constraint_row(rsinfo, con, col->colname);
+					break;
+				default:
+					break;
+			}
+		}
+	}
+
+	return (Datum) 0;
+}
+
+/* =========================================================================
+ * End of parse_table_columns / parse_table_constraints implementation
+ * ========================================================================= */
 
 /* -------------------------------------------------------------------------
  * parse_command_info helpers
