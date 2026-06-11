@@ -1774,9 +1774,27 @@ load_handler_oids(const char *command_tag, Oid *handlers, int maxhandlers)
 		ErrorData  *edata = CopyErrorData();
 
 		FlushErrorState();
-		ereport(WARNING,
-				(errmsg("ddl_instead_of: error querying intercept_rule, "
-						"skipping intercept: %s", edata->message)));
+
+		/*
+		 * ERRCODE_UNDEFINED_TABLE  (42P01) and ERRCODE_INVALID_SCHEMA_NAME
+		 * (3F000) both indicate that the ddl_instead_of extension has not been
+		 * installed in this database.  This is a fully expected condition when
+		 * shared_preload_libraries includes the library but the extension has
+		 * not been created in every database.  Treat it as a silent no-op so
+		 * that users never see spurious warnings in databases that deliberately
+		 * omit the extension.
+		 *
+		 * All other errors are genuinely unexpected and still deserve a WARNING
+		 * so that operators can investigate.
+		 */
+		if (edata->sqlerrcode != ERRCODE_UNDEFINED_TABLE &&
+			edata->sqlerrcode != ERRCODE_INVALID_SCHEMA_NAME)
+			ereport(WARNING,
+					(errmsg("ddl_instead_of: error querying intercept_rule, "
+							"skipping intercept: %s", edata->message)));
+
+		DDL_DBG("load_handler_oids: skipping intercept (%s)",
+				edata->message);
 		FreeErrorData(edata);
 		n = 0;
 	}
