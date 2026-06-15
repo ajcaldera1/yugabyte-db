@@ -76,9 +76,12 @@ ALTER EXTENSION ddl_instead_of UPDATE TO '1.3';
 -- From 1.3 to 1.4  (adds table_signature)
 ALTER EXTENSION ddl_instead_of UPDATE TO '1.4';
 
--- From any earlier version directly to 1.4
+-- From 1.4 to 1.5  (adds index storage estimation functions)
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.5';
+
+-- From any earlier version directly to 1.5
 -- (PostgreSQL chains upgrade scripts automatically)
-ALTER EXTENSION ddl_instead_of UPDATE TO '1.4';
+ALTER EXTENSION ddl_instead_of UPDATE TO '1.5';
 ```
 
 ## Usage
@@ -163,6 +166,41 @@ BEGIN
     END IF;
 
     RETURN NULL;  -- passes structural check, execute as-is
+END;
+$$;
+```
+
+**Example — automatically set `SPLIT INTO` tablets based on `estimate_index_size`:**
+
+```sql
+-- A CREATE INDEX handler that uses estimate_index_size to compute an
+-- appropriate SPLIT INTO clause before the index is created.
+CREATE OR REPLACE FUNCTION public.autosplit_index(
+    command_tag text,
+    stmt        text
+) RETURNS text LANGUAGE plpgsql AS $$
+DECLARE
+    est     record;
+    tablets integer;
+BEGIN
+    -- Skip if the statement already specifies SPLIT INTO
+    IF stmt ~* 'SPLIT\s+INTO' THEN
+        RETURN NULL;
+    END IF;
+
+    SELECT * INTO est
+    FROM ddl_instead_of.estimate_index_size(stmt)
+    LIMIT 1;
+
+    -- Recommend at least 1 tablet; apply ceiling for the SQL clause
+    tablets := GREATEST(1, ceil(est.recommended_tablets));
+
+    -- Only add SPLIT INTO when more than one tablet is warranted
+    IF tablets <= 1 THEN
+        RETURN NULL;
+    END IF;
+
+    RETURN stmt || format(' SPLIT INTO %s TABLETS', tablets);
 END;
 $$;
 ```
@@ -579,6 +617,360 @@ SELECT
 - Audit logging: record the structural fingerprint alongside every
   `CREATE TABLE` event for forensic comparison.
 
+### `ddl_instead_of.parse_index_columns`
+
+```sql
+ddl_instead_of.parse_index_columns(statement text)
+RETURNS TABLE (
+    is_key       boolean,
+    ordinal      integer,
+    column_name  text,
+    expression   text,
+    ordering     text,
+    nulls_first  boolean,
+    where_clause text
+)
+```
+
+Parses a raw `CREATE INDEX` statement and returns one row per key column
+followed by one row per `INCLUDE` column.  Operates entirely on raw SQL text;
+no catalog lookups or OID resolution are performed.
+
+Granted to `PUBLIC`.
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `is_key` | `true` for key columns, `false` for `INCLUDE` columns |
+| `ordinal` | 1-based position within the key or include list |
+| `column_name` | Column name, or `NULL` for expression indexes |
+| `expression` | Formatted expression for expression indexes (e.g. `lower(email)`), or `NULL` for plain column indexes |
+| `ordering` | `'HASH'`, `'ASC'`, `'DESC'`, or `NULL` (database default) |
+| `nulls_first` | `true` / `false` / `NULL` (database default) |
+| `where_clause` | The `WHERE` predicate rendered as text (same on every row), or `NULL` when there is no `WHERE` clause |
+
+**Notes:**
+
+- The `ordering` column reflects the YugabyteDB-specific `HASH` sort direction
+  as well as the standard `ASC` / `DESC`.  A value of `NULL` means no ordering
+  was written explicitly.
+- Returns zero rows for statements that are not `CREATE INDEX`.
+
+**Example:**
+
+```sql
+SELECT is_key, ordinal, column_name, ordering, where_clause
+FROM ddl_instead_of.parse_index_columns($$
+    CREATE INDEX ON orders (tenant_id HASH, created_at ASC)
+    INCLUDE (total_amount)
+    WHERE status = 'active'
+$$);
+
+--  is_key | ordinal | column_name  | ordering | where_clause
+-- --------+---------+--------------+----------+------------------
+--  t      |       1 | tenant_id    | HASH     | (status = 'active')
+--  t      |       2 | created_at   | ASC      | (status = 'active')
+--  f      |       1 | total_amount |          | (status = 'active')
+```
+
+---
+
+### `ddl_instead_of.parse_index_predicates`
+
+```sql
+ddl_instead_of.parse_index_predicates(statement text)
+RETURNS TABLE (
+    conjunction  text,
+    column_name  text,
+    operator     text,
+    literal      text,
+    literal_list text,
+    negated      boolean
+)
+```
+
+Parses the `WHERE` clause of a `CREATE INDEX` statement and returns one row
+per **leaf condition**.  Boolean combinators (`AND`, `OR`, `NOT`) are not
+emitted as rows; instead, each leaf is tagged with the conjunction of its
+**parent** node so that PL/pgSQL can reconstruct the correct combination
+formula.
+
+Returns zero rows when there is no `WHERE` clause.  Granted to `PUBLIC`.
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `conjunction` | `'AND'` / `'OR'` / `'NONE'` (top-level single predicate) — indicates how this leaf combines with its siblings |
+| `column_name` | Referenced column name, or `NULL` for expression predicates |
+| `operator` | `'='`, `'<'`, `'>'`, `'<='`, `'>='`, `'<>'`, `'IS NULL'`, `'IS NOT NULL'`, `'IN'`, `'NOT IN'`, `'BETWEEN'`, `'NOT BETWEEN'`, `'LIKE'`, `'ILIKE'`, `'IS TRUE'`, `'IS FALSE'`, or `'UNKNOWN'` for unrecognised predicates |
+| `literal` | Scalar constant value (e.g. `'active'`, `42`), or `NULL` for `IS NULL` / `IS NOT NULL` |
+| `literal_list` | Comma-separated values for `IN` / `BETWEEN`, or `NULL` |
+| `negated` | `true` when the predicate is inside a `NOT` expression |
+
+**Supported predicate forms:**
+
+| Pattern | `operator` | `literal` | `literal_list` |
+|---|---|---|---|
+| `col = 'x'` | `=` | `'x'` | `NULL` |
+| `col IS NULL` | `IS NULL` | `NULL` | `NULL` |
+| `col IS NOT NULL` | `IS NOT NULL` | `NULL` | `NULL` |
+| `col IN ('a', 'b')` | `IN` | `NULL` | `'a', 'b'` |
+| `col BETWEEN 1 AND 10` | `BETWEEN` | `NULL` | `1 AND 10` |
+| `col LIKE 'x%'` | `LIKE` | `'x%'` | `NULL` |
+| `col IS TRUE` | `IS TRUE` | `NULL` | `NULL` |
+| `NOT col = 'x'` | `=` | `'x'` | `NULL` (with `negated = true`) |
+| Complex expression | `UNKNOWN` | formatted text | `NULL` |
+
+**Example:**
+
+```sql
+SELECT conjunction, column_name, operator, literal, negated
+FROM ddl_instead_of.parse_index_predicates($$
+    CREATE INDEX ON events (user_id)
+    WHERE status = 'active' AND deleted_at IS NULL
+$$);
+
+--  conjunction | column_name | operator   | literal    | negated
+-- -------------+-------------+------------+------------+---------
+--  AND         | status      | =          | 'active'   | f
+--  AND         | deleted_at  | IS NULL    |            | f
+```
+
+---
+
+### `ddl_instead_of.estimate_column_selectivity`
+
+```sql
+ddl_instead_of.estimate_column_selectivity(
+    p_table_oid    oid,
+    p_col_name     text,
+    p_operator     text,
+    p_literal      text      DEFAULT NULL,
+    p_literal_list text      DEFAULT NULL,
+    p_negated      boolean   DEFAULT false
+) RETURNS float8
+```
+
+Estimates the fraction of rows in a table that satisfy a single column
+predicate using `pg_stats` Most Common Values data (Approach B — no `EXPLAIN`
+on the live cluster).
+
+Returns a value in the range `[0.0001, 1.0]`.  Returns `0.333` (PostgreSQL's
+built-in default for unknown predicates) when statistics are unavailable or
+the operator cannot be estimated.
+
+Granted to `PUBLIC`.
+
+**Parameters:**
+
+| Parameter | Description |
+|---|---|
+| `p_table_oid` | OID of the base table (from `pg_class`) |
+| `p_col_name` | Column name as it appears in `pg_stats` |
+| `p_operator` | One of the operators returned by `parse_index_predicates` |
+| `p_literal` | Formatted literal from `parse_index_predicates.literal` |
+| `p_literal_list` | Formatted literal list from `parse_index_predicates.literal_list` |
+| `p_negated` | Whether the predicate is inside a `NOT` |
+
+**Estimation strategy by operator:**
+
+| Operator | Strategy |
+|---|---|
+| `IS NULL` | `pg_stats.null_frac` |
+| `IS NOT NULL` | `1 - null_frac` |
+| `=` | MCV lookup; falls back to `(non_null_frac - MCV_total) / (n_distinct - MCV_count)` |
+| `<>` | `non_null_frac` minus the MCV frequency of the matched value |
+| `IN` | Sum of per-element MCV frequencies; falls back to `count / n_distinct` |
+| `IS TRUE` / `IS FALSE` | MCV lookup for `'t'` or `'f'` |
+| `<`, `<=`, `>`, `>=` | PostgreSQL's default `0.333` (histogram not yet used) |
+| `BETWEEN` | Default `0.333` |
+| `LIKE` / `ILIKE` | Fixed `0.2` |
+| `UNKNOWN` | Default `0.333` |
+
+**Note:** The literal values produced by `parse_index_predicates` are
+automatically normalized (quotes and type casts stripped) before comparison
+with `pg_stats.most_common_vals` elements.
+
+---
+
+### `ddl_instead_of.estimate_index_where_selectivity`
+
+```sql
+ddl_instead_of.estimate_index_where_selectivity(
+    p_table_oid  oid,
+    p_statement  text
+) RETURNS float8
+```
+
+Combines the per-predicate selectivities for the `WHERE` clause of a
+`CREATE INDEX` statement into a single combined selectivity value.
+
+Returns `1.0` when the statement has no `WHERE` clause.  Granted to `PUBLIC`.
+
+**Combination rules:**
+
+- **`AND` leaves**: individual selectivities are multiplied.
+- **`OR` leaves**: combined using inclusion-exclusion: `1 - Π(1 - sᵢ)`.
+  After the OR block is resolved, its combined selectivity is multiplied into
+  the AND product.
+- **`UNKNOWN` or expression predicates**: use `0.333`.
+- The result is clipped to `[0.0001, 1.0]`.
+
+**Example:**
+
+```sql
+-- Table with 1,000,000 rows; status = 'active' has MCV frequency 0.35,
+-- deleted_at IS NULL has null_frac = 0.02 → IS NOT NULL selectivity = 0.98.
+SELECT ddl_instead_of.estimate_index_where_selectivity(
+    'orders'::regclass,
+    $$CREATE INDEX ON orders(user_id) WHERE status = 'active' AND deleted_at IS NOT NULL$$
+);
+-- → 0.35 × 0.98 = 0.343
+```
+
+---
+
+### `ddl_instead_of.estimate_index_size`
+
+```sql
+ddl_instead_of.estimate_index_size(
+    p_statement           text,
+    p_target_tablet_bytes bigint  DEFAULT 10737418240,  -- 10 GiB
+    p_ybctid_bytes        integer DEFAULT 24
+) RETURNS TABLE (
+    table_name           text,
+    index_key_cols       text,
+    index_include_cols   text,
+    where_clause         text,
+    base_rows            float8,
+    where_selectivity    float8,
+    effective_rows       float8,
+    entry_bytes_raw      float8,
+    entry_bytes_disk     float8,
+    total_bytes          float8,
+    recommended_tablets  float8,
+    notes                text
+)
+```
+
+Estimates the DocDB storage footprint and recommended tablet count for a
+`CREATE INDEX` statement before it is executed.  Uses `pg_stats` heuristics
+(Approach B) for `WHERE` predicate selectivity — no `EXPLAIN` is run on the
+live cluster.  The tablet count is not rounded; callers apply their own
+ceiling or threshold.
+
+Granted to `PUBLIC`.
+
+**DocDB storage model**
+
+Each index entry is stored as a key-value pair in DocDB (RocksDB-based).
+The size formula per entry:
+
+```
+Key  = Σ(key_col_avg_width + 1 type byte)
+      + ybctid_bytes           ← base-table row identifier
+      + 12 bytes HLC           ← hybrid logical clock timestamp
+      + 8 bytes RKV metadata   ← RocksDB key overhead
+
+Value = Σ(include_col_avg_width + 1 type byte)
+       + 4 bytes value prefix  ← DocDB value header
+
+Raw entry  = key + value
+Disk entry = raw entry × 1.15  ← SST block / filter / bloom overhead
+```
+
+Average column widths come from `pg_stats.avg_width`, with fallback to a
+type-family heuristic (e.g. `integer` → 4 bytes, `text` → 32 bytes,
+expression columns → 32 bytes).
+
+**Tablet recommendation**
+
+```
+effective_rows      = pg_class.reltuples × where_selectivity
+total_bytes         = effective_rows × disk_entry_bytes
+recommended_tablets = total_bytes / p_target_tablet_bytes
+```
+
+**Parameters:**
+
+| Parameter | Description |
+|---|---|
+| `p_statement` | Raw `CREATE INDEX` SQL text |
+| `p_target_tablet_bytes` | Target tablet size in bytes (default 10 GiB) |
+| `p_ybctid_bytes` | Expected ybctid size; default 24 bytes (covers most primary key shapes) |
+
+**Return columns:**
+
+| Column | Description |
+|---|---|
+| `table_name` | Schema-qualified base table name |
+| `index_key_cols` | Comma-separated key column list |
+| `index_include_cols` | Comma-separated `INCLUDE` column list, or empty string |
+| `where_clause` | `WHERE` predicate text, or empty string |
+| `base_rows` | `pg_class.reltuples`; may be `-1` or `0` before first `ANALYZE` |
+| `where_selectivity` | Estimated fraction of rows matching the `WHERE` clause |
+| `effective_rows` | `base_rows × where_selectivity` |
+| `entry_bytes_raw` | Estimated uncompressed bytes per index entry |
+| `entry_bytes_disk` | `entry_bytes_raw × 1.15` |
+| `total_bytes` | `effective_rows × entry_bytes_disk` |
+| `recommended_tablets` | `total_bytes / p_target_tablet_bytes` (not rounded) |
+| `notes` | Semicolon-separated diagnostic messages (e.g. missing statistics) |
+
+**Notes:**
+
+- `base_rows` is taken directly from `pg_class.reltuples`.  Run `ANALYZE` on
+  the base table before calling this function for accurate results.
+- For expression index columns (e.g. `lower(email)`), `avg_width` defaults to
+  32 bytes and a note is added to the `notes` column.
+- The function raises an exception if the base table does not exist.
+- `recommended_tablets` is a continuous value.  A typical caller applies
+  `GREATEST(1, ceil(recommended_tablets))` before constructing a `SPLIT INTO`
+  clause.
+
+**Example:**
+
+```sql
+SELECT
+    table_name,
+    index_key_cols,
+    index_include_cols,
+    where_clause,
+    base_rows,
+    round(where_selectivity::numeric, 4) AS selectivity,
+    round(effective_rows::numeric)        AS eff_rows,
+    round(entry_bytes_disk::numeric)      AS bytes_per_entry,
+    round(total_bytes::numeric / 1e9, 2)  AS total_gb,
+    recommended_tablets,
+    notes
+FROM ddl_instead_of.estimate_index_size($$
+    CREATE INDEX ON orders (tenant_id HASH, created_at ASC)
+    INCLUDE (total_amount)
+    WHERE status = 'active' AND deleted_at IS NULL
+$$);
+
+--  table_name | index_key_cols               | index_include_cols | where_clause
+-- ------------+------------------------------+--------------------+----------------------------------------
+--  orders     | tenant_id, created_at        | total_amount       | (status = 'active' AND deleted_at IS NULL)
+--
+--  base_rows | selectivity | eff_rows | bytes_per_entry | total_gb | recommended_tablets | notes
+-- -----------+-------------+----------+-----------------+----------+---------------------+-------
+--  2000000   |      0.3430 |   686000 |              83 |     0.06 |            0.005461 |
+```
+
+**Typical use cases:**
+
+- Pre-flight sizing: evaluate the storage impact of a proposed index before
+  creating it on a production cluster.
+- Automated `SPLIT INTO` selection: call from a `ddl_instead_of` handler on
+  `CREATE INDEX` to inject an appropriate `SPLIT INTO N TABLETS` clause based
+  on the estimated index size.
+- Capacity planning: estimate total index storage across a set of planned
+  migrations.
+
+---
+
 ### Catalog table
 
 ```sql
@@ -691,6 +1083,7 @@ Or via the YugabyteDB build wrapper (builds the full server plus the extension):
 
 | Version | Changes |
 |---|---|
+| 1.5 | Added index storage estimation suite: `parse_index_columns(statement)` (C SRF) decomposes a `CREATE INDEX` into key/include column rows with ordering and WHERE clause text; `parse_index_predicates(statement)` (C SRF) walks the WHERE clause AST and returns one row per leaf condition tagged with conjunction and negation; `estimate_column_selectivity(table_oid, col, op, …)` estimates per-predicate selectivity from `pg_stats` MCV lists (Approach B, no EXPLAIN); `estimate_index_where_selectivity(table_oid, statement)` combines AND/OR leaves using multiplication / inclusion-exclusion; `estimate_index_size(statement[, target_tablet_bytes[, ybctid_bytes]])` returns full DocDB storage estimates and an unrounded tablet count recommendation; all functions granted to PUBLIC |
 | 1.4 | Added `table_signature(statement)` — computes an MD5 fingerprint of a `CREATE TABLE` structural definition; constraint names are excluded so tables with identical structure but different constraint names produce the same hash; constraints are sorted before hashing for order-independence; granted to PUBLIC |
 | 1.3 | Added `parse_table_columns(statement)` returning per-column detail (ordinal position, name, type, nullability, default expression) and `parse_table_constraints(statement)` returning per-constraint detail (type, key columns with YugabyteDB ordering, check predicate, FK referenced table/columns, FK referential actions); type name formatter maps pg_catalog internal names to SQL standard names; expression formatter covers literals, type casts, function calls, operators, IN/BETWEEN, IS NULL, AND/OR/NOT; both granted to PUBLIC |
 | 1.2 | Added `parse_command_info(command_tag, statement)` set-returning function that extracts `object_type`, `schema_name`, `object_name`, and `object_identity` from raw DDL text; covers 20+ statement types including multi-object DROP/TRUNCATE; granted to PUBLIC |
