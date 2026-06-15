@@ -14,7 +14,9 @@ DATA = ddl_instead_of--1.0.sql \
        ddl_instead_of--1.2--1.3.sql \
        ddl_instead_of--1.3.sql \
        ddl_instead_of--1.3--1.4.sql \
-       ddl_instead_of--1.4.sql
+       ddl_instead_of--1.4.sql \
+       ddl_instead_of--1.4--1.5.sql \
+       ddl_instead_of--1.5.sql
 
 TESTS = $(wildcard sql/*.sql)
 REGRESS = $(patsubst sql/%.sql,%,$(TESTS))

@@ -1018,6 +1018,494 @@ ddl_instead_of_parse_table_constraints(PG_FUNCTION_ARGS)
  * End of parse_table_columns / parse_table_constraints implementation
  * ========================================================================= */
 
+/* =========================================================================
+ * parse_index_columns / parse_index_predicates implementation
+ *
+ * These two set-returning functions decompose a raw CREATE INDEX statement
+ * into its constituent parts so that PL/pgSQL can compute storage estimates
+ * without having to re-parse the SQL text or walk the AST itself.
+ * ========================================================================= */
+
+/*
+ * Return the unqualified column name from a ColumnRef, or NULL if the node
+ * is not a plain ColumnRef (e.g. an expression).
+ */
+static const char *
+ddlii_colref_name(Node *node)
+{
+	ColumnRef  *cr;
+
+	if (node == NULL || !IsA(node, ColumnRef))
+		return NULL;
+	cr = (ColumnRef *) node;
+	if (list_length(cr->fields) < 1)
+		return NULL;
+	/* Use the last field; any table-qualifier before it is irrelevant here */
+	return strVal(llast(cr->fields));
+}
+
+/* ---- parse_index_columns ---- */
+
+static void
+ddlii_emit_index_col_row(ReturnSetInfo *rsinfo,
+						 bool		   is_key,
+						 int		   ordinal,
+						 const char   *column_name,
+						 const char   *expression,
+						 SortByDir	   ordering,
+						 SortByNulls   nulls_ordering,
+						 const char   *where_clause)
+{
+	Datum		values[7];
+	bool		nulls[7];
+	const char *ord_str;
+
+	MemSet(nulls, 0, sizeof(nulls));
+
+	/* is_key */
+	values[0] = BoolGetDatum(is_key);
+
+	/* ordinal */
+	values[1] = Int32GetDatum(ordinal);
+
+	/* column_name */
+	if (column_name)
+		values[2] = CStringGetTextDatum(column_name);
+	else
+		nulls[2] = true;
+
+	/* expression */
+	if (expression)
+		values[3] = CStringGetTextDatum(expression);
+	else
+		nulls[3] = true;
+
+	/* ordering */
+	switch (ordering)
+	{
+		case SORTBY_HASH:	ord_str = "HASH"; break;
+		case SORTBY_ASC:	ord_str = "ASC";  break;
+		case SORTBY_DESC:	ord_str = "DESC"; break;
+		default:			ord_str = NULL;   break;  /* SORTBY_DEFAULT */
+	}
+	if (ord_str)
+		values[4] = CStringGetTextDatum(ord_str);
+	else
+		nulls[4] = true;
+
+	/* nulls_first */
+	switch (nulls_ordering)
+	{
+		case SORTBY_NULLS_FIRST:  values[5] = BoolGetDatum(true);  break;
+		case SORTBY_NULLS_LAST:   values[5] = BoolGetDatum(false); break;
+		default:                  nulls[5]  = true;                break;
+	}
+
+	/* where_clause */
+	if (where_clause)
+		values[6] = CStringGetTextDatum(where_clause);
+	else
+		nulls[6] = true;
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * ddl_instead_of_parse_index_columns
+ *
+ * Parse a CREATE INDEX statement and return one row per key column followed
+ * by one row per INCLUDE column:
+ *
+ *   is_key       boolean  -- true = key column, false = INCLUDE column
+ *   ordinal      integer  -- 1-based position within the key or include list
+ *   column_name  text     -- column name, or NULL for expression indexes
+ *   expression   text     -- formatted expression, or NULL for plain columns
+ *   ordering     text     -- 'HASH' | 'ASC' | 'DESC' | NULL (default)
+ *   nulls_first  boolean  -- NULL = database default
+ *   where_clause text     -- WHERE predicate text (same on every row); NULL if absent
+ */
+PG_FUNCTION_INFO_V1(ddl_instead_of_parse_index_columns);
+Datum
+ddl_instead_of_parse_index_columns(PG_FUNCTION_ARGS)
+{
+	text		  *stmt_text = PG_GETARG_TEXT_PP(0);
+	char		  *stmt_cstr;
+	List		  *raw_list;
+	RawStmt		  *rawstmt;
+	Node		  *stmt;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	IndexStmt	  *is;
+	ListCell	  *lc;
+	int			   ordinal;
+	char		  *where_str = NULL;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stmt_cstr = text_to_cstring(stmt_text);
+	raw_list  = raw_parser(stmt_cstr, RAW_PARSE_DEFAULT);
+	pfree(stmt_cstr);
+
+	if (list_length(raw_list) < 1)
+		return (Datum) 0;
+
+	rawstmt = linitial_node(RawStmt, raw_list);
+	stmt    = rawstmt->stmt;
+
+	if (stmt == NULL || !IsA(stmt, IndexStmt))
+		return (Datum) 0;
+
+	is = (IndexStmt *) stmt;
+
+	/* Format the WHERE predicate once; the same text appears on every row */
+	if (is->whereClause != NULL)
+		where_str = ddlii_format_expr(is->whereClause);
+
+	/* Key columns (indexParams) */
+	ordinal = 0;
+	foreach(lc, is->indexParams)
+	{
+		IndexElem  *ie = lfirst_node(IndexElem, lc);
+		char	   *expr_str = NULL;
+
+		ordinal++;
+
+		if (ie->expr != NULL)
+			expr_str = ddlii_format_expr(ie->expr);
+
+		ddlii_emit_index_col_row(rsinfo,
+								 true, /* is_key */
+								 ordinal,
+								 ie->name,
+								 expr_str,
+								 ie->ordering,
+								 ie->nulls_ordering,
+								 where_str);
+		if (expr_str)
+			pfree(expr_str);
+	}
+
+	/* INCLUDE columns (indexIncludingParams) */
+	ordinal = 0;
+	foreach(lc, is->indexIncludingParams)
+	{
+		IndexElem  *ie = lfirst_node(IndexElem, lc);
+		char	   *expr_str = NULL;
+
+		ordinal++;
+
+		if (ie->expr != NULL)
+			expr_str = ddlii_format_expr(ie->expr);
+
+		ddlii_emit_index_col_row(rsinfo,
+								 false, /* is_key = false means INCLUDE */
+								 ordinal,
+								 ie->name,
+								 expr_str,
+								 ie->ordering,
+								 ie->nulls_ordering,
+								 where_str);
+		if (expr_str)
+			pfree(expr_str);
+	}
+
+	if (where_str)
+		pfree(where_str);
+
+	return (Datum) 0;
+}
+
+/* ---- parse_index_predicates ---- */
+
+static void ddlii_walk_predicate(ReturnSetInfo *rsinfo,
+								 Node *predicate,
+								 const char *conjunction,
+								 bool negated);
+
+static void
+ddlii_emit_predicate_row(ReturnSetInfo *rsinfo,
+						 const char   *conjunction,
+						 const char   *column_name,
+						 const char   *operator_name,
+						 const char   *literal,
+						 const char   *literal_list,
+						 bool		   negated)
+{
+	Datum  values[6];
+	bool   nulls[6];
+
+	MemSet(nulls, 0, sizeof(nulls));
+
+	/* conjunction */
+	values[0] = CStringGetTextDatum(conjunction ? conjunction : "NONE");
+
+	/* column_name */
+	if (column_name)
+		values[1] = CStringGetTextDatum(column_name);
+	else
+		nulls[1] = true;
+
+	/* operator */
+	values[2] = CStringGetTextDatum(operator_name ? operator_name : "UNKNOWN");
+
+	/* literal */
+	if (literal)
+		values[3] = CStringGetTextDatum(literal);
+	else
+		nulls[3] = true;
+
+	/* literal_list (for IN / BETWEEN) */
+	if (literal_list)
+		values[4] = CStringGetTextDatum(literal_list);
+	else
+		nulls[4] = true;
+
+	/* negated */
+	values[5] = BoolGetDatum(negated);
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+
+/*
+ * Recursively walk a raw-parse-tree predicate node and emit one row per
+ * leaf condition into the SRF tuplestore.
+ *
+ * conjunction: 'AND', 'OR', or NULL/'NONE' for the top-level single predicate.
+ * negated:     true when the current sub-tree is inside a NOT expression.
+ *
+ * AND/OR BoolExpr nodes are not emitted themselves; they recurse and tag each
+ * leaf with the parent conjunction so PL/pgSQL can reconstruct the combination
+ * formula (multiply selectivities for AND; use 1-(1-s1)*(1-s2) for OR).
+ */
+static void
+ddlii_walk_predicate(ReturnSetInfo *rsinfo,
+					 Node		  *predicate,
+					 const char   *conjunction,
+					 bool		   negated)
+{
+	if (predicate == NULL)
+		return;
+
+	if (IsA(predicate, BoolExpr))
+	{
+		BoolExpr   *be = (BoolExpr *) predicate;
+		ListCell   *lc;
+
+		if (be->boolop == NOT_EXPR)
+		{
+			/* Flip negation for the single child */
+			ddlii_walk_predicate(rsinfo, (Node *) linitial(be->args),
+								 conjunction, !negated);
+		}
+		else
+		{
+			const char *child_conj = (be->boolop == AND_EXPR) ? "AND" : "OR";
+			foreach(lc, be->args)
+				ddlii_walk_predicate(rsinfo, (Node *) lfirst(lc),
+									 child_conj, negated);
+		}
+	}
+	else if (IsA(predicate, NullTest))
+	{
+		NullTest   *nt  = (NullTest *) predicate;
+		const char *col = ddlii_colref_name((Node *) nt->arg);
+		const char *op  = (nt->nulltesttype == IS_NULL)
+						  ? "IS NULL" : "IS NOT NULL";
+
+		ddlii_emit_predicate_row(rsinfo, conjunction ? conjunction : "NONE",
+								 col, op, NULL, NULL, negated);
+	}
+	else if (IsA(predicate, BooleanTest))
+	{
+		BooleanTest *bt  = (BooleanTest *) predicate;
+		const char  *col = ddlii_colref_name((Node *) bt->arg);
+		const char  *op;
+
+		switch (bt->booltesttype)
+		{
+			case IS_TRUE:        op = "IS TRUE";        break;
+			case IS_NOT_TRUE:    op = "IS NOT TRUE";    break;
+			case IS_FALSE:       op = "IS FALSE";       break;
+			case IS_NOT_FALSE:   op = "IS NOT FALSE";   break;
+			case IS_UNKNOWN:     op = "IS UNKNOWN";     break;
+			case IS_NOT_UNKNOWN: op = "IS NOT UNKNOWN"; break;
+			default:             op = "UNKNOWN";        break;
+		}
+
+		ddlii_emit_predicate_row(rsinfo, conjunction ? conjunction : "NONE",
+								 col, op, NULL, NULL, negated);
+	}
+	else if (IsA(predicate, A_Expr))
+	{
+		A_Expr	   *ae = (A_Expr *) predicate;
+		const char *op_name = NULL;
+		const char *col;
+		char	   *literal      = NULL;
+		char	   *literal_list = NULL;
+		const char *mapped_op;
+
+		/* Operator name */
+		if (list_length(ae->name) >= 1 && IsA(linitial(ae->name), String))
+			op_name = strVal((String *) linitial(ae->name));
+
+		/* Column on the LHS (may be NULL for expression predicates) */
+		col = ddlii_colref_name(ae->lexpr);
+
+		switch (ae->kind)
+		{
+			case AEXPR_OP:
+				if      (!op_name)                    mapped_op = "UNKNOWN";
+				else if (strcmp(op_name, "=")  == 0)  mapped_op = "=";
+				else if (strcmp(op_name, "<")  == 0)  mapped_op = "<";
+				else if (strcmp(op_name, ">")  == 0)  mapped_op = ">";
+				else if (strcmp(op_name, "<=") == 0)  mapped_op = "<=";
+				else if (strcmp(op_name, ">=") == 0)  mapped_op = ">=";
+				else if (strcmp(op_name, "<>") == 0)  mapped_op = "<>";
+				else                                   mapped_op = op_name;
+
+				if (ae->rexpr != NULL)
+					literal = ddlii_format_expr(ae->rexpr);
+				break;
+
+			case AEXPR_IN:
+				mapped_op = (op_name && strcmp(op_name, "=") == 0)
+							? "IN" : "NOT IN";
+				if (ae->rexpr != NULL && IsA(ae->rexpr, List))
+				{
+					StringInfoData	buf;
+					ListCell	   *lc2;
+					bool			first = true;
+
+					initStringInfo(&buf);
+					foreach(lc2, (List *) ae->rexpr)
+					{
+						char *elem = ddlii_format_expr((Node *) lfirst(lc2));
+						if (!first) appendStringInfoString(&buf, ", ");
+						first = false;
+						appendStringInfoString(&buf, elem);
+						pfree(elem);
+					}
+					literal_list = buf.data;
+				}
+				break;
+
+			case AEXPR_BETWEEN:
+			case AEXPR_NOT_BETWEEN:
+			case AEXPR_BETWEEN_SYM:
+			case AEXPR_NOT_BETWEEN_SYM:
+			{
+				StringInfoData buf;
+
+				mapped_op =
+					(ae->kind == AEXPR_BETWEEN)         ? "BETWEEN" :
+					(ae->kind == AEXPR_NOT_BETWEEN)     ? "NOT BETWEEN" :
+					(ae->kind == AEXPR_BETWEEN_SYM)     ? "BETWEEN SYMMETRIC" :
+														  "NOT BETWEEN SYMMETRIC";
+
+				if (ae->rexpr != NULL && IsA(ae->rexpr, List))
+				{
+					List *bounds = (List *) ae->rexpr;
+					if (list_length(bounds) >= 2)
+					{
+						char *lo = ddlii_format_expr((Node *) linitial(bounds));
+						char *hi = ddlii_format_expr((Node *) lsecond(bounds));
+						initStringInfo(&buf);
+						appendStringInfo(&buf, "%s AND %s", lo, hi);
+						pfree(lo); pfree(hi);
+						literal_list = buf.data;
+					}
+				}
+				break;
+			}
+
+			case AEXPR_LIKE:
+			case AEXPR_ILIKE:
+			{
+				bool is_like = (ae->kind == AEXPR_LIKE);
+				bool neg_op  = (op_name &&
+								(strcmp(op_name, "!~~") == 0 ||
+								 strcmp(op_name, "!~~*") == 0));
+				mapped_op = is_like ? (neg_op ? "NOT LIKE"  : "LIKE")
+									: (neg_op ? "NOT ILIKE" : "ILIKE");
+				if (ae->rexpr != NULL)
+					literal = ddlii_format_expr(ae->rexpr);
+				break;
+			}
+
+			default:
+				mapped_op = "UNKNOWN";
+				break;
+		}
+
+		ddlii_emit_predicate_row(rsinfo, conjunction ? conjunction : "NONE",
+								 col, mapped_op, literal, literal_list, negated);
+
+		if (literal)	  pfree(literal);
+		if (literal_list) pfree(literal_list);
+	}
+	else
+	{
+		/* Unrecognised node: format and emit as UNKNOWN */
+		char *expr_str = ddlii_format_expr(predicate);
+		ddlii_emit_predicate_row(rsinfo, conjunction ? conjunction : "NONE",
+								 NULL, "UNKNOWN", expr_str, NULL, negated);
+		pfree(expr_str);
+	}
+}
+
+/*
+ * ddl_instead_of_parse_index_predicates
+ *
+ * Parse a CREATE INDEX statement and return one row per leaf condition in
+ * the WHERE clause.  Returns zero rows when there is no WHERE clause.
+ *
+ *   conjunction   text     -- 'AND' | 'OR' | 'NONE' (top-level single predicate)
+ *   column_name   text     -- referenced column, or NULL for expressions
+ *   operator      text     -- '=' | '<' | '>' | '<=' | '>=' | '<>' |
+ *                             'IS NULL' | 'IS NOT NULL' | 'IN' | 'NOT IN' |
+ *                             'BETWEEN' | 'LIKE' | 'ILIKE' | 'UNKNOWN'
+ *   literal       text     -- constant value (NULL for IS NULL / IS NOT NULL)
+ *   literal_list  text     -- comma-separated values for IN / BETWEEN
+ *   negated       boolean  -- true when wrapped in NOT
+ */
+PG_FUNCTION_INFO_V1(ddl_instead_of_parse_index_predicates);
+Datum
+ddl_instead_of_parse_index_predicates(PG_FUNCTION_ARGS)
+{
+	text		  *stmt_text = PG_GETARG_TEXT_PP(0);
+	char		  *stmt_cstr;
+	List		  *raw_list;
+	RawStmt		  *rawstmt;
+	Node		  *stmt;
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	IndexStmt	  *is;
+
+	InitMaterializedSRF(fcinfo, 0);
+
+	stmt_cstr = text_to_cstring(stmt_text);
+	raw_list  = raw_parser(stmt_cstr, RAW_PARSE_DEFAULT);
+	pfree(stmt_cstr);
+
+	if (list_length(raw_list) < 1)
+		return (Datum) 0;
+
+	rawstmt = linitial_node(RawStmt, raw_list);
+	stmt    = rawstmt->stmt;
+
+	if (stmt == NULL || !IsA(stmt, IndexStmt))
+		return (Datum) 0;
+
+	is = (IndexStmt *) stmt;
+
+	if (is->whereClause != NULL)
+		ddlii_walk_predicate(rsinfo, is->whereClause, NULL, false);
+
+	return (Datum) 0;
+}
+
+/* =========================================================================
+ * End of parse_index_columns / parse_index_predicates implementation
+ * ========================================================================= */
+
 /* -------------------------------------------------------------------------
  * parse_command_info helpers
  *

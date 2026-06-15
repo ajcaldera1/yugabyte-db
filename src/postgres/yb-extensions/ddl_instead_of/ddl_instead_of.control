@@ -1,6 +1,6 @@
 # ddl_instead_of extension
 comment = 'Intercept top-level utility DDL via ProcessUtility_hook before event triggers'
-default_version = '1.4'
+default_version = '1.5'
 module_pathname = '$libdir/ddl_instead_of'
 relocatable = false
 schema = ddl_instead_of
