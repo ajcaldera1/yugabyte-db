@@ -541,13 +541,23 @@ class Report:
 ###################################################################################################
 # Checking
 ###################################################################################################
+def decode_command_output(output):
+    # Command stdout is not guaranteed to be valid UTF-8. YSQL /rpcz in particular
+    # embeds client query text and application_name, which can contain Windows-1252
+    # or other non-UTF-8 bytes. Strict utf-8 decoding crashes the whole node health
+    # script with UnicodeDecodeError.
+    if not output:
+        return ''
+    return str(output.decode('utf-8', 'replace').encode('ascii', 'ignore').decode('ascii'))
+
+
 def check_output(cmd, env, success_statuses=[0]):
     try:
         output = subprocess.check_output(
             cmd, shell=True, stderr=subprocess.STDOUT, env=env)
-        return str(output.decode('utf-8').encode("ascii", "ignore").decode("ascii"))
+        return decode_command_output(output)
     except subprocess.CalledProcessError as ex:
-        output = ex.output.decode('utf-8').encode("ascii", "ignore").decode("ascii")
+        output = decode_command_output(ex.output)
         if ex.returncode in success_statuses:
             # Some commands, like grep, can return error statuses even under normal operation
             return str(output)
@@ -2927,11 +2937,20 @@ class CheckCoordinator:
                         logging.info("Retry # {} for check {}"
                                      .format(str(check.tries), check.func_name))
 
-                    if check.yb_process is None:
-                        check.result = getattr(check.instance, check.func_name)()
-                    else:
-                        check.result =\
-                            getattr(check.instance, check.func_name)(check.yb_process,)
+                    try:
+                        if check.yb_process is None:
+                            check.result = getattr(check.instance, check.func_name)()
+                        else:
+                            check.result =\
+                                getattr(check.instance, check.func_name)(check.yb_process,)
+                    except Exception as ex:
+                        # Keep remaining checks running if one check raises (e.g. UnicodeDecodeError
+                        # before decode_command_output, or any other unexpected exception).
+                        logging.exception("Check {} raised unexpected exception"
+                                          .format(check.func_name))
+                        e = check.instance._new_entry(check.func_name, check.yb_process)
+                        check.result = e.fill_and_return_entry(
+                            ["Unexpected error: {}".format(ex)], has_error=True)
                     if check.result.has_error:
                         logging.info("Check {} failed with details {}"
                                      .format(check.func_name, check.result.details))
